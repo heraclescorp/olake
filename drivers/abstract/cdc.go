@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/datazip-inc/olake/constants"
@@ -115,21 +116,46 @@ func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destinatio
 
 	var finalMetadataState any
 	clearDedup := false
-	writers := make(map[string]*destination.WriterThread)
-	metadataStates := make(map[string]any)
+	writers := make(map[string]*destination.WriterThread, len(streams))
+	metadataStates := make(map[string]any, len(streams))
 	// true (default) → overlap window open, inserts emit "i" (equality delete + write).
 	// false          → steady-state, inserts emit "c" (write only).
 	dedupInserts := make(map[string]bool, len(streams))
+	defer handleWriterCleanup(cdcCtx, cdcCtxCancel, &err, writers, "", &finalMetadataState, &clearDedup)
 
-	for _, stream := range streams {
+	setupGroup := utils.NewCGroupWithLimit(cdcCtx, constants.CDCMetadataConcurrency)
+	var writersMu sync.Mutex
+	var setupErrOnce sync.Once
+	var setupErr error
+	utils.ConcurrentInGroup(setupGroup, streams, func(setupCtx context.Context, _ int, stream types.StreamInterface) (createErr error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				createErr = writerPanicError(createErr, recovered)
+			}
+			if createErr != nil {
+				createErr = fmt.Errorf("failed to create CDC writer for stream %s: %w", stream.ID(), createErr)
+				// Preserve the cause before canceled siblings report context.Canceled.
+				setupErrOnce.Do(func() {
+					setupErr = createErr
+					cdcCtxCancel()
+				})
+			}
+		}()
+		if createErr = setupCtx.Err(); createErr != nil {
+			return createErr
+		}
+
 		threadID := generateThreadID(stream.ID(), "")
+		// Writers outlive setupGroup, whose context is canceled by Block.
 		w, writerMeta, createErr := pool.NewWriter(cdcCtx, stream, destination.WithThreadID(threadID), destination.WithApplyFilter(true), destination.WithKeepDeletesThroughFilter(slices.Contains(constants.CDCKeepDeletesThroughFilterDrivers, constants.DriverType(a.driver.Type()))))
 		if createErr != nil {
-			return fmt.Errorf("failed to create CDC writer for stream %s: %w", stream.ID(), createErr)
+			return createErr
 		}
+
+		writersMu.Lock()
+		defer writersMu.Unlock()
 		writers[stream.ID()] = w
 		var writerMetaState any
-
 		dedupInserts[stream.ID()] = true
 		if writerMeta != nil {
 			writerMetaState = writerMeta.State
@@ -138,9 +164,14 @@ func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destinatio
 			}
 		}
 		metadataStates[stream.ID()] = writerMetaState
+		return nil
+	})
+	if groupErr := setupGroup.Block(); groupErr != nil {
+		return setupErr
 	}
-
-	defer handleWriterCleanup(cdcCtx, cdcCtxCancel, &err, writers, "", &finalMetadataState, &clearDedup)
+	if err = cdcCtx.Err(); err != nil {
+		return err
+	}
 
 	finalMetadataState, err = a.driver.StreamChanges(cdcCtx, streamIndex, metadataStates, func(ctx context.Context, change CDCChange) error {
 		writer := writers[change.Stream.ID()]

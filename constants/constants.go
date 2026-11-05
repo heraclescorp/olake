@@ -76,6 +76,9 @@ const (
 	// MaxDestinationBatchBytes is the maximum source bytes held in a writer thread buffer before flush.
 	MaxDestinationBatchBytes = int64(1) * 1024 * 1024 * 1024 // 1 GB
 
+	// CDCMetadataConcurrency bounds table setup and commits.
+	CDCMetadataConcurrency = 16
+
 	// Index store constants
 	IndexDBDir                = "OLAKE_INDEX_DB_DIR"
 	IndexDBCacheSizePerStream = "OLAKE_INDEX_DB_CACHE_SIZE"
