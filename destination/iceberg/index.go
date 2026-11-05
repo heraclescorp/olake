@@ -9,11 +9,14 @@ import (
 	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils/logger"
+	"google.golang.org/grpc"
 )
 
 // indexScanFlushRows is how many scanned rows are buffered in memory before being
 // written to the index. Bounds the memory a full table rebuild can take.
 const indexScanFlushRows = 200_000
+
+const indexScanMaxRecvMsgSize = 16 * 1024 * 1024
 
 // reconcileTableIndex makes the stream's index agree with the destination table before the first record is written
 func (i *Iceberg) reconcileTableIndex(ctx context.Context, index types.StreamIndex, tableSnapshotID int64, hasEqualityDeletes bool) error {
@@ -63,7 +66,7 @@ func (i *Iceberg) fillTableIndex(ctx context.Context, index types.StreamIndex, t
 	posIterator, err := i.server.tableIndexClient.ScanTableForIndexing(ctx, &proto.TableIndexScanRequest{
 		ThreadId:       i.options.ThreadID,
 		FromSnapshotId: fromSnapshotID,
-	})
+	}, grpc.MaxCallRecvMsgSize(indexScanMaxRecvMsgSize))
 	if err != nil {
 		return fmt.Errorf("failed to start stream index scan: %s", err)
 	}

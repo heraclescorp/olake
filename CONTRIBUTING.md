@@ -7,6 +7,7 @@ To ensure consistency, we follow a structured contribution process. All guidelin
 - [How To Raise A PR](https://olake.io/docs/community/issues-and-prs)
 - [Setting Up A Development Environment](https://olake.io/docs/community/setting-up-a-dev-env)
 - **Running tests locally** — run `make help` for all local database-stack and test targets (e.g. `make test.integration.<driver>` for a driver's whole suite, `make test.discover.<driver>` / `make test.sync.<driver>` / `make test.2pc.<driver>` for one of them, `make test.unit`)
+- **Iceberg index recovery** — `go test ./destination/iceberg -run TestFillTableIndexReceivesLargeScanBatch` exercises streamed responses above gRPC's default 4 MiB limit using a real gRPC server and a local Pebble index. Index-scan responses have a bounded 16 MiB receive limit; other RPC limits are unchanged.
 - **Backward compatibility tests** — see
   [tests/testutils/compatibility/README.md](tests/testutils/compatibility/README.md)
   for what the suite asserts, how `constants/state-versions.json` drives it,
