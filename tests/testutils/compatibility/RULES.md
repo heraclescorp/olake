@@ -180,6 +180,18 @@ v0.7.2 follows the rules exactly as v0.7.2 would. A commit with no release in
 it, or an image reference, has no version to compare: gates and dated rules
 never apply to it, while `type_only` still does.
 
+## Postgres binary columns
+
+Postgres `bytea` uses native Binary values when the loaded state version is 8
+or newer, matching MySQL's binary-support gate. Snapshots preserve raw bytes;
+CDC decodes the wire representation before writing. The replication connection
+requests hex `bytea_output` independently of the server's default.
+
+States before version 8 retain the legacy String schema and values. Existing
+version-8 Postgres destinations created with String `bytea` columns need a
+destination rebuild and re-backfill to adopt Binary; this is not an automatic
+String-to-Binary schema migration.
+
 ## Mistakes fail loudly
 
 Every driver's test binary loads the file when it starts, and stops on:
