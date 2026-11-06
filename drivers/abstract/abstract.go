@@ -360,19 +360,17 @@ func generateThreadID(streamID, hash string) string {
 	return fmt.Sprintf("%s_%s", streamID, suffix)
 }
 
-// handleWriterCleanup is a helper that creates a defer function for common writer cleanup operations
-// It handles writer close (single or multiple), panic recovery, and calls the provided postProcess function
-// The err parameter should be a pointer to the error variable that will be returned from the function
-// The cancel parameter is used to cancel the context when an error occurs, so other threads can detect the failure
-// The writer parameter can be either:
-//   - *destination.WriterThread for a single writer
-//   - map[string]*destination.WriterThread for multiple writers keyed by stream ID
+func writerPanicError(prior error, value any) error {
+	if prior == nil {
+		return errs.Precondition(errs.InternalError, codeWriterPanicRecovered, fmt.Errorf("panic recovered: %v", value))
+	}
+	return fmt.Errorf("%w: panic recovered: %v", prior, value)
+}
+
+// handleWriterCleanup joins all closes before PostCDC may acknowledge progress.
 func handleWriterCleanup(ctx context.Context, cancel context.CancelFunc, err *error, writer any, threadID string, mtState *any, dedupInserts *bool) {
 	if r := recover(); r != nil {
-		// panic is classified as internal error
-		*err = utils.Ternary(*err == nil,
-			errs.Precondition(errs.InternalError, codeWriterPanicRecovered, fmt.Errorf("panic recovered: %v", r)),
-			fmt.Errorf("%w: panic recovered: %v", *err, r)).(error)
+		*err = writerPanicError(*err, r)
 	}
 
 	if *err != nil {
@@ -380,10 +378,17 @@ func handleWriterCleanup(ctx context.Context, cancel context.CancelFunc, err *er
 	}
 
 	var closeErr error
+	_, multipleWriters := writer.(map[string]*destination.WriterThread)
 
-	closeWriter := func(w *destination.WriterThread, metadataValue any) error {
+	closeWriter := func(w *destination.WriterThread, metadataValue any) (setErr error) {
 		var metadataState any
-		var setErr error
+		if multipleWriters {
+			defer func() {
+				if r := recover(); r != nil {
+					setErr = writerPanicError(setErr, r)
+				}
+			}()
+		}
 
 		if metadataValue != nil {
 			ms, err := types.SetMetadataState(metadataValue, threadID)
@@ -410,26 +415,43 @@ func handleWriterCleanup(ctx context.Context, cancel context.CancelFunc, err *er
 		}
 		closeErr = closeWriter(w, mtStateValue)
 	case map[string]*destination.WriterThread:
-		// Multiple writers keyed by stream ID
-		for streamID, inserter := range w {
-			if inserter != nil {
-				var mtStateValue any
-				if mtState != nil {
-					if mtStateValueByStream, ok := (*mtState).(map[string]any); ok {
-						mtStateValue = mtStateValueByStream[streamID]
-					} else {
-						mtStateValue = *mtState
-					}
-				}
-				closeErr = errors.Join(closeErr, closeWriter(inserter, mtStateValue))
-			}
+		if len(w) == 0 {
+			break
 		}
+		group := utils.NewCGroupWithLimit(ctx, constants.CDCMetadataConcurrency)
+		var closeErrMu sync.Mutex
+		for streamID, inserter := range w {
+			if inserter == nil {
+				continue
+			}
+			var mtStateValue any
+			if mtState != nil {
+				if mtStateValueByStream, ok := (*mtState).(map[string]any); ok {
+					mtStateValue = mtStateValueByStream[streamID]
+				} else {
+					mtStateValue = *mtState
+				}
+			}
+			group.Add(func(_ context.Context) error {
+				if writerErr := closeWriter(inserter, mtStateValue); writerErr != nil {
+					closeErrMu.Lock()
+					closeErr = errors.Join(closeErr, writerErr)
+					closeErrMu.Unlock()
+				}
+				return nil
+			})
+		}
+		_ = group.Block()
 	default:
 		closeErr = fmt.Errorf("unsupported writer type")
 	}
 
 	if closeErr != nil {
-		*err = utils.Ternary(*err == nil, closeErr, fmt.Errorf("%s: prev error: %w", closeErr, *err)).(error)
+		if multipleWriters && *err != nil {
+			*err = fmt.Errorf("prev error: %w; close error: %w", *err, closeErr)
+		} else {
+			*err = utils.Ternary(*err == nil, closeErr, fmt.Errorf("%s: prev error: %w", closeErr, *err)).(error)
+		}
 	}
 	if *err != nil {
 		cancel()
