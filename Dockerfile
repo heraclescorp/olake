@@ -1,5 +1,12 @@
 ARG GO_BUILD=cross
 
+FROM --platform=$BUILDPLATFORM maven:3.9-eclipse-temurin-17 AS iceberg-writer
+WORKDIR /build
+COPY destination/iceberg/olake-iceberg-java-writer/pom.xml ./
+COPY destination/iceberg/olake-iceberg-java-writer/src ./src
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn -B clean package -Dmaven.test.skip=true
+
 FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm AS go-cross
 FROM golang:1.26.10-bookworm AS go-target
 
@@ -68,9 +75,7 @@ COPY --from=builder /home/app/drivers/${DRIVER_NAME}/olake /home/olake
 # Sets the version of olake in ENV
 ENV DRIVER_VERSION=${DRIVER_VERSION}
 
-# Copy the pre-built JAR file from Maven
-# First try to copy from the source location (works after Maven build)
-COPY destination/iceberg/olake-iceberg-java-writer/target/olake-iceberg-java-writer-0.0.1-SNAPSHOT.jar /home/olake-iceberg-java-writer.jar
+COPY --from=iceberg-writer /build/target/olake-iceberg-java-writer-0.0.1-SNAPSHOT.jar /home/olake-iceberg-java-writer.jar
 
 # Copy driver and destination spec files
 COPY --from=builder /home/app/drivers/${DRIVER_NAME}/resources/spec.json /drivers/${DRIVER_NAME}/resources/spec.json
