@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strings"
@@ -71,16 +72,17 @@ const (
 )
 
 type Postgres struct {
-	client     *sqlx.DB
-	version    int // server_version_num of the connected server (e.g. 140005), read in Setup
-	sizer      ctidSizer
-	sshClient  *ssh.Client
-	config     *Config // postgres driver connection config
-	CDCSupport bool    // indicates if the Postgres instance supports CDC
-	cdcConfig  CDC
-	replicator waljs.Replicator
-	state      *types.State // reference to globally present state
-	streams    []types.StreamInterface
+	client      *sqlx.DB
+	version     int // server_version_num of the connected server (e.g. 140005), read in Setup
+	sizer       ctidSizer
+	sshClient   *ssh.Client
+	config      *Config // postgres driver connection config
+	CDCSupport  bool    // indicates if the Postgres instance supports CDC
+	cdcConfig   CDC
+	replicator  waljs.Replicator
+	state       *types.State // reference to globally present state
+	streams     []types.StreamInterface
+	typeMapping map[string]types.DataType
 	// prerequisites holds the CDC setup checks evaluated in Setup; when the config selects CDC,
 	// unmet required checks fail Setup via abstract.RequireCDCPrerequisites.
 	prerequisites types.PrerequisiteResults
@@ -95,6 +97,7 @@ func (p *Postgres) Setup(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to validate config: %w", err)
 	}
+	p.typeMapping = pgTypeToDataTypes()
 
 	if p.config.SSHConfig != nil && p.config.SSHConfig.Host != "" {
 		logger.Info("Found SSH Configuration")
@@ -263,7 +266,7 @@ func (p *Postgres) ProduceSchema(ctx context.Context, streamID types.StreamID) (
 		for _, column := range columnSchemaOutput {
 			stream.WithCursorField(column.Name)
 			var datatype types.DataType
-			if val, found := pgTypeToDataTypes[*column.DataType]; found {
+			if val, found := p.typeMapping[*column.DataType]; found {
 				datatype = val
 			} else {
 				logger.Debugf("failed to get respective type in datatypes for column: %s[%s]", column.Name, *column.DataType)
@@ -313,6 +316,15 @@ func (p *Postgres) dataTypeConverter(value interface{}, columnType string) (inte
 	if value == nil {
 		return nil, typeutils.ErrNullValue
 	}
-	olakeType := typeutils.ExtractAndMapColumnType(columnType, pgTypeToDataTypes)
+	olakeType := typeutils.ExtractAndMapColumnType(columnType, p.typeMapping)
+	if olakeType == types.Binary {
+		if value, ok := value.(string); ok {
+			decoded, err := hex.DecodeString(strings.TrimPrefix(value, `\x`))
+			if err != nil {
+				return nil, fmt.Errorf("failed to decode bytea: %w", err)
+			}
+			return decoded, nil
+		}
+	}
 	return typeutils.ReformatValue(olakeType, value)
 }
