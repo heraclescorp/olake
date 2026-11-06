@@ -235,7 +235,7 @@ func RawDataColumnBuffer(record types.RawRecord, protoSchema []*proto.IcebergPay
 	maps.Copy(dataMap, record.OlakeColumns)
 
 	// 2. Add stringified data as a single column
-	bytesData, err := json.Marshal(record.Data)
+	bytesData, err := internal.MarshalRawData(record.Data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal data in normalization: %s", err)
 	}
