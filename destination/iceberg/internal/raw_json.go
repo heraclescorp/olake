@@ -9,6 +9,9 @@ import (
 
 func MarshalRawData(data map[string]any) ([]byte, error) {
 	encoded, err := json.Marshal(data)
+	if err == nil {
+		return encoded, nil
+	}
 	var unsupported *json.UnsupportedValueError
 	if !errors.As(err, &unsupported) {
 		return encoded, err
