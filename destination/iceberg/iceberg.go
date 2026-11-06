@@ -357,7 +357,7 @@ func (i *Iceberg) FlattenAndCleanData(ctx context.Context, records []types.RawRe
 	if !i.stream.NormalizationEnabled() {
 		err := utils.Concurrent(ctx, records, runtime.GOMAXPROCS(0)*16, func(_ context.Context, record types.RawRecord, idx int) error {
 			// JSON-encode original source data before overwriting the map
-			dataBytes, err := json.Marshal(record.Data)
+			dataBytes, err := internal.MarshalRawData(record.Data)
 			if err != nil {
 				return destination.WriteFailure(fmt.Errorf("failed to marshal raw data: %w", err))
 			}
