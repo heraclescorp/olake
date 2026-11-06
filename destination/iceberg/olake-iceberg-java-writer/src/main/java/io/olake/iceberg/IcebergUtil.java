@@ -239,7 +239,7 @@ public class IcebergUtil {
         LOGGER.warn("Table not found: {}", tableID.toString());
         return false;
       }
-      return icebergCatalog.dropTable(tableID, false);
+      return icebergCatalog.dropTable(tableID, true);
     } catch(Exception e){
       LOGGER.error("Failed to drop table {}.{}: {}", namespace, tableName, e.getMessage());
       throw new RuntimeException("Failed to drop table: " + namespace + "." + tableName, e);
