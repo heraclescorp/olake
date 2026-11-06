@@ -141,7 +141,7 @@ func AdvanceLSN(ctx context.Context, db *sqlx.DB, slot, currentWalPos string) (p
 		return 0, fmt.Errorf("failed to parse advance target lsn[%s]: %w", currentWalPos, err)
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	for {
 		var endLSN pglogrepl.LSN
