@@ -179,9 +179,22 @@ func (p *pgoutputReplicator) tupleValuesToMap(rel *pglogrepl.RelationMessage, tu
 			continue
 		}
 
-		// Convert according to OID to string
 		typeName := oidToString(colType)
-		val, err := p.socket.changeFilter.converter(string(col.Data), typeName)
+		var value any
+		if colType == pgtype.ByteaOID && utils.IsBinarySupported() {
+			var format int16 = pgtype.TextFormatCode
+			if col.DataType == pglogrepl.TupleDataTypeBinary {
+				format = pgtype.BinaryFormatCode
+			}
+			var err error
+			value, err = (pgtype.ByteaCodec{}).DecodeValue(nil, colType, format, col.Data)
+			if err != nil {
+				return nil, 0, fmt.Errorf("failed to decode bytea column[%s]: %w", colName, err)
+			}
+		} else {
+			value = string(col.Data)
+		}
+		val, err := p.socket.changeFilter.converter(value, typeName)
 		if err != nil && err != typeutils.ErrNullValue {
 			return nil, 0, err
 		}

@@ -58,6 +58,9 @@ func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, re
 	connURL := config.Connection
 	q := connURL.Query()
 	q.Set("replication", "database")
+	if utils.IsBinarySupported() {
+		q.Set("bytea_output", "hex")
+	}
 	connURL.RawQuery = q.Encode()
 
 	cfg, err := pgconn.ParseConfig(connURL.String())
