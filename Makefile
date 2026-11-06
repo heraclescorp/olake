@@ -342,10 +342,6 @@ $(ICEBERG_JAR): $(ICEBERG_JAR_SRCS)
 .PHONY: iceberg.jar
 iceberg.jar: $(ICEBERG_JAR)
 
-# The Dockerfile COPYs the writer JAR, so every image build gets it as a prerequisite here. Separate
-# from the docker.%.build rule above only because $(ICEBERG_JAR) is defined further down.
-$(addsuffix .build,$(addprefix docker.,$(DRIVERS))): $(ICEBERG_JAR)
-
 # --- dev builds (generated per driver, incl. s3) ------------------------------
 # CGO_ENABLED=0 is set here, not left to the environment: db2 is the one driver that needs cgo
 # and GO_ENV.db2 turns it back on right after (it is appended to this same recipe line). Without
