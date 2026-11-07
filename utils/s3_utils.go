@@ -167,3 +167,35 @@ func FinalizeS3Upload(ctx context.Context, noSave bool) error {
 	}
 	return nil
 }
+
+// ResolveArtifactOutput follows config-folder overrides without downloading an
+// output that need not exist yet. The returned URI is empty for filesystem jobs.
+func ResolveArtifactOutput(outputPath, defaultName, sourcePath string) (string, string, error) {
+	if outputPath == "" {
+		outputPath = filepath.Join(filepath.Dir(sourcePath), defaultName)
+	}
+	applyConfigFolder(os.Getenv(constants.EnvS3ConfigFolder), []*string{&outputPath})
+	if isS3Path(outputPath) {
+		if _, _, err := parseS3URI(outputPath); err != nil {
+			return "", "", err
+		}
+		return filepath.Join(s3LocalPath(), path.Base(outputPath)), outputPath, nil
+	}
+	if s3util.JobBucket != "" {
+		return outputPath, "s3://" + s3util.JobBucket + "/" + path.Join(s3util.JobPrefix, path.Base(outputPath)), nil
+	}
+	return outputPath, "", nil
+}
+
+// UploadArtifactOutput deliberately uploads only the proposal. Enrollment must
+// never upload its input catalogs/state before the worker's database CAS commits.
+func UploadArtifactOutput(ctx context.Context, localPath, uri string, noSave bool) error {
+	if noSave || uri == "" {
+		return nil
+	}
+	bucket, key, err := parseS3URI(uri)
+	if err != nil {
+		return err
+	}
+	return s3util.UploadFileToS3(ctx, localPath, bucket, key)
+}
