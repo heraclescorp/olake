@@ -85,7 +85,9 @@ type Postgres struct {
 	typeMapping map[string]types.DataType
 	// prerequisites holds the CDC setup checks evaluated in Setup; when the config selects CDC,
 	// unmet required checks fail Setup via abstract.RequireCDCPrerequisites.
-	prerequisites types.PrerequisiteResults
+	prerequisites    types.PrerequisiteResults
+	enrollmentIssue  error
+	enrollmentTables []pubTable
 }
 
 func (p *Postgres) CDCSupported() bool {
@@ -93,6 +95,10 @@ func (p *Postgres) CDCSupported() bool {
 }
 
 func (p *Postgres) Setup(ctx context.Context) error {
+	return p.setup(ctx, true)
+}
+
+func (p *Postgres) setup(ctx context.Context, requireCDCPrerequisites bool) error {
 	err := p.config.Validate()
 	if err != nil {
 		return fmt.Errorf("failed to validate config: %w", err)
@@ -161,11 +167,13 @@ func (p *Postgres) Setup(ctx context.Context) error {
 			cdc.InitialWaitTime = defaultCDCInitialWaitTime
 		}
 
-		// The config selects CDC, so an unmet requirement fails the connection test rather than
-		// leaving a source that cannot sync.
-		p.prerequisites = abstract.RunPrerequisites(ctx, p.prerequisiteChecks(cdc))
-		if err := abstract.RequireCDCPrerequisites(p.Type(), p.prerequisites); err != nil {
-			return err
+		// Normal sync/check require all CDC prerequisites. Enrollment reports missing
+		// publication/slot coverage per candidate instead, without starting replication.
+		if requireCDCPrerequisites {
+			p.prerequisites = abstract.RunPrerequisites(ctx, p.prerequisiteChecks(cdc))
+			if err := abstract.RequireCDCPrerequisites(p.Type(), p.prerequisites); err != nil {
+				return err
+			}
 		}
 		p.CDCSupport = true
 		p.cdcConfig = *cdc

@@ -147,14 +147,22 @@ func (s *Stream) MarshalJSON() ([]byte, error) {
 		slices.Sort(arr)
 		return &arr
 	}
+	var sortedModes *[]SyncMode
+	if s.SupportedSyncModes != nil {
+		modes := s.SupportedSyncModes.Array()
+		slices.Sort(modes)
+		sortedModes = &modes
+	}
 	return json.Marshal(&struct {
 		*Alias
-		AvailableCursorFields   *[]string `json:"available_cursor_fields,omitempty"`
-		SourceDefinedPrimaryKey *[]string `json:"source_defined_primary_key,omitempty"`
+		AvailableCursorFields   *[]string   `json:"available_cursor_fields,omitempty"`
+		SourceDefinedPrimaryKey *[]string   `json:"source_defined_primary_key,omitempty"`
+		SupportedSyncModes      *[]SyncMode `json:"supported_sync_modes,omitempty"`
 	}{
 		Alias:                   (*Alias)(s),
 		AvailableCursorFields:   sortedStrings(s.AvailableCursorFields),
 		SourceDefinedPrimaryKey: sortedStrings(s.SourceDefinedPrimaryKey),
+		SupportedSyncModes:      sortedModes,
 	})
 }
 

@@ -59,7 +59,11 @@ var RootCmd = &cobra.Command{
 		s3Err := utils.ResolveS3Paths(cmd.Context(), []*string{
 			&configPath, &destinationConfigPath, &streamsPath, &statePath, &differencePath,
 			&availableStreamsPath, &selectedStreamsPath, &differenceAvailableStreamsPath, &differenceSelectedStreamsPath,
+			&enrollmentPolicyPath,
 		}, telemetry.PropsFiles())
+		if s3Err == nil && cmd.Name() == "discover-new-tables" {
+			enrollmentResultPath, enrollmentResultURI, s3Err = utils.ResolveArtifactOutput(enrollmentResultPath, "enrollment-result.json", configPath)
+		}
 		// set global variables
 		viper.SetDefault(constants.ConfigFolder, os.TempDir())
 		viper.SetDefault(constants.StatePath, filepath.Join(os.TempDir(), "state.json"))
@@ -112,6 +116,9 @@ var RootCmd = &cobra.Command{
 	// After a successful subcommand (sync/discover/clear). Cobra skips this hook when
 	// RunE failed, which matches FinalizeS3Upload's "do not upload a failed run" rule.
 	PersistentPostRunE: func(cmd *cobra.Command, _ []string) error {
+		if cmd.Name() == "discover-new-tables" {
+			return utils.UploadArtifactOutput(cmd.Context(), enrollmentResultPath, enrollmentResultURI, noSave)
+		}
 		return utils.FinalizeS3Upload(cmd.Context(), noSave)
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -179,7 +186,7 @@ func init() {
 	cobra.EnableTraverseRunHooks = true
 
 	// TODO: replace --catalog flag with --streams
-	commands = append(commands, specCmd, checkCmd, discoverCmd, syncCmd, clearCmd)
+	commands = append(commands, specCmd, checkCmd, discoverCmd, discoverNewTablesCmd, syncCmd, clearCmd)
 	RootCmd.PersistentFlags().StringVarP(&configPath, "config", "", "not-set", "(Required) Config for connector")
 	RootCmd.PersistentFlags().StringVarP(&destinationConfigPath, "destination", "", "not-set", "(Required) Destination config for connector")
 	RootCmd.PersistentFlags().StringVarP(&destinationType, "destination-type", "", "not-set", "Destination type for spec")
