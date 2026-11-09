@@ -3,6 +3,7 @@ package io.olake.iceberg;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.CatalogUtil;
@@ -35,6 +36,11 @@ public class OlakeRpcServer {
     static Catalog icebergCatalog;
 
     public static void main(String[] args) throws InterruptedException {
+        RuntimeTelemetry telemetry = RuntimeTelemetry.start();
+        RuntimeRecording recording = RuntimeRecording.start();
+        LOGGER.info("JVM effective memory: max_heap_bytes={} committed_heap_bytes={} available_processors={}",
+                Runtime.getRuntime().maxMemory(), Runtime.getRuntime().totalMemory(),
+                Runtime.getRuntime().availableProcessors());
         Server server;
         try {
             CatalogHttpLogging.install();
@@ -77,7 +83,8 @@ public class OlakeRpcServer {
                 stringConfigMap.getOrDefault("max-message-size", String.valueOf(Integer.MAX_VALUE)));
 
             ServerBuilder<?> serverBuilder = ServerBuilder.forPort(port)
-                        .maxInboundMessageSize(maxMessageSize);
+                        .maxInboundMessageSize(maxMessageSize)
+                        .intercept(telemetry.serverInterceptor());
 
             ConcurrentMap<String, IcebergSession> sharedSessions = new ConcurrentHashMap<>();
 
@@ -100,12 +107,24 @@ public class OlakeRpcServer {
 
             server = serverBuilder.build().start();
 
-            // Graceful shutdown so the OS sees the gRPC port released cleanly.
-            Runtime.getRuntime().addShutdownHook(new Thread(server::shutdown, "olake-grpc-shutdown"));
+            // Drain requests before the bounded final metric export; no diagnostics listener is opened.
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                server.shutdown();
+                try {
+                    server.awaitTermination(3, TimeUnit.SECONDS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    telemetry.close();
+                    recording.close();
+                }
+            }, "olake-grpc-shutdown"));
 
             LOGGER.info("Server started on port {} with max message size: {}MB",
                         port, (maxMessageSize / (1024 * 1024)));
         } catch (Throwable t) {
+            telemetry.close();
+            recording.close();
             // stderr, not LOGGER: that is stdout, and Go only keeps stderr. Unwrap so Go sees
             // the real class, not Iceberg's IllegalArgumentException wrapper.
             Throwable cause = OlakeFailures.rootCause(t);
@@ -119,5 +138,7 @@ public class OlakeRpcServer {
         // Blocks until shutdown, which is what keeps the process alive. Outside the try above:
         // a failure while serving is not a failure to start.
         server.awaitTermination();
+        telemetry.close();
+        recording.close();
     }
 }

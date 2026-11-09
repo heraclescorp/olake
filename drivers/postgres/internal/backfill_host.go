@@ -12,6 +12,7 @@ import (
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils/errs"
 	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/datazip-inc/olake/utils/observability"
 	"github.com/jmoiron/sqlx"
 )
 
@@ -171,6 +172,7 @@ func (p *Postgres) setupBackfillHost(ctx context.Context) error {
 // has applied the Aurora log through the stream's barrier before it is returned, so the caller's next
 // snapshot on the same connection contains every commit the writer had made durable by then.
 func (p *Postgres) backfillConn(ctx context.Context, stream types.StreamInterface) (*sqlx.Conn, error) {
+	ctx = observability.WithTable(ctx, stream.Namespace(), stream.Name())
 	conn, err := p.backfillClient.Connx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire a backfill connection: %w", err)
@@ -184,17 +186,20 @@ func (p *Postgres) backfillConn(ctx context.Context, stream types.StreamInterfac
 		closeBackfillConn(conn)
 		return nil, err
 	}
+	var attempts int64
 	applied, waited, err := waitForAppliedLSN(ctx, func(ctx context.Context) (int64, error) {
+		attempts++
 		return readAppliedLSN(ctx, conn)
 	}, target, readerCatchUpTimeout, readerCatchUpPollInterval)
+	observability.RecordReaderBarrier(ctx, attempts, waited, err == nil)
 	if err != nil {
 		closeBackfillConn(conn)
 		return nil, fmt.Errorf("stream[%s]: backfill host is not caught up with the writer: %w", stream.ID(), err)
 	}
-	if waited > readerCatchUpPollInterval {
-		logger.Infof("stream[%s]: backfill host caught up after %s (applied %d >= writer durable_lsn %d)", stream.ID(), waited.Round(time.Millisecond), applied, target)
+	if attempts > 1 {
+		logger.Infof("stream[%s]: backfill host caught up after %s and %d checks (applied %d >= writer durable_lsn %d)", stream.ID(), waited.Round(time.Millisecond), attempts, applied, target)
 	} else {
-		logger.Debugf("stream[%s]: backfill host already caught up (applied %d >= writer durable_lsn %d)", stream.ID(), applied, target)
+		logger.Debugf("stream[%s]: backfill host already caught up on first check (applied %d >= writer durable_lsn %d)", stream.ID(), applied, target)
 	}
 	return conn, nil
 }

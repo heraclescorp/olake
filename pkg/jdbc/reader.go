@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/datazip-inc/olake/drivers/abstract"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/observability"
 	"github.com/datazip-inc/olake/utils/typeutils"
 )
 
@@ -39,12 +41,35 @@ func (o *Reader[T]) Capture(onCapture func(T) error) error {
 		return fmt.Errorf("base query ends with ';': %s", o.query)
 	}
 
+	measuring := observability.Enabled()
+	var queryStart time.Time
+	if measuring {
+		queryStart = time.Now()
+	}
 	rows, err := o.exec(o.ctx, o.query, o.args...)
 	if err != nil {
+		observability.RecordFailure(o.ctx, "read")
 		return err
 	}
 
-	for rows.Next() {
+	var rowNumber uint64
+	for {
+		sample := measuring && rowNumber%1024 == 0
+		var readStart time.Time
+		if sample {
+			readStart = time.Now()
+		}
+		hasRow := rows.Next()
+		if sample {
+			observability.RecordDuration(o.ctx, "source_next_sample", time.Since(readStart))
+		}
+		if rowNumber == 0 && measuring {
+			observability.RecordDuration(o.ctx, "query_to_first_row", time.Since(queryStart))
+		}
+		if !hasRow {
+			break
+		}
+		rowNumber++
 		err := onCapture(rows)
 		if err != nil {
 			return err
@@ -53,6 +78,7 @@ func (o *Reader[T]) Capture(onCapture func(T) error) error {
 
 	err = rows.Err()
 	if err != nil {
+		observability.RecordFailure(o.ctx, "read")
 		return err
 	}
 	return nil
@@ -136,6 +162,7 @@ func MapScan(rows *sql.Rows, dest map[string]any, converter func(value interface
 // and reused for every row; the size is summed inline in the conversion loop.
 func MapScanConcurrent(setter *Reader[*sql.Rows], converter func(value interface{}, columnType string) (interface{}, error), OnMessage abstract.BackfillMsgFn, columnSizer func(colType *sql.ColumnType) func(v any) int64) error {
 	valuesCh := make(chan []any)
+	measuring := observability.Enabled()
 
 	var (
 		columns   []string
@@ -146,6 +173,7 @@ func MapScanConcurrent(setter *Reader[*sql.Rows], converter func(value interface
 	// Producer: scan rows and push raw values onto the channel.
 	producer := func(ctx context.Context) error {
 		defer close(valuesCh)
+		var rowNumber uint64
 
 		return setter.Capture(func(rows *sql.Rows) error {
 			if columns == nil {
@@ -170,11 +198,19 @@ func MapScanConcurrent(setter *Reader[*sql.Rows], converter func(value interface
 				vals[i] = *(scanDests[i].(*any))
 			}
 
+			rowNumber++
+			var sendStart time.Time
+			if measuring && rowNumber%1024 == 0 {
+				sendStart = time.Now()
+			}
 			select {
 			case <-ctx.Done():
 				// If the processor failed, errgroup cancels the ctx; return nil so the original error wins.
 				return nil
 			case valuesCh <- vals:
+				if !sendStart.IsZero() {
+					observability.RecordDuration(setter.ctx, "row_handoff_sample", time.Since(sendStart))
+				}
 				return nil
 			}
 		})
@@ -183,6 +219,12 @@ func MapScanConcurrent(setter *Reader[*sql.Rows], converter func(value interface
 	// Consumer: convert + emit records.
 	consumer := func(ctx context.Context) error {
 		var sizeOf map[string]func(v any) int64
+		var readRows, readBytes int64
+		defer func() {
+			if measuring {
+				observability.AddRows(setter.ctx, "read", readRows, readBytes)
+			}
+		}()
 		for vals := range valuesCh {
 			// colTypes is safely visible here: the producer sets it before the first
 			// channel send. Build the per-column sizers once for the result set, keyed
@@ -194,6 +236,10 @@ func MapScanConcurrent(setter *Reader[*sql.Rows], converter func(value interface
 				}
 			}
 
+			var normalizeStart time.Time
+			if measuring && readRows%1024 == 0 {
+				normalizeStart = time.Now()
+			}
 			var rowBytes int64
 			record := make(map[string]any, len(columns))
 			for i, col := range columns {
@@ -212,6 +258,17 @@ func MapScanConcurrent(setter *Reader[*sql.Rows], converter func(value interface
 					return fmt.Errorf("failed to convert value for column %s: %w", col, err)
 				}
 				record[col] = conv
+			}
+			if measuring {
+				if !normalizeStart.IsZero() {
+					observability.RecordDuration(setter.ctx, "row_convert_sample", time.Since(normalizeStart))
+				}
+				readRows++
+				readBytes += rowBytes
+				if readRows == 1024 {
+					observability.AddRows(setter.ctx, "read", readRows, readBytes)
+					readRows, readBytes = 0, 0
+				}
 			}
 
 			if err := OnMessage(ctx, record, rowBytes); err != nil {

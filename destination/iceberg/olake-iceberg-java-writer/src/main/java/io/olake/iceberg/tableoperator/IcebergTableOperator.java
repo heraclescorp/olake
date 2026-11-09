@@ -56,6 +56,8 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import io.olake.iceberg.rpc.RecordIngest.ArrowPayload;
+import io.olake.iceberg.RuntimeTelemetry;
+import io.olake.iceberg.RuntimeTelemetry.Stage;
 
 /**
  * Wrapper to perform operations on iceberg tables
@@ -197,10 +199,11 @@ public class IcebergTableOperator {
       }
     }
 
-    // Refresh once before committing
-    table.refresh();
-
+    long commitStarted = RuntimeTelemetry.startTimer();
+    boolean committed = false;
     try {
+      // Refresh once before committing; flush is measured separately above.
+      table.refresh();
       Transaction transaction = table.newTransaction();
 
       // 1. Stage Property Update - mark thread as committed
@@ -214,6 +217,7 @@ public class IcebergTableOperator {
       // leaves the transaction empty, so committing it writes nothing
       if (!hasFiles) {
         transaction.commitTransaction();
+        committed = true;
         LOGGER.info("No files to commit for thread: {}, committed {} state only", threadId, STATE_KEY_2PC);
         return 0L;
       }
@@ -309,6 +313,7 @@ public class IcebergTableOperator {
       }
 
       transaction.commitTransaction();
+      committed = true;
 
       // take transaction snapshot id as commit id
       Snapshot staged = transaction.table().currentSnapshot();
@@ -333,10 +338,14 @@ public class IcebergTableOperator {
       String msg = String.format("Failed to commit for thread %s: %s", threadId, e.getMessage());
       LOGGER.error(msg, e);
       throw new RuntimeException(msg, e);
+    } finally {
+      RuntimeTelemetry.recordDuration(Stage.COMMIT, commitStarted, committed);
     }
   }
 
   public void completeWriter() {
+    long flushStarted = writer == null ? 0 : RuntimeTelemetry.startTimer();
+    boolean flushed = false;
     try {
       if (writer == null) {
         LOGGER.warn("no writer to complete");
@@ -349,6 +358,7 @@ public class IcebergTableOperator {
       // Only ever non-empty for a deletion-vector writer: the vectors it just wrote
       // supersede ones already on the table, and those must be retired at commit.
       rewrittenDeleteFiles.addAll(Arrays.asList(writerResult.rewrittenDeleteFiles()));
+      flushed = true;
     } catch (IOException e) {
       LOGGER.error("Failed to complete writer", e);
       throw new RuntimeException("Failed to complete writer", e);
@@ -360,9 +370,11 @@ public class IcebergTableOperator {
         }
       } catch (IOException e) {
         LOGGER.warn("Failed to close writer", e);
+        flushed = false;
       }
       // to reinitiate 
       writer = null;
+      RuntimeTelemetry.recordDuration(Stage.FLUSH, flushStarted, flushed);
     }
   }
 

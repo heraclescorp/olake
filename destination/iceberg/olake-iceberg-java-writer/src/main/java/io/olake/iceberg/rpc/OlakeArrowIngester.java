@@ -17,6 +17,8 @@ import org.apache.iceberg.types.Types.NestedField;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.olake.iceberg.RuntimeTelemetry;
+import io.olake.iceberg.RuntimeTelemetry.Stage;
 import io.olake.iceberg.rpc.RecordIngest.ArrowPayload;
 import io.olake.iceberg.tableoperator.ArrowDeletionVectorWriter;
 import io.olake.iceberg.tableoperator.DeleteMode;
@@ -171,11 +173,18 @@ public class OlakeArrowIngester extends ArrowIngestServiceGrpc.ArrowIngestServic
 
                 case UPLOAD_FILE -> {
                     ArrowPayload.FileUploadRequest uploadReq = metadata.getFileUpload();
-                    FileIO fileIO = session.icebergTable.io();
-                    OutputFile outputFile = fileIO.newOutputFile(uploadReq.getFilePath());
-                    try (OutputStream out = outputFile.create()) {
-                        out.write(uploadReq.getFileData().toByteArray());
-                        out.flush();
+                    long uploadStarted = RuntimeTelemetry.startTimer();
+                    boolean uploaded = false;
+                    try {
+                        FileIO fileIO = session.icebergTable.io();
+                        OutputFile outputFile = fileIO.newOutputFile(uploadReq.getFilePath());
+                        try (OutputStream out = outputFile.create()) {
+                            uploadReq.getFileData().writeTo(out);
+                            out.flush();
+                        }
+                        uploaded = true;
+                    } finally {
+                        RuntimeTelemetry.recordDuration(Stage.UPLOAD, uploadStarted, uploaded);
                     }
                     LOGGER.info("{} Successfully uploaded file to: {}", requestId, uploadReq.getFilePath());
                     sendResponse(responseObserver, uploadReq.getFilePath());

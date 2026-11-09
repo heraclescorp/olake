@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/pkg/indexdb"
@@ -12,6 +13,7 @@ import (
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/errs"
 	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/datazip-inc/olake/utils/observability"
 )
 
 type (
@@ -67,6 +69,7 @@ type (
 		recordsFiltered atomic.Int64
 		bytesPushed     atomic.Int64
 		bufferBytes     int64 // source bytes currently held in buffer (for byte-based flush)
+		metricsContext  context.Context
 	}
 )
 
@@ -173,6 +176,7 @@ func (w *WriterPool) GetStats() *Stats {
 }
 
 func (w *WriterPool) NewWriter(ctx context.Context, stream types.StreamInterface, options ...ThreadOptions) (*WriterThread, *types.MetadataState, error) {
+	ctx = observability.WithTable(ctx, stream.Namespace(), stream.Name())
 	w.stats.ThreadCount.Add(1)
 
 	opts := &Options{}
@@ -234,6 +238,7 @@ func (w *WriterPool) NewWriter(ctx context.Context, stream types.StreamInterface
 		stats:          w.stats,
 		streamArtifact: streamArtifact,
 		group:          utils.NewCGroupWithLimit(ctx, 1), // currently only one thread (To make sure flush can run parallel when buffer filling)
+		metricsContext: ctx,
 	}, prevStreamState, nil
 }
 
@@ -262,7 +267,14 @@ func (wt *WriterThread) Push(ctx context.Context, record types.RawRecord, source
 			copy(buf, wt.buffer)
 			wt.buffer = wt.buffer[:0]
 			wt.bufferBytes = 0
+			var queuedAt time.Time
+			if observability.Enabled() {
+				queuedAt = time.Now()
+			}
 			wt.group.Add(func(ctx context.Context) error {
+				if !queuedAt.IsZero() {
+					observability.RecordDuration(ctx, "flush_queue", time.Since(queuedAt))
+				}
 				return wt.flush(ctx, buf)
 			})
 		}
@@ -288,8 +300,16 @@ func (wt *WriterThread) flush(ctx context.Context, buf []types.RawRecord) (err e
 	flushCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	recordsCountBeforeFiltering := len(buf)
+	var normalizeStart time.Time
+	if observability.Enabled() {
+		normalizeStart = time.Now()
+	}
 	evolution, buf, threadSchema, err := wt.writer.FlattenAndCleanData(flushCtx, buf)
+	if !normalizeStart.IsZero() {
+		observability.RecordDuration(ctx, "normalize", time.Since(normalizeStart))
+	}
 	if err != nil {
+		observability.RecordFailure(ctx, "normalize")
 		return fmt.Errorf("failed to flatten and clean data: %w", err)
 	}
 	filtered := int64(recordsCountBeforeFiltering - len(buf))
@@ -304,13 +324,16 @@ func (wt *WriterThread) flush(ctx context.Context, buf []types.RawRecord) (err e
 		}
 		wt.streamArtifact.mu.Unlock()
 		if err != nil {
+			observability.RecordFailure(ctx, "normalize")
 			return fmt.Errorf("failed to evolve schema: %w", err)
 		}
 	}
 
 	if err := wt.writer.Write(flushCtx, buf); err != nil {
+		observability.RecordFailure(ctx, "write")
 		return fmt.Errorf("failed to write records: %w", err)
 	}
+	observability.AddRows(ctx, "pushed", int64(len(buf)), 0)
 
 	logger.Infof("Thread[%s]: successfully wrote %d records", wt.threadID, len(buf))
 	return nil
@@ -327,6 +350,15 @@ func (wt *WriterThread) rollbackStats() {
 }
 
 func (wt *WriterThread) Close(closeCtx context.Context, finalMetadataState any) (err error) {
+	metricsContext := closeCtx
+	if wt.metricsContext != nil {
+		metricsContext = wt.metricsContext
+	}
+	defer func() {
+		if err != nil {
+			observability.RecordFailure(metricsContext, "commit")
+		}
+	}()
 	select {
 	case <-closeCtx.Done():
 		// Wait for in-flight flushes so rollback below can't race their stat updates.
@@ -359,8 +391,15 @@ func (wt *WriterThread) Close(closeCtx context.Context, finalMetadataState any) 
 				cancel()
 			}
 
+			var commitStart time.Time
+			if observability.Enabled() {
+				commitStart = time.Now()
+			}
 			if closeErr := wt.writer.Close(ctx, finalMetadataState); closeErr != nil {
 				err = utils.Ternary(err == nil, closeErr, fmt.Errorf("%w: flush error: %w", closeErr, err)).(error)
+			}
+			if !commitStart.IsZero() {
+				observability.RecordDuration(metricsContext, "commit", time.Since(commitStart))
 			}
 
 			// Commit is successful only when both the final flush and writer.Close (dest
@@ -369,6 +408,8 @@ func (wt *WriterThread) Close(closeCtx context.Context, finalMetadataState any) 
 			// live read/filtered/byte stats so they count committed data only.
 			if err != nil {
 				wt.rollbackStats()
+			} else {
+				observability.AddRows(metricsContext, "committed", wt.recordsPushed.Load()-wt.recordsFiltered.Load(), 0)
 			}
 		}()
 

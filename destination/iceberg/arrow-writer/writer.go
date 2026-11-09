@@ -17,6 +17,7 @@ import (
 	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/observability"
 	"github.com/datazip-inc/olake/utils/typeutils"
 )
 
@@ -95,6 +96,7 @@ func New(ctx context.Context, options *destination.Options, partitionInfo []inte
 		pendingVectors: make(map[string]*pendingVector),
 	}
 
+	writer.indexThread.SetObservabilityContext(ctx)
 	if err := writer.initialize(ctx); err != nil {
 		return nil, fmt.Errorf("failed to initialize: %w", err)
 	}
@@ -256,6 +258,10 @@ func (w *ArrowWriter) indexRecord(writer *Writer, olakeID string, opType string,
 }
 
 func (w *ArrowWriter) Write(ctx context.Context, records []types.RawRecord) error {
+	if observability.Enabled() {
+		started := time.Now()
+		defer func() { observability.RecordDuration(ctx, "write", time.Since(started)) }()
+	}
 	var err error
 
 	if err := w.extract(ctx, records); err != nil {
@@ -365,6 +371,10 @@ func (w *ArrowWriter) flush(ctx context.Context, rw *RollingWriter, partitionKey
 		return nil
 	}
 
+	if observability.Enabled() {
+		started := time.Now()
+		defer func() { observability.RecordDuration(ctx, "flush", time.Since(started)) }()
+	}
 	if err := rw.currentWriter.Close(); err != nil {
 		return fmt.Errorf("failed to close writer during flush: %s", err)
 	}
@@ -392,6 +402,7 @@ func (w *ArrowWriter) EvolveSchema(ctx context.Context, newSchema map[string]str
 
 // Close flushes all writers and commits files to Iceberg.
 func (w *ArrowWriter) Close(ctx context.Context, finalMetadataState any) (err error) {
+	defer w.indexThread.ReleaseObservability()
 	if err := w.completeWriters(ctx); err != nil {
 		return fmt.Errorf("failed to close arrow writers: %w", err)
 	}
@@ -447,6 +458,11 @@ func (w *ArrowWriter) Close(ctx context.Context, finalMetadataState any) (err er
 	if w.indexThread != nil && committedSnapshotID != nil && *committedSnapshotID != 0 {
 		batch := w.indexThread
 		w.indexThread = nil
+		var indexCommitStart time.Time
+		if observability.Enabled() {
+			indexCommitStart = time.Now()
+			defer func() { observability.RecordDuration(ctx, "index_commit", time.Since(indexCommitStart)) }()
+		}
 		if applyErr := w.options.TableIndex.Commit(batch, committedSnapshotID); applyErr != nil {
 			return fmt.Errorf("failed to apply stream index: %s", applyErr)
 		}
@@ -457,6 +473,7 @@ func (w *ArrowWriter) Close(ctx context.Context, finalMetadataState any) (err er
 
 // abort index batch when thread is aborted
 func (w *ArrowWriter) Abort() {
+	w.indexThread.ReleaseObservability()
 	w.indexThread = nil
 }
 
@@ -713,6 +730,10 @@ func (w *ArrowWriter) uploadFile(ctx context.Context, rw *RollingWriter, partiti
 	uploadCtx, cancel := context.WithTimeout(ctx, constants.GRPCRequestTimeout)
 	defer cancel()
 
+	if observability.Enabled() {
+		started := time.Now()
+		defer func() { observability.RecordDuration(ctx, "upload", time.Since(started)) }()
+	}
 	if _, err := w.server.SendClientRequest(uploadCtx, request); err != nil {
 		return fmt.Errorf("failed to upload %s file: %w", rw.fileType, err)
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"time"
 
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/destination"
@@ -12,6 +13,7 @@ import (
 	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/datazip-inc/olake/utils/observability"
 	"github.com/datazip-inc/olake/utils/typeutils"
 )
 
@@ -36,6 +38,11 @@ func New(options *destination.Options, schema map[string]string, stream types.St
 }
 
 func (w *LegacyWriter) Write(ctx context.Context, records []types.RawRecord) error {
+	w.indexThread.SetObservabilityContext(ctx)
+	var encodeStart time.Time
+	if observability.Enabled() {
+		encodeStart = time.Now()
+	}
 	protoSchema := make([]*proto.IcebergPayload_SchemaField, 0, len(w.schema))
 	for field, dType := range w.schema {
 		protoSchema = append(protoSchema, &proto.IcebergPayload_SchemaField{
@@ -128,12 +135,22 @@ func (w *LegacyWriter) Write(ctx context.Context, records []types.RawRecord) err
 		Records: protoRecords,
 	}
 
+	if !encodeStart.IsZero() {
+		observability.RecordDuration(ctx, "encode", time.Since(encodeStart))
+	}
 	// Send to gRPC server with timeout
 	reqCtx, cancel := context.WithTimeout(ctx, constants.GRPCRequestTimeout)
 	defer cancel()
 
 	// Send the batch to the server
+	var rpcStart time.Time
+	if observability.Enabled() {
+		rpcStart = time.Now()
+	}
 	res, err := w.server.SendClientRequest(reqCtx, request)
+	if !rpcStart.IsZero() {
+		observability.RecordDuration(ctx, "rpc", time.Since(rpcStart))
+	}
 	if err != nil {
 		return fmt.Errorf("failed to send batch: %w", err)
 	}
@@ -141,6 +158,10 @@ func (w *LegacyWriter) Write(ctx context.Context, records []types.RawRecord) err
 	ingestResponse := res.(*proto.RecordIngestResponse)
 	logger.Debugf("Thread[%s]: sent batch to Iceberg server, response: %s", w.options.ThreadID, ingestResponse.GetResult())
 
+	var indexStart time.Time
+	if observability.Enabled() {
+		indexStart = time.Now()
+	}
 	if w.indexThread != nil {
 		for _, fileMap := range ingestResponse.GetFilePositionMaps() {
 			logger.Debugf("Thread[%s]: file position map: %s (%d ranges)", w.options.ThreadID, fileMap.GetFilePath(), len(fileMap.GetRanges()))
@@ -159,6 +180,9 @@ func (w *LegacyWriter) Write(ctx context.Context, records []types.RawRecord) err
 			}
 		}
 	}
+	if !indexStart.IsZero() {
+		observability.RecordDuration(ctx, "index_pending", time.Since(indexStart))
+	}
 
 	return nil
 }
@@ -167,6 +191,7 @@ func (w *LegacyWriter) Write(ctx context.Context, records []types.RawRecord) err
 // commit. Nothing was written to the index, so releasing the buffer is the
 // entire rollback.
 func (w *LegacyWriter) Abort() {
+	w.indexThread.ReleaseObservability()
 	w.indexThread = nil
 }
 
@@ -177,6 +202,7 @@ func (w *LegacyWriter) EvolveSchema(_ context.Context, newSchema map[string]stri
 }
 
 func (w *LegacyWriter) Close(ctx context.Context, finalMetadataState any) error {
+	defer w.indexThread.ReleaseObservability()
 	// Commit payload from CDC/driver only: e.g. {"captured_cdc_pos":"0/123ABC"}
 	var payloadStr string
 	if finalMetadataState != nil {
@@ -218,6 +244,11 @@ func (w *LegacyWriter) Close(ctx context.Context, finalMetadataState any) error 
 	if w.indexThread != nil && ingestResponse.SnapshotId != 0 {
 		batch := w.indexThread
 		w.indexThread = nil
+		var indexCommitStart time.Time
+		if observability.Enabled() {
+			indexCommitStart = time.Now()
+			defer func() { observability.RecordDuration(ctx, "index_commit", time.Since(indexCommitStart)) }()
+		}
 		if err := w.options.TableIndex.Commit(batch, &ingestResponse.SnapshotId); err != nil {
 			return fmt.Errorf("failed to apply stream index: %s", err)
 		}

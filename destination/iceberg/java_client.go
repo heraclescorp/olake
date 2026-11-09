@@ -152,12 +152,66 @@ func writeGCPCredsTempFile(credsJSON string) (string, error) {
 	return f.Name(), nil
 }
 
+// javaHeapEnvironment changes only the child JVM environment. _JAVA_OPTIONS is
+// processed after command-line options, so the appended percentage wins over
+// both the legacy launch default and inherited MaxRAMPercentage settings.
+func javaHeapEnvironment(env []string) ([]string, error) {
+	const policyKey = "OLAKE_JAVA_HEAP_PERCENT="
+	const optionsKey = "_JAVA_OPTIONS="
+	percent, present, optionsIndex := "", false, -1
+	for i, entry := range env {
+		if strings.HasPrefix(entry, policyKey) {
+			percent, present = strings.TrimPrefix(entry, policyKey), true
+		}
+		if strings.HasPrefix(entry, optionsKey) {
+			optionsIndex = i
+		}
+	}
+	if !present {
+		return env, nil
+	}
+	value, err := strconv.Atoi(percent)
+	if err != nil || value < 1 || value > 80 {
+		return nil, fmt.Errorf("OLAKE_JAVA_HEAP_PERCENT must be an integer between 1 and 80")
+	}
+	for _, entry := range env {
+		key, options, _ := strings.Cut(entry, "=")
+		if key != "_JAVA_OPTIONS" && key != "JAVA_TOOL_OPTIONS" && key != "JDK_JAVA_OPTIONS" {
+			continue
+		}
+		for _, option := range strings.Fields(options) {
+			if strings.HasPrefix(option, "-Xmx") || strings.HasPrefix(option, "-XX:MaxHeapSize=") || strings.HasPrefix(option, "-XX:MaxRAM=") || option == "-XX:-UseContainerSupport" {
+				return nil, fmt.Errorf("per-job Java heap percentage conflicts with inherited absolute heap or container-detection options")
+			}
+		}
+	}
+	childEnv := append([]string(nil), env...)
+	options := ""
+	if optionsIndex >= 0 {
+		options = strings.TrimPrefix(childEnv[optionsIndex], optionsKey)
+		if options != "" {
+			options += " "
+		}
+	}
+	options += "-XX:MaxRAMPercentage=" + strconv.Itoa(value)
+	if optionsIndex >= 0 {
+		childEnv[optionsIndex] = optionsKey + options
+	} else {
+		childEnv = append(childEnv, optionsKey+options)
+	}
+	return childEnv, nil
+}
+
 // startServer launches the JVM and returns the running instance. Invoked once
 // from Iceberg.Initialize (via WriterPool.NewWriterPool) before any
 // sync/check/clear work begins.
 func startServer(config *Config) (*serverInstance, error) {
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("failed to validate config: %w", err)
+	}
+	javaEnv, err := javaHeapEnvironment(os.Environ())
+	if err != nil {
+		return nil, err
 	}
 
 	const serverID = "shared"
@@ -188,7 +242,7 @@ func startServer(config *Config) (*serverInstance, error) {
 			"-XX:+UseG1GC",
 			"-XX:MaxRAMPercentage=75.0",
 			"-XX:+ExitOnOutOfMemoryError",
-			"-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005",
+			"-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:5005",
 			"-jar", config.JarPath, string(configJSON))
 	} else {
 		serverCmd = exec.Command("java",
@@ -198,7 +252,12 @@ func startServer(config *Config) (*serverInstance, error) {
 			"-jar", config.JarPath, string(configJSON))
 	}
 
-	serverCmd.Env = os.Environ()
+	serverCmd.Env = javaEnv
+	if percent, present := os.LookupEnv("OLAKE_JAVA_HEAP_PERCENT"); present {
+		logger.Infof("Iceberg JVM launch memory: MaxRAMPercentage=%s (per-job override)", percent)
+	} else {
+		logger.Infof("Iceberg JVM launch memory: MaxRAMPercentage=75 (default; inherited JVM options may override)")
+	}
 	appendEnv := func(key, value string) {
 		if value == "" {
 			return
@@ -267,7 +326,7 @@ func (s *serverInstance) SendClientRequest(ctx context.Context, payload interfac
 // Shutdown kills the JVM and releases its port. Safe to call from defer.
 // Signal-driven teardown flows through here too: the root context cancels on
 // signal, the command returns, and its deferred Close runs this.
-func (s *serverInstance) Shutdown(ctx context.Context) {
+func (s *serverInstance) Shutdown(_ context.Context) {
 	if s == nil {
 		return
 	}
@@ -277,8 +336,8 @@ func (s *serverInstance) Shutdown(ctx context.Context) {
 		_ = s.conn.Close()
 	}
 	if s.cmd != nil && s.cmd.Process != nil {
-		// Ask politely first; the JVM's own shutdown hook releases the gRPC port
-		// in an orderly way. Hard-kill only if it doesn't exit in a few seconds.
+		// Allow the JVM to drain and flush metrics even when the request context
+		// is canceled. The independent grace is bounded to ten seconds.
 		_ = s.cmd.Process.Signal(syscall.SIGTERM)
 		done := make(chan struct{}, 1)
 		go func() {
@@ -287,9 +346,6 @@ func (s *serverInstance) Shutdown(ctx context.Context) {
 		}()
 		select {
 		case <-done:
-		case <-ctx.Done():
-			logger.Warnf("Context canceled, killing Iceberg JVM")
-			_ = s.cmd.Process.Kill()
 		case <-time.After(10 * time.Second):
 			logger.Warnf("Iceberg JVM did not exit within 10s after SIGTERM, killing")
 			_ = s.cmd.Process.Kill()

@@ -12,10 +12,16 @@ import (
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/datazip-inc/olake/utils/observability"
 	"github.com/datazip-inc/olake/utils/typeutils"
 )
 
 func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams chan string, pool *destination.WriterPool, stream types.StreamInterface) error {
+	mainCtx = observability.WithTable(mainCtx, stream.Namespace(), stream.Name())
+	var tableStart time.Time
+	if observability.Enabled() {
+		tableStart = time.Now()
+	}
 	chunksSet := a.state.GetChunks(stream.Self())
 	var err error
 	if chunksSet == nil || chunksSet.Len() == 0 {
@@ -27,6 +33,7 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 		a.state.SetChunks(stream.Self(), chunksSet)
 	}
 	chunks := chunksSet.Array()
+	observability.AddChunks(mainCtx, "planned", int64(len(chunks)))
 	if len(chunks) == 0 {
 		if backfilledStreams != nil {
 			backfilledStreams <- stream.ID()
@@ -44,6 +51,26 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 	filterDataBySelectedColumnsFn := stream.RetainSelectedColumns()
 
 	chunkProcessor := func(gCtx context.Context, _ int, chunk types.Chunk) (err error) {
+		gCtx = observability.WithTable(gCtx, stream.Namespace(), stream.Name())
+		observability.AddChunks(mainCtx, "active", 1)
+		var chunkStart time.Time
+		if observability.Enabled() {
+			chunkStart = time.Now()
+		}
+		skipped := false
+		defer func() {
+			observability.AddChunks(mainCtx, "active", -1)
+			if !chunkStart.IsZero() {
+				observability.RecordDuration(mainCtx, "chunk", time.Since(chunkStart))
+			}
+			if err != nil || gCtx.Err() != nil {
+				observability.AddChunks(mainCtx, "failed", 1)
+			} else if skipped {
+				observability.AddChunks(mainCtx, "skipped", 1)
+			} else {
+				observability.AddChunks(mainCtx, "completed", 1)
+			}
+		}()
 		// create backfill context, so that main context not affected if backfill retries
 		backfillCtx, backfillCtxCancel := context.WithCancel(gCtx)
 		defer backfillCtxCancel()
@@ -60,6 +87,9 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 			}
 			chunksLeft := a.state.RemoveChunk(stream.Self(), chunk)
 			if chunksLeft == 0 && backfilledStreams != nil {
+				if !tableStart.IsZero() {
+					observability.RecordDuration(mainCtx, "table", time.Since(tableStart))
+				}
 				backfilledStreams <- stream.ID()
 			}
 			logger.Infof("finished chunk min[%v] and max[%v] of stream %s", chunk.Min, chunk.Max, stream.ID())
@@ -69,6 +99,7 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 
 		if prevMetadataState != nil {
 			if slices.Contains(prevMetadataState.FullRefreshCommittedIDs, threadID) {
+				skipped = true
 				logger.Infof("Thread[%s]: chunk min[%v] and max[%v] already committed, skipping", threadID, chunk.Min, chunk.Max)
 				return nil
 			}

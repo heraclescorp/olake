@@ -38,4 +38,31 @@ The Java packages have been renamed from io.debezium.server.iceberg to io.olake.
 and the gRPC protobuf package from io.debezium.server.iceberg.rpc to io.olake.iceberg.rpc.
 olake-iceberg-java-writer does not use or depend on Debezium.
 
+Runtime memory and diagnostics:
+- OLAKE_JAVA_HEAP_PERCENT is an optional per-child-JVM integer from 1 through 80.
+  When set, the Go launcher appends -XX:MaxRAMPercentage to the child's
+  _JAVA_OPTIONS after inherited options; other JVM options remain intact.
+  An absent policy preserves the existing launch configuration. Explicit -Xmx
+  still takes JVM precedence; startup logs report the actual max heap in bytes.
+- Java metrics are disabled unless OTEL_EXPORTER_OTLP_ENDPOINT or
+  OTEL_EXPORTER_OTLP_METRICS_ENDPOINT is configured. Standard OTLP headers,
+  endpoint precedence, compression, TLS and resource attributes are supported.
+  Metrics use HTTP/protobuf with a 15-second collection interval, 2-second
+  export timeout and 128-series per-instrument SDK cardinality cap. Traces and
+  log export are disabled. Export failures do not fail ingestion; shutdown
+  drains RPCs and performs a bounded final metric flush.
+- Runtime metrics cover CPU time, Linux RSS when available, heap used/committed/
+  actual maximum, nonheap, direct/mapped buffer pools, GC count/time and threads.
+  olake.stage.duration records seconds for conversion, parquet_write, flush,
+  upload, commit and server-side rpc attempts, with bounded stage/outcome labels.
+  Every datapoint explicitly includes job_id, component=iceberg-java and
+  operation; table, file, row and request data are never metric dimensions.
+  OLAKE_WORKFLOW_ID is resource context only, not a metric dimension.
+- Optional JFR requires both OLAKE_PROFILE_DIR and OLAKE_JFR_PROFILE_SECONDS
+  (integer 1..300). A unique mode-0600 local file retains up to 64 MiB subject
+  to JFR chunk granularity and the chosen duration. Only CPU samples/load and
+  GC/heap-summary events are enabled, not JVM arguments, environment variables,
+  system properties or file/socket I/O. No profiling listener is opened;
+  recording failures are nonfatal. The existing opt-in debugger is loopback-only.
+
 Copyright 2025 Datazip Inc.
