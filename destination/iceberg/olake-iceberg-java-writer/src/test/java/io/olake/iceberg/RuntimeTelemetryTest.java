@@ -3,6 +3,7 @@ package io.olake.iceberg;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
@@ -11,6 +12,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -147,6 +150,51 @@ class RuntimeTelemetryTest {
             telemetry.close();
             assertEquals(afterClose, requests.get());
         } finally {
+            telemetry.close();
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void concurrentCloseWaitsForFinalExportAcknowledgement() throws Exception {
+        CountDownLatch exportReceived = new CountDownLatch(1);
+        CountDownLatch acknowledgeExport = new CountDownLatch(1);
+        CountDownLatch secondCloseStarted = new CountDownLatch(1);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/metrics", exchange -> {
+            exchange.getRequestBody().readAllBytes();
+            exportReceived.countDown();
+            try {
+                exchange.sendResponseHeaders(acknowledgeExport.await(5, TimeUnit.SECONDS) ? 200 : 503, -1);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                exchange.sendResponseHeaders(503, -1);
+            } finally {
+                exchange.close();
+            }
+        });
+        server.start();
+        var telemetry = RuntimeTelemetry.create(Map.of(
+                "OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:" + server.getAddress().getPort()));
+        var callers = Executors.newFixedThreadPool(2);
+        try {
+            telemetry.record(Stage.COMMIT, System.nanoTime() - 1_000_000, true);
+            var firstClose = callers.submit(telemetry::close);
+            assertTrue(exportReceived.await(3, TimeUnit.SECONDS), "final export never reached collector");
+            var secondClose = callers.submit(() -> {
+                secondCloseStarted.countDown();
+                telemetry.close();
+            });
+            assertTrue(secondCloseStarted.await(3, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> secondClose.get(150, TimeUnit.MILLISECONDS),
+                    "shutdown hook returned while another caller was still flushing metrics");
+            acknowledgeExport.countDown();
+            firstClose.get(5, TimeUnit.SECONDS);
+            secondClose.get(5, TimeUnit.SECONDS);
+        } finally {
+            acknowledgeExport.countDown();
+            callers.shutdown();
+            assertTrue(callers.awaitTermination(8, TimeUnit.SECONDS));
             telemetry.close();
             server.stop(0);
         }

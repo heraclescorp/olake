@@ -316,8 +316,9 @@ public final class RuntimeTelemetry implements AutoCloseable {
         return sdk == null || sdk.getSdkMeterProvider().forceFlush().join(2, TimeUnit.SECONDS).isSuccess();
     }
 
+    // The main thread and shutdown hook must both wait for an in-progress final flush.
     @Override
-    public void close() {
+    public synchronized void close() {
         if (sdk == null || !closed.compareAndSet(false, true)) {
             return;
         }

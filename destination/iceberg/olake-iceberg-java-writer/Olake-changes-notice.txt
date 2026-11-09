@@ -50,7 +50,9 @@ Runtime memory and diagnostics:
   Metrics use HTTP/protobuf with a 15-second collection interval, 2-second
   export timeout and 128-series per-instrument SDK cardinality cap. Traces and
   log export are disabled. Export failures do not fail ingestion; shutdown
-  drains RPCs and performs a bounded final metric flush.
+  drains RPCs and performs a bounded final metric flush. Concurrent close callers
+  wait for the in-progress flush before returning; collector/network failures
+  remain bounded best-effort exports.
 - Runtime metrics cover CPU time, Linux RSS when available, heap used/committed/
   actual maximum, nonheap, direct/mapped buffer pools, GC count/time and threads.
   olake.stage.duration records seconds for conversion, parquet_write, flush,
