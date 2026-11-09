@@ -109,7 +109,7 @@ const PostgresUISchema = `{
       "ui:sections": [
         {"id": "cdc", "title": "Change data capture (CDC)", "cdc": "toggle", "fields": ["update_method"]},
         {"id": "connection", "title": "Connection details", "fields": ["host", "database", "schemas", "username", "password", "port", "jdbc_url_params", "ssl"]},
-        {"id": "additional", "title": "Additional configuration", "fields": ["max_threads", "retry_count", "ssh_config"]}
+        {"id": "additional", "title": "Additional configuration", "fields": ["max_threads", "retry_count", "backfill_host", "ssh_config"]}
       ],
       "ui:grid": [
         { "host": 12, "database": 12 },
@@ -117,7 +117,8 @@ const PostgresUISchema = `{
         { "password": 12, "port": 12 },
         { "jdbc_url_params": 12, "ssl": 12 },
         { "max_threads": 12, "update_method": 12 },
-        { "retry_count": 12, "ssh_config": 12 }
+        { "retry_count": 12, "backfill_host": 12 },
+        { "ssh_config": 12 }
       ],
       "schemas": {
         "ui:options": {

@@ -24,6 +24,11 @@ const (
 	codePortInvalid             = "postgres.port_invalid"
 	codeDatabaseMissing         = "postgres.database_missing"
 	codeSchemaBlank             = "postgres.schema_blank"
+	// Backfill host (Aurora reader) checks.
+	codeBackfillHostSchemeIncluded = "postgres.backfill_host_scheme_included"
+	codeBackfillHostIsWriter       = "postgres.backfill_host_is_writer"
+	codeBackfillHostOutsideCluster = "postgres.backfill_host_outside_cluster"
+	codeAuroraLSNUnavailable       = "postgres.aurora_lsn_unavailable"
 )
 
 // sqlStateCategories maps a PostgreSQL SQLSTATE to a failure category. SQLSTATE rather than the

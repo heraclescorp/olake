@@ -3,7 +3,9 @@ package driver
 import (
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/datazip-inc/olake/utils"
@@ -24,6 +26,11 @@ type Config struct {
 	RetryCount       int               `json:"retry_count"`
 	SSHConfig        *utils.SSHConfig  `json:"ssh_config"`
 	Schemas          []string          `json:"schemas,omitempty"`
+	// BackfillHost is an optional Aurora PostgreSQL reader instance for chunk planning and chunk scans.
+	// The replication slot, publication checks, CDC, discovery and incremental change reads use Host.
+	BackfillHost string `json:"backfill_host,omitempty"`
+	// BackfillConnection is Connection pointed at BackfillHost; nil when no backfill host is set.
+	BackfillConnection *url.URL `json:"-"`
 }
 
 // Capture Write Ahead Logs
@@ -40,6 +47,11 @@ func (c *Config) Validate() error {
 	} else if strings.Contains(c.Host, "https") || strings.Contains(c.Host, "http") {
 		return errs.Precondition(errs.ConfigInvalid, codeHostSchemeIncluded,
 			fmt.Errorf("host should not contain http or https"))
+	}
+
+	if strings.Contains(c.BackfillHost, "https") || strings.Contains(c.BackfillHost, "http") {
+		return errs.Precondition(errs.ConfigInvalid, codeBackfillHostSchemeIncluded,
+			fmt.Errorf("backfill host should not contain http or https"))
 	}
 
 	// Validate port
@@ -61,15 +73,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	// Add the connection parameters to the url
-	parsed := &url.URL{
-		Scheme: "postgres",
-		User:   utils.Ternary(c.Password != "", url.UserPassword(c.Username, c.Password), url.User(c.Username)).(*url.Userinfo),
-		Host:   fmt.Sprintf("%s:%d", c.Host, c.Port),
-		Path:   "/" + c.Database,
-	}
-
-	query := parsed.Query()
+	query := url.Values{}
 
 	// Set additional connection parameters if available
 	if len(c.JDBCURLParams) > 0 {
@@ -94,8 +98,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("failed to validate ssl config: %w", err)
 	}
 
-	parsed.RawQuery = query.Encode()
-	c.Connection = parsed
+	c.Connection = c.connectionURL(c.Host, query)
+	if c.BackfillHost != "" {
+		c.BackfillConnection = c.connectionURL(c.BackfillHost, query)
+	}
 
 	for i, s := range c.Schemas {
 		if strings.TrimSpace(s) == "" {
@@ -107,8 +113,24 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// connectionURL shares every connection setting between the writer Host and the BackfillHost reader.
+func (c *Config) connectionURL(host string, query url.Values) *url.URL {
+	return &url.URL{
+		Scheme:   "postgres",
+		User:     utils.Ternary(c.Password != "", url.UserPassword(c.Username, c.Password), url.User(c.Username)).(*url.Userinfo),
+		Host:     net.JoinHostPort(host, strconv.Itoa(c.Port)),
+		Path:     "/" + c.Database,
+		RawQuery: query.Encode(),
+	}
+}
+
 func (c *Config) buildTLSConfig() (*tls.Config, error) {
 	return utils.BuildTLSConfig(c.Host, c.SSLConfiguration)
+}
+
+// buildBackfillTLSConfig verifies the reader's certificate against BackfillHost, the name actually dialed.
+func (c *Config) buildBackfillTLSConfig() (*tls.Config, error) {
+	return utils.BuildTLSConfig(c.BackfillHost, c.SSLConfiguration)
 }
 
 type Table struct {

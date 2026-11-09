@@ -6,6 +6,11 @@
             "title": "Postgres Host",
             "description": "Database host address for connection"
         },
+        "backfill_host": {
+            "type": "string",
+            "title": "Backfill Host",
+            "description": "Optional Aurora PostgreSQL reader instance endpoint for chunked table copies (backfills and full refreshes). The replication slot, CDC, discovery and incremental change reads stay on Postgres Host."
+        },
         "port": {
             "type": "integer",
             "title": "Postgres Port",
