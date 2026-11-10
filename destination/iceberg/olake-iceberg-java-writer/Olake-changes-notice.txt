@@ -39,6 +39,10 @@ and the gRPC protobuf package from io.debezium.server.iceberg.rpc to io.olake.ic
 olake-iceberg-java-writer does not use or depend on Debezium.
 
 Runtime memory and diagnostics:
+- Go writer batches flush at 64 MiB of reported source bytes or the configured
+  record count. A single oversized record is preserved, not truncated; encoded
+  and in-memory sizes can exceed source size. Copied producer slots release their
+  references, and existing strings pass into protobuf fields without formatting.
 - OLAKE_JAVA_HEAP_PERCENT is an optional per-child-JVM integer from 1 through 80.
   When set, the Go launcher appends -XX:MaxRAMPercentage to the child's
   _JAVA_OPTIONS after inherited options; other JVM options remain intact.

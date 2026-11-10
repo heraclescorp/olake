@@ -371,9 +371,13 @@ func toProtoFieldValue(iceType string, val any) (*proto.IcebergPayload_IceRecord
 				Value: &proto.IcebergPayload_IceRecord_FieldValue_BytesValue{BytesValue: b},
 			}, nil
 		}
+		text, ok := val.(string)
+		if !ok {
+			text = fmt.Sprintf("%v", val)
+		}
 		return &proto.IcebergPayload_IceRecord_FieldValue{
 			Value: &proto.IcebergPayload_IceRecord_FieldValue_StringValue{
-				StringValue: fmt.Sprintf("%v", val),
+				StringValue: text,
 			},
 		}, nil
 	}

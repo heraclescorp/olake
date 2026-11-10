@@ -265,6 +265,7 @@ func (wt *WriterThread) Push(ctx context.Context, record types.RawRecord, source
 		if len(wt.buffer) >= int(wt.batchSize) || wt.bufferBytes >= constants.MaxDestinationBatchBytes {
 			buf := make([]types.RawRecord, len(wt.buffer))
 			copy(buf, wt.buffer)
+			clear(wt.buffer)
 			wt.buffer = wt.buffer[:0]
 			wt.bufferBytes = 0
 			var queuedAt time.Time
