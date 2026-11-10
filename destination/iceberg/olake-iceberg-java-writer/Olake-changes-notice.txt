@@ -64,6 +64,15 @@ Runtime memory and diagnostics:
   Every datapoint explicitly includes job_id, component=iceberg-java and
   operation; table, file, row and request data are never metric dimensions.
   OLAKE_WORKFLOW_ID is resource context only, not a metric dimension.
+- Index catch-up logs report from/to snapshots, per-snapshot operation and safe
+  producer tags, selected files/records/bytes, and historical additions removed
+  later in the traversed range. The removal count is not full target liveness.
+  File byte counts describe whole data files, not projected or transferred bytes.
+  Java file timings include downstream blocking; emitter summaries separately
+  report monotonic readiness wait and send time. Go summaries separate receive,
+  staging, intermediate durable flushes and final checkpoint; Pebble summaries
+  separate row staging/Sync from new-file mapping Sync. Failures retain partial
+  observations. New logs omit row identifiers, payloads and full file paths.
 - Optional JFR requires both OLAKE_PROFILE_DIR and OLAKE_JFR_PROFILE_SECONDS
   (integer 1..300). A unique mode-0600 local file retains up to 64 MiB subject
   to JFR chunk granularity and the chosen duration. Only CPU samples/load and

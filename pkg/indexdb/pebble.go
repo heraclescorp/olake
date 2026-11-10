@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
@@ -60,7 +61,11 @@ func DefaultOptions() StoreOptions {
 func Open(stream types.StreamInterface) (types.StreamIndex, error) {
 	opts := DefaultOptions()
 	dir := indexDir(opts.Dir, stream)
-	return openIndex(dir, opts)
+	index, err := openIndex(dir, opts)
+	if index != nil {
+		index.table = fmt.Sprintf("%s.%s", stream.GetDestinationDatabase(nil), stream.GetDestinationTable())
+	}
+	return index, err
 }
 
 // Drop removes the on-disk index directory for streamID.
@@ -103,8 +108,9 @@ var (
 )
 
 type pebbleIndex struct {
-	dir string
-	db  *pebble.DB
+	dir   string
+	table string
+	db    *pebble.DB
 
 	fileMu     sync.RWMutex
 	pathToID   map[string]uint64
@@ -210,7 +216,45 @@ func (i *pebbleIndex) Lookup(key string) (types.RowLocation, bool, error) {
 	return types.RowLocation{FilePath: path, Position: position}, true, nil
 }
 
-func (i *pebbleIndex) Commit(batch *types.StreamIndexThread, snapshotID *int64) error {
+// pebbleCommitStats belongs to a single Commit. Plain counters in the existing
+// staging pass avoid per-row timers, atomics, allocations or extra iteration.
+// Staging time includes file interning and its separately reported Sync time.
+type pebbleCommitStats struct {
+	mutations          int64
+	fileIDLookups      int64
+	fileIDCacheHits    int64
+	fileIDStoreLookups int64
+	newFileAttempts    int64
+	newFiles           int64
+	fileInternDuration time.Duration
+	fileSyncAttempts   int64
+	fileSyncSuccesses  int64
+	fileSyncDuration   time.Duration
+}
+
+func (i *pebbleIndex) Commit(batch *types.StreamIndexThread, snapshotID *int64) (err error) {
+	started := time.Now()
+	var stats pebbleCommitStats
+	var stagingDuration, batchSyncDuration time.Duration
+	var checkpoint int64
+	if snapshotID != nil {
+		checkpoint = *snapshotID
+	}
+	stage := "staging"
+	batchSyncAttempted, batchSyncSuccess := false, false
+	defer func() {
+		if stage == "staging" {
+			stagingDuration = time.Since(started)
+		}
+		outcome := "success"
+		if err != nil {
+			outcome = "failed"
+		}
+		logger.Infof("Table[%s]: stream index Pebble commit outcome=%s stage=%s checkpoint_requested=%t snapshot=%d mutations=%d staging_ms=%d batch_sync_attempted=%t batch_sync_success=%t batch_sync_ms=%d file_id_lookups=%d file_id_cache_hits=%d file_id_store_lookups=%d new_file_attempts=%d new_files=%d file_intern_ms=%d file_sync_attempts=%d file_sync_successes=%d file_sync_ms=%d duration_ms=%d",
+			i.table, outcome, stage, snapshotID != nil, checkpoint, stats.mutations, stagingDuration.Milliseconds(),
+			batchSyncAttempted, batchSyncSuccess, batchSyncDuration.Milliseconds(), stats.fileIDLookups, stats.fileIDCacheHits, stats.fileIDStoreLookups,
+			stats.newFileAttempts, stats.newFiles, stats.fileInternDuration.Milliseconds(), stats.fileSyncAttempts, stats.fileSyncSuccesses, stats.fileSyncDuration.Milliseconds(), time.Since(started).Milliseconds())
+	}()
 	pending := i.db.NewBatch()
 	defer func() {
 		_ = pending.Close()
@@ -218,7 +262,11 @@ func (i *pebbleIndex) Commit(batch *types.StreamIndexThread, snapshotID *int64) 
 
 	if batch != nil {
 		err := batch.Range(func(key string, loc types.RowLocation) error {
-			return i.stageChange(pending, key, loc)
+			if err := i.stageChange(pending, key, loc, &stats); err != nil {
+				return err
+			}
+			stats.mutations++
+			return nil
 		})
 		if err != nil {
 			return err
@@ -229,25 +277,36 @@ func (i *pebbleIndex) Commit(batch *types.StreamIndexThread, snapshotID *int64) 
 		if err := pending.Set(metaKey(metaSnapshot), binary.AppendVarint(nil, *snapshotID), nil); err != nil {
 			return fmt.Errorf("failed to stage stream index checkpoint[%d] in %s: %s", *snapshotID, i.dir, err)
 		}
+		stats.mutations++
 	}
 
 	if pending.Empty() {
+		stagingDuration = time.Since(started)
+		stage = "empty"
 		return nil
 	}
 
-	if err := pending.Commit(pebble.Sync); err != nil {
+	stagingDuration = time.Since(started)
+	stage = "batch_sync"
+	batchSyncAttempted = true
+	syncStarted := time.Now()
+	err = pending.Commit(pebble.Sync)
+	batchSyncDuration = time.Since(syncStarted)
+	if err != nil {
 		return fmt.Errorf("failed to commit stream index changes in %s: %s", i.dir, err)
 	}
+	batchSyncSuccess = true
+	stage = "complete"
 
 	return nil
 }
 
-func (i *pebbleIndex) stageChange(batch *pebble.Batch, key string, loc types.RowLocation) error {
+func (i *pebbleIndex) stageChange(batch *pebble.Batch, key string, loc types.RowLocation, stats *pebbleCommitStats) error {
 	if loc.Position < 0 {
 		return fmt.Errorf("stream index position for key[%s] must not be negative, got %d", key, loc.Position)
 	}
 
-	fileID, err := i.fileID(loc.FilePath)
+	fileID, err := i.fileID(loc.FilePath, stats)
 	if err != nil {
 		return err
 	}
@@ -311,11 +370,13 @@ func (i *pebbleIndex) Close() error {
 	return nil
 }
 
-func (i *pebbleIndex) fileID(path string) (uint64, error) {
+func (i *pebbleIndex) fileID(path string, stats *pebbleCommitStats) (uint64, error) {
+	stats.fileIDLookups++
 	i.fileMu.RLock()
 	id, cached := i.pathToID[path]
 	i.fileMu.RUnlock()
 	if cached {
+		stats.fileIDCacheHits++
 		return id, nil
 	}
 
@@ -323,15 +384,22 @@ func (i *pebbleIndex) fileID(path string) (uint64, error) {
 	defer i.fileMu.Unlock()
 
 	if id, cached := i.pathToID[path]; cached {
+		stats.fileIDCacheHits++
 		return id, nil
 	}
 
+	stats.fileIDStoreLookups++
 	id, found, err := i.readFileID(path)
 	if err != nil {
 		return 0, err
 	}
 
 	if !found {
+		stats.newFileAttempts++
+		started := time.Now()
+		defer func() {
+			stats.fileInternDuration += time.Since(started)
+		}()
 		id = i.nextFileID
 
 		batch := i.db.NewBatch()
@@ -345,9 +413,15 @@ func (i *pebbleIndex) fileID(path string) (uint64, error) {
 		if err := setCounter(batch, metaNextFileID, id+1); err != nil {
 			return 0, err
 		}
-		if err := batch.Commit(pebble.Sync); err != nil {
+		stats.fileSyncAttempts++
+		syncStarted := time.Now()
+		err := batch.Commit(pebble.Sync)
+		stats.fileSyncDuration += time.Since(syncStarted)
+		if err != nil {
 			return 0, fmt.Errorf("failed to intern file path %s: %s", path, err)
 		}
+		stats.fileSyncSuccesses++
+		stats.newFiles++
 
 		i.nextFileID = id + 1
 	}
