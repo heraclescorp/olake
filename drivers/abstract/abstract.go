@@ -26,16 +26,20 @@ type CDCChange struct {
 	Data         map[string]any
 	ExtraColumns map[string]any // Driver-specific CDC metadata (e.g., LSN, binlog position, resume token)
 	Bytes        int64
+	// UnavailableColumns lists columns the source could not send (Postgres unchanged
+	// TOAST); Data holds constants.UnavailableValue for them. Nil for other drivers.
+	UnavailableColumns []string
 }
 
-func NewCDCChange(stream types.StreamInterface, timestamp time.Time, kind string, data, extraColumns map[string]any, sourceBytes int64) CDCChange {
+func NewCDCChange(stream types.StreamInterface, timestamp time.Time, kind string, data, extraColumns map[string]any, sourceBytes int64, unavailableColumns []string) CDCChange {
 	return CDCChange{
-		Stream:       stream,
-		Timestamp:    timestamp,
-		Kind:         kind,
-		Data:         data,
-		ExtraColumns: extraColumns,
-		Bytes:        sourceBytes,
+		Stream:             stream,
+		Timestamp:          timestamp,
+		Kind:               kind,
+		Data:               data,
+		ExtraColumns:       extraColumns,
+		Bytes:              sourceBytes,
+		UnavailableColumns: unavailableColumns,
 	}
 }
 
@@ -76,6 +80,15 @@ func (a *AbstractDriver) Spec() any {
 
 func (a *AbstractDriver) Type() string {
 	return a.driver.Type()
+}
+
+// SupportedUpdateTypes returns the delete formats the source can feed, nil when it has no restriction.
+func (a *AbstractDriver) SupportedUpdateTypes() []types.UpdateType {
+	if restricter, ok := a.driver.(UpdateTypeRestricter); ok {
+		return restricter.SupportedUpdateTypes()
+	}
+
+	return nil
 }
 
 func (a *AbstractDriver) Discover(ctx context.Context, maxDiscoverThreads int, skipSchema bool) ([]*types.Stream, error) {
@@ -150,15 +163,11 @@ func (a *AbstractDriver) Discover(ctx context.Context, maxDiscoverThreads int, s
 			convStream.SyncMode = types.FULLREFRESH
 		}
 
-		// add default stream properties
+		// add default stream properties; the update type is chosen by types.ApplyDestinationDefaults
 		convStream.DefaultStreamProperties = &types.DefaultStreamProperties{
 			Normalization: types.IsDriverRelational(a.driver.Type()),
 			AppendMode:    types.IsDriverAppendOnly(a.driver.Type()),
 			UpdateType:    types.UpdateTypeEquality,
-		}
-		// Kafka upsert always writes positional deletes; append-mode streams never consult this.
-		if a.driver.Type() == string(constants.Kafka) {
-			convStream.DefaultStreamProperties.UpdateType = types.UpdateTypePosition
 		}
 
 		finalStreams = append(finalStreams, convStream)

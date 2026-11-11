@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/datazip-inc/olake/drivers/postgres/internal/waljs"
 	"github.com/datazip-inc/olake/pkg/jdbc"
-	"github.com/datazip-inc/olake/pkg/waljs"
 	"github.com/datazip-inc/olake/types"
 	"github.com/jmoiron/sqlx"
 	"github.com/stretchr/testify/require"
