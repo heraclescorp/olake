@@ -74,7 +74,7 @@ const (
 	CdcTimestamp = "_cdc_timestamp"
 
 	// MaxDestinationBatchBytes is the maximum source bytes held in a writer thread buffer before flush.
-	MaxDestinationBatchBytes = int64(1) * 1024 * 1024 * 1024 // 1 GB
+	MaxDestinationBatchBytes = int64(64) * 1024 * 1024 // 64 MiB
 
 	// CDCMetadataConcurrency bounds table setup and commits.
 	CDCMetadataConcurrency = 16

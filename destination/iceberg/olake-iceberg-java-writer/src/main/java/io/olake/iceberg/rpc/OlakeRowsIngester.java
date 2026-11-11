@@ -16,6 +16,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.olake.iceberg.IcebergUtil;
+import io.olake.iceberg.RuntimeTelemetry;
+import io.olake.iceberg.RuntimeTelemetry.Stage;
 import io.olake.iceberg.SchemaConvertor;
 import io.olake.iceberg.tableIndex.EqualityDeleteMigrator;
 import io.olake.iceberg.rpc.RecordIngest.IcebergPayload;
@@ -185,10 +187,26 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
 
                 case RECORDS:
                     LOGGER.debug("{} Received {} records for thread {}", requestId, request.getRecordsCount(), threadId);
-                    SchemaConvertor recordsConvertor = new SchemaConvertor(session.identifierField, metadata.getSchemaList());
-                    List<RecordWrapper> finalRecords = recordsConvertor.convert(session.upsert, session.icebergTable.schema(), request.getRecordsList());
-                    
-                    List<RecordIngest.FilePositionMap> positionMaps = session.op.addToTablePerSchema(threadId, session.icebergTable, finalRecords);
+                    long conversionStarted = RuntimeTelemetry.startTimer();
+                    boolean converted = false;
+                    List<RecordWrapper> finalRecords;
+                    try {
+                        SchemaConvertor recordsConvertor = new SchemaConvertor(session.identifierField, metadata.getSchemaList());
+                        finalRecords = recordsConvertor.convert(session.upsert, session.icebergTable.schema(), request.getRecordsList());
+                        converted = true;
+                    } finally {
+                        RuntimeTelemetry.recordDuration(Stage.CONVERSION, conversionStarted, converted);
+                    }
+
+                    long writeStarted = RuntimeTelemetry.startTimer();
+                    boolean written = false;
+                    List<RecordIngest.FilePositionMap> positionMaps;
+                    try {
+                        positionMaps = session.op.addToTablePerSchema(threadId, session.icebergTable, finalRecords);
+                        written = positionMaps != null;
+                    } finally {
+                        RuntimeTelemetry.recordDuration(Stage.PARQUET_WRITE, writeStarted, written);
+                    }
                     
                     sendResponse(responseObserver, io.olake.iceberg.rpc.RecordIngest.RecordIngestResponse.newBuilder()
                         .setResult("successfully pushed records: " + request.getRecordsCount())

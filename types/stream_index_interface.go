@@ -1,5 +1,11 @@
 package types
 
+import (
+	"context"
+
+	"github.com/datazip-inc/olake/utils/observability"
+)
+
 // RowLocation addresses a single row within one data file of a destination table.
 type RowLocation struct {
 	FilePath string
@@ -26,8 +32,14 @@ type streamIndexChange struct {
 
 // StreamIndexThread buffers the index changes of a single writer thread until the destination commit happens
 type StreamIndexThread struct {
-	index   StreamIndex
-	changes map[string]streamIndexChange
+	index           StreamIndex
+	changes         map[string]streamIndexChange
+	metricsContext  context.Context
+	metricsEntries  int64
+	metricsBytes    int64
+	reportedEntries int64
+	reportedBytes   int64
+	metricUpdates   uint64
 }
 
 // NewStreamIndexThread returns an empty batch that resolves misses against index.
@@ -41,6 +53,20 @@ func NewStreamIndexThread(index StreamIndex) *StreamIndexThread {
 
 // Put records key as living at loc once this batch is applied.
 func (b *StreamIndexThread) Put(key string, loc RowLocation) {
+	if b.metricsContext != nil {
+		previous, exists := b.changes[key]
+		if !exists {
+			b.metricsEntries++
+			b.metricsBytes += int64(len(key) + 48)
+		} else {
+			b.metricsBytes -= int64(len(previous.loc.FilePath))
+		}
+		b.metricsBytes += int64(len(loc.FilePath))
+		b.metricUpdates++
+		if b.metricUpdates%1024 == 0 {
+			b.reportPendingIndex()
+		}
+	}
 	b.changes[key] = streamIndexChange{loc: loc}
 }
 
@@ -65,4 +91,27 @@ func (b *StreamIndexThread) Range(fn func(key string, loc RowLocation) error) er
 		}
 	}
 	return nil
+}
+
+// SetObservabilityContext enables estimated logical index payload accounting for this chunk.
+// It deliberately does not claim to measure Go heap or shared-string ownership.
+func (b *StreamIndexThread) SetObservabilityContext(ctx context.Context) {
+	if b != nil && b.metricsContext == nil && observability.Enabled() {
+		b.metricsContext = ctx
+	}
+}
+
+func (b *StreamIndexThread) reportPendingIndex() {
+	observability.AddPendingIndex(b.metricsContext, b.metricsEntries-b.reportedEntries, b.metricsBytes-b.reportedBytes)
+	b.reportedEntries, b.reportedBytes = b.metricsEntries, b.metricsBytes
+}
+
+// ReleaseObservability removes this chunk's contribution after commit or abort.
+func (b *StreamIndexThread) ReleaseObservability() {
+	if b == nil || b.metricsContext == nil {
+		return
+	}
+	observability.AddPendingIndex(b.metricsContext, -b.reportedEntries, -b.reportedBytes)
+	b.reportedEntries, b.reportedBytes = 0, 0
+	b.metricsContext = nil
 }

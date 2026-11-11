@@ -64,18 +64,23 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
   @Override
   public void scanTableForIndexing(TableIndexScanRequest request, StreamObserver<TableIndexScanBatch> responseObserver) {
     long startTime = System.currentTimeMillis();
+    BatchEmitter emitter = null;
+    String tableName = "unresolved";
+    boolean completed = false;
 
     try {
       IcebergSession session = requireSession(request.getThreadId());
+      tableName = session.icebergTable.name();
       Long fromSnapshotId = request.hasFromSnapshotId() ? request.getFromSnapshotId() : null;
 
-      BatchEmitter emitter = new BatchEmitter(responseObserver);
+      emitter = new BatchEmitter(responseObserver);
       TableIndexScanner.ScanResult result = TableIndexScanner.scan(
           session.icebergTable, session.identifierField, fromSnapshotId, emitter);
 
       emitter.finish();
 
       responseObserver.onCompleted();
+      completed = true;
       LOGGER.info("streamed table index of {} entries for thread {} in {} ms",
           result.entries, request.getThreadId(), System.currentTimeMillis() - startTime);
     } catch (CallAbandoned e) {
@@ -86,6 +91,11 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
           request.getThreadId(), e.getMessage());
       LOGGER.error(message, e);
       responseObserver.onError(io.grpc.Status.INTERNAL.withDescription(message).asRuntimeException());
+    } finally {
+      if (emitter != null) {
+        emitter.logSummary(tableName, request.getThreadId(),
+            request.hasFromSnapshotId() ? request.getFromSnapshotId() : null, completed);
+      }
     }
   }
 
@@ -207,6 +217,12 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
     private final StreamObserver<T> responseObserver;
     private final ServerCallStreamObserver<T> call;
     private final Object readyLock = new Object();
+    private long readyWaitNanos;
+    private long waitCount;
+    private long timeoutWakes;
+    private long callbackWakes;
+    private long callbacks;
+    private long onNextNanos;
 
     private Outbound(StreamObserver<T> responseObserver) {
       this.responseObserver = responseObserver;
@@ -220,7 +236,12 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
 
     private void send(T message) {
       awaitReady();
-      responseObserver.onNext(message);
+      long started = System.nanoTime();
+      try {
+        responseObserver.onNext(message);
+      } finally {
+        onNextNanos += System.nanoTime() - started;
+      }
     }
 
     private void awaitReady() {
@@ -228,7 +249,8 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
         return;
       }
 
-      long waitedMillis = 0;
+      long waitBaseline = readyWaitNanos;
+      long nextReportMillis = STALL_REPORT_MILLIS;
       synchronized (readyLock) {
         while (true) {
           if (call.isCancelled()) {
@@ -237,16 +259,28 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
           if (call.isReady()) {
             return;
           }
+          long waitStarted = System.nanoTime();
+          long callbacksBefore = callbacks;
+          waitCount++;
           try {
             readyLock.wait(READY_WAIT_MILLIS);
           } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new CallAbandoned();
+          } finally {
+            long elapsed = System.nanoTime() - waitStarted;
+            readyWaitNanos += elapsed;
+            if (callbacks != callbacksBefore) {
+              callbackWakes++;
+            } else if (elapsed >= READY_WAIT_MILLIS * 1_000_000L) {
+              timeoutWakes++;
+            }
           }
 
-          waitedMillis += READY_WAIT_MILLIS;
-          if (waitedMillis % STALL_REPORT_MILLIS == 0) {
+          long waitedMillis = (readyWaitNanos - waitBaseline) / 1_000_000L;
+          if (waitedMillis >= nextReportMillis) {
             LOGGER.warn("stream has waited {} ms for the caller to consume; still streaming", waitedMillis);
+            nextReportMillis = waitedMillis + STALL_REPORT_MILLIS;
           }
         }
       }
@@ -254,6 +288,7 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
 
     private void wakeUp() {
       synchronized (readyLock) {
+        callbacks++;
         readyLock.notifyAll();
       }
     }
@@ -265,6 +300,9 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
     private TableIndexScanBatch.Builder batch = TableIndexScanBatch.newBuilder();
     private long snapshotId;
     private boolean sentAnything;
+    private long batches;
+    private long entries;
+    private long buildNanos;
 
     private BatchEmitter(StreamObserver<TableIndexScanBatch> responseObserver) {
       this.outbound = new Outbound<>(responseObserver);
@@ -299,9 +337,27 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
     }
 
     private void send() {
-      outbound.send(batch.build());
+      long started = System.nanoTime();
+      TableIndexScanBatch message;
+      try {
+        message = batch.build();
+      } finally {
+        buildNanos += System.nanoTime() - started;
+      }
+      outbound.send(message);
+      batches++;
+      entries += message.getEntriesCount();
       batch = TableIndexScanBatch.newBuilder().setSnapshotId(snapshotId);
       sentAnything = true;
+    }
+
+    private void logSummary(String table, String threadId, Long from, boolean completed) {
+      synchronized (outbound.readyLock) {
+        LOGGER.info("table index emitter table={} thread={} from={} to={} completed={} cancelled={} batches={} entries={} bufferedEntries={} readyWaitNanos={} waitCount={} timeoutWakes={} callbackWakes={} callbacks={} batchBuildNanos={} onNextNanos={}",
+            table, threadId, from, snapshotId, completed, outbound.call != null && outbound.call.isCancelled(), batches,
+            entries, batch.getEntriesCount(), outbound.readyWaitNanos, outbound.waitCount, outbound.timeoutWakes,
+            outbound.callbackWakes, outbound.callbacks, buildNanos, outbound.onNextNanos);
+      }
     }
   }
 

@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/types"
 )
 
@@ -163,8 +164,12 @@ func TestWriteChunksBySize(t *testing.T) {
 		}
 		return types.RawRecord{Data: map[string]any{"id": id, "payload": value}}
 	}
+	// sized from the limit: two parts fit in one chunk, three do not, and a large record exceeds it alone
+	limitMB := int(constants.MaxDestinationBatchBytes / (1024 * 1024))
+	part := limitMB * 2 / 5
+	large := limitMB + limitMB/2
 
-	overLimit := []types.RawRecord{record(0, 400), record(1, 400), record(2, 400), record(3, 400), record(4, 400)}
+	overLimit := []types.RawRecord{record(0, part), record(1, part), record(2, part), record(3, part), record(4, part)}
 
 	testCases := []struct {
 		name     string
@@ -181,7 +186,7 @@ func TestWriteChunksBySize(t *testing.T) {
 		{
 			name:     "a batch under the limit is one call",
 			resolver: &unavailableValuesResolver{filledBytes: 1},
-			records:  []types.RawRecord{record(0, 400), record(1, 400)},
+			records:  []types.RawRecord{record(0, part), record(1, part)},
 			expected: [][]int{{0, 1}},
 		},
 		{
@@ -193,7 +198,7 @@ func TestWriteChunksBySize(t *testing.T) {
 		{
 			name:     "a record over the limit goes alone",
 			resolver: &unavailableValuesResolver{filledBytes: 1},
-			records:  []types.RawRecord{record(0, 1), record(1, 1500), record(2, 1)},
+			records:  []types.RawRecord{record(0, 1), record(1, large), record(2, 1)},
 			expected: [][]int{{0}, {1}, {2}},
 		},
 		{

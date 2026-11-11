@@ -13,6 +13,7 @@ import (
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/datazip-inc/olake/utils/observability"
 )
 
 // RunChangeStream orchestrates the CDC sync process:
@@ -118,6 +119,10 @@ func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destinatio
 	clearDedup := false
 	writers := make(map[string]*destination.WriterThread, len(streams))
 	metadataStates := make(map[string]any, len(streams))
+	var metricContexts map[string]context.Context
+	if observability.Enabled() {
+		metricContexts = make(map[string]context.Context, len(streams))
+	}
 	// true (default) → overlap window open, inserts emit "i" (equality delete + write).
 	// false          → steady-state, inserts emit "c" (write only).
 	dedupInserts := make(map[string]bool, len(streams))
@@ -155,6 +160,9 @@ func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destinatio
 		writersMu.Lock()
 		defer writersMu.Unlock()
 		writers[stream.ID()] = w
+		if metricContexts != nil {
+			metricContexts[stream.ID()] = observability.WithTable(cdcCtx, stream.Namespace(), stream.Name())
+		}
 		var writerMetaState any
 		dedupInserts[stream.ID()] = true
 		if writerMeta != nil {
@@ -175,6 +183,9 @@ func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destinatio
 
 	finalMetadataState, err = a.driver.StreamChanges(cdcCtx, streamIndex, metadataStates, func(ctx context.Context, change CDCChange) error {
 		writer := writers[change.Stream.ID()]
+		if metricContexts != nil {
+			observability.AddRows(metricContexts[change.Stream.ID()], "read", 1, change.Bytes)
+		}
 		olakeColumns := map[string]any{
 			constants.OlakeID:        utils.GetKeysHash(change.Data, change.Stream.GetStream().SourceDefinedPrimaryKey.Array()...),
 			constants.OpType:         mapChangeKindToOperationType(change.Kind, dedupInserts[change.Stream.ID()], change.Stream),
