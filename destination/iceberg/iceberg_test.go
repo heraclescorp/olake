@@ -217,3 +217,37 @@ func TestWriteChunksBySize(t *testing.T) {
 		})
 	}
 }
+
+// A value the source could not send must never reach the writer as the placeholder: neither
+// on a stream without a row index (eq) nor when the index has no previous version of the row.
+func TestFlattenAndCleanDataRejectsUnrecoveredValues(t *testing.T) {
+	testCases := []struct {
+		name     string
+		resolver func(t *testing.T) *unavailableValuesResolver
+	}{
+		{
+			name:     "a stream without a row index",
+			resolver: func(*testing.T) *unavailableValuesResolver { return nil },
+		},
+		{
+			name: "a row the index has no previous version of",
+			resolver: func(t *testing.T) *unavailableValuesResolver {
+				return testResolver(t, true, &testWriter{locations: map[string]types.RowLocation{}}, &testReader{table: testTable{}})
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := testConfiguredStream(true)
+			stream.Stream = types.NewStream("toast_table", "public", nil)
+			iceberg := &Iceberg{stream: stream, unavailableValues: tc.resolver(t)}
+			records := []types.RawRecord{testRecord("42", "u", map[string]any{"id": 42, "payload": placeholder}, "payload")}
+
+			_, written, _, err := iceberg.FlattenAndCleanData(context.Background(), records)
+
+			require.ErrorContains(t, err, `unchanged TOAST column "payload"`)
+			assert.Nil(t, written)
+		})
+	}
+}

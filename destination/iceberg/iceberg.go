@@ -158,7 +158,8 @@ func (i *Iceberg) Setup(ctx context.Context, stream types.StreamInterface, _ any
 	}
 
 	// Recovery needs the row's previous location, which only a thread with a stream index
-	// has. Equality mode keeps the placeholder; backfill records never carry one.
+	// has. Equality mode cannot recover, so RejectUnavailableValues fails its marked records;
+	// backfill records never carry one.
 	if indexThread != nil {
 		i.unavailableValues = newUnavailableValuesResolver(options.ThreadID, i.stream, i.writer, indexThread, i.server.tableIndexClient)
 	}
@@ -305,6 +306,9 @@ func (i *Iceberg) FlattenAndCleanData(ctx context.Context, records []types.RawRe
 		if err := i.unavailableValues.Resolve(ctx, records); err != nil {
 			return false, nil, nil, fmt.Errorf("failed to recover unavailable column values: %w", err)
 		}
+	}
+	if err := destination.RejectUnavailableValues(i.stream, records); err != nil {
+		return false, nil, nil, err
 	}
 
 	// extractSchemaFromRecords detects difference in current thread schema and the batch that being received
