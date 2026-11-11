@@ -78,6 +78,26 @@ class IcebergTableOperatorTest {
         assertEquals("0/2", storedLSN());
     }
 
+    @Test
+    @DisplayName("state-only commit refreshes a stale handle and preserves other recovery fields")
+    void preservesRecoveryStateCommittedSinceTableWasLoaded() throws Exception {
+        Table otherWriter = catalog.loadTable(TABLE_ID);
+        otherWriter.updateProperties().set(STATE_KEY_2PC,
+                "{\"state\":\"{\\\"lsn\\\":\\\"0/1\\\",\\\"otherCursor\\\":\\\"keep\\\"}\","
+                        + "\"full_refresh_committed_ids\":[\"completed-chunk\"]}").commit();
+        assertNull(table.properties().get(STATE_KEY_2PC), "arrange a genuinely stale writer handle");
+
+        commitWithoutFiles("cdc-thread", "{\"id\":\"cdc-thread\",\"state\":\"{\\\"lsn\\\":\\\"0/2\\\"}\"}");
+
+        Table persisted = catalog.loadTable(TABLE_ID);
+        JsonNode recovery = MAPPER.readTree(persisted.properties().get(STATE_KEY_2PC));
+        JsonNode state = MAPPER.readTree(recovery.get("state").asText());
+        assertEquals("0/2", state.get("lsn").asText());
+        assertEquals("keep", state.get("otherCursor").asText());
+        assertEquals("completed-chunk", recovery.get("full_refresh_committed_ids").get(0).asText());
+        assertNull(persisted.currentSnapshot(), "a recovery-state update must not create a data snapshot");
+    }
+
     // backfill threads send no payload, so an empty chunk records nothing
     @Test
     @DisplayName("backfill without files leaves the 2pc state untouched")

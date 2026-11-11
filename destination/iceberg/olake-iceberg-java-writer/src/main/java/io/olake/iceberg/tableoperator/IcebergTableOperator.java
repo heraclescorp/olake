@@ -202,8 +202,7 @@ public class IcebergTableOperator {
     long commitStarted = RuntimeTelemetry.startTimer();
     boolean committed = false;
     try {
-      // Refresh once before committing; flush is measured separately above.
-      table.refresh();
+      // newTransaction refreshes the table before recovery properties are read below.
       Transaction transaction = table.newTransaction();
 
       // 1. Stage Property Update - mark thread as committed
