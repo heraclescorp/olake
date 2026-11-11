@@ -25,6 +25,10 @@ type Config interface {
 	Validate() error
 }
 
+type ConnectionChecker interface {
+	CheckConnection(context.Context) error
+}
+
 type DriverInterface interface {
 	GetConfigRef() Config
 	Spec() any

@@ -26,6 +26,11 @@ const (
 	codeSchemaBlank             = "postgres.schema_blank"
 	codeUpdateTypeWithoutIndex  = "postgres.update_type_without_table_index"
 	codeAppendModeWithToast     = "postgres.append_mode_with_preserve_toast_values"
+	// Backfill host (Aurora reader) checks.
+	codeBackfillHostSchemeIncluded = "postgres.backfill_host_scheme_included"
+	codeBackfillHostIsWriter       = "postgres.backfill_host_is_writer"
+	codeBackfillHostOutsideCluster = "postgres.backfill_host_outside_cluster"
+	codeAuroraLSNUnavailable       = "postgres.aurora_lsn_unavailable"
 )
 
 // sqlStateCategories maps a PostgreSQL SQLSTATE to a failure category. SQLSTATE rather than the

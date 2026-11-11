@@ -37,6 +37,7 @@ public class OlakeRpcServer {
     public static void main(String[] args) throws InterruptedException {
         Server server;
         try {
+            CatalogHttpLogging.install();
             if (args.length < 1) {
                 LOGGER.error("Please provide a JSON config as an argument.");
                 System.exit(1);

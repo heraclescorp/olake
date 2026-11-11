@@ -2,11 +2,13 @@ package driver
 
 import (
 	"context"
-	"database/sql"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/datazip-inc/olake/constants"
@@ -88,6 +90,15 @@ type Postgres struct {
 	prerequisites    types.PrerequisiteResults
 	enrollmentIssue  error
 	enrollmentTables []pubTable
+	// backfillClient serves chunk planning and chunk scans: the BackfillHost reader when one is
+	// configured, otherwise the same pool as client.
+	backfillClient *sqlx.DB
+	// backfillBarrier is set only with a BackfillHost and holds copies until the reader has caught up.
+	backfillBarrier *readerBarrier
+	backfillMu      sync.Mutex
+	backfillInit    *backfillInitialization
+	backfillClosed  bool
+	poolOpener      func(context.Context, *url.URL, *tls.Config) (*sqlx.DB, error)
 }
 
 func (p *Postgres) CDCSupported() bool {
@@ -113,40 +124,21 @@ func (p *Postgres) setup(ctx context.Context, requireCDCPrerequisites bool) erro
 		}
 	}
 
-	var db *sql.DB
-	pgCfg, err := pgx.ParseConfig(p.config.Connection.String())
-	if err != nil {
-		return fmt.Errorf("failed to parse postgres connection string: %w", err)
-	}
 	tlsConfig, err := p.config.buildTLSConfig()
 	if err != nil {
 		return fmt.Errorf("failed to build tls config: %w", err)
 	}
-	if tlsConfig != nil {
-		pgCfg.TLSConfig = tlsConfig
-	}
-
-	if p.sshClient != nil {
-		logger.Info("Connecting to Postgres via SSH tunnel")
-		// Allows pgx to use the SSH client to connect to the database
-		pgCfg.DialFunc = func(_ context.Context, _, addr string) (net.Conn, error) {
-			return p.sshClient.Dial("tcp", addr)
-		}
-	}
-
-	db = stdlib.OpenDB(*pgCfg)
-	sqlxDB := sqlx.NewDb(db, "pgx")
-	sqlxDB.SetMaxOpenConns(p.config.MaxThreads)
-	pgClient := sqlxDB.Unsafe()
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
-	// force a connection and test that it worked
-	err = pgClient.PingContext(ctx)
+	pgClient, err := p.openPool(ctx, p.config.Connection, tlsConfig)
 	if err != nil {
-		return fmt.Errorf("failed to ping database: %w", err)
+		return err
 	}
 	p.client = pgClient
+	if p.config.BackfillConnection == nil {
+		p.backfillClient = pgClient
+	}
 	p.version, err = serverVersionNum(ctx, pgClient)
 	if err != nil {
 		return fmt.Errorf("failed to detect postgres server version: %w", err)
@@ -181,6 +173,41 @@ func (p *Postgres) setup(ctx context.Context, requireCDCPrerequisites bool) erro
 		logger.Info("Standard Replication is selected")
 	}
 	return nil
+}
+
+// openPool connects to one source instance with the shared credentials, TLS settings and SSH tunnel.
+func (p *Postgres) openPool(ctx context.Context, connection *url.URL, tlsConfig *tls.Config) (*sqlx.DB, error) {
+	if p.poolOpener != nil {
+		return p.poolOpener(ctx, connection, tlsConfig)
+	}
+	pgCfg, err := pgx.ParseConfig(connection.String())
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse postgres connection string: %w", err)
+	}
+	if tlsConfig != nil {
+		pgCfg.TLSConfig = tlsConfig
+	}
+
+	if p.sshClient != nil {
+		logger.Info("Connecting to Postgres via SSH tunnel")
+		// Allows pgx to use the SSH client to connect to the database
+		pgCfg.DialFunc = func(_ context.Context, _, addr string) (net.Conn, error) {
+			return p.sshClient.Dial("tcp", addr)
+		}
+	}
+
+	sqlxDB := sqlx.NewDb(stdlib.OpenDB(*pgCfg), "pgx")
+	sqlxDB.SetMaxOpenConns(p.config.MaxThreads)
+	pgClient := sqlxDB.Unsafe()
+
+	// force a connection and test that it worked
+	if err := pgClient.PingContext(ctx); err != nil {
+		if closeErr := pgClient.Close(); closeErr != nil {
+			logger.Warnf("failed to close unreachable postgres pool: %s", closeErr)
+		}
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+	return pgClient, nil
 }
 
 // serverVersionNum returns the server's server_version_num, e.g. 140005 for PG 14.5.
@@ -221,6 +248,19 @@ func (p *Postgres) SupportedUpdateTypes() []types.UpdateType {
 }
 
 func (p *Postgres) CloseConnection() {
+	p.backfillMu.Lock()
+	p.backfillClosed = true
+	reader := p.backfillClient
+	if p.backfillInit != nil {
+		p.backfillInit.cancel()
+	}
+	p.backfillMu.Unlock()
+	if reader != nil && reader != p.client {
+		if err := reader.Close(); err != nil {
+			logger.Errorf("failed to close connection with backfill host: %s", err)
+		}
+	}
+
 	if p.client != nil {
 		err := p.client.Close()
 		if err != nil {

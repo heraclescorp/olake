@@ -120,6 +120,10 @@
     </dependencies>
   </dependencyManagement>
   <dependencies>
+    <dependency>
+      <groupId>org.apache.httpcomponents.client5</groupId>
+      <artifactId>httpclient5</artifactId>
+    </dependency>
     <!-- Log4j2 implementation -->
     <dependency>
       <groupId>org.apache.logging.log4j</groupId>

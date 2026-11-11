@@ -291,3 +291,83 @@ func TestConfig_buildTLSConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestConfig_ValidateBackfillHost(t *testing.T) {
+	newConfig := func(backfillHost string) *Config {
+		return &Config{
+			Host:          "writer.internal",
+			BackfillHost:  backfillHost,
+			Port:          5432,
+			Username:      "olake",
+			Password:      "secret",
+			Database:      "ebdb",
+			JDBCURLParams: map[string]string{"connect_timeout": "10"},
+			SSLConfiguration: &utils.SSLConfig{
+				Mode: utils.SSLModeRequire,
+			},
+		}
+	}
+
+	t.Run("reader connection keeps every writer setting except the host", func(t *testing.T) {
+		config := newConfig("reader.internal")
+		if err := config.Validate(); err != nil {
+			t.Fatalf("expected no error but got: %v", err)
+		}
+		if config.BackfillConnection == nil {
+			t.Fatalf("expected a backfill connection URL")
+		}
+		if config.BackfillConnection.Host != "reader.internal:5432" {
+			t.Fatalf("expected reader.internal:5432, got %s", config.BackfillConnection.Host)
+		}
+		writer, reader := *config.Connection, *config.BackfillConnection
+		writer.Host, reader.Host = "", ""
+		if writer.String() != reader.String() {
+			t.Fatalf("expected identical credentials, database and parameters, got writer %s and reader %s", writer.String(), reader.String())
+		}
+	})
+
+	t.Run("brackets an IPv6 backfill host", func(t *testing.T) {
+		config := newConfig("::1")
+		if err := config.Validate(); err != nil {
+			t.Fatalf("expected no error but got: %v", err)
+		}
+		if config.BackfillConnection.Host != "[::1]:5432" {
+			t.Fatalf("expected [::1]:5432, got %s", config.BackfillConnection.Host)
+		}
+	})
+
+	t.Run("no backfill host means writer-only reads", func(t *testing.T) {
+		config := newConfig("")
+		if err := config.Validate(); err != nil {
+			t.Fatalf("expected no error but got: %v", err)
+		}
+		if config.BackfillConnection != nil {
+			t.Fatalf("expected no backfill connection, got %s", config.BackfillConnection.String())
+		}
+	})
+
+	t.Run("rejects a scheme in the backfill host", func(t *testing.T) {
+		if err := newConfig("https://reader.internal").Validate(); err == nil {
+			t.Fatalf("expected an error for a backfill host with a scheme")
+		}
+	})
+}
+
+func TestConfig_buildBackfillTLSConfigVerifiesTheReaderHost(t *testing.T) {
+	certs := testutils.GenerateTestCerts()
+	config := &Config{
+		Host:         "writer.internal",
+		BackfillHost: "reader.internal",
+		SSLConfiguration: &utils.SSLConfig{
+			Mode:     utils.SSLModeVerifyFull,
+			ServerCA: certs.CACert,
+		},
+	}
+	tlsCfg, err := config.buildBackfillTLSConfig()
+	if err != nil {
+		t.Fatalf("expected no error but got: %v", err)
+	}
+	if tlsCfg.ServerName != "reader.internal" {
+		t.Fatalf("expected verify-full against reader.internal, got %s", tlsCfg.ServerName)
+	}
+}

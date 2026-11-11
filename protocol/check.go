@@ -57,6 +57,9 @@ var checkCmd = &cobra.Command{
 				// required checks when the config selects CDC (abstract.RequireCDCPrerequisites).
 				err := connector.Setup(cmd.Context())
 				prerequisites = connector.Prerequisites()
+				if err == nil {
+					err = connector.CheckConnection(cmd.Context())
+				}
 				return err
 			}
 
