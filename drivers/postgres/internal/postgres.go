@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/datazip-inc/olake/constants"
@@ -94,6 +95,10 @@ type Postgres struct {
 	backfillClient *sqlx.DB
 	// backfillBarrier is set only with a BackfillHost and holds copies until the reader has caught up.
 	backfillBarrier *readerBarrier
+	backfillMu      sync.Mutex
+	backfillInit    *backfillInitialization
+	backfillClosed  bool
+	poolOpener      func(context.Context, *url.URL, *tls.Config) (*sqlx.DB, error)
 }
 
 func (p *Postgres) CDCSupported() bool {
@@ -131,18 +136,15 @@ func (p *Postgres) setup(ctx context.Context, requireCDCPrerequisites bool) erro
 		return err
 	}
 	p.client = pgClient
-	p.backfillClient = pgClient
+	if p.config.BackfillConnection == nil {
+		p.backfillClient = pgClient
+	}
 	p.version, err = serverVersionNum(ctx, pgClient)
 	if err != nil {
 		return fmt.Errorf("failed to detect postgres server version: %w", err)
 	}
 	p.sizer = newCTIDSizer(p.version)
 	logger.Infof("Connected to Postgres server_version_num=%d", p.version)
-	if p.config.BackfillConnection != nil {
-		if err := p.setupBackfillHost(ctx); err != nil {
-			return err
-		}
-	}
 	// TODO: correct cdc setup
 	found, _ := utils.IsOfType(p.config.UpdateMethod, "replication_slot")
 	if found {
@@ -175,6 +177,9 @@ func (p *Postgres) setup(ctx context.Context, requireCDCPrerequisites bool) erro
 
 // openPool connects to one source instance with the shared credentials, TLS settings and SSH tunnel.
 func (p *Postgres) openPool(ctx context.Context, connection *url.URL, tlsConfig *tls.Config) (*sqlx.DB, error) {
+	if p.poolOpener != nil {
+		return p.poolOpener(ctx, connection, tlsConfig)
+	}
 	pgCfg, err := pgx.ParseConfig(connection.String())
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse postgres connection string: %w", err)
@@ -231,8 +236,15 @@ func (p *Postgres) Spec() any {
 }
 
 func (p *Postgres) CloseConnection() {
-	if p.backfillClient != nil && p.backfillClient != p.client {
-		if err := p.backfillClient.Close(); err != nil {
+	p.backfillMu.Lock()
+	p.backfillClosed = true
+	reader := p.backfillClient
+	if p.backfillInit != nil {
+		p.backfillInit.cancel()
+	}
+	p.backfillMu.Unlock()
+	if reader != nil && reader != p.client {
+		if err := reader.Close(); err != nil {
 			logger.Errorf("failed to close connection with backfill host: %s", err)
 		}
 	}
