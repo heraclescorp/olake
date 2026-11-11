@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -137,93 +138,130 @@ func TestEnrollmentExplicitPolicy(t *testing.T) {
 	if err := enrollmentTestPolicy().validate(saved.saved); err != nil {
 		t.Fatal(err)
 	}
+	// A policy saved before drop_removed_columns existed still validates, with the option off.
+	var savedPolicy enrollmentPolicy
+	if err := json.Unmarshal([]byte(`{"enabled":true,"schemas":[{"namespace":"public","destination_database":"warehouse:public"}],"defaults":{"normalization":true,"append_mode":false,"update_type":"pos","sync_new_columns":false},"target_query_engines":["athena"]}`), &savedPolicy); err != nil {
+		t.Fatal(err)
+	}
+	if err := savedPolicy.validate(saved.saved); err != nil {
+		t.Fatal(err)
+	}
+	if savedPolicy.Defaults.DropRemovedColumns != nil {
+		t.Fatal("absent drop_removed_columns must stay unset")
+	}
 }
 
 func TestEnrollmentApprovedSubsetPreservesBothCatalogFormats(t *testing.T) {
-	for _, split := range []bool{false, true} {
-		t.Run(map[bool]string{false: "legacy", true: "split"}[split], func(t *testing.T) {
-			saved := enrollmentTestCatalog(t, split, enrollmentSavedFixture)
-			oldStreams := slices.Clone(saved.streams)
-			oldSelection := slices.Clone(saved.selections["public"])
-			source := &enrollmentTestSource{
-				names: []types.StreamID{{Namespace: "public", Name: "valid"}, {Namespace: "public", Name: "kept"}, {Namespace: "outside", Name: "not_approved"}, {Namespace: "public", Name: "excluded"}, {Namespace: "public", Name: "no_pk"}, {Namespace: "public", Name: "unpublished"}, {Namespace: "public", Name: "invalid.name"}},
-				noPK:  map[string]bool{"no_pk": true}, invalid: map[string]string{"unpublished": "table is not covered by the configured publication"},
-			}
-			result, err := discoverNewTables(context.Background(), source, saved, enrollmentTestPolicy(), enrollmentTestDestination(), nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(result.Enrolled, []enrolledTable{{Namespace: "public", StreamName: "valid"}}) {
-				t.Fatalf("unexpected enrollment: %+v", result.Enrolled)
-			}
-			if !reflect.DeepEqual(source.produced, []types.StreamID{{Namespace: "public", Name: "no_pk"}, {Namespace: "public", Name: "unpublished"}, {Namespace: "public", Name: "valid"}}) {
-				t.Fatalf("schema fetched outside valid name/approval subset: %+v", source.produced)
-			}
-			if len(result.Skipped) != 3 {
-				t.Fatalf("unexpected skips: %+v", result.Skipped)
-			}
-			for i := range oldStreams {
-				assertEnrollmentJSONEqual(t, oldStreams[i], saved.streams[i])
-			}
-			assertEnrollmentJSONEqual(t, oldSelection[0], saved.selections["public"][0])
-			if len(saved.selections["public"]) != 2 {
-				t.Fatal("known excluded stream was selected")
-			}
-			if split {
-				if result.StreamsConfig != "" || result.AvailableStreamsConfig == "" || result.SelectedStreamsConfig == "" {
-					t.Fatal("wrong output format")
-				}
-			} else if result.StreamsConfig == "" || result.AvailableStreamsConfig != "" || result.SelectedStreamsConfig != "" {
-				t.Fatal("wrong output format")
-			}
-			var metadata map[string]json.RawMessage
-			if err := json.Unmarshal(saved.selections["public"][1], &metadata); err != nil {
-				t.Fatal(err)
-			}
-			if string(metadata["append_mode"]) != "false" {
-				t.Fatal("new append default must be explicit, including false")
-			}
-			var columns types.SelectedColumns
-			if err := json.Unmarshal(metadata["selected_columns"], &columns); err != nil {
-				t.Fatal(err)
-			}
-			if columns.SyncNewColumns || !slices.Contains(columns.Columns, "payload") || !slices.Contains(columns.Columns, "_olake_id") {
-				t.Fatalf("new-column policy was not explicit: %+v", columns)
-			}
-			// Re-load the exact proposed result through the ordinary reader: no custom runtime format.
-			dir := t.TempDir()
-			var loaded *types.Catalog
-			if split {
-				a, s := filepath.Join(dir, "available.json"), filepath.Join(dir, "selected.json")
-				if err := os.WriteFile(a, []byte(result.AvailableStreamsConfig), 0600); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(s, []byte(result.SelectedStreamsConfig), 0600); err != nil {
-					t.Fatal(err)
-				}
-				loaded, err = types.ResolveCatalog("", a, s)
-			} else {
-				path := filepath.Join(dir, "streams.json")
-				if err := os.WriteFile(path, []byte(result.StreamsConfig), 0600); err != nil {
-					t.Fatal(err)
-				}
-				loaded, err = types.ResolveCatalog(path, "", "")
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(loaded.Streams) != 3 || len(loaded.SelectedStreams["public"]) != 2 {
-				t.Fatal("ordinary reader lost selection or definitions")
-			}
-			selection := loaded.SelectedStreams["public"][1]
-			stream := &types.ConfiguredStream{Stream: loaded.Streams[2].Stream, StreamMetadata: selection}
-			if stream.GetSyncMode() != types.CDC || stream.GetDestinationDatabase(nil) != "warehouse_public" || stream.GetDestinationTable() != "valid" {
-				t.Fatal("ordinary reader resolved different destination or sync mode")
-			}
-			if stream.GetUpdateType() != types.UpdateTypePosition || stream.AppendModeEnabled() || !stream.NormalizationEnabled() {
-				t.Fatal("ordinary reader lost explicit defaults")
-			}
-		})
+	for _, dropRemovedColumns := range []*bool{nil, new(false), new(true)} {
+		option := "unset"
+		if dropRemovedColumns != nil {
+			option = strconv.FormatBool(*dropRemovedColumns)
+		}
+		for _, split := range []bool{false, true} {
+			t.Run(map[bool]string{false: "legacy", true: "split"}[split]+"/drop_removed_columns="+option, func(t *testing.T) {
+				testEnrollmentApprovedSubset(t, split, dropRemovedColumns)
+			})
+		}
+	}
+}
+
+func testEnrollmentApprovedSubset(t *testing.T, split bool, dropRemovedColumns *bool) {
+	saved := enrollmentTestCatalog(t, split, enrollmentSavedFixture)
+	policy := enrollmentTestPolicy()
+	policy.Defaults.DropRemovedColumns = dropRemovedColumns
+	if err := policy.validate(saved.saved); err != nil {
+		t.Fatal(err)
+	}
+	oldStreams := slices.Clone(saved.streams)
+	oldSelection := slices.Clone(saved.selections["public"])
+	source := &enrollmentTestSource{
+		names: []types.StreamID{{Namespace: "public", Name: "valid"}, {Namespace: "public", Name: "kept"}, {Namespace: "outside", Name: "not_approved"}, {Namespace: "public", Name: "excluded"}, {Namespace: "public", Name: "no_pk"}, {Namespace: "public", Name: "unpublished"}, {Namespace: "public", Name: "invalid.name"}},
+		noPK:  map[string]bool{"no_pk": true}, invalid: map[string]string{"unpublished": "table is not covered by the configured publication"},
+	}
+	result, err := discoverNewTables(context.Background(), source, saved, policy, enrollmentTestDestination(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(result.Enrolled, []enrolledTable{{Namespace: "public", StreamName: "valid"}}) {
+		t.Fatalf("unexpected enrollment: %+v", result.Enrolled)
+	}
+	if !reflect.DeepEqual(source.produced, []types.StreamID{{Namespace: "public", Name: "no_pk"}, {Namespace: "public", Name: "unpublished"}, {Namespace: "public", Name: "valid"}}) {
+		t.Fatalf("schema fetched outside valid name/approval subset: %+v", source.produced)
+	}
+	if len(result.Skipped) != 3 {
+		t.Fatalf("unexpected skips: %+v", result.Skipped)
+	}
+	for i := range oldStreams {
+		assertEnrollmentJSONEqual(t, oldStreams[i], saved.streams[i])
+	}
+	assertEnrollmentJSONEqual(t, oldSelection[0], saved.selections["public"][0])
+	if len(saved.selections["public"]) != 2 {
+		t.Fatal("known excluded stream was selected")
+	}
+	if split {
+		if result.StreamsConfig != "" || result.AvailableStreamsConfig == "" || result.SelectedStreamsConfig == "" {
+			t.Fatal("wrong output format")
+		}
+	} else if result.StreamsConfig == "" || result.AvailableStreamsConfig != "" || result.SelectedStreamsConfig != "" {
+		t.Fatal("wrong output format")
+	}
+	var metadata map[string]json.RawMessage
+	if err := json.Unmarshal(saved.selections["public"][1], &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if string(metadata["append_mode"]) != "false" {
+		t.Fatal("new append default must be explicit, including false")
+	}
+	var columns types.SelectedColumns
+	if err := json.Unmarshal(metadata["selected_columns"], &columns); err != nil {
+		t.Fatal(err)
+	}
+	if columns.SyncNewColumns || !slices.Contains(columns.Columns, "payload") || !slices.Contains(columns.Columns, "_olake_id") {
+		t.Fatalf("new-column policy was not explicit: %+v", columns)
+	}
+	// Re-load the exact proposed result through the ordinary reader: no custom runtime format.
+	dir := t.TempDir()
+	var loaded *types.Catalog
+	if split {
+		a, s := filepath.Join(dir, "available.json"), filepath.Join(dir, "selected.json")
+		if err := os.WriteFile(a, []byte(result.AvailableStreamsConfig), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(s, []byte(result.SelectedStreamsConfig), 0600); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err = types.ResolveCatalog("", a, s)
+	} else {
+		path := filepath.Join(dir, "streams.json")
+		if err := os.WriteFile(path, []byte(result.StreamsConfig), 0600); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err = types.ResolveCatalog(path, "", "")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Streams) != 3 || len(loaded.SelectedStreams["public"]) != 2 {
+		t.Fatal("ordinary reader lost selection or definitions")
+	}
+	selection := loaded.SelectedStreams["public"][1]
+	stream := &types.ConfiguredStream{Stream: loaded.Streams[2].Stream, StreamMetadata: selection}
+	if stream.GetSyncMode() != types.CDC || stream.GetDestinationDatabase(nil) != "warehouse_public" || stream.GetDestinationTable() != "valid" {
+		t.Fatal("ordinary reader resolved different destination or sync mode")
+	}
+	if stream.GetUpdateType() != types.UpdateTypePosition || stream.AppendModeEnabled() || !stream.NormalizationEnabled() {
+		t.Fatal("ordinary reader lost explicit defaults")
+	}
+	wantDrop := dropRemovedColumns != nil && *dropRemovedColumns
+	if stream.DropRemovedColumnsEnabled() != wantDrop {
+		t.Fatalf("enrolled drop_removed_columns=%v, want %v", stream.DropRemovedColumnsEnabled(), wantDrop)
+	}
+	if _, present := metadata["drop_removed_columns"]; present != wantDrop {
+		t.Fatalf("saved selection %s: drop_removed_columns present=%v, want %v", saved.selections["public"][1], present, wantDrop)
+	}
+	existing := &types.ConfiguredStream{Stream: loaded.Streams[0].Stream, StreamMetadata: loaded.SelectedStreams["public"][0]}
+	if existing.DropRemovedColumnsEnabled() {
+		t.Fatal("policy default changed an existing stream")
 	}
 }
 

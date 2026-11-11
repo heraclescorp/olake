@@ -17,6 +17,8 @@ type enrollmentDefaults struct {
 	AppendMode     *bool            `json:"append_mode"`
 	UpdateType     types.UpdateType `json:"update_type"`
 	SyncNewColumns *bool            `json:"sync_new_columns"`
+	// Optional, unlike the others: policies saved before it existed leave it unset, which is off.
+	DropRemovedColumns *bool `json:"drop_removed_columns"`
 }
 
 type enrollmentPolicy struct {
