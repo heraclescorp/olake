@@ -18,6 +18,8 @@ message IcebergPayload {
     GET_OR_CREATE_TABLE = 4;
     REFRESH_TABLE_SCHEMA = 5;
     CLOSE_SESSION = 6;
+    // Adds and drops columns named in added_columns / dropped_columns in one schema update.
+    ALTER_COLUMNS = 7;
   }
   
   PayloadType type = 1;
@@ -50,6 +52,16 @@ message IcebergPayload {
     DeleteMode delete_mode = 11;
     // Whether the catalog allows declaring identifier_field on the table; only equality deletes need it declared.
     bool declare_identifier_fields = 12;
+    // ALTER_COLUMNS only.
+    repeated AddedColumn added_columns = 13;
+    repeated string dropped_columns = 14;
+  }
+
+  message AddedColumn {
+    string key = 1;
+    string ice_type = 2;
+    // What rows written before the column existed read for it; unset is NULL.
+    IceRecord.FieldValue initial_default = 3;
   }
 
   message SchemaField {

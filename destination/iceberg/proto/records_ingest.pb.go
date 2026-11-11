@@ -31,6 +31,8 @@ const (
 	IcebergPayload_GET_OR_CREATE_TABLE  IcebergPayload_PayloadType = 4
 	IcebergPayload_REFRESH_TABLE_SCHEMA IcebergPayload_PayloadType = 5
 	IcebergPayload_CLOSE_SESSION        IcebergPayload_PayloadType = 6
+	// Adds and drops columns named in added_columns / dropped_columns in one schema update.
+	IcebergPayload_ALTER_COLUMNS IcebergPayload_PayloadType = 7
 )
 
 // Enum value maps for IcebergPayload_PayloadType.
@@ -43,6 +45,7 @@ var (
 		4: "GET_OR_CREATE_TABLE",
 		5: "REFRESH_TABLE_SCHEMA",
 		6: "CLOSE_SESSION",
+		7: "ALTER_COLUMNS",
 	}
 	IcebergPayload_PayloadType_value = map[string]int32{
 		"RECORDS":              0,
@@ -52,6 +55,7 @@ var (
 		"GET_OR_CREATE_TABLE":  4,
 		"REFRESH_TABLE_SCHEMA": 5,
 		"CLOSE_SESSION":        6,
+		"ALTER_COLUMNS":        7,
 	}
 )
 
@@ -874,8 +878,11 @@ type IcebergPayload_Metadata struct {
 	DeleteMode IcebergPayload_DeleteMode `protobuf:"varint,11,opt,name=delete_mode,json=deleteMode,proto3,enum=io.olake.iceberg.rpc.IcebergPayload_DeleteMode" json:"delete_mode,omitempty"`
 	// Whether the catalog allows declaring identifier_field on the table; only equality deletes need it declared.
 	DeclareIdentifierFields bool `protobuf:"varint,12,opt,name=declare_identifier_fields,json=declareIdentifierFields,proto3" json:"declare_identifier_fields,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// ALTER_COLUMNS only.
+	AddedColumns   []*IcebergPayload_AddedColumn `protobuf:"bytes,13,rep,name=added_columns,json=addedColumns,proto3" json:"added_columns,omitempty"`
+	DroppedColumns []string                      `protobuf:"bytes,14,rep,name=dropped_columns,json=droppedColumns,proto3" json:"dropped_columns,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *IcebergPayload_Metadata) Reset() {
@@ -985,6 +992,81 @@ func (x *IcebergPayload_Metadata) GetDeclareIdentifierFields() bool {
 	return false
 }
 
+func (x *IcebergPayload_Metadata) GetAddedColumns() []*IcebergPayload_AddedColumn {
+	if x != nil {
+		return x.AddedColumns
+	}
+	return nil
+}
+
+func (x *IcebergPayload_Metadata) GetDroppedColumns() []string {
+	if x != nil {
+		return x.DroppedColumns
+	}
+	return nil
+}
+
+type IcebergPayload_AddedColumn struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Key     string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	IceType string                 `protobuf:"bytes,2,opt,name=ice_type,json=iceType,proto3" json:"ice_type,omitempty"`
+	// What rows written before the column existed read for it; unset is NULL.
+	InitialDefault *IcebergPayload_IceRecord_FieldValue `protobuf:"bytes,3,opt,name=initial_default,json=initialDefault,proto3" json:"initial_default,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *IcebergPayload_AddedColumn) Reset() {
+	*x = IcebergPayload_AddedColumn{}
+	mi := &file_records_ingest_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IcebergPayload_AddedColumn) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IcebergPayload_AddedColumn) ProtoMessage() {}
+
+func (x *IcebergPayload_AddedColumn) ProtoReflect() protoreflect.Message {
+	mi := &file_records_ingest_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IcebergPayload_AddedColumn.ProtoReflect.Descriptor instead.
+func (*IcebergPayload_AddedColumn) Descriptor() ([]byte, []int) {
+	return file_records_ingest_proto_rawDescGZIP(), []int{0, 1}
+}
+
+func (x *IcebergPayload_AddedColumn) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *IcebergPayload_AddedColumn) GetIceType() string {
+	if x != nil {
+		return x.IceType
+	}
+	return ""
+}
+
+func (x *IcebergPayload_AddedColumn) GetInitialDefault() *IcebergPayload_IceRecord_FieldValue {
+	if x != nil {
+		return x.InitialDefault
+	}
+	return nil
+}
+
 type IcebergPayload_SchemaField struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	IceType       string                 `protobuf:"bytes,1,opt,name=ice_type,json=iceType,proto3" json:"ice_type,omitempty"`
@@ -995,7 +1077,7 @@ type IcebergPayload_SchemaField struct {
 
 func (x *IcebergPayload_SchemaField) Reset() {
 	*x = IcebergPayload_SchemaField{}
-	mi := &file_records_ingest_proto_msgTypes[12]
+	mi := &file_records_ingest_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1007,7 +1089,7 @@ func (x *IcebergPayload_SchemaField) String() string {
 func (*IcebergPayload_SchemaField) ProtoMessage() {}
 
 func (x *IcebergPayload_SchemaField) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[12]
+	mi := &file_records_ingest_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1020,7 +1102,7 @@ func (x *IcebergPayload_SchemaField) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IcebergPayload_SchemaField.ProtoReflect.Descriptor instead.
 func (*IcebergPayload_SchemaField) Descriptor() ([]byte, []int) {
-	return file_records_ingest_proto_rawDescGZIP(), []int{0, 1}
+	return file_records_ingest_proto_rawDescGZIP(), []int{0, 2}
 }
 
 func (x *IcebergPayload_SchemaField) GetIceType() string {
@@ -1047,7 +1129,7 @@ type IcebergPayload_PartitionField struct {
 
 func (x *IcebergPayload_PartitionField) Reset() {
 	*x = IcebergPayload_PartitionField{}
-	mi := &file_records_ingest_proto_msgTypes[13]
+	mi := &file_records_ingest_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1059,7 +1141,7 @@ func (x *IcebergPayload_PartitionField) String() string {
 func (*IcebergPayload_PartitionField) ProtoMessage() {}
 
 func (x *IcebergPayload_PartitionField) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[13]
+	mi := &file_records_ingest_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1072,7 +1154,7 @@ func (x *IcebergPayload_PartitionField) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IcebergPayload_PartitionField.ProtoReflect.Descriptor instead.
 func (*IcebergPayload_PartitionField) Descriptor() ([]byte, []int) {
-	return file_records_ingest_proto_rawDescGZIP(), []int{0, 2}
+	return file_records_ingest_proto_rawDescGZIP(), []int{0, 3}
 }
 
 func (x *IcebergPayload_PartitionField) GetField() string {
@@ -1105,7 +1187,7 @@ type IcebergPayload_IceRecord struct {
 
 func (x *IcebergPayload_IceRecord) Reset() {
 	*x = IcebergPayload_IceRecord{}
-	mi := &file_records_ingest_proto_msgTypes[14]
+	mi := &file_records_ingest_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1117,7 +1199,7 @@ func (x *IcebergPayload_IceRecord) String() string {
 func (*IcebergPayload_IceRecord) ProtoMessage() {}
 
 func (x *IcebergPayload_IceRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[14]
+	mi := &file_records_ingest_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1130,7 +1212,7 @@ func (x *IcebergPayload_IceRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IcebergPayload_IceRecord.ProtoReflect.Descriptor instead.
 func (*IcebergPayload_IceRecord) Descriptor() ([]byte, []int) {
-	return file_records_ingest_proto_rawDescGZIP(), []int{0, 3}
+	return file_records_ingest_proto_rawDescGZIP(), []int{0, 4}
 }
 
 func (x *IcebergPayload_IceRecord) GetFields() []*IcebergPayload_IceRecord_FieldValue {
@@ -1180,7 +1262,7 @@ type IcebergPayload_IceRecord_FieldValue struct {
 
 func (x *IcebergPayload_IceRecord_FieldValue) Reset() {
 	*x = IcebergPayload_IceRecord_FieldValue{}
-	mi := &file_records_ingest_proto_msgTypes[15]
+	mi := &file_records_ingest_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1192,7 +1274,7 @@ func (x *IcebergPayload_IceRecord_FieldValue) String() string {
 func (*IcebergPayload_IceRecord_FieldValue) ProtoMessage() {}
 
 func (x *IcebergPayload_IceRecord_FieldValue) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[15]
+	mi := &file_records_ingest_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1205,7 +1287,7 @@ func (x *IcebergPayload_IceRecord_FieldValue) ProtoReflect() protoreflect.Messag
 
 // Deprecated: Use IcebergPayload_IceRecord_FieldValue.ProtoReflect.Descriptor instead.
 func (*IcebergPayload_IceRecord_FieldValue) Descriptor() ([]byte, []int) {
-	return file_records_ingest_proto_rawDescGZIP(), []int{0, 3, 0}
+	return file_records_ingest_proto_rawDescGZIP(), []int{0, 4, 0}
 }
 
 func (x *IcebergPayload_IceRecord_FieldValue) GetValue() isIcebergPayload_IceRecord_FieldValue_Value {
@@ -1339,7 +1421,7 @@ type FilePositionMap_Range struct {
 
 func (x *FilePositionMap_Range) Reset() {
 	*x = FilePositionMap_Range{}
-	mi := &file_records_ingest_proto_msgTypes[16]
+	mi := &file_records_ingest_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1351,7 +1433,7 @@ func (x *FilePositionMap_Range) String() string {
 func (*FilePositionMap_Range) ProtoMessage() {}
 
 func (x *FilePositionMap_Range) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[16]
+	mi := &file_records_ingest_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1400,7 +1482,7 @@ type ArrowPayload_FileMetadata struct {
 
 func (x *ArrowPayload_FileMetadata) Reset() {
 	*x = ArrowPayload_FileMetadata{}
-	mi := &file_records_ingest_proto_msgTypes[17]
+	mi := &file_records_ingest_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1412,7 +1494,7 @@ func (x *ArrowPayload_FileMetadata) String() string {
 func (*ArrowPayload_FileMetadata) ProtoMessage() {}
 
 func (x *ArrowPayload_FileMetadata) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[17]
+	mi := &file_records_ingest_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1466,7 +1548,7 @@ type ArrowPayload_FileUploadRequest struct {
 
 func (x *ArrowPayload_FileUploadRequest) Reset() {
 	*x = ArrowPayload_FileUploadRequest{}
-	mi := &file_records_ingest_proto_msgTypes[18]
+	mi := &file_records_ingest_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1478,7 +1560,7 @@ func (x *ArrowPayload_FileUploadRequest) String() string {
 func (*ArrowPayload_FileUploadRequest) ProtoMessage() {}
 
 func (x *ArrowPayload_FileUploadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[18]
+	mi := &file_records_ingest_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1521,7 +1603,7 @@ type ArrowPayload_DeletionVectorBatch struct {
 
 func (x *ArrowPayload_DeletionVectorBatch) Reset() {
 	*x = ArrowPayload_DeletionVectorBatch{}
-	mi := &file_records_ingest_proto_msgTypes[19]
+	mi := &file_records_ingest_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1533,7 +1615,7 @@ func (x *ArrowPayload_DeletionVectorBatch) String() string {
 func (*ArrowPayload_DeletionVectorBatch) ProtoMessage() {}
 
 func (x *ArrowPayload_DeletionVectorBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[19]
+	mi := &file_records_ingest_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1574,7 +1656,7 @@ type ArrowPayload_Metadata struct {
 
 func (x *ArrowPayload_Metadata) Reset() {
 	*x = ArrowPayload_Metadata{}
-	mi := &file_records_ingest_proto_msgTypes[20]
+	mi := &file_records_ingest_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1586,7 +1668,7 @@ func (x *ArrowPayload_Metadata) String() string {
 func (*ArrowPayload_Metadata) ProtoMessage() {}
 
 func (x *ArrowPayload_Metadata) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[20]
+	mi := &file_records_ingest_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1669,7 +1751,7 @@ type ArrowPayload_FileMetadata_PartitionValue struct {
 
 func (x *ArrowPayload_FileMetadata_PartitionValue) Reset() {
 	*x = ArrowPayload_FileMetadata_PartitionValue{}
-	mi := &file_records_ingest_proto_msgTypes[21]
+	mi := &file_records_ingest_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1681,7 +1763,7 @@ func (x *ArrowPayload_FileMetadata_PartitionValue) String() string {
 func (*ArrowPayload_FileMetadata_PartitionValue) ProtoMessage() {}
 
 func (x *ArrowPayload_FileMetadata_PartitionValue) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[21]
+	mi := &file_records_ingest_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1835,7 +1917,7 @@ type ArrowPayload_DeletionVectorBatch_Entry struct {
 
 func (x *ArrowPayload_DeletionVectorBatch_Entry) Reset() {
 	*x = ArrowPayload_DeletionVectorBatch_Entry{}
-	mi := &file_records_ingest_proto_msgTypes[22]
+	mi := &file_records_ingest_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1847,7 +1929,7 @@ func (x *ArrowPayload_DeletionVectorBatch_Entry) String() string {
 func (*ArrowPayload_DeletionVectorBatch_Entry) ProtoMessage() {}
 
 func (x *ArrowPayload_DeletionVectorBatch_Entry) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[22]
+	mi := &file_records_ingest_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1895,7 +1977,7 @@ type TableIndexScanBatch_Entry struct {
 
 func (x *TableIndexScanBatch_Entry) Reset() {
 	*x = TableIndexScanBatch_Entry{}
-	mi := &file_records_ingest_proto_msgTypes[24]
+	mi := &file_records_ingest_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1907,7 +1989,7 @@ func (x *TableIndexScanBatch_Entry) String() string {
 func (*TableIndexScanBatch_Entry) ProtoMessage() {}
 
 func (x *TableIndexScanBatch_Entry) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[24]
+	mi := &file_records_ingest_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1955,7 +2037,7 @@ type ReadRowsRequest_Row struct {
 
 func (x *ReadRowsRequest_Row) Reset() {
 	*x = ReadRowsRequest_Row{}
-	mi := &file_records_ingest_proto_msgTypes[25]
+	mi := &file_records_ingest_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1967,7 +2049,7 @@ func (x *ReadRowsRequest_Row) String() string {
 func (*ReadRowsRequest_Row) ProtoMessage() {}
 
 func (x *ReadRowsRequest_Row) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[25]
+	mi := &file_records_ingest_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2008,7 +2090,7 @@ type ReadRowsRequest_FileRows struct {
 
 func (x *ReadRowsRequest_FileRows) Reset() {
 	*x = ReadRowsRequest_FileRows{}
-	mi := &file_records_ingest_proto_msgTypes[26]
+	mi := &file_records_ingest_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2020,7 +2102,7 @@ func (x *ReadRowsRequest_FileRows) String() string {
 func (*ReadRowsRequest_FileRows) ProtoMessage() {}
 
 func (x *ReadRowsRequest_FileRows) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[26]
+	mi := &file_records_ingest_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2063,7 +2145,7 @@ type ReadRowsBatch_Row struct {
 
 func (x *ReadRowsBatch_Row) Reset() {
 	*x = ReadRowsBatch_Row{}
-	mi := &file_records_ingest_proto_msgTypes[27]
+	mi := &file_records_ingest_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2075,7 +2157,7 @@ func (x *ReadRowsBatch_Row) String() string {
 func (*ReadRowsBatch_Row) ProtoMessage() {}
 
 func (x *ReadRowsBatch_Row) ProtoReflect() protoreflect.Message {
-	mi := &file_records_ingest_proto_msgTypes[27]
+	mi := &file_records_ingest_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2116,11 +2198,11 @@ var File_records_ingest_proto protoreflect.FileDescriptor
 
 const file_records_ingest_proto_rawDesc = "" +
 	"\n" +
-	"\x14records_ingest.proto\x12\x14io.olake.iceberg.rpc\"\xf3\r\n" +
+	"\x14records_ingest.proto\x12\x14io.olake.iceberg.rpc\"\xa7\x10\n" +
 	"\x0eIcebergPayload\x12D\n" +
 	"\x04type\x18\x01 \x01(\x0e20.io.olake.iceberg.rpc.IcebergPayload.PayloadTypeR\x04type\x12I\n" +
 	"\bmetadata\x18\x02 \x01(\v2-.io.olake.iceberg.rpc.IcebergPayload.MetadataR\bmetadata\x12H\n" +
-	"\arecords\x18\x03 \x03(\v2..io.olake.iceberg.rpc.IcebergPayload.IceRecordR\arecords\x1a\xe0\x04\n" +
+	"\arecords\x18\x03 \x03(\v2..io.olake.iceberg.rpc.IcebergPayload.IceRecordR\arecords\x1a\xe0\x05\n" +
 	"\bMetadata\x12&\n" +
 	"\x0fdest_table_name\x18\x01 \x01(\tR\rdestTableName\x12\x1b\n" +
 	"\tthread_id\x18\x02 \x01(\tR\bthreadId\x12.\n" +
@@ -2134,9 +2216,15 @@ const file_records_ingest_proto_rawDesc = "" +
 	" \x01(\x03H\x01R\x0ebaseSnapshotId\x88\x01\x01\x12P\n" +
 	"\vdelete_mode\x18\v \x01(\x0e2/.io.olake.iceberg.rpc.IcebergPayload.DeleteModeR\n" +
 	"deleteMode\x12:\n" +
-	"\x19declare_identifier_fields\x18\f \x01(\bR\x17declareIdentifierFieldsB\x13\n" +
+	"\x19declare_identifier_fields\x18\f \x01(\bR\x17declareIdentifierFields\x12U\n" +
+	"\radded_columns\x18\r \x03(\v20.io.olake.iceberg.rpc.IcebergPayload.AddedColumnR\faddedColumns\x12'\n" +
+	"\x0fdropped_columns\x18\x0e \x03(\tR\x0edroppedColumnsB\x13\n" +
 	"\x11_identifier_fieldB\x13\n" +
-	"\x11_base_snapshot_id\x1a:\n" +
+	"\x11_base_snapshot_id\x1a\x9e\x01\n" +
+	"\vAddedColumn\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x19\n" +
+	"\bice_type\x18\x02 \x01(\tR\aiceType\x12b\n" +
+	"\x0finitial_default\x18\x03 \x01(\v29.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValueR\x0einitialDefault\x1a:\n" +
 	"\vSchemaField\x12\x19\n" +
 	"\bice_type\x18\x01 \x01(\tR\aiceType\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x1aD\n" +
@@ -2164,7 +2252,7 @@ const file_records_ingest_proto_rawDesc = "" +
 	"bytesValueB\a\n" +
 	"\x05valueB\x13\n" +
 	"\x11_delete_file_pathB\x12\n" +
-	"\x10_delete_position\"\x8f\x01\n" +
+	"\x10_delete_position\"\xa2\x01\n" +
 	"\vPayloadType\x12\v\n" +
 	"\aRECORDS\x10\x00\x12\n" +
 	"\n" +
@@ -2174,7 +2262,8 @@ const file_records_ingest_proto_rawDesc = "" +
 	"DROP_TABLE\x10\x03\x12\x17\n" +
 	"\x13GET_OR_CREATE_TABLE\x10\x04\x12\x18\n" +
 	"\x14REFRESH_TABLE_SCHEMA\x10\x05\x12\x11\n" +
-	"\rCLOSE_SESSION\x10\x06\"~\n" +
+	"\rCLOSE_SESSION\x10\x06\x12\x11\n" +
+	"\rALTER_COLUMNS\x10\a\"~\n" +
 	"\n" +
 	"DeleteMode\x12\x1b\n" +
 	"\x17DELETE_MODE_UNSPECIFIED\x10\x00\x12\x18\n" +
@@ -2316,7 +2405,7 @@ func file_records_ingest_proto_rawDescGZIP() []byte {
 }
 
 var file_records_ingest_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_records_ingest_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
+var file_records_ingest_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
 var file_records_ingest_proto_goTypes = []any{
 	(IcebergPayload_PayloadType)(0),                  // 0: io.olake.iceberg.rpc.IcebergPayload.PayloadType
 	(IcebergPayload_DeleteMode)(0),                   // 1: io.olake.iceberg.rpc.IcebergPayload.DeleteMode
@@ -2333,65 +2422,68 @@ var file_records_ingest_proto_goTypes = []any{
 	(*ReadRowsRequest)(nil),                          // 12: io.olake.iceberg.rpc.ReadRowsRequest
 	(*ReadRowsBatch)(nil),                            // 13: io.olake.iceberg.rpc.ReadRowsBatch
 	(*IcebergPayload_Metadata)(nil),                  // 14: io.olake.iceberg.rpc.IcebergPayload.Metadata
-	(*IcebergPayload_SchemaField)(nil),               // 15: io.olake.iceberg.rpc.IcebergPayload.SchemaField
-	(*IcebergPayload_PartitionField)(nil),            // 16: io.olake.iceberg.rpc.IcebergPayload.PartitionField
-	(*IcebergPayload_IceRecord)(nil),                 // 17: io.olake.iceberg.rpc.IcebergPayload.IceRecord
-	(*IcebergPayload_IceRecord_FieldValue)(nil),      // 18: io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue
-	(*FilePositionMap_Range)(nil),                    // 19: io.olake.iceberg.rpc.FilePositionMap.Range
-	(*ArrowPayload_FileMetadata)(nil),                // 20: io.olake.iceberg.rpc.ArrowPayload.FileMetadata
-	(*ArrowPayload_FileUploadRequest)(nil),           // 21: io.olake.iceberg.rpc.ArrowPayload.FileUploadRequest
-	(*ArrowPayload_DeletionVectorBatch)(nil),         // 22: io.olake.iceberg.rpc.ArrowPayload.DeletionVectorBatch
-	(*ArrowPayload_Metadata)(nil),                    // 23: io.olake.iceberg.rpc.ArrowPayload.Metadata
-	(*ArrowPayload_FileMetadata_PartitionValue)(nil), // 24: io.olake.iceberg.rpc.ArrowPayload.FileMetadata.PartitionValue
-	(*ArrowPayload_DeletionVectorBatch_Entry)(nil),   // 25: io.olake.iceberg.rpc.ArrowPayload.DeletionVectorBatch.Entry
-	nil,                               // 26: io.olake.iceberg.rpc.ArrowIngestResponse.IcebergSchemasEntry
-	(*TableIndexScanBatch_Entry)(nil), // 27: io.olake.iceberg.rpc.TableIndexScanBatch.Entry
-	(*ReadRowsRequest_Row)(nil),       // 28: io.olake.iceberg.rpc.ReadRowsRequest.Row
-	(*ReadRowsRequest_FileRows)(nil),  // 29: io.olake.iceberg.rpc.ReadRowsRequest.FileRows
-	(*ReadRowsBatch_Row)(nil),         // 30: io.olake.iceberg.rpc.ReadRowsBatch.Row
-	nil,                               // 31: io.olake.iceberg.rpc.ReadRowsBatch.Row.ValuesEntry
+	(*IcebergPayload_AddedColumn)(nil),               // 15: io.olake.iceberg.rpc.IcebergPayload.AddedColumn
+	(*IcebergPayload_SchemaField)(nil),               // 16: io.olake.iceberg.rpc.IcebergPayload.SchemaField
+	(*IcebergPayload_PartitionField)(nil),            // 17: io.olake.iceberg.rpc.IcebergPayload.PartitionField
+	(*IcebergPayload_IceRecord)(nil),                 // 18: io.olake.iceberg.rpc.IcebergPayload.IceRecord
+	(*IcebergPayload_IceRecord_FieldValue)(nil),      // 19: io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue
+	(*FilePositionMap_Range)(nil),                    // 20: io.olake.iceberg.rpc.FilePositionMap.Range
+	(*ArrowPayload_FileMetadata)(nil),                // 21: io.olake.iceberg.rpc.ArrowPayload.FileMetadata
+	(*ArrowPayload_FileUploadRequest)(nil),           // 22: io.olake.iceberg.rpc.ArrowPayload.FileUploadRequest
+	(*ArrowPayload_DeletionVectorBatch)(nil),         // 23: io.olake.iceberg.rpc.ArrowPayload.DeletionVectorBatch
+	(*ArrowPayload_Metadata)(nil),                    // 24: io.olake.iceberg.rpc.ArrowPayload.Metadata
+	(*ArrowPayload_FileMetadata_PartitionValue)(nil), // 25: io.olake.iceberg.rpc.ArrowPayload.FileMetadata.PartitionValue
+	(*ArrowPayload_DeletionVectorBatch_Entry)(nil),   // 26: io.olake.iceberg.rpc.ArrowPayload.DeletionVectorBatch.Entry
+	nil,                               // 27: io.olake.iceberg.rpc.ArrowIngestResponse.IcebergSchemasEntry
+	(*TableIndexScanBatch_Entry)(nil), // 28: io.olake.iceberg.rpc.TableIndexScanBatch.Entry
+	(*ReadRowsRequest_Row)(nil),       // 29: io.olake.iceberg.rpc.ReadRowsRequest.Row
+	(*ReadRowsRequest_FileRows)(nil),  // 30: io.olake.iceberg.rpc.ReadRowsRequest.FileRows
+	(*ReadRowsBatch_Row)(nil),         // 31: io.olake.iceberg.rpc.ReadRowsBatch.Row
+	nil,                               // 32: io.olake.iceberg.rpc.ReadRowsBatch.Row.ValuesEntry
 }
 var file_records_ingest_proto_depIdxs = []int32{
 	0,  // 0: io.olake.iceberg.rpc.IcebergPayload.type:type_name -> io.olake.iceberg.rpc.IcebergPayload.PayloadType
 	14, // 1: io.olake.iceberg.rpc.IcebergPayload.metadata:type_name -> io.olake.iceberg.rpc.IcebergPayload.Metadata
-	17, // 2: io.olake.iceberg.rpc.IcebergPayload.records:type_name -> io.olake.iceberg.rpc.IcebergPayload.IceRecord
+	18, // 2: io.olake.iceberg.rpc.IcebergPayload.records:type_name -> io.olake.iceberg.rpc.IcebergPayload.IceRecord
 	5,  // 3: io.olake.iceberg.rpc.RecordIngestResponse.file_position_maps:type_name -> io.olake.iceberg.rpc.FilePositionMap
-	19, // 4: io.olake.iceberg.rpc.FilePositionMap.ranges:type_name -> io.olake.iceberg.rpc.FilePositionMap.Range
+	20, // 4: io.olake.iceberg.rpc.FilePositionMap.ranges:type_name -> io.olake.iceberg.rpc.FilePositionMap.Range
 	2,  // 5: io.olake.iceberg.rpc.ArrowPayload.type:type_name -> io.olake.iceberg.rpc.ArrowPayload.PayloadType
-	23, // 6: io.olake.iceberg.rpc.ArrowPayload.metadata:type_name -> io.olake.iceberg.rpc.ArrowPayload.Metadata
-	26, // 7: io.olake.iceberg.rpc.ArrowIngestResponse.icebergSchemas:type_name -> io.olake.iceberg.rpc.ArrowIngestResponse.IcebergSchemasEntry
-	27, // 8: io.olake.iceberg.rpc.TableIndexScanBatch.entries:type_name -> io.olake.iceberg.rpc.TableIndexScanBatch.Entry
+	24, // 6: io.olake.iceberg.rpc.ArrowPayload.metadata:type_name -> io.olake.iceberg.rpc.ArrowPayload.Metadata
+	27, // 7: io.olake.iceberg.rpc.ArrowIngestResponse.icebergSchemas:type_name -> io.olake.iceberg.rpc.ArrowIngestResponse.IcebergSchemasEntry
+	28, // 8: io.olake.iceberg.rpc.TableIndexScanBatch.entries:type_name -> io.olake.iceberg.rpc.TableIndexScanBatch.Entry
 	1,  // 9: io.olake.iceberg.rpc.MigrateEqualityDeletesRequest.target_mode:type_name -> io.olake.iceberg.rpc.IcebergPayload.DeleteMode
-	29, // 10: io.olake.iceberg.rpc.ReadRowsRequest.files:type_name -> io.olake.iceberg.rpc.ReadRowsRequest.FileRows
-	30, // 11: io.olake.iceberg.rpc.ReadRowsBatch.rows:type_name -> io.olake.iceberg.rpc.ReadRowsBatch.Row
-	15, // 12: io.olake.iceberg.rpc.IcebergPayload.Metadata.schema:type_name -> io.olake.iceberg.rpc.IcebergPayload.SchemaField
-	16, // 13: io.olake.iceberg.rpc.IcebergPayload.Metadata.partition_fields:type_name -> io.olake.iceberg.rpc.IcebergPayload.PartitionField
+	30, // 10: io.olake.iceberg.rpc.ReadRowsRequest.files:type_name -> io.olake.iceberg.rpc.ReadRowsRequest.FileRows
+	31, // 11: io.olake.iceberg.rpc.ReadRowsBatch.rows:type_name -> io.olake.iceberg.rpc.ReadRowsBatch.Row
+	16, // 12: io.olake.iceberg.rpc.IcebergPayload.Metadata.schema:type_name -> io.olake.iceberg.rpc.IcebergPayload.SchemaField
+	17, // 13: io.olake.iceberg.rpc.IcebergPayload.Metadata.partition_fields:type_name -> io.olake.iceberg.rpc.IcebergPayload.PartitionField
 	1,  // 14: io.olake.iceberg.rpc.IcebergPayload.Metadata.delete_mode:type_name -> io.olake.iceberg.rpc.IcebergPayload.DeleteMode
-	18, // 15: io.olake.iceberg.rpc.IcebergPayload.IceRecord.fields:type_name -> io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue
-	24, // 16: io.olake.iceberg.rpc.ArrowPayload.FileMetadata.partition_values:type_name -> io.olake.iceberg.rpc.ArrowPayload.FileMetadata.PartitionValue
-	25, // 17: io.olake.iceberg.rpc.ArrowPayload.DeletionVectorBatch.entries:type_name -> io.olake.iceberg.rpc.ArrowPayload.DeletionVectorBatch.Entry
-	20, // 18: io.olake.iceberg.rpc.ArrowPayload.Metadata.file_metadata:type_name -> io.olake.iceberg.rpc.ArrowPayload.FileMetadata
-	21, // 19: io.olake.iceberg.rpc.ArrowPayload.Metadata.file_upload:type_name -> io.olake.iceberg.rpc.ArrowPayload.FileUploadRequest
-	22, // 20: io.olake.iceberg.rpc.ArrowPayload.Metadata.deletion_vectors:type_name -> io.olake.iceberg.rpc.ArrowPayload.DeletionVectorBatch
-	24, // 21: io.olake.iceberg.rpc.ArrowPayload.DeletionVectorBatch.Entry.partition_values:type_name -> io.olake.iceberg.rpc.ArrowPayload.FileMetadata.PartitionValue
-	28, // 22: io.olake.iceberg.rpc.ReadRowsRequest.FileRows.rows:type_name -> io.olake.iceberg.rpc.ReadRowsRequest.Row
-	31, // 23: io.olake.iceberg.rpc.ReadRowsBatch.Row.values:type_name -> io.olake.iceberg.rpc.ReadRowsBatch.Row.ValuesEntry
-	18, // 24: io.olake.iceberg.rpc.ReadRowsBatch.Row.ValuesEntry.value:type_name -> io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue
-	3,  // 25: io.olake.iceberg.rpc.RecordIngestService.SendRecords:input_type -> io.olake.iceberg.rpc.IcebergPayload
-	6,  // 26: io.olake.iceberg.rpc.ArrowIngestService.IcebergAPI:input_type -> io.olake.iceberg.rpc.ArrowPayload
-	8,  // 27: io.olake.iceberg.rpc.TableIndexService.ScanTableForIndexing:input_type -> io.olake.iceberg.rpc.TableIndexScanRequest
-	10, // 28: io.olake.iceberg.rpc.TableIndexService.MigrateEqualityDeletes:input_type -> io.olake.iceberg.rpc.MigrateEqualityDeletesRequest
-	12, // 29: io.olake.iceberg.rpc.TableIndexService.ReadRows:input_type -> io.olake.iceberg.rpc.ReadRowsRequest
-	4,  // 30: io.olake.iceberg.rpc.RecordIngestService.SendRecords:output_type -> io.olake.iceberg.rpc.RecordIngestResponse
-	7,  // 31: io.olake.iceberg.rpc.ArrowIngestService.IcebergAPI:output_type -> io.olake.iceberg.rpc.ArrowIngestResponse
-	9,  // 32: io.olake.iceberg.rpc.TableIndexService.ScanTableForIndexing:output_type -> io.olake.iceberg.rpc.TableIndexScanBatch
-	11, // 33: io.olake.iceberg.rpc.TableIndexService.MigrateEqualityDeletes:output_type -> io.olake.iceberg.rpc.MigrateEqualityDeletesResponse
-	13, // 34: io.olake.iceberg.rpc.TableIndexService.ReadRows:output_type -> io.olake.iceberg.rpc.ReadRowsBatch
-	30, // [30:35] is the sub-list for method output_type
-	25, // [25:30] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	15, // 15: io.olake.iceberg.rpc.IcebergPayload.Metadata.added_columns:type_name -> io.olake.iceberg.rpc.IcebergPayload.AddedColumn
+	19, // 16: io.olake.iceberg.rpc.IcebergPayload.AddedColumn.initial_default:type_name -> io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue
+	19, // 17: io.olake.iceberg.rpc.IcebergPayload.IceRecord.fields:type_name -> io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue
+	25, // 18: io.olake.iceberg.rpc.ArrowPayload.FileMetadata.partition_values:type_name -> io.olake.iceberg.rpc.ArrowPayload.FileMetadata.PartitionValue
+	26, // 19: io.olake.iceberg.rpc.ArrowPayload.DeletionVectorBatch.entries:type_name -> io.olake.iceberg.rpc.ArrowPayload.DeletionVectorBatch.Entry
+	21, // 20: io.olake.iceberg.rpc.ArrowPayload.Metadata.file_metadata:type_name -> io.olake.iceberg.rpc.ArrowPayload.FileMetadata
+	22, // 21: io.olake.iceberg.rpc.ArrowPayload.Metadata.file_upload:type_name -> io.olake.iceberg.rpc.ArrowPayload.FileUploadRequest
+	23, // 22: io.olake.iceberg.rpc.ArrowPayload.Metadata.deletion_vectors:type_name -> io.olake.iceberg.rpc.ArrowPayload.DeletionVectorBatch
+	25, // 23: io.olake.iceberg.rpc.ArrowPayload.DeletionVectorBatch.Entry.partition_values:type_name -> io.olake.iceberg.rpc.ArrowPayload.FileMetadata.PartitionValue
+	29, // 24: io.olake.iceberg.rpc.ReadRowsRequest.FileRows.rows:type_name -> io.olake.iceberg.rpc.ReadRowsRequest.Row
+	32, // 25: io.olake.iceberg.rpc.ReadRowsBatch.Row.values:type_name -> io.olake.iceberg.rpc.ReadRowsBatch.Row.ValuesEntry
+	19, // 26: io.olake.iceberg.rpc.ReadRowsBatch.Row.ValuesEntry.value:type_name -> io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue
+	3,  // 27: io.olake.iceberg.rpc.RecordIngestService.SendRecords:input_type -> io.olake.iceberg.rpc.IcebergPayload
+	6,  // 28: io.olake.iceberg.rpc.ArrowIngestService.IcebergAPI:input_type -> io.olake.iceberg.rpc.ArrowPayload
+	8,  // 29: io.olake.iceberg.rpc.TableIndexService.ScanTableForIndexing:input_type -> io.olake.iceberg.rpc.TableIndexScanRequest
+	10, // 30: io.olake.iceberg.rpc.TableIndexService.MigrateEqualityDeletes:input_type -> io.olake.iceberg.rpc.MigrateEqualityDeletesRequest
+	12, // 31: io.olake.iceberg.rpc.TableIndexService.ReadRows:input_type -> io.olake.iceberg.rpc.ReadRowsRequest
+	4,  // 32: io.olake.iceberg.rpc.RecordIngestService.SendRecords:output_type -> io.olake.iceberg.rpc.RecordIngestResponse
+	7,  // 33: io.olake.iceberg.rpc.ArrowIngestService.IcebergAPI:output_type -> io.olake.iceberg.rpc.ArrowIngestResponse
+	9,  // 34: io.olake.iceberg.rpc.TableIndexService.ScanTableForIndexing:output_type -> io.olake.iceberg.rpc.TableIndexScanBatch
+	11, // 35: io.olake.iceberg.rpc.TableIndexService.MigrateEqualityDeletes:output_type -> io.olake.iceberg.rpc.MigrateEqualityDeletesResponse
+	13, // 36: io.olake.iceberg.rpc.TableIndexService.ReadRows:output_type -> io.olake.iceberg.rpc.ReadRowsBatch
+	32, // [32:37] is the sub-list for method output_type
+	27, // [27:32] is the sub-list for method input_type
+	27, // [27:27] is the sub-list for extension type_name
+	27, // [27:27] is the sub-list for extension extendee
+	0,  // [0:27] is the sub-list for field type_name
 }
 
 func init() { file_records_ingest_proto_init() }
@@ -2402,8 +2494,8 @@ func file_records_ingest_proto_init() {
 	file_records_ingest_proto_msgTypes[4].OneofWrappers = []any{}
 	file_records_ingest_proto_msgTypes[5].OneofWrappers = []any{}
 	file_records_ingest_proto_msgTypes[11].OneofWrappers = []any{}
-	file_records_ingest_proto_msgTypes[14].OneofWrappers = []any{}
-	file_records_ingest_proto_msgTypes[15].OneofWrappers = []any{
+	file_records_ingest_proto_msgTypes[15].OneofWrappers = []any{}
+	file_records_ingest_proto_msgTypes[16].OneofWrappers = []any{
 		(*IcebergPayload_IceRecord_FieldValue_StringValue)(nil),
 		(*IcebergPayload_IceRecord_FieldValue_IntValue)(nil),
 		(*IcebergPayload_IceRecord_FieldValue_LongValue)(nil),
@@ -2412,8 +2504,8 @@ func file_records_ingest_proto_init() {
 		(*IcebergPayload_IceRecord_FieldValue_BoolValue)(nil),
 		(*IcebergPayload_IceRecord_FieldValue_BytesValue)(nil),
 	}
-	file_records_ingest_proto_msgTypes[20].OneofWrappers = []any{}
-	file_records_ingest_proto_msgTypes[21].OneofWrappers = []any{
+	file_records_ingest_proto_msgTypes[21].OneofWrappers = []any{}
+	file_records_ingest_proto_msgTypes[22].OneofWrappers = []any{
 		(*ArrowPayload_FileMetadata_PartitionValue_IntValue)(nil),
 		(*ArrowPayload_FileMetadata_PartitionValue_LongValue)(nil),
 		(*ArrowPayload_FileMetadata_PartitionValue_StringValue)(nil),
@@ -2428,7 +2520,7 @@ func file_records_ingest_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_records_ingest_proto_rawDesc), len(file_records_ingest_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   29,
+			NumMessages:   30,
 			NumExtensions: 0,
 			NumServices:   3,
 		},

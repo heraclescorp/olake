@@ -22,6 +22,7 @@ type LegacyStreamMetadata struct {
 	Normalization        bool             `json:"normalization"`
 	UpdateType           string           `json:"update_type,omitempty"`
 	UseSourceColumnNames bool             `json:"use_source_column_names"`
+	DropRemovedColumns   bool             `json:"drop_removed_columns,omitempty"`
 	Filter               string           `json:"filter,omitempty"`
 	FilterConfig         *FilterConfig    `json:"filter_config,omitempty"`
 	SelectedColumns      *SelectedColumns `json:"selected_columns"`
@@ -63,6 +64,7 @@ func legacyToStreamMetadata(streamMetadata LegacyStreamMetadata) StreamMetadata 
 		Normalization:        &streamMetadata.Normalization,
 		UpdateType:           &streamMetadata.UpdateType,
 		UseSourceColumnNames: streamMetadata.UseSourceColumnNames,
+		DropRemovedColumns:   streamMetadata.DropRemovedColumns,
 		Filter:               streamMetadata.Filter,
 		FilterConfig:         streamMetadata.FilterConfig,
 		SelectedColumns:      streamMetadata.SelectedColumns,
@@ -162,6 +164,7 @@ func toLegacyStreamMetadata(metadata StreamMetadata, stream *Stream) LegacyStrea
 		Normalization:        configured.NormalizationEnabled(),
 		UpdateType:           updateType,
 		UseSourceColumnNames: metadata.UseSourceColumnNames,
+		DropRemovedColumns:   metadata.DropRemovedColumns,
 		Filter:               metadata.Filter,
 		FilterConfig:         metadata.FilterConfig,
 		SelectedColumns:      selectedColumns,

@@ -171,6 +171,15 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
                     LOGGER.info("{} Successfully applied schema evolution for thread: {}", requestId, threadId);
                     break;
 
+                case ALTER_COLUMNS:
+                    session.op.applyColumnChanges(session.icebergTable, metadata.getAddedColumnsList(), metadata.getDroppedColumnsList());
+                    session.icebergTable.refresh();
+                    // complete current writer
+                    session.op.completeWriter();
+                    sendResponseString(responseObserver, session.icebergTable.schema().toString());
+                    LOGGER.info("{} Successfully applied column changes for thread: {}", requestId, threadId);
+                    break;
+
                 case REFRESH_TABLE_SCHEMA:
                     session.icebergTable.refresh();
                     // complete current writer

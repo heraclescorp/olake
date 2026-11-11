@@ -14,6 +14,7 @@ type StreamInterface interface {
 	Validate(source *Stream) error
 	NormalizationEnabled() bool
 	AppendModeEnabled() bool
+	DropRemovedColumnsEnabled() bool
 	GetDestinationDatabase(icebergDB *string) string
 	GetDestinationTable() string
 	GetPartitionRegex() string

@@ -318,6 +318,10 @@ func (s *ConfiguredStream) AppendModeEnabled() bool {
 	return s.defaultStreamProperties().AppendMode
 }
 
+func (s *ConfiguredStream) DropRemovedColumnsEnabled() bool {
+	return s.StreamMetadata.DropRemovedColumns
+}
+
 // GetUpdateType returns the stream's delete format. An omitted (nil) update_type follows
 // the stream's default_stream_properties. Kafka discover defaults that to positional so
 // upsert (no create vs update) does not fall through to equality; an explicit dv is kept.

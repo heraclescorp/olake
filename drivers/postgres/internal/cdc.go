@@ -271,7 +271,7 @@ func (p *Postgres) StreamChanges(ctx context.Context, _ int, metadataStates map[
 		return nil, fmt.Errorf("failed to get slot position: %w", err)
 	}
 
-	replicator, err := waljs.NewReplicator(ctx, config, slot, recoveryLSN, p.dataTypeConverter)
+	replicator, err := waljs.NewReplicator(ctx, config, slot, recoveryLSN, p.dataTypeConverter, p.columnType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create wal connection: %w", err)
 	}

@@ -46,7 +46,7 @@ func TestPGOutputBytea(t *testing.T) {
 				return typeutils.ReformatValue(datatype, value)
 			}
 			p := &pgoutputReplicator{
-				socket: &Socket{changeFilter: NewChangeFilter(converter, stream)},
+				socket: &Socket{changeFilter: NewChangeFilter(converter, nil, stream)},
 				relationIDToMsgMap: map[uint32]*pglogrepl.RelationMessage{
 					1: {Namespace: "public", RelationName: "binary_smoke", Columns: []*pglogrepl.RelationMessageColumn{{Name: "payload", DataType: pgtype.ByteaOID}}},
 				},
@@ -104,7 +104,7 @@ func TestPGOutputUnchangedToast(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			stream := &types.ConfiguredStream{Stream: types.NewStream("toast_table", "public", nil)}
 			p := &pgoutputReplicator{
-				socket:              &Socket{changeFilter: NewChangeFilter(func(value any, _ string) (any, error) { return value, nil }, stream)},
+				socket:              &Socket{changeFilter: NewChangeFilter(func(value any, _ string) (any, error) { return value, nil }, nil, stream)},
 				preserveToastValues: tt.preserve,
 				relationIDToMsgMap: map[uint32]*pglogrepl.RelationMessage{
 					1: {Namespace: "public", RelationName: "toast_table", ReplicaIdentity: 'd', Columns: []*pglogrepl.RelationMessageColumn{
