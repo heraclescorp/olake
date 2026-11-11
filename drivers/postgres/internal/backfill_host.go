@@ -121,51 +121,122 @@ func waitForAppliedLSN(ctx context.Context, readApplied func(context.Context) (i
 	}
 }
 
+type backfillInitialization struct {
+	done   chan struct{}
+	cancel context.CancelFunc
+	err    error
+}
+
+func (p *Postgres) CheckConnection(ctx context.Context) error {
+	return p.ensureBackfillHost(ctx)
+}
+
+func (p *Postgres) ensureBackfillHost(ctx context.Context) error {
+	if p.config.BackfillConnection == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	p.backfillMu.Lock()
+	if p.backfillClosed {
+		p.backfillMu.Unlock()
+		return sql.ErrConnDone
+	}
+	if p.backfillBarrier != nil {
+		p.backfillMu.Unlock()
+		return nil
+	}
+	if init := p.backfillInit; init != nil {
+		p.backfillMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-init.done:
+			return init.err
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	init := &backfillInitialization{done: make(chan struct{}), cancel: cancel}
+	p.backfillInit = init
+	p.backfillMu.Unlock()
+
+	reader, err := p.setupBackfillHost(ctx)
+	p.backfillMu.Lock()
+	if err == nil {
+		err = ctx.Err()
+		if err == nil && p.backfillClosed {
+			err = sql.ErrConnDone
+		}
+		if err == nil {
+			p.backfillClient = reader
+			p.backfillBarrier = newReaderBarrier(p.client)
+		} else {
+			p.backfillMu.Unlock()
+			if closeErr := reader.Close(); closeErr != nil {
+				logger.Warnf("failed to close canceled backfill host pool: %s", closeErr)
+			}
+			p.backfillMu.Lock()
+		}
+	}
+	init.err = err
+	p.backfillInit = nil
+	close(init.done)
+	p.backfillMu.Unlock()
+	return err
+}
+
 // setupBackfillHost connects to BackfillHost and refuses anything but a reader of the writer's own
 // Aurora cluster, so table copies never silently come from the writer or from another database.
-func (p *Postgres) setupBackfillHost(ctx context.Context) error {
+func (p *Postgres) setupBackfillHost(ctx context.Context) (_ *sqlx.DB, err error) {
 	tlsConfig, err := p.config.buildBackfillTLSConfig()
 	if err != nil {
-		return fmt.Errorf("failed to build backfill host tls config: %w", err)
+		return nil, fmt.Errorf("failed to build backfill host tls config: %w", err)
 	}
 	reader, err := p.openPool(ctx, p.config.BackfillConnection, tlsConfig)
 	if err != nil {
-		return fmt.Errorf("failed to connect to backfill host %s: %w", p.config.BackfillHost, err)
+		return nil, fmt.Errorf("failed to connect to backfill host %s: %w", p.config.BackfillHost, err)
 	}
-	p.backfillClient = reader
+	defer func() {
+		if err != nil {
+			if closeErr := reader.Close(); closeErr != nil {
+				logger.Warnf("failed to close invalid backfill host pool: %s", closeErr)
+			}
+		}
+	}()
 
 	var instance string
 	var inRecovery bool
 	if err := reader.QueryRowContext(ctx, auroraInstanceQuery).Scan(&instance, &inRecovery); err != nil {
-		return fmt.Errorf("backfill host %s must be an Aurora PostgreSQL reader instance: %w", p.config.BackfillHost, err)
+		return nil, fmt.Errorf("backfill host %s must be an Aurora PostgreSQL reader instance: %w", p.config.BackfillHost, err)
 	}
 	if !inRecovery {
-		return errs.Precondition(errs.ConfigInvalid, codeBackfillHostIsWriter,
+		return nil, errs.Precondition(errs.ConfigInvalid, codeBackfillHostIsWriter,
 			fmt.Errorf("backfill host %s is Aurora instance %s, which is the writer; use a reader instance endpoint", p.config.BackfillHost, instance))
 	}
 
 	var clusterInstances []string
 	if err := p.client.SelectContext(ctx, &clusterInstances, auroraClusterInstancesQuery); err != nil {
-		return fmt.Errorf("failed to list Aurora cluster instances on the writer: %w", err)
+		return nil, fmt.Errorf("failed to list Aurora cluster instances on the writer: %w", err)
 	}
 	if !slices.Contains(clusterInstances, instance) {
-		return errs.Precondition(errs.ConfigInvalid, codeBackfillHostOutsideCluster,
+		return nil, errs.Precondition(errs.ConfigInvalid, codeBackfillHostOutsideCluster,
 			fmt.Errorf("backfill host %s is Aurora instance %s, which is not in the writer's cluster (instances: %s)",
 				p.config.BackfillHost, instance, strings.Join(clusterInstances, ", ")))
 	}
 
 	applied, err := readAppliedLSN(ctx, reader)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	durable, err := writerDurableLSN(ctx, p.client)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	p.backfillBarrier = newReaderBarrier(p.client)
 	logger.Infof("backfill host %s is Aurora reader %s of the writer's cluster: current_read_lsn=%d, writer durable_lsn=%d",
 		p.config.BackfillHost, instance, applied, durable)
-	return nil
+	return reader, nil
 }
 
 // backfillConn returns a dedicated backfill connection. With an Aurora reader configured, its instance
@@ -173,6 +244,9 @@ func (p *Postgres) setupBackfillHost(ctx context.Context) error {
 // snapshot on the same connection contains every commit the writer had made durable by then.
 func (p *Postgres) backfillConn(ctx context.Context, stream types.StreamInterface) (*sqlx.Conn, error) {
 	ctx = observability.WithTable(ctx, stream.Namespace(), stream.Name())
+	if err := p.ensureBackfillHost(ctx); err != nil {
+		return nil, err
+	}
 	conn, err := p.backfillClient.Connx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire a backfill connection: %w", err)

@@ -254,6 +254,13 @@ func (a *AbstractDriver) Setup(ctx context.Context) error {
 	return a.driver.Setup(ctx)
 }
 
+func (a *AbstractDriver) CheckConnection(ctx context.Context) error {
+	if checker, ok := a.driver.(ConnectionChecker); ok {
+		return checker.CheckConnection(ctx)
+	}
+	return nil
+}
+
 func (a *AbstractDriver) ClearState(streams []types.StreamInterface) (*types.State, error) {
 	if a.state == nil {
 		return &types.State{}, nil
