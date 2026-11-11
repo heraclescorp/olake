@@ -197,7 +197,14 @@ func discoverNewTables(ctx context.Context, source abstract.TableEnrollmentSourc
 			candidates = append(candidates, id)
 			targets[enrollmentTarget(approved[id.Namespace], id.Name)]++
 		}
-		available := types.AvailableUpdateTypes(engines)
+		var sourceSupported []types.UpdateType
+		if restricter, ok := source.(abstract.UpdateTypeRestricter); ok {
+			sourceSupported = restricter.SupportedUpdateTypes()
+		}
+		available, err := types.AvailableUpdateTypes(engines, destination, sourceSupported)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve update types for enrolled tables: %w", err)
+		}
 		for _, id := range candidates {
 			if err := ctx.Err(); err != nil {
 				return nil, err
