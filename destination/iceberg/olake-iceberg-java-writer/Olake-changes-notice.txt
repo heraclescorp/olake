@@ -51,12 +51,18 @@ Runtime memory and diagnostics:
 - Java metrics are disabled unless OTEL_EXPORTER_OTLP_ENDPOINT or
   OTEL_EXPORTER_OTLP_METRICS_ENDPOINT is configured. Standard OTLP headers,
   endpoint precedence, compression, TLS and resource attributes are supported.
-  Metrics use HTTP/protobuf with a 15-second collection interval, 2-second
-  export timeout and 128-series per-instrument SDK cardinality cap. Traces and
+  Metrics use HTTP/protobuf with default 15-second collection and 2-second
+  export timeout, plus a 128-series per-instrument SDK cardinality cap. Traces and
   log export are disabled. Export failures do not fail ingestion; shutdown
   drains RPCs and performs a bounded final metric flush. Concurrent close callers
   wait for the in-progress flush before returning; collector/network failures
   remain bounded best-effort exports.
+- Go and Java use their official OpenTelemetry SDKs and OTLP exporters. Resources
+  follow the shared service.name/namespace/version/instance.id convention:
+  SERVICE_NAMESPACE (or POD_NAMESPACE/localhost), GIT_HASH when available, and
+  pod/host plus process identity. Standard OTEL_RESOURCE_ATTRIBUTES and
+  OTEL_SERVICE_NAME override defaults. Pipeline-specific metrics remain bounded;
+  they do not replace the SDK transport or imply automatic trace instrumentation.
 - Runtime metrics cover CPU time, Linux RSS when available, heap used/committed/
   actual maximum, nonheap, direct/mapped buffer pools, GC count/time and threads.
   olake.stage.duration records seconds for conversion, parquet_write, flush,

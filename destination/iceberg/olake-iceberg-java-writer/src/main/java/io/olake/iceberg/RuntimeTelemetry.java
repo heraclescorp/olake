@@ -32,6 +32,7 @@ import io.opentelemetry.api.metrics.Meter;
 import io.opentelemetry.api.metrics.ObservableLongMeasurement;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.autoconfigure.AutoConfiguredOpenTelemetrySdk;
+import io.opentelemetry.sdk.autoconfigure.ResourceConfiguration;
 import io.opentelemetry.sdk.resources.Resource;
 
 /** Job-scoped, bounded metrics only: no request bodies, table names, paths or spans. */
@@ -99,9 +100,14 @@ public final class RuntimeTelemetry implements AutoCloseable {
         OpenTelemetrySdk sdk = null;
         try {
             sdk = AutoConfiguredOpenTelemetrySdk.builder().disableShutdownHook()
-                    .addPropertiesCustomizer(config -> configuration(env))
+                    .addPropertiesSupplier(() -> configuration(env))
+                    .addPropertiesCustomizer(config -> Map.of(
+                            "otel.traces.exporter", "none", "otel.logs.exporter", "none",
+                            "otel.exporter.otlp.metrics.protocol", "http/protobuf",
+                            "otel.java.metrics.cardinality.limit", "128",
+                            "otel.metrics.exemplar.filter", "always_off"))
                     .addResourceCustomizer((resource, config) -> resource.merge(Resource.create(
-                            resourceAttributes(env))))
+                            resourceAttributes(env))).merge(ResourceConfiguration.createEnvironmentResource(config)))
                     .build().getOpenTelemetrySdk();
             return new RuntimeTelemetry(sdk, env);
         } catch (RuntimeException | LinkageError error) {
@@ -127,15 +133,9 @@ public final class RuntimeTelemetry implements AutoCloseable {
         });
         // Metrics only. One periodic reader has one export in flight; all dimensions
         // are finite, with an additional SDK cardinality cap per instrument.
-        settings.put("otel.traces.exporter", "none");
-        settings.put("otel.logs.exporter", "none");
         settings.putIfAbsent("otel.metrics.exporter", "otlp");
-        settings.put("otel.exporter.otlp.metrics.protocol", "http/protobuf");
-        settings.put("otel.exporter.otlp.metrics.timeout", "2000");
-        settings.put("otel.metric.export.interval", "15000");
-        settings.put("otel.java.metrics.cardinality.limit", "128");
-        settings.put("otel.metrics.exemplar.filter", "always_off");
-        settings.put("otel.service.name", "olake-connector-java");
+        settings.putIfAbsent("otel.exporter.otlp.metrics.timeout", "2000");
+        settings.putIfAbsent("otel.metric.export.interval", "15000");
         return settings;
     }
 
@@ -146,7 +146,23 @@ public final class RuntimeTelemetry implements AutoCloseable {
     }
 
     private static Attributes resourceAttributes(Map<String, String> env) {
-        var attributes = jobAttributes(env).toBuilder().put("service.name", "olake-connector-java");
+        String host = env.getOrDefault("POD_NAME", "");
+        if (host.isBlank()) {
+            host = env.getOrDefault("HOSTNAME", "");
+        }
+        if (host.isBlank()) {
+            host = ManagementFactory.getRuntimeMXBean().getName();
+        }
+        String namespace = env.getOrDefault("SERVICE_NAMESPACE", "");
+        if (namespace.isBlank()) {
+            namespace = env.getOrDefault("POD_NAMESPACE", "localhost");
+        }
+        var attributes = jobAttributes(env).toBuilder().put("service.name", "olake-connector-java")
+                .put("service.namespace", namespace.isBlank() ? "localhost" : namespace)
+                .put("service.instance.id", host + "-" + ProcessHandle.current().pid());
+        if (!env.getOrDefault("GIT_HASH", "").isBlank()) {
+            attributes.put("service.version", env.get("GIT_HASH"));
+        }
         Map.of("OLAKE_WORKFLOW_ID", "workflow_id", "POD_NAME", "k8s.pod.name",
                 "POD_NAMESPACE", "k8s.namespace.name", "NODE_NAME", "k8s.node.name")
                 .forEach((key, name) -> {

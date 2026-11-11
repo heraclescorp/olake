@@ -7,8 +7,12 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -21,6 +25,7 @@ import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.Test;
 
+import com.google.protobuf.UnknownFieldSet;
 import com.sun.net.httpserver.HttpServer;
 
 import io.grpc.Metadata;
@@ -126,12 +131,15 @@ class RuntimeTelemetryTest {
             received.countDown();
         });
         server.start();
-        RuntimeTelemetry telemetry = RuntimeTelemetry.create(Map.of(
+        Map<String, String> env = new HashMap<>(Map.of(
                 "OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1/unused",
                 "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://127.0.0.1:" + server.getAddress().getPort() + "/custom/metrics",
                 "OTEL_EXPORTER_OTLP_METRICS_HEADERS", "Authorization=Bearer%20test-only",
                 "OTEL_EXPORTER_OTLP_COMPRESSION", "none",
                 "OLAKE_JOB_ID", "job-wire-test", "OLAKE_OPERATION_TYPE", "sync"));
+        env.putAll(Map.of("SERVICE_NAMESPACE", "aven", "POD_NAMESPACE", "pods", "POD_NAME", "worker",
+                "GIT_HASH", "revision", "OLAKE_WORKFLOW_ID", "flow-resource-only"));
+        RuntimeTelemetry telemetry = RuntimeTelemetry.create(env);
         try {
             telemetry.record(Stage.UPLOAD, System.nanoTime() - 1_000_000, true);
             assertTrue(telemetry.flush());
@@ -143,6 +151,12 @@ class RuntimeTelemetryTest {
             assertTrue(wireStrings.contains("olake.jvm.heap.max"));
             assertTrue(wireStrings.contains("job-wire-test"));
             assertTrue(wireStrings.contains("olake-connector-java"));
+            Map<String, String> resource = decodeResource(payload.get());
+            assertEquals("olake-connector-java", resource.get("service.name"));
+            assertEquals("aven", resource.get("service.namespace"));
+            assertEquals("revision", resource.get("service.version"));
+            assertEquals("worker-" + ProcessHandle.current().pid(), resource.get("service.instance.id"));
+            assertEquals("flow-resource-only", resource.get("workflow_id"));
             int beforeClose = requests.get();
             telemetry.close();
             assertTrue(requests.get() > beforeClose, "shutdown must flush before exporter teardown");
@@ -152,6 +166,67 @@ class RuntimeTelemetryTest {
         } finally {
             telemetry.close();
             server.stop(0);
+        }
+    }
+
+    private static Map<String, String> decodeResource(byte[] payload) throws IOException {
+        var request = UnknownFieldSet.parseFrom(payload);
+        assertEquals(1, request.getField(1).getLengthDelimitedList().size());
+        var resourceMetrics = UnknownFieldSet.parseFrom(request.getField(1).getLengthDelimitedList().get(0));
+        var resource = UnknownFieldSet.parseFrom(resourceMetrics.getField(1).getLengthDelimitedList().get(0));
+        Map<String, String> attributes = new HashMap<>();
+        for (var bytes : resource.getField(1).getLengthDelimitedList()) {
+            var attribute = UnknownFieldSet.parseFrom(bytes);
+            var value = UnknownFieldSet.parseFrom(attribute.getField(2).getLengthDelimitedList().get(0));
+            attributes.put(attribute.getField(1).getLengthDelimitedList().get(0).toStringUtf8(),
+                    value.getField(1).getLengthDelimitedList().get(0).toStringUtf8());
+        }
+        return attributes;
+    }
+
+    @Test
+    void resourceDefaultsAndStandardOverridesSurviveFinalExport() throws Exception {
+        for (Map<String, String> overrides : List.of(
+                Map.<String, String>of(),
+                Map.of("POD_NAMESPACE", "pods"),
+                Map.of("OTEL_RESOURCE_ATTRIBUTES", "service.version=operator-version"),
+                Map.of("SERVICE_NAMESPACE", "aven", "GIT_HASH", "revision", "POD_NAME", "worker",
+                        "OTEL_RESOURCE_ATTRIBUTES", "service.name=operator,service.namespace=operator-ns,service.version=operator-version,service.instance.id=operator-instance"),
+                Map.of("OTEL_SERVICE_NAME", "explicit", "OTEL_RESOURCE_ATTRIBUTES", "service.name=resource-name"))) {
+            AtomicReference<byte[]> payload = new AtomicReference<>();
+            HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            server.createContext("/v1/metrics", exchange -> {
+                payload.set(exchange.getRequestBody().readAllBytes());
+                exchange.sendResponseHeaders(200, -1);
+                exchange.close();
+            });
+            server.start();
+            Map<String, String> env = new HashMap<>(overrides);
+            env.put("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:" + server.getAddress().getPort());
+            try {
+                try (RuntimeTelemetry telemetry = RuntimeTelemetry.create(env)) {
+                    telemetry.record(Stage.COMMIT, System.nanoTime() - 1_000_000, true);
+                }
+                Map<String, String> resource = decodeResource(payload.get());
+                if (overrides.containsKey("POD_NAME")) {
+                    assertEquals("operator", resource.get("service.name"));
+                    assertEquals("operator-ns", resource.get("service.namespace"));
+                    assertEquals("operator-version", resource.get("service.version"));
+                    assertEquals("operator-instance", resource.get("service.instance.id"));
+                } else {
+                    assertEquals(overrides.getOrDefault("OTEL_SERVICE_NAME", "olake-connector-java"), resource.get("service.name"));
+                    assertEquals(overrides.getOrDefault("POD_NAMESPACE", "localhost"), resource.get("service.namespace"));
+                    assertEquals(ManagementFactory.getRuntimeMXBean().getName() + "-" + ProcessHandle.current().pid(),
+                            resource.get("service.instance.id"));
+                    if (overrides.containsKey("OTEL_RESOURCE_ATTRIBUTES") && !overrides.containsKey("OTEL_SERVICE_NAME")) {
+                        assertEquals("operator-version", resource.get("service.version"));
+                    } else {
+                        assertFalse(resource.containsKey("service.version"));
+                    }
+                }
+            } finally {
+                server.stop(0);
+            }
         }
     }
 

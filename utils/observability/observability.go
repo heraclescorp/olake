@@ -171,6 +171,17 @@ func startMetrics(ctx context.Context) (*sdkmetric.MeterProvider, *instruments, 
 		attribute.String("operation", labelValue(os.Getenv("OLAKE_OPERATION_TYPE"), "unknown")),
 	}
 	attrs := append([]attribute.KeyValue{attribute.String("service.name", "olake-connector-go")}, base...)
+	host := os.Getenv("POD_NAME")
+	if host == "" {
+		host, _ = os.Hostname()
+	}
+	attrs = append(attrs,
+		attribute.String("service.namespace", labelValue(os.Getenv("SERVICE_NAMESPACE"), labelValue(os.Getenv("POD_NAMESPACE"), "localhost"))),
+		attribute.String("service.instance.id", labelValue(host, "localhost")+"-"+strconv.Itoa(os.Getpid())),
+	)
+	if version := os.Getenv("GIT_HASH"); version != "" {
+		attrs = append(attrs, attribute.String("service.version", version))
+	}
 	for _, item := range []struct{ env, key string }{
 		{"OLAKE_WORKFLOW_ID", "workflow_id"},
 		{"POD_NAME", "k8s.pod.name"}, {"POD_NAMESPACE", "k8s.namespace.name"},
@@ -180,7 +191,7 @@ func startMetrics(ctx context.Context) (*sdkmetric.MeterProvider, *instruments, 
 			attrs = append(attrs, attribute.String(item.key, labelValue(value, "unknown")))
 		}
 	}
-	res, err := resource.New(ctx, resource.WithFromEnv(), resource.WithTelemetrySDK(), resource.WithAttributes(attrs...))
+	res, err := resource.New(ctx, resource.WithTelemetrySDK(), resource.WithAttributes(attrs...), resource.WithFromEnv())
 	if err != nil {
 		_ = exporter.Shutdown(ctx)
 		return nil, nil, errors.New("could not initialize Go metric resource")

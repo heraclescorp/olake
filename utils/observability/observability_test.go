@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +34,7 @@ func cleanEnvironment(t *testing.T) {
 		"OLAKE_JOB_ID", "OLAKE_OPERATION_TYPE", "OLAKE_WORKFLOW_ID",
 		"OLAKE_PROFILE_DIR", "OLAKE_CPU_PROFILE_SECONDS", "OLAKE_JAVA_HEAP_PERCENT",
 		"POD_NAME", "POD_NAMESPACE", "POD_UID", "NODE_NAME",
+		"SERVICE_NAMESPACE", "GIT_HASH",
 	} {
 		t.Setenv(key, "")
 	}
@@ -463,6 +466,83 @@ func TestHTTPProtobufExportAndShutdownAfterCancellation(t *testing.T) {
 		}
 	default:
 		t.Fatal("shutdown did not export OTLP payload")
+	}
+}
+
+func TestHTTPProtobufResourceDefaultsAndOverrides(t *testing.T) {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "localhost"
+	}
+	instance := host + "-" + strconv.Itoa(os.Getpid())
+	for _, test := range []struct {
+		name string
+		env  map[string]string
+		want map[string]string
+	}{
+		{"local defaults", nil, map[string]string{"service.name": "olake-connector-go", "service.namespace": "localhost", "service.instance.id": instance}},
+		{"Aven defaults", map[string]string{"SERVICE_NAMESPACE": "aven", "POD_NAMESPACE": "pods", "POD_NAME": "worker", "GIT_HASH": "revision"}, map[string]string{"service.namespace": "aven", "service.version": "revision", "service.instance.id": "worker-" + strconv.Itoa(os.Getpid())}},
+		{"pod namespace fallback", map[string]string{"POD_NAMESPACE": "pods"}, map[string]string{"service.namespace": "pods"}},
+		{"resource version without git hash", map[string]string{"OTEL_RESOURCE_ATTRIBUTES": "service.version=operator-version"}, map[string]string{"service.version": "operator-version"}},
+		{"operator resource overrides", map[string]string{"SERVICE_NAMESPACE": "aven", "GIT_HASH": "revision", "POD_NAME": "worker", "OTEL_RESOURCE_ATTRIBUTES": "service.name=operator,service.namespace=operator-ns,service.version=operator-version,service.instance.id=operator-instance"}, map[string]string{"service.name": "operator", "service.namespace": "operator-ns", "service.version": "operator-version", "service.instance.id": "operator-instance"}},
+		{"standard service name precedence", map[string]string{"OTEL_SERVICE_NAME": "explicit", "OTEL_RESOURCE_ATTRIBUTES": "service.name=resource-name"}, map[string]string{"service.name": "explicit"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cleanEnvironment(t)
+			requests := make(chan *collector.ExportMetricsServiceRequest, 4)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+				if err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				request := new(collector.ExportMetricsServiceRequest)
+				if err := proto.Unmarshal(body, request); err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				requests <- request
+				w.Header().Set("Content-Type", "application/x-protobuf")
+			}))
+			defer server.Close()
+			t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", server.URL)
+			for key, value := range test.env {
+				t.Setenv(key, value)
+			}
+			provider, _, err := startMetrics(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := provider.Shutdown(ctx); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case request := <-requests:
+				if len(request.ResourceMetrics) != 1 {
+					t.Fatalf("resource count=%d want=1", len(request.ResourceMetrics))
+				}
+				attrs := make(map[string]string)
+				for _, value := range request.ResourceMetrics[0].Resource.Attributes {
+					attrs[value.Key] = value.Value.GetStringValue()
+				}
+				for key, want := range test.want {
+					if attrs[key] != want {
+						t.Errorf("resource %s=%q want=%q", key, attrs[key], want)
+					}
+				}
+				if test.env["GIT_HASH"] == "" && test.env["OTEL_RESOURCE_ATTRIBUTES"] == "" {
+					if _, ok := attrs["service.version"]; ok {
+						t.Error("missing GIT_HASH produced a service version")
+					}
+				}
+			default:
+				t.Fatal("shutdown did not export a resource")
+			}
+		})
 	}
 }
 
