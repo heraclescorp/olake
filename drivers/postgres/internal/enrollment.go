@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/datazip-inc/olake/drivers/abstract"
-	"github.com/datazip-inc/olake/pkg/waljs"
+	"github.com/datazip-inc/olake/drivers/postgres/internal/waljs"
 	"github.com/datazip-inc/olake/types"
 )
 
