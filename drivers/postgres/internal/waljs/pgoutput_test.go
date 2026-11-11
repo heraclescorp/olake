@@ -2,6 +2,7 @@ package waljs
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -67,6 +68,69 @@ func TestPGOutputBytea(t *testing.T) {
 			}
 			if len(changes) != 1 || !reflect.DeepEqual(changes[0].Data["payload"], tt.want) {
 				t.Fatalf("got changes %#v, want payload %#v", changes, tt.want)
+			}
+		})
+	}
+}
+
+func TestPGOutputUnchangedToast(t *testing.T) {
+	unchanged := &pglogrepl.TupleDataColumn{DataType: pglogrepl.TupleDataTypeToast}
+	newTuple := &pglogrepl.TupleData{Columns: []*pglogrepl.TupleDataColumn{
+		{DataType: pglogrepl.TupleDataTypeText, Data: []byte("1")},
+		{DataType: pglogrepl.TupleDataTypeText, Data: []byte("approved")},
+		unchanged,
+	}}
+	fullOldTuple := &pglogrepl.TupleData{Columns: []*pglogrepl.TupleDataColumn{
+		{DataType: pglogrepl.TupleDataTypeText, Data: []byte("1")},
+		{DataType: pglogrepl.TupleDataTypeText, Data: []byte("pending")},
+		{DataType: pglogrepl.TupleDataTypeText, Data: []byte(`{"large":"document"}`)},
+	}}
+
+	tests := []struct {
+		name            string
+		preserve        bool
+		oldTuple        *pglogrepl.TupleData
+		wantErr         bool
+		wantDoc         any
+		wantUnavailable []string
+	}{
+		{name: "default identity without preserve fails instead of writing the placeholder", wantErr: true},
+		{name: "default identity with preserve marks the column for the destination", preserve: true,
+			wantDoc: constants.UnavailableValue, wantUnavailable: []string{"doc"}},
+		{name: "full identity recovers the value from the old tuple", oldTuple: fullOldTuple,
+			wantDoc: `{"large":"document"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stream := &types.ConfiguredStream{Stream: types.NewStream("toast_table", "public", nil)}
+			p := &pgoutputReplicator{
+				socket:              &Socket{changeFilter: NewChangeFilter(func(value any, _ string) (any, error) { return value, nil }, stream)},
+				preserveToastValues: tt.preserve,
+				relationIDToMsgMap: map[uint32]*pglogrepl.RelationMessage{
+					1: {Namespace: "public", RelationName: "toast_table", ReplicaIdentity: 'd', Columns: []*pglogrepl.RelationMessageColumn{
+						{Name: "id", DataType: pgtype.Int4OID},
+						{Name: "status", DataType: pgtype.TextOID},
+						{Name: "doc", DataType: pgtype.JSONBOID},
+					}},
+				},
+			}
+			var changes []abstract.CDCChange
+			err := p.emitUpdate(context.Background(), &pglogrepl.UpdateMessage{RelationID: 1, NewTuple: newTuple, OldTuple: tt.oldTuple},
+				func(_ context.Context, change abstract.CDCChange) error {
+					changes = append(changes, change)
+					return nil
+				})
+			if tt.wantErr {
+				if !errors.Is(err, constants.ErrNonRetryable) || len(changes) != 0 {
+					t.Fatalf("got changes %v with error %v, want a non-retryable error and no change", changes, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(changes) != 1 || changes[0].Data["doc"] != tt.wantDoc || !reflect.DeepEqual(changes[0].UnavailableColumns, tt.wantUnavailable) {
+				t.Fatalf("got changes %#v, want doc %v and unavailable columns %v", changes, tt.wantDoc, tt.wantUnavailable)
 			}
 		})
 	}

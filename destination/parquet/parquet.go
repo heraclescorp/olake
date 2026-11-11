@@ -490,6 +490,11 @@ func (p *Parquet) Close(ctx context.Context, finalMetadataState any) error {
 
 // validate schema change & evolution and removes null records
 func (p *Parquet) FlattenAndCleanData(ctx context.Context, records []types.RawRecord) (bool, []types.RawRecord, any, error) {
+	// TODO: add indexing in parquet destination as well as toast post reading.
+	// Parquet keeps no row index, so it cannot recover a value the source could not send.
+	if err := destination.RejectUnavailableValues(p.stream, records); err != nil {
+		return false, nil, nil, err
+	}
 	if !p.stream.NormalizationEnabled() {
 		return false, records, nil, nil
 	}
