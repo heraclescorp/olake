@@ -139,6 +139,14 @@ public final class RecordIngest {
        * <code>CLOSE_SESSION = 6;</code>
        */
       CLOSE_SESSION(6),
+      /**
+       * <pre>
+       * Adds and drops columns named in added_columns / dropped_columns in one schema update.
+       * </pre>
+       *
+       * <code>ALTER_COLUMNS = 7;</code>
+       */
+      ALTER_COLUMNS(7),
       UNRECOGNIZED(-1),
       ;
 
@@ -170,6 +178,14 @@ public final class RecordIngest {
        * <code>CLOSE_SESSION = 6;</code>
        */
       public static final int CLOSE_SESSION_VALUE = 6;
+      /**
+       * <pre>
+       * Adds and drops columns named in added_columns / dropped_columns in one schema update.
+       * </pre>
+       *
+       * <code>ALTER_COLUMNS = 7;</code>
+       */
+      public static final int ALTER_COLUMNS_VALUE = 7;
 
 
       public final int getNumber() {
@@ -203,6 +219,7 @@ public final class RecordIngest {
           case 4: return GET_OR_CREATE_TABLE;
           case 5: return REFRESH_TABLE_SCHEMA;
           case 6: return CLOSE_SESSION;
+          case 7: return ALTER_COLUMNS;
           default: return null;
         }
       }
@@ -575,6 +592,75 @@ public final class RecordIngest {
        * @return The declareIdentifierFields.
        */
       boolean getDeclareIdentifierFields();
+
+      /**
+       * <pre>
+       * ALTER_COLUMNS only.
+       * </pre>
+       *
+       * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+       */
+      java.util.List<io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn> 
+          getAddedColumnsList();
+      /**
+       * <pre>
+       * ALTER_COLUMNS only.
+       * </pre>
+       *
+       * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+       */
+      io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn getAddedColumns(int index);
+      /**
+       * <pre>
+       * ALTER_COLUMNS only.
+       * </pre>
+       *
+       * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+       */
+      int getAddedColumnsCount();
+      /**
+       * <pre>
+       * ALTER_COLUMNS only.
+       * </pre>
+       *
+       * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+       */
+      java.util.List<? extends io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumnOrBuilder> 
+          getAddedColumnsOrBuilderList();
+      /**
+       * <pre>
+       * ALTER_COLUMNS only.
+       * </pre>
+       *
+       * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+       */
+      io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumnOrBuilder getAddedColumnsOrBuilder(
+          int index);
+
+      /**
+       * <code>repeated string dropped_columns = 14;</code>
+       * @return A list containing the droppedColumns.
+       */
+      java.util.List<java.lang.String>
+          getDroppedColumnsList();
+      /**
+       * <code>repeated string dropped_columns = 14;</code>
+       * @return The count of droppedColumns.
+       */
+      int getDroppedColumnsCount();
+      /**
+       * <code>repeated string dropped_columns = 14;</code>
+       * @param index The index of the element to return.
+       * @return The droppedColumns at the given index.
+       */
+      java.lang.String getDroppedColumns(int index);
+      /**
+       * <code>repeated string dropped_columns = 14;</code>
+       * @param index The index of the value to return.
+       * @return The bytes of the droppedColumns at the given index.
+       */
+      com.google.protobuf.ByteString
+          getDroppedColumnsBytes(int index);
     }
     /**
      * Protobuf type {@code io.olake.iceberg.rpc.IcebergPayload.Metadata}
@@ -597,6 +683,9 @@ public final class RecordIngest {
         namespace_ = "";
         partitionFields_ = java.util.Collections.emptyList();
         deleteMode_ = 0;
+        addedColumns_ = java.util.Collections.emptyList();
+        droppedColumns_ =
+            com.google.protobuf.LazyStringArrayList.emptyList();
       }
 
       @java.lang.Override
@@ -1000,6 +1089,104 @@ public final class RecordIngest {
         return declareIdentifierFields_;
       }
 
+      public static final int ADDED_COLUMNS_FIELD_NUMBER = 13;
+      @SuppressWarnings("serial")
+      private java.util.List<io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn> addedColumns_;
+      /**
+       * <pre>
+       * ALTER_COLUMNS only.
+       * </pre>
+       *
+       * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+       */
+      @java.lang.Override
+      public java.util.List<io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn> getAddedColumnsList() {
+        return addedColumns_;
+      }
+      /**
+       * <pre>
+       * ALTER_COLUMNS only.
+       * </pre>
+       *
+       * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+       */
+      @java.lang.Override
+      public java.util.List<? extends io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumnOrBuilder> 
+          getAddedColumnsOrBuilderList() {
+        return addedColumns_;
+      }
+      /**
+       * <pre>
+       * ALTER_COLUMNS only.
+       * </pre>
+       *
+       * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+       */
+      @java.lang.Override
+      public int getAddedColumnsCount() {
+        return addedColumns_.size();
+      }
+      /**
+       * <pre>
+       * ALTER_COLUMNS only.
+       * </pre>
+       *
+       * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+       */
+      @java.lang.Override
+      public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn getAddedColumns(int index) {
+        return addedColumns_.get(index);
+      }
+      /**
+       * <pre>
+       * ALTER_COLUMNS only.
+       * </pre>
+       *
+       * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+       */
+      @java.lang.Override
+      public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumnOrBuilder getAddedColumnsOrBuilder(
+          int index) {
+        return addedColumns_.get(index);
+      }
+
+      public static final int DROPPED_COLUMNS_FIELD_NUMBER = 14;
+      @SuppressWarnings("serial")
+      private com.google.protobuf.LazyStringArrayList droppedColumns_ =
+          com.google.protobuf.LazyStringArrayList.emptyList();
+      /**
+       * <code>repeated string dropped_columns = 14;</code>
+       * @return A list containing the droppedColumns.
+       */
+      public com.google.protobuf.ProtocolStringList
+          getDroppedColumnsList() {
+        return droppedColumns_;
+      }
+      /**
+       * <code>repeated string dropped_columns = 14;</code>
+       * @return The count of droppedColumns.
+       */
+      public int getDroppedColumnsCount() {
+        return droppedColumns_.size();
+      }
+      /**
+       * <code>repeated string dropped_columns = 14;</code>
+       * @param index The index of the element to return.
+       * @return The droppedColumns at the given index.
+       */
+      public java.lang.String getDroppedColumns(int index) {
+        return droppedColumns_.get(index);
+      }
+      /**
+       * <code>repeated string dropped_columns = 14;</code>
+       * @param index The index of the value to return.
+       * @return The bytes of the droppedColumns at the given index.
+       */
+      public com.google.protobuf.ByteString
+          getDroppedColumnsBytes(int index) {
+        return droppedColumns_.getByteString(index);
+      }
+
       private byte memoizedIsInitialized = -1;
       @java.lang.Override
       public final boolean isInitialized() {
@@ -1046,6 +1233,12 @@ public final class RecordIngest {
         }
         if (declareIdentifierFields_ != false) {
           output.writeBool(12, declareIdentifierFields_);
+        }
+        for (int i = 0; i < addedColumns_.size(); i++) {
+          output.writeMessage(13, addedColumns_.get(i));
+        }
+        for (int i = 0; i < droppedColumns_.size(); i++) {
+          com.google.protobuf.GeneratedMessageV3.writeString(output, 14, droppedColumns_.getRaw(i));
         }
         getUnknownFields().writeTo(output);
       }
@@ -1095,6 +1288,18 @@ public final class RecordIngest {
           size += com.google.protobuf.CodedOutputStream
             .computeBoolSize(12, declareIdentifierFields_);
         }
+        for (int i = 0; i < addedColumns_.size(); i++) {
+          size += com.google.protobuf.CodedOutputStream
+            .computeMessageSize(13, addedColumns_.get(i));
+        }
+        {
+          int dataSize = 0;
+          for (int i = 0; i < droppedColumns_.size(); i++) {
+            dataSize += computeStringSizeNoTag(droppedColumns_.getRaw(i));
+          }
+          size += dataSize;
+          size += 1 * getDroppedColumnsList().size();
+        }
         size += getUnknownFields().getSerializedSize();
         memoizedSize = size;
         return size;
@@ -1137,6 +1342,10 @@ public final class RecordIngest {
         if (deleteMode_ != other.deleteMode_) return false;
         if (getDeclareIdentifierFields()
             != other.getDeclareIdentifierFields()) return false;
+        if (!getAddedColumnsList()
+            .equals(other.getAddedColumnsList())) return false;
+        if (!getDroppedColumnsList()
+            .equals(other.getDroppedColumnsList())) return false;
         if (!getUnknownFields().equals(other.getUnknownFields())) return false;
         return true;
       }
@@ -1181,6 +1390,14 @@ public final class RecordIngest {
         hash = (37 * hash) + DECLARE_IDENTIFIER_FIELDS_FIELD_NUMBER;
         hash = (53 * hash) + com.google.protobuf.Internal.hashBoolean(
             getDeclareIdentifierFields());
+        if (getAddedColumnsCount() > 0) {
+          hash = (37 * hash) + ADDED_COLUMNS_FIELD_NUMBER;
+          hash = (53 * hash) + getAddedColumnsList().hashCode();
+        }
+        if (getDroppedColumnsCount() > 0) {
+          hash = (37 * hash) + DROPPED_COLUMNS_FIELD_NUMBER;
+          hash = (53 * hash) + getDroppedColumnsList().hashCode();
+        }
         hash = (29 * hash) + getUnknownFields().hashCode();
         memoizedHashCode = hash;
         return hash;
@@ -1335,6 +1552,15 @@ public final class RecordIngest {
           baseSnapshotId_ = 0L;
           deleteMode_ = 0;
           declareIdentifierFields_ = false;
+          if (addedColumnsBuilder_ == null) {
+            addedColumns_ = java.util.Collections.emptyList();
+          } else {
+            addedColumns_ = null;
+            addedColumnsBuilder_.clear();
+          }
+          bitField0_ = (bitField0_ & ~0x00000800);
+          droppedColumns_ =
+              com.google.protobuf.LazyStringArrayList.emptyList();
           return this;
         }
 
@@ -1386,6 +1612,15 @@ public final class RecordIngest {
           } else {
             result.partitionFields_ = partitionFieldsBuilder_.build();
           }
+          if (addedColumnsBuilder_ == null) {
+            if (((bitField0_ & 0x00000800) != 0)) {
+              addedColumns_ = java.util.Collections.unmodifiableList(addedColumns_);
+              bitField0_ = (bitField0_ & ~0x00000800);
+            }
+            result.addedColumns_ = addedColumns_;
+          } else {
+            result.addedColumns_ = addedColumnsBuilder_.build();
+          }
         }
 
         private void buildPartial0(io.olake.iceberg.rpc.RecordIngest.IcebergPayload.Metadata result) {
@@ -1419,6 +1654,10 @@ public final class RecordIngest {
           }
           if (((from_bitField0_ & 0x00000400) != 0)) {
             result.declareIdentifierFields_ = declareIdentifierFields_;
+          }
+          if (((from_bitField0_ & 0x00001000) != 0)) {
+            droppedColumns_.makeImmutable();
+            result.droppedColumns_ = droppedColumns_;
           }
           result.bitField0_ |= to_bitField0_;
         }
@@ -1556,6 +1795,42 @@ public final class RecordIngest {
           if (other.getDeclareIdentifierFields() != false) {
             setDeclareIdentifierFields(other.getDeclareIdentifierFields());
           }
+          if (addedColumnsBuilder_ == null) {
+            if (!other.addedColumns_.isEmpty()) {
+              if (addedColumns_.isEmpty()) {
+                addedColumns_ = other.addedColumns_;
+                bitField0_ = (bitField0_ & ~0x00000800);
+              } else {
+                ensureAddedColumnsIsMutable();
+                addedColumns_.addAll(other.addedColumns_);
+              }
+              onChanged();
+            }
+          } else {
+            if (!other.addedColumns_.isEmpty()) {
+              if (addedColumnsBuilder_.isEmpty()) {
+                addedColumnsBuilder_.dispose();
+                addedColumnsBuilder_ = null;
+                addedColumns_ = other.addedColumns_;
+                bitField0_ = (bitField0_ & ~0x00000800);
+                addedColumnsBuilder_ = 
+                  com.google.protobuf.GeneratedMessageV3.alwaysUseFieldBuilders ?
+                     getAddedColumnsFieldBuilder() : null;
+              } else {
+                addedColumnsBuilder_.addAllMessages(other.addedColumns_);
+              }
+            }
+          }
+          if (!other.droppedColumns_.isEmpty()) {
+            if (droppedColumns_.isEmpty()) {
+              droppedColumns_ = other.droppedColumns_;
+              bitField0_ |= 0x00001000;
+            } else {
+              ensureDroppedColumnsIsMutable();
+              droppedColumns_.addAll(other.droppedColumns_);
+            }
+            onChanged();
+          }
           this.mergeUnknownFields(other.getUnknownFields());
           onChanged();
           return this;
@@ -1653,6 +1928,25 @@ public final class RecordIngest {
                   bitField0_ |= 0x00000400;
                   break;
                 } // case 96
+                case 106: {
+                  io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn m =
+                      input.readMessage(
+                          io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.parser(),
+                          extensionRegistry);
+                  if (addedColumnsBuilder_ == null) {
+                    ensureAddedColumnsIsMutable();
+                    addedColumns_.add(m);
+                  } else {
+                    addedColumnsBuilder_.addMessage(m);
+                  }
+                  break;
+                } // case 106
+                case 114: {
+                  java.lang.String s = input.readStringRequireUtf8();
+                  ensureDroppedColumnsIsMutable();
+                  droppedColumns_.add(s);
+                  break;
+                } // case 114
                 default: {
                   if (!super.parseUnknownField(input, extensionRegistry, tag)) {
                     done = true; // was an endgroup tag
@@ -2759,6 +3053,429 @@ public final class RecordIngest {
           onChanged();
           return this;
         }
+
+        private java.util.List<io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn> addedColumns_ =
+          java.util.Collections.emptyList();
+        private void ensureAddedColumnsIsMutable() {
+          if (!((bitField0_ & 0x00000800) != 0)) {
+            addedColumns_ = new java.util.ArrayList<io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn>(addedColumns_);
+            bitField0_ |= 0x00000800;
+           }
+        }
+
+        private com.google.protobuf.RepeatedFieldBuilderV3<
+            io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.Builder, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumnOrBuilder> addedColumnsBuilder_;
+
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public java.util.List<io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn> getAddedColumnsList() {
+          if (addedColumnsBuilder_ == null) {
+            return java.util.Collections.unmodifiableList(addedColumns_);
+          } else {
+            return addedColumnsBuilder_.getMessageList();
+          }
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public int getAddedColumnsCount() {
+          if (addedColumnsBuilder_ == null) {
+            return addedColumns_.size();
+          } else {
+            return addedColumnsBuilder_.getCount();
+          }
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn getAddedColumns(int index) {
+          if (addedColumnsBuilder_ == null) {
+            return addedColumns_.get(index);
+          } else {
+            return addedColumnsBuilder_.getMessage(index);
+          }
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public Builder setAddedColumns(
+            int index, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn value) {
+          if (addedColumnsBuilder_ == null) {
+            if (value == null) {
+              throw new NullPointerException();
+            }
+            ensureAddedColumnsIsMutable();
+            addedColumns_.set(index, value);
+            onChanged();
+          } else {
+            addedColumnsBuilder_.setMessage(index, value);
+          }
+          return this;
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public Builder setAddedColumns(
+            int index, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.Builder builderForValue) {
+          if (addedColumnsBuilder_ == null) {
+            ensureAddedColumnsIsMutable();
+            addedColumns_.set(index, builderForValue.build());
+            onChanged();
+          } else {
+            addedColumnsBuilder_.setMessage(index, builderForValue.build());
+          }
+          return this;
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public Builder addAddedColumns(io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn value) {
+          if (addedColumnsBuilder_ == null) {
+            if (value == null) {
+              throw new NullPointerException();
+            }
+            ensureAddedColumnsIsMutable();
+            addedColumns_.add(value);
+            onChanged();
+          } else {
+            addedColumnsBuilder_.addMessage(value);
+          }
+          return this;
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public Builder addAddedColumns(
+            int index, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn value) {
+          if (addedColumnsBuilder_ == null) {
+            if (value == null) {
+              throw new NullPointerException();
+            }
+            ensureAddedColumnsIsMutable();
+            addedColumns_.add(index, value);
+            onChanged();
+          } else {
+            addedColumnsBuilder_.addMessage(index, value);
+          }
+          return this;
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public Builder addAddedColumns(
+            io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.Builder builderForValue) {
+          if (addedColumnsBuilder_ == null) {
+            ensureAddedColumnsIsMutable();
+            addedColumns_.add(builderForValue.build());
+            onChanged();
+          } else {
+            addedColumnsBuilder_.addMessage(builderForValue.build());
+          }
+          return this;
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public Builder addAddedColumns(
+            int index, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.Builder builderForValue) {
+          if (addedColumnsBuilder_ == null) {
+            ensureAddedColumnsIsMutable();
+            addedColumns_.add(index, builderForValue.build());
+            onChanged();
+          } else {
+            addedColumnsBuilder_.addMessage(index, builderForValue.build());
+          }
+          return this;
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public Builder addAllAddedColumns(
+            java.lang.Iterable<? extends io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn> values) {
+          if (addedColumnsBuilder_ == null) {
+            ensureAddedColumnsIsMutable();
+            com.google.protobuf.AbstractMessageLite.Builder.addAll(
+                values, addedColumns_);
+            onChanged();
+          } else {
+            addedColumnsBuilder_.addAllMessages(values);
+          }
+          return this;
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public Builder clearAddedColumns() {
+          if (addedColumnsBuilder_ == null) {
+            addedColumns_ = java.util.Collections.emptyList();
+            bitField0_ = (bitField0_ & ~0x00000800);
+            onChanged();
+          } else {
+            addedColumnsBuilder_.clear();
+          }
+          return this;
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public Builder removeAddedColumns(int index) {
+          if (addedColumnsBuilder_ == null) {
+            ensureAddedColumnsIsMutable();
+            addedColumns_.remove(index);
+            onChanged();
+          } else {
+            addedColumnsBuilder_.remove(index);
+          }
+          return this;
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.Builder getAddedColumnsBuilder(
+            int index) {
+          return getAddedColumnsFieldBuilder().getBuilder(index);
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumnOrBuilder getAddedColumnsOrBuilder(
+            int index) {
+          if (addedColumnsBuilder_ == null) {
+            return addedColumns_.get(index);  } else {
+            return addedColumnsBuilder_.getMessageOrBuilder(index);
+          }
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public java.util.List<? extends io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumnOrBuilder> 
+             getAddedColumnsOrBuilderList() {
+          if (addedColumnsBuilder_ != null) {
+            return addedColumnsBuilder_.getMessageOrBuilderList();
+          } else {
+            return java.util.Collections.unmodifiableList(addedColumns_);
+          }
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.Builder addAddedColumnsBuilder() {
+          return getAddedColumnsFieldBuilder().addBuilder(
+              io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.getDefaultInstance());
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.Builder addAddedColumnsBuilder(
+            int index) {
+          return getAddedColumnsFieldBuilder().addBuilder(
+              index, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.getDefaultInstance());
+        }
+        /**
+         * <pre>
+         * ALTER_COLUMNS only.
+         * </pre>
+         *
+         * <code>repeated .io.olake.iceberg.rpc.IcebergPayload.AddedColumn added_columns = 13;</code>
+         */
+        public java.util.List<io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.Builder> 
+             getAddedColumnsBuilderList() {
+          return getAddedColumnsFieldBuilder().getBuilderList();
+        }
+        private com.google.protobuf.RepeatedFieldBuilderV3<
+            io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.Builder, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumnOrBuilder> 
+            getAddedColumnsFieldBuilder() {
+          if (addedColumnsBuilder_ == null) {
+            addedColumnsBuilder_ = new com.google.protobuf.RepeatedFieldBuilderV3<
+                io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.Builder, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumnOrBuilder>(
+                    addedColumns_,
+                    ((bitField0_ & 0x00000800) != 0),
+                    getParentForChildren(),
+                    isClean());
+            addedColumns_ = null;
+          }
+          return addedColumnsBuilder_;
+        }
+
+        private com.google.protobuf.LazyStringArrayList droppedColumns_ =
+            com.google.protobuf.LazyStringArrayList.emptyList();
+        private void ensureDroppedColumnsIsMutable() {
+          if (!droppedColumns_.isModifiable()) {
+            droppedColumns_ = new com.google.protobuf.LazyStringArrayList(droppedColumns_);
+          }
+          bitField0_ |= 0x00001000;
+        }
+        /**
+         * <code>repeated string dropped_columns = 14;</code>
+         * @return A list containing the droppedColumns.
+         */
+        public com.google.protobuf.ProtocolStringList
+            getDroppedColumnsList() {
+          droppedColumns_.makeImmutable();
+          return droppedColumns_;
+        }
+        /**
+         * <code>repeated string dropped_columns = 14;</code>
+         * @return The count of droppedColumns.
+         */
+        public int getDroppedColumnsCount() {
+          return droppedColumns_.size();
+        }
+        /**
+         * <code>repeated string dropped_columns = 14;</code>
+         * @param index The index of the element to return.
+         * @return The droppedColumns at the given index.
+         */
+        public java.lang.String getDroppedColumns(int index) {
+          return droppedColumns_.get(index);
+        }
+        /**
+         * <code>repeated string dropped_columns = 14;</code>
+         * @param index The index of the value to return.
+         * @return The bytes of the droppedColumns at the given index.
+         */
+        public com.google.protobuf.ByteString
+            getDroppedColumnsBytes(int index) {
+          return droppedColumns_.getByteString(index);
+        }
+        /**
+         * <code>repeated string dropped_columns = 14;</code>
+         * @param index The index to set the value at.
+         * @param value The droppedColumns to set.
+         * @return This builder for chaining.
+         */
+        public Builder setDroppedColumns(
+            int index, java.lang.String value) {
+          if (value == null) { throw new NullPointerException(); }
+          ensureDroppedColumnsIsMutable();
+          droppedColumns_.set(index, value);
+          bitField0_ |= 0x00001000;
+          onChanged();
+          return this;
+        }
+        /**
+         * <code>repeated string dropped_columns = 14;</code>
+         * @param value The droppedColumns to add.
+         * @return This builder for chaining.
+         */
+        public Builder addDroppedColumns(
+            java.lang.String value) {
+          if (value == null) { throw new NullPointerException(); }
+          ensureDroppedColumnsIsMutable();
+          droppedColumns_.add(value);
+          bitField0_ |= 0x00001000;
+          onChanged();
+          return this;
+        }
+        /**
+         * <code>repeated string dropped_columns = 14;</code>
+         * @param values The droppedColumns to add.
+         * @return This builder for chaining.
+         */
+        public Builder addAllDroppedColumns(
+            java.lang.Iterable<java.lang.String> values) {
+          ensureDroppedColumnsIsMutable();
+          com.google.protobuf.AbstractMessageLite.Builder.addAll(
+              values, droppedColumns_);
+          bitField0_ |= 0x00001000;
+          onChanged();
+          return this;
+        }
+        /**
+         * <code>repeated string dropped_columns = 14;</code>
+         * @return This builder for chaining.
+         */
+        public Builder clearDroppedColumns() {
+          droppedColumns_ =
+            com.google.protobuf.LazyStringArrayList.emptyList();
+          bitField0_ = (bitField0_ & ~0x00001000);;
+          onChanged();
+          return this;
+        }
+        /**
+         * <code>repeated string dropped_columns = 14;</code>
+         * @param value The bytes of the droppedColumns to add.
+         * @return This builder for chaining.
+         */
+        public Builder addDroppedColumnsBytes(
+            com.google.protobuf.ByteString value) {
+          if (value == null) { throw new NullPointerException(); }
+          checkByteStringIsUtf8(value);
+          ensureDroppedColumnsIsMutable();
+          droppedColumns_.add(value);
+          bitField0_ |= 0x00001000;
+          onChanged();
+          return this;
+        }
         @java.lang.Override
         public final Builder setUnknownFields(
             final com.google.protobuf.UnknownFieldSet unknownFields) {
@@ -2818,6 +3535,974 @@ public final class RecordIngest {
 
       @java.lang.Override
       public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.Metadata getDefaultInstanceForType() {
+        return DEFAULT_INSTANCE;
+      }
+
+    }
+
+    public interface AddedColumnOrBuilder extends
+        // @@protoc_insertion_point(interface_extends:io.olake.iceberg.rpc.IcebergPayload.AddedColumn)
+        com.google.protobuf.MessageOrBuilder {
+
+      /**
+       * <code>string key = 1;</code>
+       * @return The key.
+       */
+      java.lang.String getKey();
+      /**
+       * <code>string key = 1;</code>
+       * @return The bytes for key.
+       */
+      com.google.protobuf.ByteString
+          getKeyBytes();
+
+      /**
+       * <code>string ice_type = 2;</code>
+       * @return The iceType.
+       */
+      java.lang.String getIceType();
+      /**
+       * <code>string ice_type = 2;</code>
+       * @return The bytes for iceType.
+       */
+      com.google.protobuf.ByteString
+          getIceTypeBytes();
+
+      /**
+       * <pre>
+       * What rows written before the column existed read for it; unset is NULL.
+       * </pre>
+       *
+       * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+       * @return Whether the initialDefault field is set.
+       */
+      boolean hasInitialDefault();
+      /**
+       * <pre>
+       * What rows written before the column existed read for it; unset is NULL.
+       * </pre>
+       *
+       * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+       * @return The initialDefault.
+       */
+      io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue getInitialDefault();
+      /**
+       * <pre>
+       * What rows written before the column existed read for it; unset is NULL.
+       * </pre>
+       *
+       * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+       */
+      io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValueOrBuilder getInitialDefaultOrBuilder();
+    }
+    /**
+     * Protobuf type {@code io.olake.iceberg.rpc.IcebergPayload.AddedColumn}
+     */
+    public static final class AddedColumn extends
+        com.google.protobuf.GeneratedMessageV3 implements
+        // @@protoc_insertion_point(message_implements:io.olake.iceberg.rpc.IcebergPayload.AddedColumn)
+        AddedColumnOrBuilder {
+    private static final long serialVersionUID = 0L;
+      // Use AddedColumn.newBuilder() to construct.
+      private AddedColumn(com.google.protobuf.GeneratedMessageV3.Builder<?> builder) {
+        super(builder);
+      }
+      private AddedColumn() {
+        key_ = "";
+        iceType_ = "";
+      }
+
+      @java.lang.Override
+      @SuppressWarnings({"unused"})
+      protected java.lang.Object newInstance(
+          UnusedPrivateParameter unused) {
+        return new AddedColumn();
+      }
+
+      public static final com.google.protobuf.Descriptors.Descriptor
+          getDescriptor() {
+        return io.olake.iceberg.rpc.RecordIngest.internal_static_io_olake_iceberg_rpc_IcebergPayload_AddedColumn_descriptor;
+      }
+
+      @java.lang.Override
+      protected com.google.protobuf.GeneratedMessageV3.FieldAccessorTable
+          internalGetFieldAccessorTable() {
+        return io.olake.iceberg.rpc.RecordIngest.internal_static_io_olake_iceberg_rpc_IcebergPayload_AddedColumn_fieldAccessorTable
+            .ensureFieldAccessorsInitialized(
+                io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.class, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.Builder.class);
+      }
+
+      private int bitField0_;
+      public static final int KEY_FIELD_NUMBER = 1;
+      @SuppressWarnings("serial")
+      private volatile java.lang.Object key_ = "";
+      /**
+       * <code>string key = 1;</code>
+       * @return The key.
+       */
+      @java.lang.Override
+      public java.lang.String getKey() {
+        java.lang.Object ref = key_;
+        if (ref instanceof java.lang.String) {
+          return (java.lang.String) ref;
+        } else {
+          com.google.protobuf.ByteString bs = 
+              (com.google.protobuf.ByteString) ref;
+          java.lang.String s = bs.toStringUtf8();
+          key_ = s;
+          return s;
+        }
+      }
+      /**
+       * <code>string key = 1;</code>
+       * @return The bytes for key.
+       */
+      @java.lang.Override
+      public com.google.protobuf.ByteString
+          getKeyBytes() {
+        java.lang.Object ref = key_;
+        if (ref instanceof java.lang.String) {
+          com.google.protobuf.ByteString b = 
+              com.google.protobuf.ByteString.copyFromUtf8(
+                  (java.lang.String) ref);
+          key_ = b;
+          return b;
+        } else {
+          return (com.google.protobuf.ByteString) ref;
+        }
+      }
+
+      public static final int ICE_TYPE_FIELD_NUMBER = 2;
+      @SuppressWarnings("serial")
+      private volatile java.lang.Object iceType_ = "";
+      /**
+       * <code>string ice_type = 2;</code>
+       * @return The iceType.
+       */
+      @java.lang.Override
+      public java.lang.String getIceType() {
+        java.lang.Object ref = iceType_;
+        if (ref instanceof java.lang.String) {
+          return (java.lang.String) ref;
+        } else {
+          com.google.protobuf.ByteString bs = 
+              (com.google.protobuf.ByteString) ref;
+          java.lang.String s = bs.toStringUtf8();
+          iceType_ = s;
+          return s;
+        }
+      }
+      /**
+       * <code>string ice_type = 2;</code>
+       * @return The bytes for iceType.
+       */
+      @java.lang.Override
+      public com.google.protobuf.ByteString
+          getIceTypeBytes() {
+        java.lang.Object ref = iceType_;
+        if (ref instanceof java.lang.String) {
+          com.google.protobuf.ByteString b = 
+              com.google.protobuf.ByteString.copyFromUtf8(
+                  (java.lang.String) ref);
+          iceType_ = b;
+          return b;
+        } else {
+          return (com.google.protobuf.ByteString) ref;
+        }
+      }
+
+      public static final int INITIAL_DEFAULT_FIELD_NUMBER = 3;
+      private io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue initialDefault_;
+      /**
+       * <pre>
+       * What rows written before the column existed read for it; unset is NULL.
+       * </pre>
+       *
+       * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+       * @return Whether the initialDefault field is set.
+       */
+      @java.lang.Override
+      public boolean hasInitialDefault() {
+        return ((bitField0_ & 0x00000001) != 0);
+      }
+      /**
+       * <pre>
+       * What rows written before the column existed read for it; unset is NULL.
+       * </pre>
+       *
+       * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+       * @return The initialDefault.
+       */
+      @java.lang.Override
+      public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue getInitialDefault() {
+        return initialDefault_ == null ? io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue.getDefaultInstance() : initialDefault_;
+      }
+      /**
+       * <pre>
+       * What rows written before the column existed read for it; unset is NULL.
+       * </pre>
+       *
+       * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+       */
+      @java.lang.Override
+      public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValueOrBuilder getInitialDefaultOrBuilder() {
+        return initialDefault_ == null ? io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue.getDefaultInstance() : initialDefault_;
+      }
+
+      private byte memoizedIsInitialized = -1;
+      @java.lang.Override
+      public final boolean isInitialized() {
+        byte isInitialized = memoizedIsInitialized;
+        if (isInitialized == 1) return true;
+        if (isInitialized == 0) return false;
+
+        memoizedIsInitialized = 1;
+        return true;
+      }
+
+      @java.lang.Override
+      public void writeTo(com.google.protobuf.CodedOutputStream output)
+                          throws java.io.IOException {
+        if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(key_)) {
+          com.google.protobuf.GeneratedMessageV3.writeString(output, 1, key_);
+        }
+        if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(iceType_)) {
+          com.google.protobuf.GeneratedMessageV3.writeString(output, 2, iceType_);
+        }
+        if (((bitField0_ & 0x00000001) != 0)) {
+          output.writeMessage(3, getInitialDefault());
+        }
+        getUnknownFields().writeTo(output);
+      }
+
+      @java.lang.Override
+      public int getSerializedSize() {
+        int size = memoizedSize;
+        if (size != -1) return size;
+
+        size = 0;
+        if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(key_)) {
+          size += com.google.protobuf.GeneratedMessageV3.computeStringSize(1, key_);
+        }
+        if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(iceType_)) {
+          size += com.google.protobuf.GeneratedMessageV3.computeStringSize(2, iceType_);
+        }
+        if (((bitField0_ & 0x00000001) != 0)) {
+          size += com.google.protobuf.CodedOutputStream
+            .computeMessageSize(3, getInitialDefault());
+        }
+        size += getUnknownFields().getSerializedSize();
+        memoizedSize = size;
+        return size;
+      }
+
+      @java.lang.Override
+      public boolean equals(final java.lang.Object obj) {
+        if (obj == this) {
+         return true;
+        }
+        if (!(obj instanceof io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn)) {
+          return super.equals(obj);
+        }
+        io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn other = (io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn) obj;
+
+        if (!getKey()
+            .equals(other.getKey())) return false;
+        if (!getIceType()
+            .equals(other.getIceType())) return false;
+        if (hasInitialDefault() != other.hasInitialDefault()) return false;
+        if (hasInitialDefault()) {
+          if (!getInitialDefault()
+              .equals(other.getInitialDefault())) return false;
+        }
+        if (!getUnknownFields().equals(other.getUnknownFields())) return false;
+        return true;
+      }
+
+      @java.lang.Override
+      public int hashCode() {
+        if (memoizedHashCode != 0) {
+          return memoizedHashCode;
+        }
+        int hash = 41;
+        hash = (19 * hash) + getDescriptor().hashCode();
+        hash = (37 * hash) + KEY_FIELD_NUMBER;
+        hash = (53 * hash) + getKey().hashCode();
+        hash = (37 * hash) + ICE_TYPE_FIELD_NUMBER;
+        hash = (53 * hash) + getIceType().hashCode();
+        if (hasInitialDefault()) {
+          hash = (37 * hash) + INITIAL_DEFAULT_FIELD_NUMBER;
+          hash = (53 * hash) + getInitialDefault().hashCode();
+        }
+        hash = (29 * hash) + getUnknownFields().hashCode();
+        memoizedHashCode = hash;
+        return hash;
+      }
+
+      public static io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn parseFrom(
+          java.nio.ByteBuffer data)
+          throws com.google.protobuf.InvalidProtocolBufferException {
+        return PARSER.parseFrom(data);
+      }
+      public static io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn parseFrom(
+          java.nio.ByteBuffer data,
+          com.google.protobuf.ExtensionRegistryLite extensionRegistry)
+          throws com.google.protobuf.InvalidProtocolBufferException {
+        return PARSER.parseFrom(data, extensionRegistry);
+      }
+      public static io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn parseFrom(
+          com.google.protobuf.ByteString data)
+          throws com.google.protobuf.InvalidProtocolBufferException {
+        return PARSER.parseFrom(data);
+      }
+      public static io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn parseFrom(
+          com.google.protobuf.ByteString data,
+          com.google.protobuf.ExtensionRegistryLite extensionRegistry)
+          throws com.google.protobuf.InvalidProtocolBufferException {
+        return PARSER.parseFrom(data, extensionRegistry);
+      }
+      public static io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn parseFrom(byte[] data)
+          throws com.google.protobuf.InvalidProtocolBufferException {
+        return PARSER.parseFrom(data);
+      }
+      public static io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn parseFrom(
+          byte[] data,
+          com.google.protobuf.ExtensionRegistryLite extensionRegistry)
+          throws com.google.protobuf.InvalidProtocolBufferException {
+        return PARSER.parseFrom(data, extensionRegistry);
+      }
+      public static io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn parseFrom(java.io.InputStream input)
+          throws java.io.IOException {
+        return com.google.protobuf.GeneratedMessageV3
+            .parseWithIOException(PARSER, input);
+      }
+      public static io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn parseFrom(
+          java.io.InputStream input,
+          com.google.protobuf.ExtensionRegistryLite extensionRegistry)
+          throws java.io.IOException {
+        return com.google.protobuf.GeneratedMessageV3
+            .parseWithIOException(PARSER, input, extensionRegistry);
+      }
+
+      public static io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn parseDelimitedFrom(java.io.InputStream input)
+          throws java.io.IOException {
+        return com.google.protobuf.GeneratedMessageV3
+            .parseDelimitedWithIOException(PARSER, input);
+      }
+
+      public static io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn parseDelimitedFrom(
+          java.io.InputStream input,
+          com.google.protobuf.ExtensionRegistryLite extensionRegistry)
+          throws java.io.IOException {
+        return com.google.protobuf.GeneratedMessageV3
+            .parseDelimitedWithIOException(PARSER, input, extensionRegistry);
+      }
+      public static io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn parseFrom(
+          com.google.protobuf.CodedInputStream input)
+          throws java.io.IOException {
+        return com.google.protobuf.GeneratedMessageV3
+            .parseWithIOException(PARSER, input);
+      }
+      public static io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn parseFrom(
+          com.google.protobuf.CodedInputStream input,
+          com.google.protobuf.ExtensionRegistryLite extensionRegistry)
+          throws java.io.IOException {
+        return com.google.protobuf.GeneratedMessageV3
+            .parseWithIOException(PARSER, input, extensionRegistry);
+      }
+
+      @java.lang.Override
+      public Builder newBuilderForType() { return newBuilder(); }
+      public static Builder newBuilder() {
+        return DEFAULT_INSTANCE.toBuilder();
+      }
+      public static Builder newBuilder(io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn prototype) {
+        return DEFAULT_INSTANCE.toBuilder().mergeFrom(prototype);
+      }
+      @java.lang.Override
+      public Builder toBuilder() {
+        return this == DEFAULT_INSTANCE
+            ? new Builder() : new Builder().mergeFrom(this);
+      }
+
+      @java.lang.Override
+      protected Builder newBuilderForType(
+          com.google.protobuf.GeneratedMessageV3.BuilderParent parent) {
+        Builder builder = new Builder(parent);
+        return builder;
+      }
+      /**
+       * Protobuf type {@code io.olake.iceberg.rpc.IcebergPayload.AddedColumn}
+       */
+      public static final class Builder extends
+          com.google.protobuf.GeneratedMessageV3.Builder<Builder> implements
+          // @@protoc_insertion_point(builder_implements:io.olake.iceberg.rpc.IcebergPayload.AddedColumn)
+          io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumnOrBuilder {
+        public static final com.google.protobuf.Descriptors.Descriptor
+            getDescriptor() {
+          return io.olake.iceberg.rpc.RecordIngest.internal_static_io_olake_iceberg_rpc_IcebergPayload_AddedColumn_descriptor;
+        }
+
+        @java.lang.Override
+        protected com.google.protobuf.GeneratedMessageV3.FieldAccessorTable
+            internalGetFieldAccessorTable() {
+          return io.olake.iceberg.rpc.RecordIngest.internal_static_io_olake_iceberg_rpc_IcebergPayload_AddedColumn_fieldAccessorTable
+              .ensureFieldAccessorsInitialized(
+                  io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.class, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.Builder.class);
+        }
+
+        // Construct using io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.newBuilder()
+        private Builder() {
+          maybeForceBuilderInitialization();
+        }
+
+        private Builder(
+            com.google.protobuf.GeneratedMessageV3.BuilderParent parent) {
+          super(parent);
+          maybeForceBuilderInitialization();
+        }
+        private void maybeForceBuilderInitialization() {
+          if (com.google.protobuf.GeneratedMessageV3
+                  .alwaysUseFieldBuilders) {
+            getInitialDefaultFieldBuilder();
+          }
+        }
+        @java.lang.Override
+        public Builder clear() {
+          super.clear();
+          bitField0_ = 0;
+          key_ = "";
+          iceType_ = "";
+          initialDefault_ = null;
+          if (initialDefaultBuilder_ != null) {
+            initialDefaultBuilder_.dispose();
+            initialDefaultBuilder_ = null;
+          }
+          return this;
+        }
+
+        @java.lang.Override
+        public com.google.protobuf.Descriptors.Descriptor
+            getDescriptorForType() {
+          return io.olake.iceberg.rpc.RecordIngest.internal_static_io_olake_iceberg_rpc_IcebergPayload_AddedColumn_descriptor;
+        }
+
+        @java.lang.Override
+        public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn getDefaultInstanceForType() {
+          return io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.getDefaultInstance();
+        }
+
+        @java.lang.Override
+        public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn build() {
+          io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn result = buildPartial();
+          if (!result.isInitialized()) {
+            throw newUninitializedMessageException(result);
+          }
+          return result;
+        }
+
+        @java.lang.Override
+        public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn buildPartial() {
+          io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn result = new io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn(this);
+          if (bitField0_ != 0) { buildPartial0(result); }
+          onBuilt();
+          return result;
+        }
+
+        private void buildPartial0(io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn result) {
+          int from_bitField0_ = bitField0_;
+          if (((from_bitField0_ & 0x00000001) != 0)) {
+            result.key_ = key_;
+          }
+          if (((from_bitField0_ & 0x00000002) != 0)) {
+            result.iceType_ = iceType_;
+          }
+          int to_bitField0_ = 0;
+          if (((from_bitField0_ & 0x00000004) != 0)) {
+            result.initialDefault_ = initialDefaultBuilder_ == null
+                ? initialDefault_
+                : initialDefaultBuilder_.build();
+            to_bitField0_ |= 0x00000001;
+          }
+          result.bitField0_ |= to_bitField0_;
+        }
+
+        @java.lang.Override
+        public Builder clone() {
+          return super.clone();
+        }
+        @java.lang.Override
+        public Builder setField(
+            com.google.protobuf.Descriptors.FieldDescriptor field,
+            java.lang.Object value) {
+          return super.setField(field, value);
+        }
+        @java.lang.Override
+        public Builder clearField(
+            com.google.protobuf.Descriptors.FieldDescriptor field) {
+          return super.clearField(field);
+        }
+        @java.lang.Override
+        public Builder clearOneof(
+            com.google.protobuf.Descriptors.OneofDescriptor oneof) {
+          return super.clearOneof(oneof);
+        }
+        @java.lang.Override
+        public Builder setRepeatedField(
+            com.google.protobuf.Descriptors.FieldDescriptor field,
+            int index, java.lang.Object value) {
+          return super.setRepeatedField(field, index, value);
+        }
+        @java.lang.Override
+        public Builder addRepeatedField(
+            com.google.protobuf.Descriptors.FieldDescriptor field,
+            java.lang.Object value) {
+          return super.addRepeatedField(field, value);
+        }
+        @java.lang.Override
+        public Builder mergeFrom(com.google.protobuf.Message other) {
+          if (other instanceof io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn) {
+            return mergeFrom((io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn)other);
+          } else {
+            super.mergeFrom(other);
+            return this;
+          }
+        }
+
+        public Builder mergeFrom(io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn other) {
+          if (other == io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn.getDefaultInstance()) return this;
+          if (!other.getKey().isEmpty()) {
+            key_ = other.key_;
+            bitField0_ |= 0x00000001;
+            onChanged();
+          }
+          if (!other.getIceType().isEmpty()) {
+            iceType_ = other.iceType_;
+            bitField0_ |= 0x00000002;
+            onChanged();
+          }
+          if (other.hasInitialDefault()) {
+            mergeInitialDefault(other.getInitialDefault());
+          }
+          this.mergeUnknownFields(other.getUnknownFields());
+          onChanged();
+          return this;
+        }
+
+        @java.lang.Override
+        public final boolean isInitialized() {
+          return true;
+        }
+
+        @java.lang.Override
+        public Builder mergeFrom(
+            com.google.protobuf.CodedInputStream input,
+            com.google.protobuf.ExtensionRegistryLite extensionRegistry)
+            throws java.io.IOException {
+          if (extensionRegistry == null) {
+            throw new java.lang.NullPointerException();
+          }
+          try {
+            boolean done = false;
+            while (!done) {
+              int tag = input.readTag();
+              switch (tag) {
+                case 0:
+                  done = true;
+                  break;
+                case 10: {
+                  key_ = input.readStringRequireUtf8();
+                  bitField0_ |= 0x00000001;
+                  break;
+                } // case 10
+                case 18: {
+                  iceType_ = input.readStringRequireUtf8();
+                  bitField0_ |= 0x00000002;
+                  break;
+                } // case 18
+                case 26: {
+                  input.readMessage(
+                      getInitialDefaultFieldBuilder().getBuilder(),
+                      extensionRegistry);
+                  bitField0_ |= 0x00000004;
+                  break;
+                } // case 26
+                default: {
+                  if (!super.parseUnknownField(input, extensionRegistry, tag)) {
+                    done = true; // was an endgroup tag
+                  }
+                  break;
+                } // default:
+              } // switch (tag)
+            } // while (!done)
+          } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+            throw e.unwrapIOException();
+          } finally {
+            onChanged();
+          } // finally
+          return this;
+        }
+        private int bitField0_;
+
+        private java.lang.Object key_ = "";
+        /**
+         * <code>string key = 1;</code>
+         * @return The key.
+         */
+        public java.lang.String getKey() {
+          java.lang.Object ref = key_;
+          if (!(ref instanceof java.lang.String)) {
+            com.google.protobuf.ByteString bs =
+                (com.google.protobuf.ByteString) ref;
+            java.lang.String s = bs.toStringUtf8();
+            key_ = s;
+            return s;
+          } else {
+            return (java.lang.String) ref;
+          }
+        }
+        /**
+         * <code>string key = 1;</code>
+         * @return The bytes for key.
+         */
+        public com.google.protobuf.ByteString
+            getKeyBytes() {
+          java.lang.Object ref = key_;
+          if (ref instanceof String) {
+            com.google.protobuf.ByteString b = 
+                com.google.protobuf.ByteString.copyFromUtf8(
+                    (java.lang.String) ref);
+            key_ = b;
+            return b;
+          } else {
+            return (com.google.protobuf.ByteString) ref;
+          }
+        }
+        /**
+         * <code>string key = 1;</code>
+         * @param value The key to set.
+         * @return This builder for chaining.
+         */
+        public Builder setKey(
+            java.lang.String value) {
+          if (value == null) { throw new NullPointerException(); }
+          key_ = value;
+          bitField0_ |= 0x00000001;
+          onChanged();
+          return this;
+        }
+        /**
+         * <code>string key = 1;</code>
+         * @return This builder for chaining.
+         */
+        public Builder clearKey() {
+          key_ = getDefaultInstance().getKey();
+          bitField0_ = (bitField0_ & ~0x00000001);
+          onChanged();
+          return this;
+        }
+        /**
+         * <code>string key = 1;</code>
+         * @param value The bytes for key to set.
+         * @return This builder for chaining.
+         */
+        public Builder setKeyBytes(
+            com.google.protobuf.ByteString value) {
+          if (value == null) { throw new NullPointerException(); }
+          checkByteStringIsUtf8(value);
+          key_ = value;
+          bitField0_ |= 0x00000001;
+          onChanged();
+          return this;
+        }
+
+        private java.lang.Object iceType_ = "";
+        /**
+         * <code>string ice_type = 2;</code>
+         * @return The iceType.
+         */
+        public java.lang.String getIceType() {
+          java.lang.Object ref = iceType_;
+          if (!(ref instanceof java.lang.String)) {
+            com.google.protobuf.ByteString bs =
+                (com.google.protobuf.ByteString) ref;
+            java.lang.String s = bs.toStringUtf8();
+            iceType_ = s;
+            return s;
+          } else {
+            return (java.lang.String) ref;
+          }
+        }
+        /**
+         * <code>string ice_type = 2;</code>
+         * @return The bytes for iceType.
+         */
+        public com.google.protobuf.ByteString
+            getIceTypeBytes() {
+          java.lang.Object ref = iceType_;
+          if (ref instanceof String) {
+            com.google.protobuf.ByteString b = 
+                com.google.protobuf.ByteString.copyFromUtf8(
+                    (java.lang.String) ref);
+            iceType_ = b;
+            return b;
+          } else {
+            return (com.google.protobuf.ByteString) ref;
+          }
+        }
+        /**
+         * <code>string ice_type = 2;</code>
+         * @param value The iceType to set.
+         * @return This builder for chaining.
+         */
+        public Builder setIceType(
+            java.lang.String value) {
+          if (value == null) { throw new NullPointerException(); }
+          iceType_ = value;
+          bitField0_ |= 0x00000002;
+          onChanged();
+          return this;
+        }
+        /**
+         * <code>string ice_type = 2;</code>
+         * @return This builder for chaining.
+         */
+        public Builder clearIceType() {
+          iceType_ = getDefaultInstance().getIceType();
+          bitField0_ = (bitField0_ & ~0x00000002);
+          onChanged();
+          return this;
+        }
+        /**
+         * <code>string ice_type = 2;</code>
+         * @param value The bytes for iceType to set.
+         * @return This builder for chaining.
+         */
+        public Builder setIceTypeBytes(
+            com.google.protobuf.ByteString value) {
+          if (value == null) { throw new NullPointerException(); }
+          checkByteStringIsUtf8(value);
+          iceType_ = value;
+          bitField0_ |= 0x00000002;
+          onChanged();
+          return this;
+        }
+
+        private io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue initialDefault_;
+        private com.google.protobuf.SingleFieldBuilderV3<
+            io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue.Builder, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValueOrBuilder> initialDefaultBuilder_;
+        /**
+         * <pre>
+         * What rows written before the column existed read for it; unset is NULL.
+         * </pre>
+         *
+         * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+         * @return Whether the initialDefault field is set.
+         */
+        public boolean hasInitialDefault() {
+          return ((bitField0_ & 0x00000004) != 0);
+        }
+        /**
+         * <pre>
+         * What rows written before the column existed read for it; unset is NULL.
+         * </pre>
+         *
+         * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+         * @return The initialDefault.
+         */
+        public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue getInitialDefault() {
+          if (initialDefaultBuilder_ == null) {
+            return initialDefault_ == null ? io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue.getDefaultInstance() : initialDefault_;
+          } else {
+            return initialDefaultBuilder_.getMessage();
+          }
+        }
+        /**
+         * <pre>
+         * What rows written before the column existed read for it; unset is NULL.
+         * </pre>
+         *
+         * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+         */
+        public Builder setInitialDefault(io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue value) {
+          if (initialDefaultBuilder_ == null) {
+            if (value == null) {
+              throw new NullPointerException();
+            }
+            initialDefault_ = value;
+          } else {
+            initialDefaultBuilder_.setMessage(value);
+          }
+          bitField0_ |= 0x00000004;
+          onChanged();
+          return this;
+        }
+        /**
+         * <pre>
+         * What rows written before the column existed read for it; unset is NULL.
+         * </pre>
+         *
+         * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+         */
+        public Builder setInitialDefault(
+            io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue.Builder builderForValue) {
+          if (initialDefaultBuilder_ == null) {
+            initialDefault_ = builderForValue.build();
+          } else {
+            initialDefaultBuilder_.setMessage(builderForValue.build());
+          }
+          bitField0_ |= 0x00000004;
+          onChanged();
+          return this;
+        }
+        /**
+         * <pre>
+         * What rows written before the column existed read for it; unset is NULL.
+         * </pre>
+         *
+         * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+         */
+        public Builder mergeInitialDefault(io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue value) {
+          if (initialDefaultBuilder_ == null) {
+            if (((bitField0_ & 0x00000004) != 0) &&
+              initialDefault_ != null &&
+              initialDefault_ != io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue.getDefaultInstance()) {
+              getInitialDefaultBuilder().mergeFrom(value);
+            } else {
+              initialDefault_ = value;
+            }
+          } else {
+            initialDefaultBuilder_.mergeFrom(value);
+          }
+          if (initialDefault_ != null) {
+            bitField0_ |= 0x00000004;
+            onChanged();
+          }
+          return this;
+        }
+        /**
+         * <pre>
+         * What rows written before the column existed read for it; unset is NULL.
+         * </pre>
+         *
+         * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+         */
+        public Builder clearInitialDefault() {
+          bitField0_ = (bitField0_ & ~0x00000004);
+          initialDefault_ = null;
+          if (initialDefaultBuilder_ != null) {
+            initialDefaultBuilder_.dispose();
+            initialDefaultBuilder_ = null;
+          }
+          onChanged();
+          return this;
+        }
+        /**
+         * <pre>
+         * What rows written before the column existed read for it; unset is NULL.
+         * </pre>
+         *
+         * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+         */
+        public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue.Builder getInitialDefaultBuilder() {
+          bitField0_ |= 0x00000004;
+          onChanged();
+          return getInitialDefaultFieldBuilder().getBuilder();
+        }
+        /**
+         * <pre>
+         * What rows written before the column existed read for it; unset is NULL.
+         * </pre>
+         *
+         * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+         */
+        public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValueOrBuilder getInitialDefaultOrBuilder() {
+          if (initialDefaultBuilder_ != null) {
+            return initialDefaultBuilder_.getMessageOrBuilder();
+          } else {
+            return initialDefault_ == null ?
+                io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue.getDefaultInstance() : initialDefault_;
+          }
+        }
+        /**
+         * <pre>
+         * What rows written before the column existed read for it; unset is NULL.
+         * </pre>
+         *
+         * <code>.io.olake.iceberg.rpc.IcebergPayload.IceRecord.FieldValue initial_default = 3;</code>
+         */
+        private com.google.protobuf.SingleFieldBuilderV3<
+            io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue.Builder, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValueOrBuilder> 
+            getInitialDefaultFieldBuilder() {
+          if (initialDefaultBuilder_ == null) {
+            initialDefaultBuilder_ = new com.google.protobuf.SingleFieldBuilderV3<
+                io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue.Builder, io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValueOrBuilder>(
+                    getInitialDefault(),
+                    getParentForChildren(),
+                    isClean());
+            initialDefault_ = null;
+          }
+          return initialDefaultBuilder_;
+        }
+        @java.lang.Override
+        public final Builder setUnknownFields(
+            final com.google.protobuf.UnknownFieldSet unknownFields) {
+          return super.setUnknownFields(unknownFields);
+        }
+
+        @java.lang.Override
+        public final Builder mergeUnknownFields(
+            final com.google.protobuf.UnknownFieldSet unknownFields) {
+          return super.mergeUnknownFields(unknownFields);
+        }
+
+
+        // @@protoc_insertion_point(builder_scope:io.olake.iceberg.rpc.IcebergPayload.AddedColumn)
+      }
+
+      // @@protoc_insertion_point(class_scope:io.olake.iceberg.rpc.IcebergPayload.AddedColumn)
+      private static final io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn DEFAULT_INSTANCE;
+      static {
+        DEFAULT_INSTANCE = new io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn();
+      }
+
+      public static io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn getDefaultInstance() {
+        return DEFAULT_INSTANCE;
+      }
+
+      private static final com.google.protobuf.Parser<AddedColumn>
+          PARSER = new com.google.protobuf.AbstractParser<AddedColumn>() {
+        @java.lang.Override
+        public AddedColumn parsePartialFrom(
+            com.google.protobuf.CodedInputStream input,
+            com.google.protobuf.ExtensionRegistryLite extensionRegistry)
+            throws com.google.protobuf.InvalidProtocolBufferException {
+          Builder builder = newBuilder();
+          try {
+            builder.mergeFrom(input, extensionRegistry);
+          } catch (com.google.protobuf.InvalidProtocolBufferException e) {
+            throw e.setUnfinishedMessage(builder.buildPartial());
+          } catch (com.google.protobuf.UninitializedMessageException e) {
+            throw e.asInvalidProtocolBufferException().setUnfinishedMessage(builder.buildPartial());
+          } catch (java.io.IOException e) {
+            throw new com.google.protobuf.InvalidProtocolBufferException(e)
+                .setUnfinishedMessage(builder.buildPartial());
+          }
+          return builder.buildPartial();
+        }
+      };
+
+      public static com.google.protobuf.Parser<AddedColumn> parser() {
+        return PARSER;
+      }
+
+      @java.lang.Override
+      public com.google.protobuf.Parser<AddedColumn> getParserForType() {
+        return PARSER;
+      }
+
+      @java.lang.Override
+      public io.olake.iceberg.rpc.RecordIngest.IcebergPayload.AddedColumn getDefaultInstanceForType() {
         return DEFAULT_INSTANCE;
       }
 
@@ -28156,6 +29841,11 @@ io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue defaultVal
     com.google.protobuf.GeneratedMessageV3.FieldAccessorTable
       internal_static_io_olake_iceberg_rpc_IcebergPayload_Metadata_fieldAccessorTable;
   private static final com.google.protobuf.Descriptors.Descriptor
+    internal_static_io_olake_iceberg_rpc_IcebergPayload_AddedColumn_descriptor;
+  private static final 
+    com.google.protobuf.GeneratedMessageV3.FieldAccessorTable
+      internal_static_io_olake_iceberg_rpc_IcebergPayload_AddedColumn_fieldAccessorTable;
+  private static final com.google.protobuf.Descriptors.Descriptor
     internal_static_io_olake_iceberg_rpc_IcebergPayload_SchemaField_descriptor;
   private static final 
     com.google.protobuf.GeneratedMessageV3.FieldAccessorTable
@@ -28300,12 +29990,12 @@ io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue defaultVal
   static {
     java.lang.String[] descriptorData = {
       "\n\023record_ingest.proto\022\024io.olake.iceberg." +
-      "rpc\"\240\013\n\016IcebergPayload\022>\n\004type\030\001 \001(\01620.i" +
+      "rpc\"\230\r\n\016IcebergPayload\022>\n\004type\030\001 \001(\01620.i" +
       "o.olake.iceberg.rpc.IcebergPayload.Paylo" +
       "adType\022?\n\010metadata\030\002 \001(\0132-.io.olake.iceb" +
       "erg.rpc.IcebergPayload.Metadata\022?\n\007recor" +
       "ds\030\003 \003(\0132..io.olake.iceberg.rpc.IcebergP" +
-      "ayload.IceRecord\032\314\003\n\010Metadata\022\027\n\017dest_ta" +
+      "ayload.IceRecord\032\256\004\n\010Metadata\022\027\n\017dest_ta" +
       "ble_name\030\001 \001(\t\022\021\n\tthread_id\030\002 \001(\t\022\035\n\020ide" +
       "ntifier_field\030\003 \001(\tH\000\210\001\001\022@\n\006schema\030\004 \003(\013" +
       "20.io.olake.iceberg.rpc.IcebergPayload.S" +
@@ -28315,117 +30005,123 @@ io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue defaultVal
       "ayload.PartitionField\022\035\n\020base_snapshot_i" +
       "d\030\n \001(\003H\001\210\001\001\022D\n\013delete_mode\030\013 \001(\0162/.io.o" +
       "lake.iceberg.rpc.IcebergPayload.DeleteMo" +
-      "de\022!\n\031declare_identifier_fields\030\014 \001(\010B\023\n" +
-      "\021_identifier_fieldB\023\n\021_base_snapshot_id\032" +
-      ",\n\013SchemaField\022\020\n\010ice_type\030\001 \001(\t\022\013\n\003key\030" +
-      "\002 \001(\t\0322\n\016PartitionField\022\r\n\005field\030\001 \001(\t\022\021" +
-      "\n\ttransform\030\002 \001(\t\032\210\003\n\tIceRecord\022I\n\006field" +
-      "s\030\001 \003(\01329.io.olake.iceberg.rpc.IcebergPa" +
-      "yload.IceRecord.FieldValue\022\023\n\013record_typ" +
-      "e\030\002 \001(\t\022\035\n\020delete_file_path\030\003 \001(\tH\000\210\001\001\022\034" +
-      "\n\017delete_position\030\004 \001(\003H\001\210\001\001\032\264\001\n\nFieldVa" +
-      "lue\022\026\n\014string_value\030\001 \001(\tH\000\022\023\n\tint_value" +
-      "\030\002 \001(\005H\000\022\024\n\nlong_value\030\003 \001(\003H\000\022\025\n\013float_" +
-      "value\030\004 \001(\002H\000\022\026\n\014double_value\030\005 \001(\001H\000\022\024\n" +
-      "\nbool_value\030\006 \001(\010H\000\022\025\n\013bytes_value\030\007 \001(\014" +
-      "H\000B\007\n\005valueB\023\n\021_delete_file_pathB\022\n\020_del" +
-      "ete_position\"\217\001\n\013PayloadType\022\013\n\007RECORDS\020" +
-      "\000\022\n\n\006COMMIT\020\001\022\021\n\rEVOLVE_SCHEMA\020\002\022\016\n\nDROP" +
-      "_TABLE\020\003\022\027\n\023GET_OR_CREATE_TABLE\020\004\022\030\n\024REF" +
-      "RESH_TABLE_SCHEMA\020\005\022\021\n\rCLOSE_SESSION\020\006\"~" +
-      "\n\nDeleteMode\022\033\n\027DELETE_MODE_UNSPECIFIED\020" +
-      "\000\022\030\n\024DELETE_MODE_EQUALITY\020\001\022\030\n\024DELETE_MO" +
-      "DE_POSITION\020\002\022\037\n\033DELETE_MODE_DELETION_VE" +
-      "CTOR\020\003\"\306\001\n\024RecordIngestResponse\022\016\n\006resul" +
-      "t\030\001 \001(\t\022\017\n\007success\030\002 \001(\010\022\027\n\017olake_2pc_st" +
-      "ate\030\003 \001(\t\022\023\n\013snapshot_id\030\004 \001(\003\022\034\n\024has_eq" +
-      "uality_deletes\030\005 \001(\010\022A\n\022file_position_ma" +
-      "ps\030\006 \003(\0132%.io.olake.iceberg.rpc.FilePosi" +
-      "tionMap\"\252\001\n\017FilePositionMap\022\021\n\tfile_path" +
-      "\030\001 \001(\t\022;\n\006ranges\030\002 \003(\0132+.io.olake.iceber" +
-      "g.rpc.FilePositionMap.Range\032G\n\005Range\022\027\n\017" +
-      "batch_start_idx\030\001 \001(\005\022\026\n\016start_position\030" +
-      "\002 \001(\003\022\r\n\005count\030\003 \001(\005\"\235\n\n\014ArrowPayload\022<\n" +
-      "\004type\030\001 \001(\0162..io.olake.iceberg.rpc.Arrow" +
-      "Payload.PayloadType\022=\n\010metadata\030\002 \001(\0132+." +
-      "io.olake.iceberg.rpc.ArrowPayload.Metada" +
-      "ta\032\337\002\n\014FileMetadata\022\021\n\tfile_type\030\001 \001(\t\022\021" +
-      "\n\tfile_path\030\002 \001(\t\022\024\n\014record_count\030\003 \001(\003\022" +
-      "X\n\020partition_values\030\005 \003(\0132>.io.olake.ice" +
-      "berg.rpc.ArrowPayload.FileMetadata.Parti" +
-      "tionValue\032\270\001\n\016PartitionValue\022\023\n\tint_valu" +
-      "e\030\001 \001(\005H\000\022\024\n\nlong_value\030\002 \001(\003H\000\022\026\n\014strin" +
-      "g_value\030\003 \001(\tH\000\022\025\n\013float_value\030\004 \001(\002H\000\022\026" +
-      "\n\014double_value\030\005 \001(\001H\000\022\024\n\nbool_value\030\006 \001" +
-      "(\010H\000\022\025\n\013bytes_value\030\007 \001(\014H\000B\007\n\005value\0329\n\021" +
-      "FileUploadRequest\022\021\n\tfile_data\030\001 \001(\014\022\021\n\t" +
-      "file_path\030\002 \001(\t\032\363\001\n\023DeletionVectorBatch\022" +
-      "M\n\007entries\030\001 \003(\0132<.io.olake.iceberg.rpc." +
-      "ArrowPayload.DeletionVectorBatch.Entry\032\214" +
-      "\001\n\005Entry\022\026\n\016data_file_path\030\001 \001(\t\022\021\n\tposi" +
-      "tions\030\002 \003(\003\022X\n\020partition_values\030\003 \003(\0132>." +
-      "io.olake.iceberg.rpc.ArrowPayload.FileMe" +
-      "tadata.PartitionValue\032\217\003\n\010Metadata\022\027\n\017de" +
-      "st_table_name\030\001 \001(\t\022\021\n\tthread_id\030\002 \001(\t\022F" +
-      "\n\rfile_metadata\030\003 \003(\0132/.io.olake.iceberg" +
-      ".rpc.ArrowPayload.FileMetadata\022N\n\013file_u" +
-      "pload\030\004 \001(\01324.io.olake.iceberg.rpc.Arrow" +
-      "Payload.FileUploadRequestH\000\210\001\001\022\017\n\007payloa" +
-      "d\030\006 \001(\t\022\035\n\020base_snapshot_id\030\007 \001(\003H\001\210\001\001\022U" +
-      "\n\020deletion_vectors\030\010 \001(\01326.io.olake.iceb" +
+      "de\022!\n\031declare_identifier_fields\030\014 \001(\010\022G\n" +
+      "\radded_columns\030\r \003(\01320.io.olake.iceberg." +
+      "rpc.IcebergPayload.AddedColumn\022\027\n\017droppe" +
+      "d_columns\030\016 \003(\tB\023\n\021_identifier_fieldB\023\n\021" +
+      "_base_snapshot_id\032\200\001\n\013AddedColumn\022\013\n\003key" +
+      "\030\001 \001(\t\022\020\n\010ice_type\030\002 \001(\t\022R\n\017initial_defa" +
+      "ult\030\003 \001(\01329.io.olake.iceberg.rpc.Iceberg" +
+      "Payload.IceRecord.FieldValue\032,\n\013SchemaFi" +
+      "eld\022\020\n\010ice_type\030\001 \001(\t\022\013\n\003key\030\002 \001(\t\0322\n\016Pa" +
+      "rtitionField\022\r\n\005field\030\001 \001(\t\022\021\n\ttransform" +
+      "\030\002 \001(\t\032\210\003\n\tIceRecord\022I\n\006fields\030\001 \003(\01329.i" +
+      "o.olake.iceberg.rpc.IcebergPayload.IceRe" +
+      "cord.FieldValue\022\023\n\013record_type\030\002 \001(\t\022\035\n\020" +
+      "delete_file_path\030\003 \001(\tH\000\210\001\001\022\034\n\017delete_po" +
+      "sition\030\004 \001(\003H\001\210\001\001\032\264\001\n\nFieldValue\022\026\n\014stri" +
+      "ng_value\030\001 \001(\tH\000\022\023\n\tint_value\030\002 \001(\005H\000\022\024\n" +
+      "\nlong_value\030\003 \001(\003H\000\022\025\n\013float_value\030\004 \001(\002" +
+      "H\000\022\026\n\014double_value\030\005 \001(\001H\000\022\024\n\nbool_value" +
+      "\030\006 \001(\010H\000\022\025\n\013bytes_value\030\007 \001(\014H\000B\007\n\005value" +
+      "B\023\n\021_delete_file_pathB\022\n\020_delete_positio" +
+      "n\"\242\001\n\013PayloadType\022\013\n\007RECORDS\020\000\022\n\n\006COMMIT" +
+      "\020\001\022\021\n\rEVOLVE_SCHEMA\020\002\022\016\n\nDROP_TABLE\020\003\022\027\n" +
+      "\023GET_OR_CREATE_TABLE\020\004\022\030\n\024REFRESH_TABLE_" +
+      "SCHEMA\020\005\022\021\n\rCLOSE_SESSION\020\006\022\021\n\rALTER_COL" +
+      "UMNS\020\007\"~\n\nDeleteMode\022\033\n\027DELETE_MODE_UNSP" +
+      "ECIFIED\020\000\022\030\n\024DELETE_MODE_EQUALITY\020\001\022\030\n\024D" +
+      "ELETE_MODE_POSITION\020\002\022\037\n\033DELETE_MODE_DEL" +
+      "ETION_VECTOR\020\003\"\306\001\n\024RecordIngestResponse\022" +
+      "\016\n\006result\030\001 \001(\t\022\017\n\007success\030\002 \001(\010\022\027\n\017olak" +
+      "e_2pc_state\030\003 \001(\t\022\023\n\013snapshot_id\030\004 \001(\003\022\034" +
+      "\n\024has_equality_deletes\030\005 \001(\010\022A\n\022file_pos" +
+      "ition_maps\030\006 \003(\0132%.io.olake.iceberg.rpc." +
+      "FilePositionMap\"\252\001\n\017FilePositionMap\022\021\n\tf" +
+      "ile_path\030\001 \001(\t\022;\n\006ranges\030\002 \003(\0132+.io.olak" +
+      "e.iceberg.rpc.FilePositionMap.Range\032G\n\005R" +
+      "ange\022\027\n\017batch_start_idx\030\001 \001(\005\022\026\n\016start_p" +
+      "osition\030\002 \001(\003\022\r\n\005count\030\003 \001(\005\"\235\n\n\014ArrowPa" +
+      "yload\022<\n\004type\030\001 \001(\0162..io.olake.iceberg.r" +
+      "pc.ArrowPayload.PayloadType\022=\n\010metadata\030" +
+      "\002 \001(\0132+.io.olake.iceberg.rpc.ArrowPayloa" +
+      "d.Metadata\032\337\002\n\014FileMetadata\022\021\n\tfile_type" +
+      "\030\001 \001(\t\022\021\n\tfile_path\030\002 \001(\t\022\024\n\014record_coun" +
+      "t\030\003 \001(\003\022X\n\020partition_values\030\005 \003(\0132>.io.o" +
+      "lake.iceberg.rpc.ArrowPayload.FileMetada" +
+      "ta.PartitionValue\032\270\001\n\016PartitionValue\022\023\n\t" +
+      "int_value\030\001 \001(\005H\000\022\024\n\nlong_value\030\002 \001(\003H\000\022" +
+      "\026\n\014string_value\030\003 \001(\tH\000\022\025\n\013float_value\030\004" +
+      " \001(\002H\000\022\026\n\014double_value\030\005 \001(\001H\000\022\024\n\nbool_v" +
+      "alue\030\006 \001(\010H\000\022\025\n\013bytes_value\030\007 \001(\014H\000B\007\n\005v" +
+      "alue\0329\n\021FileUploadRequest\022\021\n\tfile_data\030\001" +
+      " \001(\014\022\021\n\tfile_path\030\002 \001(\t\032\363\001\n\023DeletionVect" +
+      "orBatch\022M\n\007entries\030\001 \003(\0132<.io.olake.iceb" +
       "erg.rpc.ArrowPayload.DeletionVectorBatch" +
-      "H\002\210\001\001B\016\n\014_file_uploadB\023\n\021_base_snapshot_" +
-      "idB\023\n\021_deletion_vectors\"k\n\013PayloadType\022\017" +
-      "\n\013UPLOAD_FILE\020\000\022\027\n\023REGISTER_AND_COMMIT\020\001" +
-      "\022\016\n\nJSONSCHEMA\020\002\022\014\n\010FILEPATH\020\003\022\024\n\020DELETI" +
-      "ON_VECTORS\020\004\"\335\001\n\023ArrowIngestResponse\022\016\n\006" +
-      "result\030\001 \001(\t\022U\n\016icebergSchemas\030\002 \003(\0132=.i" +
-      "o.olake.iceberg.rpc.ArrowIngestResponse." +
-      "IcebergSchemasEntry\022\030\n\013snapshot_id\030\003 \001(\003" +
-      "H\000\210\001\001\0325\n\023IcebergSchemasEntry\022\013\n\003key\030\001 \001(" +
-      "\t\022\r\n\005value\030\002 \001(\t:\0028\001B\016\n\014_snapshot_id\"^\n\025" +
-      "TableIndexScanRequest\022\021\n\tthread_id\030\001 \001(\t" +
-      "\022\035\n\020from_snapshot_id\030\002 \001(\003H\000\210\001\001B\023\n\021_from" +
-      "_snapshot_id\"\254\001\n\023TableIndexScanBatch\022@\n\007" +
-      "entries\030\001 \003(\0132/.io.olake.iceberg.rpc.Tab" +
-      "leIndexScanBatch.Entry\022\023\n\013snapshot_id\030\002 " +
-      "\001(\003\032>\n\005Entry\022\020\n\010olake_id\030\001 \001(\t\022\021\n\tfile_p" +
-      "ath\030\002 \001(\t\022\020\n\010position\030\003 \001(\003\"x\n\035MigrateEq" +
-      "ualityDeletesRequest\022\021\n\tthread_id\030\001 \001(\t\022" +
-      "D\n\013target_mode\030\002 \001(\0162/.io.olake.iceberg." +
-      "rpc.IcebergPayload.DeleteMode\"y\n\036Migrate" +
-      "EqualityDeletesResponse\022\023\n\013snapshot_id\030\001" +
-      " \001(\003\022\036\n\026rewritten_delete_files\030\002 \001(\003\022\"\n\032" +
-      "positional_deletes_written\030\003 \001(\003\"\345\001\n\017Rea" +
-      "dRowsRequest\022\021\n\tthread_id\030\001 \001(\t\022=\n\005files" +
-      "\030\002 \003(\0132..io.olake.iceberg.rpc.ReadRowsRe" +
-      "quest.FileRows\032(\n\003Row\022\020\n\010position\030\001 \001(\003\022" +
-      "\017\n\007columns\030\002 \003(\t\032V\n\010FileRows\022\021\n\tfile_pat" +
-      "h\030\001 \001(\t\0227\n\004rows\030\002 \003(\0132).io.olake.iceberg" +
-      ".rpc.ReadRowsRequest.Row\"\242\002\n\rReadRowsBat" +
-      "ch\0225\n\004rows\030\001 \003(\0132\'.io.olake.iceberg.rpc." +
-      "ReadRowsBatch.Row\032\331\001\n\003Row\022\021\n\tfile_path\030\001" +
-      " \001(\t\022\020\n\010position\030\002 \001(\003\022C\n\006values\030\003 \003(\01323" +
-      ".io.olake.iceberg.rpc.ReadRowsBatch.Row." +
-      "ValuesEntry\032h\n\013ValuesEntry\022\013\n\003key\030\001 \001(\t\022" +
-      "H\n\005value\030\002 \001(\01329.io.olake.iceberg.rpc.Ic" +
-      "ebergPayload.IceRecord.FieldValue:\0028\0012v\n" +
-      "\023RecordIngestService\022_\n\013SendRecords\022$.io" +
-      ".olake.iceberg.rpc.IcebergPayload\032*.io.o" +
-      "lake.iceberg.rpc.RecordIngestResponse2q\n" +
-      "\022ArrowIngestService\022[\n\nIcebergAPI\022\".io.o" +
-      "lake.iceberg.rpc.ArrowPayload\032).io.olake" +
-      ".iceberg.rpc.ArrowIngestResponse2\345\002\n\021Tab" +
-      "leIndexService\022p\n\024ScanTableForIndexing\022+" +
-      ".io.olake.iceberg.rpc.TableIndexScanRequ" +
-      "est\032).io.olake.iceberg.rpc.TableIndexSca" +
-      "nBatch0\001\022\203\001\n\026MigrateEqualityDeletes\0223.io" +
-      ".olake.iceberg.rpc.MigrateEqualityDelete" +
-      "sRequest\0324.io.olake.iceberg.rpc.MigrateE" +
-      "qualityDeletesResponse\022X\n\010ReadRows\022%.io." +
-      "olake.iceberg.rpc.ReadRowsRequest\032#.io.o" +
-      "lake.iceberg.rpc.ReadRowsBatch0\001B\035B\014Reco" +
-      "rdIngestZ\riceberg/protob\006proto3"
+      ".Entry\032\214\001\n\005Entry\022\026\n\016data_file_path\030\001 \001(\t" +
+      "\022\021\n\tpositions\030\002 \003(\003\022X\n\020partition_values\030" +
+      "\003 \003(\0132>.io.olake.iceberg.rpc.ArrowPayloa" +
+      "d.FileMetadata.PartitionValue\032\217\003\n\010Metada" +
+      "ta\022\027\n\017dest_table_name\030\001 \001(\t\022\021\n\tthread_id" +
+      "\030\002 \001(\t\022F\n\rfile_metadata\030\003 \003(\0132/.io.olake" +
+      ".iceberg.rpc.ArrowPayload.FileMetadata\022N" +
+      "\n\013file_upload\030\004 \001(\01324.io.olake.iceberg.r" +
+      "pc.ArrowPayload.FileUploadRequestH\000\210\001\001\022\017" +
+      "\n\007payload\030\006 \001(\t\022\035\n\020base_snapshot_id\030\007 \001(" +
+      "\003H\001\210\001\001\022U\n\020deletion_vectors\030\010 \001(\01326.io.ol" +
+      "ake.iceberg.rpc.ArrowPayload.DeletionVec" +
+      "torBatchH\002\210\001\001B\016\n\014_file_uploadB\023\n\021_base_s" +
+      "napshot_idB\023\n\021_deletion_vectors\"k\n\013Paylo" +
+      "adType\022\017\n\013UPLOAD_FILE\020\000\022\027\n\023REGISTER_AND_" +
+      "COMMIT\020\001\022\016\n\nJSONSCHEMA\020\002\022\014\n\010FILEPATH\020\003\022\024" +
+      "\n\020DELETION_VECTORS\020\004\"\335\001\n\023ArrowIngestResp" +
+      "onse\022\016\n\006result\030\001 \001(\t\022U\n\016icebergSchemas\030\002" +
+      " \003(\0132=.io.olake.iceberg.rpc.ArrowIngestR" +
+      "esponse.IcebergSchemasEntry\022\030\n\013snapshot_" +
+      "id\030\003 \001(\003H\000\210\001\001\0325\n\023IcebergSchemasEntry\022\013\n\003" +
+      "key\030\001 \001(\t\022\r\n\005value\030\002 \001(\t:\0028\001B\016\n\014_snapsho" +
+      "t_id\"^\n\025TableIndexScanRequest\022\021\n\tthread_" +
+      "id\030\001 \001(\t\022\035\n\020from_snapshot_id\030\002 \001(\003H\000\210\001\001B" +
+      "\023\n\021_from_snapshot_id\"\254\001\n\023TableIndexScanB" +
+      "atch\022@\n\007entries\030\001 \003(\0132/.io.olake.iceberg" +
+      ".rpc.TableIndexScanBatch.Entry\022\023\n\013snapsh" +
+      "ot_id\030\002 \001(\003\032>\n\005Entry\022\020\n\010olake_id\030\001 \001(\t\022\021" +
+      "\n\tfile_path\030\002 \001(\t\022\020\n\010position\030\003 \001(\003\"x\n\035M" +
+      "igrateEqualityDeletesRequest\022\021\n\tthread_i" +
+      "d\030\001 \001(\t\022D\n\013target_mode\030\002 \001(\0162/.io.olake." +
+      "iceberg.rpc.IcebergPayload.DeleteMode\"y\n" +
+      "\036MigrateEqualityDeletesResponse\022\023\n\013snaps" +
+      "hot_id\030\001 \001(\003\022\036\n\026rewritten_delete_files\030\002" +
+      " \001(\003\022\"\n\032positional_deletes_written\030\003 \001(\003" +
+      "\"\345\001\n\017ReadRowsRequest\022\021\n\tthread_id\030\001 \001(\t\022" +
+      "=\n\005files\030\002 \003(\0132..io.olake.iceberg.rpc.Re" +
+      "adRowsRequest.FileRows\032(\n\003Row\022\020\n\010positio" +
+      "n\030\001 \001(\003\022\017\n\007columns\030\002 \003(\t\032V\n\010FileRows\022\021\n\t" +
+      "file_path\030\001 \001(\t\0227\n\004rows\030\002 \003(\0132).io.olake" +
+      ".iceberg.rpc.ReadRowsRequest.Row\"\242\002\n\rRea" +
+      "dRowsBatch\0225\n\004rows\030\001 \003(\0132\'.io.olake.iceb" +
+      "erg.rpc.ReadRowsBatch.Row\032\331\001\n\003Row\022\021\n\tfil" +
+      "e_path\030\001 \001(\t\022\020\n\010position\030\002 \001(\003\022C\n\006values" +
+      "\030\003 \003(\01323.io.olake.iceberg.rpc.ReadRowsBa" +
+      "tch.Row.ValuesEntry\032h\n\013ValuesEntry\022\013\n\003ke" +
+      "y\030\001 \001(\t\022H\n\005value\030\002 \001(\01329.io.olake.iceber" +
+      "g.rpc.IcebergPayload.IceRecord.FieldValu" +
+      "e:\0028\0012v\n\023RecordIngestService\022_\n\013SendReco" +
+      "rds\022$.io.olake.iceberg.rpc.IcebergPayloa" +
+      "d\032*.io.olake.iceberg.rpc.RecordIngestRes" +
+      "ponse2q\n\022ArrowIngestService\022[\n\nIcebergAP" +
+      "I\022\".io.olake.iceberg.rpc.ArrowPayload\032)." +
+      "io.olake.iceberg.rpc.ArrowIngestResponse" +
+      "2\345\002\n\021TableIndexService\022p\n\024ScanTableForIn" +
+      "dexing\022+.io.olake.iceberg.rpc.TableIndex" +
+      "ScanRequest\032).io.olake.iceberg.rpc.Table" +
+      "IndexScanBatch0\001\022\203\001\n\026MigrateEqualityDele" +
+      "tes\0223.io.olake.iceberg.rpc.MigrateEquali" +
+      "tyDeletesRequest\0324.io.olake.iceberg.rpc." +
+      "MigrateEqualityDeletesResponse\022X\n\010ReadRo" +
+      "ws\022%.io.olake.iceberg.rpc.ReadRowsReques" +
+      "t\032#.io.olake.iceberg.rpc.ReadRowsBatch0\001" +
+      "B\035B\014RecordIngestZ\riceberg/protob\006proto3"
     };
     descriptor = com.google.protobuf.Descriptors.FileDescriptor
       .internalBuildGeneratedFileFrom(descriptorData,
@@ -28442,21 +30138,27 @@ io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue defaultVal
     internal_static_io_olake_iceberg_rpc_IcebergPayload_Metadata_fieldAccessorTable = new
       com.google.protobuf.GeneratedMessageV3.FieldAccessorTable(
         internal_static_io_olake_iceberg_rpc_IcebergPayload_Metadata_descriptor,
-        new java.lang.String[] { "DestTableName", "ThreadId", "IdentifierField", "Schema", "Payload", "Namespace", "Upsert", "PartitionFields", "BaseSnapshotId", "DeleteMode", "DeclareIdentifierFields", });
-    internal_static_io_olake_iceberg_rpc_IcebergPayload_SchemaField_descriptor =
+        new java.lang.String[] { "DestTableName", "ThreadId", "IdentifierField", "Schema", "Payload", "Namespace", "Upsert", "PartitionFields", "BaseSnapshotId", "DeleteMode", "DeclareIdentifierFields", "AddedColumns", "DroppedColumns", });
+    internal_static_io_olake_iceberg_rpc_IcebergPayload_AddedColumn_descriptor =
       internal_static_io_olake_iceberg_rpc_IcebergPayload_descriptor.getNestedTypes().get(1);
+    internal_static_io_olake_iceberg_rpc_IcebergPayload_AddedColumn_fieldAccessorTable = new
+      com.google.protobuf.GeneratedMessageV3.FieldAccessorTable(
+        internal_static_io_olake_iceberg_rpc_IcebergPayload_AddedColumn_descriptor,
+        new java.lang.String[] { "Key", "IceType", "InitialDefault", });
+    internal_static_io_olake_iceberg_rpc_IcebergPayload_SchemaField_descriptor =
+      internal_static_io_olake_iceberg_rpc_IcebergPayload_descriptor.getNestedTypes().get(2);
     internal_static_io_olake_iceberg_rpc_IcebergPayload_SchemaField_fieldAccessorTable = new
       com.google.protobuf.GeneratedMessageV3.FieldAccessorTable(
         internal_static_io_olake_iceberg_rpc_IcebergPayload_SchemaField_descriptor,
         new java.lang.String[] { "IceType", "Key", });
     internal_static_io_olake_iceberg_rpc_IcebergPayload_PartitionField_descriptor =
-      internal_static_io_olake_iceberg_rpc_IcebergPayload_descriptor.getNestedTypes().get(2);
+      internal_static_io_olake_iceberg_rpc_IcebergPayload_descriptor.getNestedTypes().get(3);
     internal_static_io_olake_iceberg_rpc_IcebergPayload_PartitionField_fieldAccessorTable = new
       com.google.protobuf.GeneratedMessageV3.FieldAccessorTable(
         internal_static_io_olake_iceberg_rpc_IcebergPayload_PartitionField_descriptor,
         new java.lang.String[] { "Field", "Transform", });
     internal_static_io_olake_iceberg_rpc_IcebergPayload_IceRecord_descriptor =
-      internal_static_io_olake_iceberg_rpc_IcebergPayload_descriptor.getNestedTypes().get(3);
+      internal_static_io_olake_iceberg_rpc_IcebergPayload_descriptor.getNestedTypes().get(4);
     internal_static_io_olake_iceberg_rpc_IcebergPayload_IceRecord_fieldAccessorTable = new
       com.google.protobuf.GeneratedMessageV3.FieldAccessorTable(
         internal_static_io_olake_iceberg_rpc_IcebergPayload_IceRecord_descriptor,

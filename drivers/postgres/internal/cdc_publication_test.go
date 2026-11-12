@@ -49,6 +49,7 @@ func (m *mockStream) ResolveColumnName(key string) string { return key }
 func (m *mockStream) GetPartitionRegex() string           { return "" }
 func (m *mockStream) GetUpdateType() types.UpdateType     { return "" }
 func (m *mockStream) ResolveUpsertOp() bool               { return false }
+func (m *mockStream) DropRemovedColumnsEnabled() bool     { return false }
 
 func ms(schema, table string) types.StreamInterface {
 	return &mockStream{name: table, namespace: schema}

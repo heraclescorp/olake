@@ -372,6 +372,10 @@ func (p *Postgres) MaxRetries() int {
 	return p.config.RetryCount
 }
 
+func (p *Postgres) columnType(columnType string) types.DataType {
+	return typeutils.ExtractAndMapColumnType(columnType, p.typeMapping)
+}
+
 func (p *Postgres) dataTypeConverter(value interface{}, columnType string) (interface{}, error) {
 	if value == nil {
 		return nil, typeutils.ErrNullValue

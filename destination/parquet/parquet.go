@@ -570,6 +570,11 @@ func (p *Parquet) FlattenAndCleanData(ctx context.Context, records []types.RawRe
 	return schemaChange, records, p.schema, nil
 }
 
+// ApplySourceColumns is a no-op: parquet files take their columns from the records written.
+func (p *Parquet) ApplySourceColumns(_ context.Context, globalSchema any, _ types.SourceColumnsChange) (any, error) {
+	return globalSchema, nil
+}
+
 // EvolveSchema updates the schema based on changes. Need to pass olakeTimestamp to get the correct partition path based on record ingestion time.
 func (p *Parquet) EvolveSchema(_ context.Context, _, _ any) (any, error) {
 	if !p.stream.NormalizationEnabled() {

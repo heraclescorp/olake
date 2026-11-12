@@ -27,6 +27,8 @@ type Writer interface {
 	FlattenAndCleanData(ctx context.Context, records []types.RawRecord) (bool, []types.RawRecord, any, error)
 	// EvolveSchema updates the schema based on changes.
 	EvolveSchema(ctx context.Context, globalSchema, recordsSchema any) (any, error)
+	// ApplySourceColumns aligns the destination schema with the source's current columns and returns the resulting schema.
+	ApplySourceColumns(ctx context.Context, globalSchema any, change types.SourceColumnsChange) (any, error)
 	// drop the streams from the destination
 	DropStreams(ctx context.Context, dropStreams []types.StreamInterface) error
 	// cleans and commits(if no error) files and data to destination

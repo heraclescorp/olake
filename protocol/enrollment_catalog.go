@@ -110,11 +110,13 @@ func (c *enrollmentCatalog) add(stream *types.Stream, defaults enrollmentDefault
 		return err
 	}
 	columns := &types.SelectedColumns{Columns: stream.Schema.ColumnNames(), SyncNewColumns: *defaults.SyncNewColumns}
+	dropRemovedColumns := defaults.DropRemovedColumns != nil && *defaults.DropRemovedColumns
 	var metadata any = types.StreamMetadata{
 		StreamName:          stream.Name,
 		Normalization:       defaults.Normalization,
 		AppendMode:          defaults.AppendMode,
 		UpdateType:          new(string(defaults.UpdateType)),
+		DropRemovedColumns:  dropRemovedColumns,
 		SelectedColumns:     columns,
 		SyncMode:            stream.SyncMode,
 		DestinationDatabase: stream.DestinationDatabase,
@@ -126,10 +128,11 @@ func (c *enrollmentCatalog) add(stream *types.Stream, defaults enrollmentDefault
 			AppendMode bool `json:"append_mode"`
 		}{
 			LegacyStreamMetadata: types.LegacyStreamMetadata{
-				StreamName:      stream.Name,
-				Normalization:   *defaults.Normalization,
-				UpdateType:      string(defaults.UpdateType),
-				SelectedColumns: columns,
+				StreamName:         stream.Name,
+				Normalization:      *defaults.Normalization,
+				UpdateType:         string(defaults.UpdateType),
+				DropRemovedColumns: dropRemovedColumns,
+				SelectedColumns:    columns,
 			},
 			AppendMode: *defaults.AppendMode,
 		}

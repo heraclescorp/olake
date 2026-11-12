@@ -58,6 +58,15 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import io.olake.iceberg.rpc.RecordIngest.ArrowPayload;
 import io.olake.iceberg.RuntimeTelemetry;
 import io.olake.iceberg.RuntimeTelemetry.Stage;
+import io.olake.iceberg.SchemaConvertor;
+import io.olake.iceberg.rpc.RecordIngest.IcebergPayload;
+import io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue;
+import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.PartitionField;
+import org.apache.iceberg.SortField;
+import org.apache.iceberg.expressions.Literal;
+import org.apache.iceberg.types.Type;
+import org.apache.iceberg.types.Types;
 
 /**
  * Wrapper to perform operations on iceberg tables
@@ -148,6 +157,112 @@ public class IcebergTableOperator {
       LOGGER.warn("Extending schema of {}", icebergTable.name());
       us.commit();
     }
+  }
+
+  /**
+   * Adds the missing columns and deletes the requested ones in one schema update, committed
+   * only when something changed. Deletes are metadata-only: data files keep the column.
+   *
+   * Defaults need format version 3, so on older tables a column is added without one and
+   * existing rows read NULL. Columns the table depends on (identifier fields, partition and
+   * sort sources) are kept.
+   *
+   * @return whether the schema changed
+   */
+  public boolean applyColumnChanges(Table table, List<IcebergPayload.AddedColumn> added, List<String> dropped) {
+    table.refresh();
+    int formatVersion = ((HasTableOperations) table).operations().current().formatVersion();
+    Schema current = table.schema();
+    UpdateSchema us = table.updateSchema();
+    boolean changed = false;
+
+    for (IcebergPayload.AddedColumn column : added) {
+      if (current.findField(column.getKey()) != null) {
+        continue;
+      }
+      Type type = SchemaConvertor.icebergPrimitiveField(column.getIceType());
+      Literal<?> initialDefault = null;
+      if (column.hasInitialDefault()) {
+        if (formatVersion < 3) {
+          LOGGER.warn("{}: adding column {} with NULL for existing rows: format version {} does not support column defaults",
+              table.name(), column.getKey(), formatVersion);
+        } else {
+          initialDefault = toLiteral(column.getInitialDefault(), type);
+          if (initialDefault == null) {
+            LOGGER.warn("{}: adding column {} with NULL for existing rows: value {} does not convert to {}",
+                table.name(), column.getKey(), column.getInitialDefault(), type);
+          }
+        }
+      }
+      if (initialDefault != null) {
+        us.addColumn(column.getKey(), type, null, initialDefault);
+      } else {
+        us.addColumn(column.getKey(), type);
+      }
+      LOGGER.info("{}: adding column {} {} with initial default {}", table.name(), column.getKey(), type, initialDefault);
+      changed = true;
+    }
+
+    Set<Integer> requiredIds = new HashSet<>(current.identifierFieldIds());
+    for (PartitionSpec spec : table.specs().values()) {
+      for (PartitionField field : spec.fields()) {
+        requiredIds.add(field.sourceId());
+      }
+    }
+    for (SortField field : table.sortOrder().fields()) {
+      requiredIds.add(field.sourceId());
+    }
+    for (String name : dropped) {
+      Types.NestedField field = current.findField(name);
+      if (field == null) {
+        continue;
+      }
+      if (requiredIds.contains(field.fieldId())) {
+        LOGGER.warn("{}: keeping column {} removed at the source: it is an identifier, partition or sort source column",
+            table.name(), name);
+        continue;
+      }
+      us.deleteColumn(name);
+      LOGGER.info("{}: deleting column {} removed at the source", table.name(), name);
+      changed = true;
+    }
+
+    if (changed) {
+      us.commit();
+    }
+    return changed;
+  }
+
+  /** Converts a value encoded like a row value into a literal of type, null when it does not convert. */
+  static Literal<?> toLiteral(FieldValue value, Type type) {
+    Literal<?> literal;
+    switch (value.getValueCase()) {
+      case STRING_VALUE:
+        literal = Literal.of(value.getStringValue());
+        break;
+      case INT_VALUE:
+        literal = Literal.of(value.getIntValue());
+        break;
+      case LONG_VALUE:
+        // timestamps arrive as epoch micros, which is how a long literal converts to them
+        literal = Literal.of(value.getLongValue());
+        break;
+      case FLOAT_VALUE:
+        literal = Literal.of(value.getFloatValue());
+        break;
+      case DOUBLE_VALUE:
+        literal = Literal.of(value.getDoubleValue());
+        break;
+      case BOOL_VALUE:
+        literal = Literal.of(value.getBoolValue());
+        break;
+      case BYTES_VALUE:
+        literal = Literal.of(value.getBytesValue().asReadOnlyByteBuffer());
+        break;
+      default:
+        return null;
+    }
+    return literal.to(type);
   }
 
   /**

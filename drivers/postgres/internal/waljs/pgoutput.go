@@ -26,6 +26,7 @@ type pgoutputReplicator struct {
 	relationIDToMsgMap   map[uint32]*pglogrepl.RelationMessage // map to store relation id
 	transactionCompleted bool                                  // if both begin and commit message received, then transaction is completed
 	preserveToastValues  bool                                  // mark columns Postgres left out of an UPDATE so the destination can recover them
+	db                   *sqlx.DB                              // regular connection for catalog reads; the replication connection cannot run queries mid-stream
 }
 
 func (p *pgoutputReplicator) Socket() *Socket {
@@ -33,6 +34,11 @@ func (p *pgoutputReplicator) Socket() *Socket {
 }
 
 func (p *pgoutputReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, insertFn abstract.CDCMsgFn) error {
+	p.db = db
+	if err := p.emitSyncStartColumns(ctx, insertFn); err != nil {
+		return err
+	}
+
 	err := pglogrepl.StartReplication(ctx, p.socket.pgConn, fmt.Sprintf("%q", p.socket.ReplicationSlot), p.socket.ConfirmedFlushLSN, pglogrepl.StartReplicationOptions{
 		PluginArgs: []string{"proto_version '1'", fmt.Sprintf("publication_names '%s'", p.publication)}})
 	if err != nil {
@@ -121,11 +127,15 @@ func (p *pgoutputReplicator) processPgoutputWAL(ctx context.Context, walData []b
 
 	switch msg := logicalMsg.(type) {
 	case *pglogrepl.RelationMessage:
-		if _, relationVisited := p.relationIDToMsgMap[msg.RelationID]; !relationVisited && msg.ReplicaIdentity != 'f' {
+		prev, relationVisited := p.relationIDToMsgMap[msg.RelationID]
+		if !relationVisited && msg.ReplicaIdentity != 'f' {
 			logger.Warnf("table[%s.%s] replica identity is not FULL, unchanged TOAST column values may be lost during CDC UPDATE events; set REPLICA IDENTITY FULL to avoid data loss", msg.Namespace, msg.RelationName)
 		}
 		p.relationIDToMsgMap[msg.RelationID] = msg
-		return nil
+		if !relationColumnsChanged(prev, msg) {
+			return nil
+		}
+		return p.emitRelationColumns(ctx, msg, insertFn)
 	case *pglogrepl.BeginMessage:
 		p.transactionCompleted = false
 		p.txnCommitTime = msg.CommitTime

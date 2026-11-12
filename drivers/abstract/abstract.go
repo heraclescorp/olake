@@ -29,6 +29,9 @@ type CDCChange struct {
 	// UnavailableColumns lists columns the source could not send (Postgres unchanged
 	// TOAST); Data holds constants.UnavailableValue for them. Nil for other drivers.
 	UnavailableColumns []string
+	// SourceColumns, when set, makes this a schema change with no row data: the
+	// stream's current source columns, applied in order with the stream's rows.
+	SourceColumns *types.SourceColumnsChange
 }
 
 func NewCDCChange(stream types.StreamInterface, timestamp time.Time, kind string, data, extraColumns map[string]any, sourceBytes int64, unavailableColumns []string) CDCChange {
@@ -41,6 +44,10 @@ func NewCDCChange(stream types.StreamInterface, timestamp time.Time, kind string
 		Bytes:              sourceBytes,
 		UnavailableColumns: unavailableColumns,
 	}
+}
+
+func NewSourceColumnsChange(stream types.StreamInterface, change types.SourceColumnsChange) CDCChange {
+	return CDCChange{Stream: stream, SourceColumns: &change}
 }
 
 type AbstractDriver struct { //nolint:gosec,revive

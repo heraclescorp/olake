@@ -73,6 +73,10 @@ func (*metadataTestWriter) EvolveSchema(_ context.Context, schema, _ any) (any, 
 	return schema, nil
 }
 
+func (*metadataTestWriter) ApplySourceColumns(_ context.Context, schema any, _ types.SourceColumnsChange) (any, error) {
+	return schema, nil
+}
+
 func (*metadataTestWriter) DropStreams(context.Context, []types.StreamInterface) error { return nil }
 
 func (w *metadataTestWriter) Close(ctx context.Context, metadata any) error {

@@ -283,6 +283,39 @@ func (wt *WriterThread) Push(ctx context.Context, record types.RawRecord, source
 	}
 }
 
+// ApplySourceColumns applies a source schema change after every record pushed before it: the
+// buffer is flushed first, on the same ordered group, so earlier rows keep the old schema.
+func (wt *WriterThread) ApplySourceColumns(ctx context.Context, change types.SourceColumnsChange) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-wt.group.Ctx().Done():
+		return wt.group.Block()
+	default:
+		buf := make([]types.RawRecord, len(wt.buffer))
+		copy(buf, wt.buffer)
+		clear(wt.buffer)
+		wt.buffer = wt.buffer[:0]
+		wt.bufferBytes = 0
+		wt.group.Add(func(ctx context.Context) error {
+			if err := wt.flush(ctx, buf); err != nil {
+				return err
+			}
+			wt.streamArtifact.mu.Lock()
+			defer wt.streamArtifact.mu.Unlock()
+			newSchema, err := wt.writer.ApplySourceColumns(ctx, wt.streamArtifact.schema, change)
+			if err != nil {
+				return fmt.Errorf("failed to apply source columns: %w", err)
+			}
+			if newSchema != nil {
+				wt.streamArtifact.schema = newSchema
+			}
+			return nil
+		})
+		return nil
+	}
+}
+
 func (wt *WriterThread) flush(ctx context.Context, buf []types.RawRecord) (err error) {
 	// skip empty buffers
 	if len(buf) == 0 {

@@ -16,12 +16,15 @@ import (
 type ChangeFilter struct {
 	tables    map[string]types.StreamInterface
 	converter func(value interface{}, columnType string) (interface{}, error)
+	// columnType maps a source type name to the type its converted values have
+	columnType func(columnType string) types.DataType
 }
 
-func NewChangeFilter(typeConverter func(value interface{}, columnType string) (interface{}, error), streams ...types.StreamInterface) ChangeFilter {
+func NewChangeFilter(typeConverter func(value interface{}, columnType string) (interface{}, error), columnType func(columnType string) types.DataType, streams ...types.StreamInterface) ChangeFilter {
 	filter := ChangeFilter{
-		converter: typeConverter,
-		tables:    make(map[string]types.StreamInterface),
+		converter:  typeConverter,
+		columnType: columnType,
+		tables:     make(map[string]types.StreamInterface),
 	}
 
 	for _, stream := range streams {

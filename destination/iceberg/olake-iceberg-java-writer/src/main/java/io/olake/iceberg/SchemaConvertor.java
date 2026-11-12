@@ -155,7 +155,7 @@ public class SchemaConvertor {
 
   private static final Pattern FIXED_TYPE = Pattern.compile("^fixed\\[(\\d+)\\]$");
 
-  private static Type.PrimitiveType icebergPrimitiveField(String fieldType) {
+  public static Type.PrimitiveType icebergPrimitiveField(String fieldType) {
     Matcher fixed = FIXED_TYPE.matcher(fieldType);
     if (fixed.matches()) {
       return Types.FixedType.ofLength(Integer.parseInt(fixed.group(1)));

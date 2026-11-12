@@ -153,7 +153,7 @@ func TestToProtoFieldValue(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			fv, err := toProtoFieldValue(tc.iceType, tc.value)
+			fv, err := ToProtoFieldValue(tc.iceType, tc.value)
 			if tc.wantErr {
 				require.Error(t, err)
 				return

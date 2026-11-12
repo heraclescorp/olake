@@ -96,7 +96,7 @@ func (w *LegacyWriter) Write(ctx context.Context, records []types.RawRecord) err
 				protoColumnsValue = append(protoColumnsValue, nil)
 				continue
 			}
-			fv, err := toProtoFieldValue(field.IceType, val)
+			fv, err := ToProtoFieldValue(field.IceType, val)
 			if err != nil {
 				return fmt.Errorf("field[%s]: %s", field.Key, err)
 			}
@@ -282,7 +282,7 @@ func RawDataColumnBuffer(record types.RawRecord, protoSchema []*proto.IcebergPay
 			continue
 		}
 
-		fv, err := toProtoFieldValue(field.IceType, value)
+		fv, err := ToProtoFieldValue(field.IceType, value)
 		if err != nil {
 			return nil, fmt.Errorf("field[%s]: %s", field.Key, err)
 		}
@@ -293,7 +293,8 @@ func RawDataColumnBuffer(record types.RawRecord, protoSchema []*proto.IcebergPay
 	return protoColumnsValue, nil
 }
 
-func toProtoFieldValue(iceType string, val any) (*proto.IcebergPayload_IceRecord_FieldValue, error) {
+// ToProtoFieldValue encodes a value for an iceberg column of type iceType.
+func ToProtoFieldValue(iceType string, val any) (*proto.IcebergPayload_IceRecord_FieldValue, error) {
 	switch iceType {
 	case "boolean":
 		v, err := typeutils.ReformatBool(val)

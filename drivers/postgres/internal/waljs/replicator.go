@@ -9,6 +9,7 @@ import (
 
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/drivers/abstract"
+	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/jackc/pglogrepl"
@@ -53,7 +54,7 @@ type Replicator interface {
 	StreamChanges(ctx context.Context, db *sqlx.DB, insertFn abstract.CDCMsgFn) error
 }
 
-func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, recoveryLSN *pglogrepl.LSN, typeConverter func(value interface{}, columnType string) (interface{}, error)) (Replicator, error) {
+func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, recoveryLSN *pglogrepl.LSN, typeConverter func(value interface{}, columnType string) (interface{}, error), columnType func(columnType string) types.DataType) (Replicator, error) {
 	// Build PostgreSQL connection config
 	connURL := config.Connection
 	q := connURL.Query()
@@ -116,7 +117,7 @@ func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, re
 	// Create and return final connection object
 	socket := &Socket{
 		pgConn:             pgConn,
-		changeFilter:       NewChangeFilter(typeConverter, config.Tables.Array()...),
+		changeFilter:       NewChangeFilter(typeConverter, columnType, config.Tables.Array()...),
 		ConfirmedFlushLSN:  slot.LSN,
 		ClientXLogPos:      slot.LSN,
 		CurrentWalPosition: targetWalPos,

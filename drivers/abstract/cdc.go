@@ -183,6 +183,9 @@ func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destinatio
 
 	finalMetadataState, err = a.driver.StreamChanges(cdcCtx, streamIndex, metadataStates, func(ctx context.Context, change CDCChange) error {
 		writer := writers[change.Stream.ID()]
+		if change.SourceColumns != nil {
+			return writer.ApplySourceColumns(ctx, *change.SourceColumns)
+		}
 		if metricContexts != nil {
 			observability.AddRows(metricContexts[change.Stream.ID()], "read", 1, change.Bytes)
 		}

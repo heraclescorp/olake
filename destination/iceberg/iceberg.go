@@ -35,6 +35,8 @@ type Iceberg struct {
 	writer        Writer                   // writer instance
 	// unavailableValues recovers values the source could not send; nil unless the stream keeps a row index (pos or dv)
 	unavailableValues *unavailableValuesResolver
+	// syncStartColumns are columns added from the source catalog at sync start (see planSourceColumns)
+	syncStartColumns map[string]struct{}
 	// Why Schema On Thread Level?
 	// Schema on thread level is identical to the writer instance available in the Java server.
 	// It defines when to complete the Java writer and when schema evolution is required.

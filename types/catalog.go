@@ -91,6 +91,8 @@ type StreamMetadata struct {
 	UpdateType     *string `json:"update_type,omitempty"`
 	// When enabled, source column names are preserved as-is; otherwise utils.Reformat() is applied to generate destination-safe lowercase column names.
 	UseSourceColumnNames bool `json:"use_source_column_names,omitempty"`
+	// When enabled, a column dropped at the source is deleted from the destination schema; otherwise it stays and new rows hold NULL.
+	DropRemovedColumns bool `json:"drop_removed_columns,omitempty"`
 	//legacy filter input
 	Filter string `json:"filter,omitempty"`
 	//new filter input
