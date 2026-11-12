@@ -179,7 +179,7 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
                     break;
 
                 case GET_OR_CREATE_TABLE:
-                    session.icebergTable.refresh();
+                    // loadOrCreateTable supplies current metadata, including any format upgrade.
                     String commitState = session.op.getCommitState(session.icebergTable);
                     sendTableResponse(responseObserver, session.icebergTable.schema().toString(),
                             commitState != null ? commitState : "", session);
