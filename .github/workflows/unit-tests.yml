@@ -12,7 +12,8 @@ permissions:
 jobs:
   unit-tests:
     name: Run Unit Tests
-    runs-on: ubuntu-latest
+    # IBM's clidriver requires libxml2.so.2, matching the Ubuntu 24.04 runtime image.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -24,6 +25,9 @@ jobs:
         uses: ./.github/actions/driver-deps
         with:
           save: "true"
+
+      - name: Install DB2 runtime library
+        run: sudo apt-get install -y libxml2
 
       - name: Run All Unit Tests
         run: |
