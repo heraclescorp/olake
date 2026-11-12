@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/datazip-inc/olake/constants"
-	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/datazip-inc/olake/types"
 	"github.com/stretchr/testify/assert"
 )
@@ -38,10 +37,10 @@ func tableSchema(columns ...string) map[string]string {
 	return schema
 }
 
-func addedKeys(added []*proto.IcebergPayload_AddedColumn) []string {
+func addedKeys(added []*nativeSourceColumn) []string {
 	keys := make([]string, 0, len(added))
 	for _, column := range added {
-		keys = append(keys, column.GetKey())
+		keys = append(keys, column.Key)
 	}
 	return keys
 }
@@ -60,10 +59,10 @@ func TestPlanSourceColumnsAdds(t *testing.T) {
 
 	assert.Empty(t, dropped)
 	assert.Equal(t, []string{"qty", "note", "created", "bad"}, addedKeys(added))
-	assert.Equal(t, "int", added[0].GetIceType())
-	assert.Equal(t, int32(7), added[0].GetInitialDefault().GetIntValue())
+	assert.Equal(t, "int", added[0].IceType)
+	assert.Equal(t, int32(7), added[0].InitialDefault.Any())
 	for _, column := range added[1:] {
-		assert.Nil(t, column.GetInitialDefault(), column.GetKey())
+		assert.Nil(t, column.InitialDefault, column.Key)
 	}
 }
 

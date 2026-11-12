@@ -488,33 +488,6 @@ func TestNativeWriterConstructorReusesLoadedMetadata(t *testing.T) {
 	}
 }
 
-func TestNativeWriterConstructorRefreshesAfterSchemaConflict(t *testing.T) {
-	ctx := context.Background()
-	cfg, stream, realCatalog := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
-	seed := openNativeTestWriter(t, ctx, cfg, stream, realCatalog, nil, "seed", true)
-	seed.Abort()
-	stream.Stream.UpsertField("added", types.String, true, false)
-	cat := &nativeCommitFaultCatalog{Catalog: realCatalog}
-	cat.fault = func(ctx context.Context, id table.Identifier, _ []table.Requirement, _ []table.Update) (bool, error) {
-		cat.fault = nil
-		fresh, err := realCatalog.LoadTable(ctx, id)
-		require.NoError(t, err)
-		tx := fresh.NewTransaction()
-		require.NoError(t, tx.SetProperties(apacheiceberg.Properties{nativeRecoveryProperty: `{"state":"fresh-recovery"}`}))
-		_, err = tx.Commit(ctx)
-		require.NoError(t, err)
-		return true, table.ErrCommitFailed
-	}
-	options := &destination.Options{ThreadID: "schema-retry"}
-	writer, state, err := newNativeWriter(ctx, cfg, stream, options, cat, nil)
-	require.NoError(t, err)
-	require.Equal(t, 2, cat.loads, "only the conflict should trigger a second load")
-	require.Equal(t, 2, cat.calls)
-	require.Equal(t, "fresh-recovery", state.State)
-	require.Equal(t, "string", writer.schemaMap()["added"])
-	writer.Abort()
-}
-
 func TestNativeWriterCreationKeepsCatalogLocationAndCredentialsPrivate(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")

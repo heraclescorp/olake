@@ -1,0 +1,3405 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package table
+
+import (
+	"encoding/binary"
+	"math"
+	"testing"
+
+	"github.com/apache/arrow-go/v18/parquet/variant"
+	"github.com/apache/iceberg-go"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+)
+
+const (
+	IntMinValue, IntMaxValue int32 = 30, 79
+)
+
+func TestManifestEvaluator(t *testing.T) {
+	var (
+		IntMin, IntMax       = []byte{byte(IntMinValue), 0x00, 0x00, 0x00}, []byte{byte(IntMaxValue), 0x00, 0x00, 0x00}
+		StringMin, StringMax = []byte("a"), []byte("z")
+		FloatMin, _          = iceberg.Float32Literal(0).MarshalBinary()
+		FloatMax, _          = iceberg.Float32Literal(20).MarshalBinary()
+		DblMin, _            = iceberg.Float64Literal(0).MarshalBinary()
+		DblMax, _            = iceberg.Float64Literal(20).MarshalBinary()
+		NanTrue, NanFalse    = true, false
+
+		testSchema = iceberg.NewSchema(1,
+			iceberg.NestedField{
+				ID: 1, Name: "id",
+				Type: iceberg.PrimitiveTypes.Int32, Required: true,
+			},
+			iceberg.NestedField{
+				ID: 2, Name: "all_nulls_missing_nan",
+				Type: iceberg.PrimitiveTypes.String, Required: false,
+			},
+			iceberg.NestedField{
+				ID: 3, Name: "some_nulls",
+				Type: iceberg.PrimitiveTypes.String, Required: false,
+			},
+			iceberg.NestedField{
+				ID: 4, Name: "no_nulls",
+				Type: iceberg.PrimitiveTypes.String, Required: false,
+			},
+			iceberg.NestedField{
+				ID: 5, Name: "float",
+				Type: iceberg.PrimitiveTypes.Float32, Required: false,
+			},
+			iceberg.NestedField{
+				ID: 6, Name: "all_nulls_double",
+				Type: iceberg.PrimitiveTypes.Float64, Required: false,
+			},
+			iceberg.NestedField{
+				ID: 7, Name: "all_nulls_no_nans",
+				Type: iceberg.PrimitiveTypes.Float32, Required: false,
+			},
+			iceberg.NestedField{
+				ID: 8, Name: "all_nans",
+				Type: iceberg.PrimitiveTypes.Float64, Required: false,
+			},
+			iceberg.NestedField{
+				ID: 9, Name: "both_nan_and_null",
+				Type: iceberg.PrimitiveTypes.Float32, Required: false,
+			},
+			iceberg.NestedField{
+				ID: 10, Name: "no_nan_or_null",
+				Type: iceberg.PrimitiveTypes.Float64, Required: false,
+			},
+			iceberg.NestedField{
+				ID: 11, Name: "all_nulls_missing_nan_float",
+				Type: iceberg.PrimitiveTypes.Float32, Required: false,
+			},
+			iceberg.NestedField{
+				ID: 12, Name: "all_same_value_or_null",
+				Type: iceberg.PrimitiveTypes.String, Required: false,
+			},
+			iceberg.NestedField{
+				ID: 13, Name: "no_nulls_same_value_a",
+				Type: iceberg.PrimitiveTypes.Binary, Required: false,
+			},
+		)
+	)
+
+	partFields := make([]iceberg.PartitionField, 0, testSchema.NumFields())
+	for _, f := range testSchema.Fields() {
+		partFields = append(partFields, iceberg.PartitionField{
+			Name:      f.Name,
+			SourceIDs: []int{f.ID},
+			FieldID:   f.ID,
+			Transform: iceberg.IdentityTransform{},
+		})
+	}
+
+	spec := iceberg.NewPartitionSpec(partFields...)
+	manifestNoStats := iceberg.NewManifestFile(1, "", 0, 0, 0).Build()
+	manifest := iceberg.NewManifestFile(1, "", 0, 0, 0).Partitions(
+		[]iceberg.FieldSummary{
+			{ // id
+				ContainsNull: false,
+				ContainsNaN:  nil,
+				LowerBound:   &IntMin,
+				UpperBound:   &IntMax,
+			},
+			{ // all_nulls_missing_nan
+				ContainsNull: true,
+				ContainsNaN:  nil,
+				LowerBound:   nil,
+				UpperBound:   nil,
+			},
+			{ // some_nulls
+				ContainsNull: true,
+				ContainsNaN:  nil,
+				LowerBound:   &StringMin,
+				UpperBound:   &StringMax,
+			},
+			{ // no_nulls
+				ContainsNull: false,
+				ContainsNaN:  nil,
+				LowerBound:   &StringMin,
+				UpperBound:   &StringMax,
+			},
+			{ // float
+				ContainsNull: true,
+				ContainsNaN:  nil,
+				LowerBound:   &FloatMin,
+				UpperBound:   &FloatMax,
+			},
+			{ // all_nulls_double
+				ContainsNull: true,
+				ContainsNaN:  nil,
+				LowerBound:   nil,
+				UpperBound:   nil,
+			},
+			{ // all_nulls_no_nans
+				ContainsNull: true,
+				ContainsNaN:  &NanFalse,
+				LowerBound:   nil,
+				UpperBound:   nil,
+			},
+			{ // all_nans
+				ContainsNull: false,
+				ContainsNaN:  &NanTrue,
+				LowerBound:   nil,
+				UpperBound:   nil,
+			},
+			{ // both_nan_and_null
+				ContainsNull: true,
+				ContainsNaN:  &NanTrue,
+				LowerBound:   nil,
+				UpperBound:   nil,
+			},
+			{ // no_nan_or_null
+				ContainsNull: false,
+				ContainsNaN:  &NanFalse,
+				LowerBound:   &DblMin,
+				UpperBound:   &DblMax,
+			},
+			{ // all_nulls_missing_nan_float
+				ContainsNull: true,
+				ContainsNaN:  nil,
+				LowerBound:   nil,
+				UpperBound:   nil,
+			},
+			{ // all_same_value_or_null
+				ContainsNull: true,
+				ContainsNaN:  nil,
+				LowerBound:   &StringMin,
+				UpperBound:   &StringMin,
+			},
+			{ // no_nulls_same_value_a
+				ContainsNull: false,
+				ContainsNaN:  nil,
+				LowerBound:   &StringMin,
+				UpperBound:   &StringMin,
+			},
+		}).Build()
+
+	t.Run("all nulls", func(t *testing.T) {
+		tests := []struct {
+			field    string
+			expected bool
+			msg      string
+		}{
+			{"all_nulls_missing_nan", false, "should skip: all nulls column with non-floating type contains all null"},
+			{"all_nulls_missing_nan_float", true, "should read: no NaN information may indicate presence of NaN value"},
+			{"some_nulls", true, "should read: column with some nulls contains a non-null value"},
+			{"no_nulls", true, "should read: non-null column contains a non-null value"},
+		}
+
+		for _, tt := range tests {
+			eval, err := newManifestEvaluator(spec, testSchema,
+				iceberg.NotNull(iceberg.Reference(tt.field)), true)
+			require.NoError(t, err)
+
+			result, err := eval(manifest)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, result, tt.msg)
+		}
+	})
+
+	t.Run("no nulls", func(t *testing.T) {
+		tests := []struct {
+			field    string
+			expected bool
+			msg      string
+		}{
+			{"all_nulls_missing_nan", true, "should read: at least one null value in all null column"},
+			{"some_nulls", true, "should read: column with some nulls contains a null value"},
+			{"no_nulls", false, "should skip: non-null column contains no null values"},
+			{"both_nan_and_null", true, "should read: both_nan_and_null column contains no null values"},
+		}
+
+		for _, tt := range tests {
+			eval, err := newManifestEvaluator(spec, testSchema,
+				iceberg.IsNull(iceberg.Reference(tt.field)), true)
+			require.NoError(t, err)
+
+			result, err := eval(manifest)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, result, tt.msg)
+		}
+	})
+
+	t.Run("is nan", func(t *testing.T) {
+		tests := []struct {
+			field    string
+			expected bool
+			msg      string
+		}{
+			{"float", true, "should read: no information on if there are nan values in float column"},
+			{"all_nulls_double", true, "should read: no NaN information may indicate presence of NaN value"},
+			{"all_nulls_missing_nan_float", true, "should read: no NaN information may indicate presence of NaN value"},
+			{"all_nulls_no_nans", false, "should skip: no nan column doesn't contain nan value"},
+			{"all_nans", true, "should read: all_nans column contains nan value"},
+			{"both_nan_and_null", true, "should read: both_nan_and_null column contains nan value"},
+			{"no_nan_or_null", false, "should skip: no_nan_or_null column doesn't contain nan value"},
+		}
+
+		for _, tt := range tests {
+			eval, err := newManifestEvaluator(spec, testSchema,
+				iceberg.IsNaN(iceberg.Reference(tt.field)), true)
+			require.NoError(t, err)
+
+			result, err := eval(manifest)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, result, tt.msg)
+		}
+	})
+
+	t.Run("not nan", func(t *testing.T) {
+		tests := []struct {
+			field    string
+			expected bool
+			msg      string
+		}{
+			{"float", true, "should read: no information on if there are nan values in float column"},
+			{"all_nulls_double", true, "should read: all null column contains non nan value"},
+			{"all_nulls_no_nans", true, "should read: no_nans column contains non nan value"},
+			{"all_nans", false, "should skip: all nans columndoesn't contain non nan value"},
+			{"both_nan_and_null", true, "should read: both_nan_and_null nans column contains non nan value"},
+			{"no_nan_or_null", true, "should read: no_nan_or_null column contains non nan value"},
+		}
+
+		for _, tt := range tests {
+			eval, err := newManifestEvaluator(spec, testSchema,
+				iceberg.NotNaN(iceberg.Reference(tt.field)), true)
+			require.NoError(t, err)
+
+			result, err := eval(manifest)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, result, tt.msg)
+		}
+	})
+
+	t.Run("test missing stats", func(t *testing.T) {
+		exprs := []iceberg.BooleanExpression{
+			iceberg.LessThan(iceberg.Reference("id"), int32(5)),
+			iceberg.LessThanEqual(iceberg.Reference("id"), int32(30)),
+			iceberg.EqualTo(iceberg.Reference("id"), int32(70)),
+			iceberg.GreaterThan(iceberg.Reference("id"), int32(78)),
+			iceberg.GreaterThanEqual(iceberg.Reference("id"), int32(90)),
+			iceberg.NotEqualTo(iceberg.Reference("id"), int32(101)),
+			iceberg.IsNull(iceberg.Reference("id")),
+			iceberg.NotNull(iceberg.Reference("id")),
+			iceberg.IsNaN(iceberg.Reference("float")),
+			iceberg.NotNaN(iceberg.Reference("float")),
+		}
+
+		for _, tt := range exprs {
+			eval, err := newManifestEvaluator(spec, testSchema, tt, true)
+			require.NoError(t, err)
+
+			result, err := eval(manifestNoStats)
+			require.NoError(t, err)
+			assert.Truef(t, result, "should read when missing stats for expr: %s", tt)
+		}
+	})
+
+	t.Run("test exprs", func(t *testing.T) {
+		tests := []struct {
+			expr   iceberg.BooleanExpression
+			expect bool
+			msg    string
+		}{
+			{
+				iceberg.NewNot(iceberg.LessThan(iceberg.Reference("id"), int32(IntMinValue-25))),
+				true, "should read: not(false)",
+			},
+			{
+				iceberg.NewNot(iceberg.GreaterThan(iceberg.Reference("id"), int32(IntMinValue-25))),
+				false, "should skip: not(true)",
+			},
+			{
+				iceberg.NewAnd(
+					iceberg.LessThan(iceberg.Reference("id"), int32(IntMinValue-25)),
+					iceberg.GreaterThanEqual(iceberg.Reference("id"), int32(IntMinValue-30))),
+				false, "should skip: and(false, true)",
+			},
+			{
+				iceberg.NewAnd(
+					iceberg.LessThan(iceberg.Reference("id"), int32(IntMinValue-25)),
+					iceberg.GreaterThanEqual(iceberg.Reference("id"), int32(IntMaxValue+1))),
+				false, "should skip: and(false, false)",
+			},
+			{
+				iceberg.NewAnd(
+					iceberg.GreaterThan(iceberg.Reference("id"), int32(IntMinValue-25)),
+					iceberg.LessThanEqual(iceberg.Reference("id"), int32(IntMinValue))),
+				true, "should read: and(true, true)",
+			},
+			{
+				iceberg.NewOr(
+					iceberg.LessThan(iceberg.Reference("id"), int32(IntMinValue-25)),
+					iceberg.GreaterThanEqual(iceberg.Reference("id"), int32(IntMaxValue+1))),
+				false, "should skip: or(false, false)",
+			},
+			{
+				iceberg.NewOr(
+					iceberg.LessThan(iceberg.Reference("id"), int32(IntMinValue-25)),
+					iceberg.GreaterThanEqual(iceberg.Reference("id"), int32(IntMaxValue-19))),
+				true, "should read: or(false, true)",
+			},
+			{
+				iceberg.LessThan(iceberg.Reference("some_nulls"), "1"), false,
+				"should not read: id range below lower bound",
+			},
+			{
+				iceberg.LessThan(iceberg.Reference("some_nulls"), "b"), true,
+				"should read: lower bound in range",
+			},
+			{
+				iceberg.LessThan(iceberg.Reference("float"), 15.50), true,
+				"should read: lower bound in range",
+			},
+			{
+				iceberg.LessThan(iceberg.Reference("no_nan_or_null"), 15.50), true,
+				"should read: lower bound in range",
+			},
+			{
+				iceberg.LessThanEqual(iceberg.Reference("no_nulls_same_value_a"), "a"), true,
+				"should read: lower bound in range",
+			},
+			{
+				iceberg.LessThan(iceberg.Reference("id"), int32(IntMinValue-25)), false,
+				"should not read: id range below lower bound (5 < 30)",
+			},
+			{
+				iceberg.LessThan(iceberg.Reference("id"), int32(IntMinValue)), false,
+				"should not read: id range below lower bound (30 is not < 30)",
+			},
+			{
+				iceberg.LessThan(iceberg.Reference("id"), int32(IntMinValue+1)), true,
+				"should read: one possible id",
+			},
+			{
+				iceberg.LessThan(iceberg.Reference("id"), int32(IntMaxValue)), true,
+				"should read: many possible ids",
+			},
+			{
+				iceberg.LessThanEqual(iceberg.Reference("id"), int32(IntMinValue-25)), false,
+				"should not read: id range below lower bound (5 < 30)",
+			},
+			{
+				iceberg.LessThanEqual(iceberg.Reference("id"), int32(IntMinValue-1)), false,
+				"should not read: id range below lower bound 29 < 30",
+			},
+			{
+				iceberg.LessThanEqual(iceberg.Reference("id"), int32(IntMinValue)), true,
+				"should read: one possible id",
+			},
+			{
+				iceberg.LessThanEqual(iceberg.Reference("id"), int32(IntMaxValue)), true,
+				"should read: many possible ids",
+			},
+			{
+				iceberg.GreaterThan(iceberg.Reference("id"), int32(IntMaxValue+6)), false,
+				"should not read: id range above upper bound (85 < 79)",
+			},
+			{
+				iceberg.GreaterThan(iceberg.Reference("id"), int32(IntMaxValue)), false,
+				"should not read: id range above upper bound (79 is not > 79)",
+			},
+			{
+				iceberg.GreaterThan(iceberg.Reference("id"), int32(IntMaxValue-1)), true,
+				"should read: one possible id",
+			},
+			{
+				iceberg.GreaterThan(iceberg.Reference("id"), int32(IntMaxValue-4)), true,
+				"should read: many possible ids",
+			},
+			{
+				iceberg.GreaterThanEqual(iceberg.Reference("id"), int32(IntMaxValue+6)), false,
+				"should not read: id range is above upper bound (85 < 79)",
+			},
+			{
+				iceberg.GreaterThanEqual(iceberg.Reference("id"), int32(IntMaxValue+1)), false,
+				"should not read: id range above upper bound (80 > 79)",
+			},
+			{
+				iceberg.GreaterThanEqual(iceberg.Reference("id"), int32(IntMaxValue)), true,
+				"should read: one possible id",
+			},
+			{
+				iceberg.GreaterThanEqual(iceberg.Reference("id"), int32(IntMaxValue)), true,
+				"should read: many possible ids",
+			},
+			{
+				iceberg.EqualTo(iceberg.Reference("id"), int32(IntMinValue-25)), false,
+				"should not read: id below lower bound",
+			},
+			{
+				iceberg.EqualTo(iceberg.Reference("id"), int32(IntMinValue-1)), false,
+				"should not read: id below lower bound",
+			},
+			{
+				iceberg.EqualTo(iceberg.Reference("id"), int32(IntMinValue)), true,
+				"should read: id equal to lower bound",
+			},
+			{
+				iceberg.EqualTo(iceberg.Reference("id"), int32(IntMaxValue-4)), true,
+				"should read: id between lower and upper bounds",
+			},
+			{
+				iceberg.EqualTo(iceberg.Reference("id"), int32(IntMaxValue)), true,
+				"should read: id equal to upper bound",
+			},
+			{
+				iceberg.EqualTo(iceberg.Reference("id"), int32(IntMaxValue+1)), false,
+				"should not read: id above upper bound",
+			},
+			{
+				iceberg.EqualTo(iceberg.Reference("id"), int32(IntMaxValue+6)), false,
+				"should not read: id above upper bound",
+			},
+			{
+				iceberg.NotEqualTo(iceberg.Reference("id"), int32(IntMinValue-25)), true,
+				"should read: id below lower bound",
+			},
+			{
+				iceberg.NotEqualTo(iceberg.Reference("id"), int32(IntMinValue-1)), true,
+				"should read: id below lower bound",
+			},
+			{
+				iceberg.NotEqualTo(iceberg.Reference("id"), int32(IntMinValue)), true,
+				"should read: id equal to lower bound",
+			},
+			{
+				iceberg.NotEqualTo(iceberg.Reference("id"), int32(IntMaxValue-4)), true,
+				"should read: id between lower and upper bounds",
+			},
+			{
+				iceberg.NotEqualTo(iceberg.Reference("id"), int32(IntMaxValue)), true,
+				"should read: id equal to upper bound",
+			},
+			{
+				iceberg.NotEqualTo(iceberg.Reference("id"), int32(IntMaxValue+1)), true,
+				"should read: id above upper bound",
+			},
+			{
+				iceberg.NotEqualTo(iceberg.Reference("id"), int32(IntMaxValue+6)), true,
+				"should read: id above upper bound",
+			},
+			{
+				iceberg.NewNot(iceberg.EqualTo(iceberg.Reference("id"), int32(IntMinValue-25))), true,
+				"should read: id below lower bound",
+			},
+			{
+				iceberg.NewNot(iceberg.EqualTo(iceberg.Reference("id"), int32(IntMinValue-1))), true,
+				"should read: id below lower bound",
+			},
+			{
+				iceberg.NewNot(iceberg.EqualTo(iceberg.Reference("id"), int32(IntMinValue))), true,
+				"should read: id equal to lower bound",
+			},
+			{
+				iceberg.NewNot(iceberg.EqualTo(iceberg.Reference("id"), int32(IntMaxValue-4))), true,
+				"should read: id between lower and upper bounds",
+			},
+			{
+				iceberg.NewNot(iceberg.EqualTo(iceberg.Reference("id"), int32(IntMaxValue))), true,
+				"should read: id equal to upper bound",
+			},
+			{
+				iceberg.NewNot(iceberg.EqualTo(iceberg.Reference("id"), int32(IntMaxValue+1))), true,
+				"should read: id above upper bound",
+			},
+			{
+				iceberg.NewNot(iceberg.EqualTo(iceberg.Reference("id"), int32(IntMaxValue+6))), true,
+				"should read: id above upper bound",
+			},
+			{
+				iceberg.IsIn(iceberg.Reference("id"), int32(IntMinValue-25), IntMinValue-24), false,
+				"should not read: id below lower bound (5 < 30, 6 < 30)",
+			},
+			{
+				iceberg.IsIn(iceberg.Reference("id"), int32(IntMinValue-2), IntMinValue-1), false,
+				"should not read: id below lower bound (28 < 30, 29 < 30)",
+			},
+			{
+				iceberg.IsIn(iceberg.Reference("id"), int32(IntMinValue-1), IntMinValue), true,
+				"should read: id equal to lower bound (30 == 30)",
+			},
+			{
+				iceberg.IsIn(iceberg.Reference("id"), int32(IntMaxValue-4), IntMaxValue-3), true,
+				"should read: id between lower and upper bounds (30 < 75 < 79, 30 < 76 < 79)",
+			},
+			{
+				iceberg.IsIn(iceberg.Reference("id"), int32(IntMaxValue), IntMaxValue+1), true,
+				"should read: id equal to upper bound (79 == 79)",
+			},
+			{
+				iceberg.IsIn(iceberg.Reference("id"), int32(IntMaxValue+1), IntMaxValue+2), false,
+				"should not read: id above upper bound (80 > 79, 81 > 79)",
+			},
+			{
+				iceberg.IsIn(iceberg.Reference("id"), int32(IntMaxValue+6), IntMaxValue+7), false,
+				"should not read: id above upper bound (85 > 79, 86 > 79)",
+			},
+			{
+				iceberg.IsIn(iceberg.Reference("all_nulls_missing_nan"), "abc", "def"), false,
+				"should skip: in on all nulls column",
+			},
+			{
+				iceberg.IsIn(iceberg.Reference("some_nulls"), "abc", "def"), true,
+				"should read: in on some nulls column",
+			},
+			{
+				iceberg.IsIn(iceberg.Reference("no_nulls"), "abc", "def"), true,
+				"should read: in on no nulls column",
+			},
+			{
+				iceberg.IsIn(iceberg.Reference("no_nulls_same_value_a"), "a", "b"), true,
+				"should read: in on no nulls column",
+			},
+			{
+				iceberg.IsIn(iceberg.Reference("float"), 0, -5.5), true,
+				"should read: float equal to lower bound",
+			},
+			{
+				iceberg.IsIn(iceberg.Reference("no_nan_or_null"), 0, -5.5), true,
+				"should read: float equal to lower bound",
+			},
+			{
+				iceberg.NotIn(iceberg.Reference("id"), int32(IntMinValue-25), IntMinValue-24), true,
+				"should read: id below lower bound (5 < 30, 6 < 30)",
+			},
+			{
+				iceberg.NotIn(iceberg.Reference("id"), int32(IntMinValue-2), IntMinValue-1), true,
+				"should read: id below lower bound (28 < 30, 29 < 30)",
+			},
+			{
+				iceberg.NotIn(iceberg.Reference("id"), int32(IntMinValue-1), IntMinValue), true,
+				"should read: id equal to lower bound (30 == 30)",
+			},
+			{
+				iceberg.NotIn(iceberg.Reference("id"), int32(IntMaxValue-4), IntMaxValue-3), true,
+				"should read: id between lower and upper bounds (30 < 75 < 79, 30 < 76 < 79)",
+			},
+			{
+				iceberg.NotIn(iceberg.Reference("id"), int32(IntMaxValue), IntMaxValue+1), true,
+				"should read: id equal to upper bound (79 == 79)",
+			},
+			{
+				iceberg.NotIn(iceberg.Reference("id"), int32(IntMaxValue+1), IntMaxValue+2), true,
+				"should read: id above upper bound (80 > 79, 81 > 79)",
+			},
+			{
+				iceberg.NotIn(iceberg.Reference("id"), int32(IntMaxValue+6), IntMaxValue+7), true,
+				"should read: id above upper bound (85 > 79, 86 > 79)",
+			},
+			{
+				iceberg.NotIn(iceberg.Reference("all_nulls_missing_nan"), "abc", "def"), true,
+				"should read: notIn on all nulls column",
+			},
+			{
+				iceberg.NotIn(iceberg.Reference("some_nulls"), "abc", "def"), true,
+				"should read: notIn on some nulls column",
+			},
+			{
+				iceberg.NotIn(iceberg.Reference("no_nulls"), "abc", "def"), true,
+				"should read: notIn on no nulls column",
+			},
+			{
+				iceberg.StartsWith(iceberg.Reference("some_nulls"), "a"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.StartsWith(iceberg.Reference("some_nulls"), "aa"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.StartsWith(iceberg.Reference("some_nulls"), "dddd"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.StartsWith(iceberg.Reference("some_nulls"), "z"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.StartsWith(iceberg.Reference("no_nulls"), "a"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.StartsWith(iceberg.Reference("some_nulls"), "zzzz"), false,
+				"should skip: range doesn't match",
+			},
+			{
+				iceberg.StartsWith(iceberg.Reference("some_nulls"), "1"), false,
+				"should skip: range doesn't match",
+			},
+			{
+				iceberg.StartsWith(iceberg.Reference("no_nulls_same_value_a"), "a"), true,
+				"should read: all values start with the prefix",
+			},
+			{
+				iceberg.NotStartsWith(iceberg.Reference("some_nulls"), "a"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.NotStartsWith(iceberg.Reference("some_nulls"), "aa"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.NotStartsWith(iceberg.Reference("some_nulls"), "dddd"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.NotStartsWith(iceberg.Reference("some_nulls"), "z"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.NotStartsWith(iceberg.Reference("no_nulls"), "a"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.NotStartsWith(iceberg.Reference("some_nulls"), "zzzz"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.NotStartsWith(iceberg.Reference("some_nulls"), "1"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.NotStartsWith(iceberg.Reference("all_same_value_or_null"), "a"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.NotStartsWith(iceberg.Reference("all_same_value_or_null"), "aa"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.NotStartsWith(iceberg.Reference("all_same_value_or_null"), "A"), true,
+				"should read: range matches",
+			},
+			// Iceberg does not implement SQL 3-way boolean logic, so the choice of an
+			// all null column matching is by definition in order to surface more values
+			// to the query engine to allow it to make its own decision
+			{
+				iceberg.NotStartsWith(iceberg.Reference("all_nulls_missing_nan"), "A"), true,
+				"should read: range matches",
+			},
+			{
+				iceberg.NotStartsWith(iceberg.Reference("no_nulls_same_value_a"), "a"), false,
+				"should not read: all values start with the prefix",
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.expr.String(), func(t *testing.T) {
+				eval, err := newManifestEvaluator(spec, testSchema,
+					tt.expr, true)
+				require.NoError(t, err)
+
+				result, err := eval(manifest)
+				require.NoError(t, err)
+				assert.Equal(t, tt.expect, result, tt.msg)
+			})
+		}
+	})
+}
+
+func TestManifestEvaluatorWithDroppedPartitionSource(t *testing.T) {
+	// Manifest partition summaries are positional per the spec's full field
+	// list. When a partition field's source column is dropped from the current
+	// schema, the evaluator must keep that field's slot (as an Unknown-typed
+	// placeholder) rather than compacting it away; otherwise a later, present
+	// field is read against an earlier slot's bounds.
+	bound := func(lo, hi int64) iceberg.FieldSummary {
+		lower, err := iceberg.Int64Literal(lo).MarshalBinary()
+		require.NoError(t, err)
+		upper, err := iceberg.Int64Literal(hi).MarshalBinary()
+		require.NoError(t, err)
+
+		return iceberg.FieldSummary{ContainsNull: false, LowerBound: &lower, UpperBound: &upper}
+	}
+	manifestWith := func(summaries ...iceberg.FieldSummary) iceberg.ManifestFile {
+		return iceberg.NewManifestFile(1, "", 0, 0, 0).Partitions(summaries).Build()
+	}
+	// evalForCol projects (col == 2) onto the spec and returns the manifest
+	// evaluator. In every case below the dropped field's slot contains 2
+	// exactly when the present field's slot does not, so a compacted read of
+	// the wrong slot flips both the match and the prune assertion.
+	evalForCol := func(spec iceberg.PartitionSpec, schema *iceberg.Schema, col string) func(iceberg.ManifestFile) bool {
+		project := newInclusiveProjection(schema, spec, true)
+		partitionFilter, err := project(iceberg.EqualTo(iceberg.Reference(col), int64(2)))
+		require.NoError(t, err)
+		eval, err := newManifestEvaluator(spec, schema, partitionFilter, true)
+		require.NoError(t, err)
+
+		return func(mf iceberg.ManifestFile) bool {
+			res, err := eval(mf)
+			require.NoError(t, err)
+
+			return res
+		}
+	}
+
+	t.Run("dropped source at slot 0", func(t *testing.T) {
+		// q_part (slot 0) sources a dropped column; p_part (slot 1) sources the
+		// present column "p". Compaction would drop q_part and read p_part at
+		// slot 0.
+		spec := iceberg.NewPartitionSpec(
+			iceberg.PartitionField{SourceIDs: []int{3}, FieldID: 1000, Name: "q_part", Transform: iceberg.IdentityTransform{}},
+			iceberg.PartitionField{SourceIDs: []int{2}, FieldID: 1001, Name: "p_part", Transform: iceberg.IdentityTransform{}},
+		)
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+			iceberg.NestedField{ID: 2, Name: "p", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		)
+		eval := evalForCol(spec, schema, "p")
+
+		assert.True(t, eval(manifestWith(bound(100, 200), bound(2, 2))),
+			"p=2 is in p_part's slot-1 bounds; must read slot 1, not q_part's slot 0")
+		assert.False(t, eval(manifestWith(bound(0, 5), bound(100, 200))),
+			"p=2 is outside p_part's slot-1 bounds; manifest must be pruned (reading slot 0 would wrongly keep it)")
+	})
+
+	t.Run("dropped sources around a middle field", func(t *testing.T) {
+		// b_part (slot 1) sources the only present column; a_part (slot 0) and
+		// c_part (slot 2) source dropped columns. Dropping the leading a_part
+		// shifts b_part to slot 0 under compaction.
+		spec := iceberg.NewPartitionSpec(
+			iceberg.PartitionField{SourceIDs: []int{3}, FieldID: 1000, Name: "a_part", Transform: iceberg.IdentityTransform{}},
+			iceberg.PartitionField{SourceIDs: []int{2}, FieldID: 1001, Name: "b_part", Transform: iceberg.IdentityTransform{}},
+			iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1002, Name: "c_part", Transform: iceberg.IdentityTransform{}},
+		)
+		schema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+			iceberg.NestedField{ID: 2, Name: "b", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		)
+		eval := evalForCol(spec, schema, "b")
+
+		// Dropped slots 0 and 2 carry the opposite bounds to b_part, catching
+		// an off-by-one in either direction.
+		assert.True(t, eval(manifestWith(bound(100, 200), bound(2, 2), bound(100, 200))),
+			"b=2 is in b_part's slot-1 bounds; must read slot 1")
+		assert.False(t, eval(manifestWith(bound(0, 5), bound(100, 200), bound(0, 5))),
+			"b=2 is outside b_part's slot-1 bounds; manifest must be pruned")
+	})
+}
+
+type ProjectionTestSuite struct {
+	suite.Suite
+}
+
+func (*ProjectionTestSuite) schema() *iceberg.Schema {
+	return iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
+		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 3, Name: "event_date", Type: iceberg.PrimitiveTypes.Date},
+		iceberg.NestedField{ID: 4, Name: "event_ts", Type: iceberg.PrimitiveTypes.Timestamp},
+	)
+}
+
+func (*ProjectionTestSuite) emptySpec() iceberg.PartitionSpec {
+	return iceberg.NewPartitionSpec()
+}
+
+func (*ProjectionTestSuite) idSpec() iceberg.PartitionSpec {
+	return iceberg.NewPartitionSpec(
+		iceberg.PartitionField{
+			SourceIDs: []int{1}, FieldID: 1000,
+			Transform: iceberg.IdentityTransform{}, Name: "id_part",
+		},
+	)
+}
+
+func (p *ProjectionTestSuite) unknownSpec() iceberg.PartitionSpec {
+	unknown, err := iceberg.ParseTransform("custom_transform[42]")
+	p.Require().NoError(err)
+
+	return iceberg.NewPartitionSpec(
+		iceberg.PartitionField{
+			SourceIDs: []int{1}, FieldID: 1000,
+			Transform: unknown, Name: "id_custom",
+		},
+	)
+}
+
+// Both fields partition the same column: the bucket field still prunes, the
+// unknown one contributes nothing.
+func (p *ProjectionTestSuite) bucketAndUnknownSpec() iceberg.PartitionSpec {
+	unknown, err := iceberg.ParseTransform("custom_transform[42]")
+	p.Require().NoError(err)
+
+	return iceberg.NewPartitionSpec(
+		iceberg.PartitionField{
+			SourceIDs: []int{1}, FieldID: 1000,
+			Transform: iceberg.BucketTransform{NumBuckets: 4}, Name: "id_bucket",
+		},
+		iceberg.PartitionField{
+			SourceIDs: []int{1}, FieldID: 1001,
+			Transform: unknown, Name: "id_custom",
+		},
+	)
+}
+
+func (*ProjectionTestSuite) bucketSpec() iceberg.PartitionSpec {
+	return iceberg.NewPartitionSpec(
+		iceberg.PartitionField{
+			SourceIDs: []int{2}, FieldID: 1000,
+			Transform: iceberg.BucketTransform{NumBuckets: 16}, Name: "data_bucket",
+		},
+	)
+}
+
+func (*ProjectionTestSuite) daySpec() iceberg.PartitionSpec {
+	return iceberg.NewPartitionSpec(
+		iceberg.PartitionField{
+			SourceIDs: []int{4}, FieldID: 1000,
+			Transform: iceberg.DayTransform{}, Name: "date",
+		},
+		iceberg.PartitionField{
+			SourceIDs: []int{3}, FieldID: 1001,
+			Transform: iceberg.DayTransform{}, Name: "ddate",
+		},
+	)
+}
+
+func (*ProjectionTestSuite) hourSpec() iceberg.PartitionSpec {
+	return iceberg.NewPartitionSpec(
+		iceberg.PartitionField{
+			SourceIDs: []int{4}, FieldID: 1000,
+			Transform: iceberg.HourTransform{}, Name: "hour",
+		},
+	)
+}
+
+func (*ProjectionTestSuite) truncateStrSpec() iceberg.PartitionSpec {
+	return iceberg.NewPartitionSpec(
+		iceberg.PartitionField{
+			SourceIDs: []int{2}, FieldID: 1000,
+			Transform: iceberg.TruncateTransform{Width: 2}, Name: "data_trunc",
+		},
+	)
+}
+
+func (*ProjectionTestSuite) truncateIntSpec() iceberg.PartitionSpec {
+	return iceberg.NewPartitionSpec(
+		iceberg.PartitionField{
+			SourceIDs: []int{1}, FieldID: 1000,
+			Transform: iceberg.TruncateTransform{Width: 10}, Name: "id_trunc",
+		},
+	)
+}
+
+func (*ProjectionTestSuite) idAndBucketSpec() iceberg.PartitionSpec {
+	return iceberg.NewPartitionSpec(
+		iceberg.PartitionField{
+			SourceIDs: []int{1}, FieldID: 1000,
+			Transform: iceberg.IdentityTransform{}, Name: "id_part",
+		},
+		iceberg.PartitionField{
+			SourceIDs: []int{2}, FieldID: 1001,
+			Transform: iceberg.BucketTransform{NumBuckets: 16}, Name: "data_bucket",
+		},
+	)
+}
+
+func (p *ProjectionTestSuite) TestIdentityProjection() {
+	schema, spec := p.schema(), p.idSpec()
+
+	idRef, idPartRef := iceberg.Reference("id"), iceberg.Reference("id_part")
+	tests := []struct {
+		pred     iceberg.BooleanExpression
+		expected iceberg.BooleanExpression
+	}{
+		{iceberg.NotNull(idRef), iceberg.NotNull(idPartRef)},
+		{iceberg.IsNull(idRef), iceberg.IsNull(idPartRef)},
+		{iceberg.LessThan(idRef, int64(100)), iceberg.LessThan(idPartRef, int64(100))},
+		{iceberg.LessThanEqual(idRef, int64(101)), iceberg.LessThanEqual(idPartRef, int64(101))},
+		{iceberg.GreaterThan(idRef, int64(102)), iceberg.GreaterThan(idPartRef, int64(102))},
+		{iceberg.GreaterThanEqual(idRef, int64(103)), iceberg.GreaterThanEqual(idPartRef, int64(103))},
+		{iceberg.EqualTo(idRef, int64(104)), iceberg.EqualTo(idPartRef, int64(104))},
+		{iceberg.NotEqualTo(idRef, int64(105)), iceberg.NotEqualTo(idPartRef, int64(105))},
+		{iceberg.IsIn(idRef, int64(3), 4, 5), iceberg.IsIn(idPartRef, int64(3), 4, 5)},
+		{iceberg.NotIn(idRef, int64(3), 4, 5), iceberg.NotIn(idPartRef, int64(3), 4, 5)},
+	}
+
+	project := newInclusiveProjection(schema, spec, true)
+	for _, tt := range tests {
+		p.Run(tt.pred.String(), func() {
+			expr, err := project(tt.pred)
+			p.Require().NoError(err)
+			p.Truef(tt.expected.Equals(expr), "expected: %s\ngot: %s", tt.expected, expr)
+		})
+	}
+}
+
+func (p *ProjectionTestSuite) TestBucketProjection() {
+	schema, spec := p.schema(), p.bucketSpec()
+
+	dataRef, dataBkt := iceberg.Reference("data"), iceberg.Reference("data_bucket")
+	tests := []struct {
+		pred, expected iceberg.BooleanExpression
+	}{
+		{iceberg.NotNull(dataRef), iceberg.NotNull(dataBkt)},
+		{iceberg.IsNull(dataRef), iceberg.IsNull(dataBkt)},
+		{iceberg.LessThan(dataRef, "val"), iceberg.AlwaysTrue{}},
+		{iceberg.LessThanEqual(dataRef, "val"), iceberg.AlwaysTrue{}},
+		{iceberg.GreaterThan(dataRef, "val"), iceberg.AlwaysTrue{}},
+		{iceberg.GreaterThanEqual(dataRef, "val"), iceberg.AlwaysTrue{}},
+		{iceberg.EqualTo(dataRef, "val"), iceberg.EqualTo(dataBkt, int32(14))},
+		{iceberg.NotEqualTo(dataRef, "val"), iceberg.AlwaysTrue{}},
+		{iceberg.IsIn(dataRef, "v1", "v2", "v3"), iceberg.IsIn(dataBkt, int32(1), 3, 13)},
+		{iceberg.NotIn(dataRef, "v1", "v2", "v3"), iceberg.AlwaysTrue{}},
+	}
+
+	project := newInclusiveProjection(schema, spec, true)
+	for _, tt := range tests {
+		p.Run(tt.pred.String(), func() {
+			expr, err := project(tt.pred)
+			p.Require().NoError(err)
+			p.Truef(tt.expected.Equals(expr), "expected: %s\ngot: %s", tt.expected, expr)
+		})
+	}
+}
+
+func (p *ProjectionTestSuite) TestHourProjection() {
+	schema, spec := p.schema(), p.hourSpec()
+
+	ref, hour := iceberg.Reference("event_ts"), iceberg.Reference("hour")
+	tests := []struct {
+		pred, expected iceberg.BooleanExpression
+	}{
+		{iceberg.NotNull(ref), iceberg.NotNull(hour)},
+		{iceberg.IsNull(ref), iceberg.IsNull(hour)},
+		{iceberg.LessThan(ref, "2022-11-27T10:00:00"), iceberg.LessThanEqual(hour, int32(463761))},
+		{iceberg.LessThanEqual(ref, "2022-11-27T10:00:00"), iceberg.LessThanEqual(hour, int32(463762))},
+		{iceberg.GreaterThan(ref, "2022-11-27T09:59:59.999999"), iceberg.GreaterThanEqual(hour, int32(463762))},
+		{iceberg.GreaterThanEqual(ref, "2022-11-27T09:59:59.999999"), iceberg.GreaterThanEqual(hour, int32(463761))},
+		{iceberg.EqualTo(ref, "2022-11-27T10:00:00"), iceberg.EqualTo(hour, int32(463762))},
+		{iceberg.NotEqualTo(ref, "2022-11-27T10:00:00"), iceberg.AlwaysTrue{}},
+		{iceberg.IsIn(ref, "2022-11-27T10:00:00", "2022-11-27T09:59:59.999999"), iceberg.IsIn(hour, int32(463761), 463762)},
+		{iceberg.NotIn(ref, "2022-11-27T10:00:00", "2022-11-27T09:59:59.999999"), iceberg.AlwaysTrue{}},
+	}
+
+	project := newInclusiveProjection(schema, spec, true)
+	for _, tt := range tests {
+		p.Run(tt.pred.String(), func() {
+			expr, err := project(tt.pred)
+			p.Require().NoError(err)
+			p.Truef(tt.expected.Equals(expr), "expected: %s\ngot: %s", tt.expected, expr)
+		})
+	}
+}
+
+func (p *ProjectionTestSuite) TestDayProjection() {
+	schema, spec := p.schema(), p.daySpec()
+
+	ref, date := iceberg.Reference("event_ts"), iceberg.Reference("date")
+	tests := []struct {
+		pred, expected iceberg.BooleanExpression
+	}{
+		{iceberg.NotNull(ref), iceberg.NotNull(date)},
+		{iceberg.IsNull(ref), iceberg.IsNull(date)},
+		{iceberg.LessThan(ref, "2022-11-27T00:00:00"), iceberg.LessThanEqual(date, int32(19322))},
+		{iceberg.LessThanEqual(ref, "2022-11-27T00:00:00"), iceberg.LessThanEqual(date, int32(19323))},
+		{iceberg.GreaterThan(ref, "2022-11-26T23:59:59.999999"), iceberg.GreaterThanEqual(date, int32(19323))},
+		{iceberg.GreaterThanEqual(ref, "2022-11-26T23:59:59.999999"), iceberg.GreaterThanEqual(date, int32(19322))},
+		{iceberg.EqualTo(ref, "2022-11-27T10:00:00"), iceberg.EqualTo(date, int32(19323))},
+		{iceberg.NotEqualTo(ref, "2022-11-27T10:00:00"), iceberg.AlwaysTrue{}},
+		{iceberg.IsIn(ref, "2022-11-27T00:00:00", "2022-11-26T23:59:59.999999"), iceberg.IsIn(date, int32(19322), 19323)},
+		{iceberg.NotIn(ref, "2022-11-27T00:00:00", "2022-11-26T23:59:59.999999"), iceberg.AlwaysTrue{}},
+	}
+
+	project := newInclusiveProjection(schema, spec, true)
+	for _, tt := range tests {
+		p.Run(tt.pred.String(), func() {
+			expr, err := project(tt.pred)
+			p.Require().NoError(err)
+			p.Truef(tt.expected.Equals(expr), "expected: %s\ngot: %s", tt.expected, expr)
+		})
+	}
+}
+
+func (p *ProjectionTestSuite) TestDateDayProjection() {
+	schema, spec := p.schema(), p.daySpec()
+
+	ref, date := iceberg.Reference("event_date"), iceberg.Reference("ddate")
+	tests := []struct {
+		pred, expected iceberg.BooleanExpression
+	}{
+		{iceberg.NotNull(ref), iceberg.NotNull(date)},
+		{iceberg.IsNull(ref), iceberg.IsNull(date)},
+		{iceberg.LessThan(ref, "2022-11-27"), iceberg.LessThanEqual(date, int32(19322))},
+		{iceberg.LessThanEqual(ref, "2022-11-27"), iceberg.LessThanEqual(date, int32(19323))},
+		{iceberg.GreaterThan(ref, "2022-11-26"), iceberg.GreaterThanEqual(date, int32(19323))},
+		{iceberg.GreaterThanEqual(ref, "2022-11-26"), iceberg.GreaterThanEqual(date, int32(19322))},
+		{iceberg.EqualTo(ref, "2022-11-27"), iceberg.EqualTo(date, int32(19323))},
+		{iceberg.NotEqualTo(ref, "2022-11-27"), iceberg.AlwaysTrue{}},
+		{iceberg.IsIn(ref, "2022-11-27", "2022-11-26"), iceberg.IsIn(date, int32(19322), 19323)},
+		{iceberg.NotIn(ref, "2022-11-27", "2022-11-26"), iceberg.AlwaysTrue{}},
+	}
+
+	project := newInclusiveProjection(schema, spec, true)
+	for _, tt := range tests {
+		p.Run(tt.pred.String(), func() {
+			expr, err := project(tt.pred)
+			p.Require().NoError(err)
+			p.Truef(tt.expected.Equals(expr), "expected: %s\ngot: %s", tt.expected, expr)
+		})
+	}
+}
+
+func (p *ProjectionTestSuite) TestStringTruncateProjection() {
+	schema, spec := p.schema(), p.truncateStrSpec()
+
+	ref, truncStr := iceberg.Reference("data"), iceberg.Reference("data_trunc")
+	tests := []struct {
+		pred, expected iceberg.BooleanExpression
+	}{
+		{iceberg.NotNull(ref), iceberg.NotNull(truncStr)},
+		{iceberg.IsNull(ref), iceberg.IsNull(truncStr)},
+		{iceberg.LessThan(ref, "aaa"), iceberg.LessThanEqual(truncStr, "aa")},
+		{iceberg.LessThanEqual(ref, "aaa"), iceberg.LessThanEqual(truncStr, "aa")},
+		{iceberg.GreaterThan(ref, "aaa"), iceberg.GreaterThanEqual(truncStr, "aa")},
+		{iceberg.GreaterThanEqual(ref, "aaa"), iceberg.GreaterThanEqual(truncStr, "aa")},
+		{iceberg.EqualTo(ref, "aaa"), iceberg.EqualTo(truncStr, "aa")},
+		{iceberg.NotEqualTo(ref, "aaa"), iceberg.AlwaysTrue{}},
+		{iceberg.IsIn(ref, "aaa", "aab"), iceberg.EqualTo(truncStr, "aa")},
+		{iceberg.NotIn(ref, "aaa", "aab"), iceberg.AlwaysTrue{}},
+		{iceberg.NotStartsWith(ref, "a"), iceberg.NotStartsWith(truncStr, "a")},
+		{iceberg.NotStartsWith(ref, "aa"), iceberg.NotEqualTo(truncStr, "aa")},
+		{iceberg.NotStartsWith(ref, "aaa"), iceberg.AlwaysTrue{}},
+		{iceberg.NotStartsWith(ref, "é"), iceberg.NotStartsWith(truncStr, "é")},
+		{iceberg.NotStartsWith(ref, "éé"), iceberg.NotEqualTo(truncStr, "éé")},
+		{iceberg.NotStartsWith(ref, "ééa"), iceberg.AlwaysTrue{}},
+	}
+
+	project := newInclusiveProjection(schema, spec, true)
+	for _, tt := range tests {
+		p.Run(tt.pred.String(), func() {
+			expr, err := project(tt.pred)
+			p.Require().NoError(err)
+			p.Truef(tt.expected.Equals(expr), "expected: %s\ngot: %s", tt.expected, expr)
+		})
+	}
+}
+
+func (p *ProjectionTestSuite) TestBinaryTruncateProjection() {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "data", Type: iceberg.PrimitiveTypes.Binary},
+	)
+	spec := iceberg.NewPartitionSpec(
+		iceberg.PartitionField{
+			SourceIDs: []int{1}, FieldID: 1000,
+			Transform: iceberg.TruncateTransform{Width: 2}, Name: "data_trunc",
+		},
+	)
+
+	ref, truncBin := iceberg.Reference("data"), iceberg.Reference("data_trunc")
+	notStartsWith := func(t iceberg.UnboundTerm, v string) iceberg.BooleanExpression {
+		return iceberg.LiteralPredicate(iceberg.OpNotStartsWith, t, iceberg.NewLiteral([]byte(v)))
+	}
+	tests := []struct {
+		pred, expected iceberg.BooleanExpression
+	}{
+		{iceberg.NotNull(ref), iceberg.NotNull(truncBin)},
+		{iceberg.IsNull(ref), iceberg.IsNull(truncBin)},
+		{iceberg.LessThan(ref, []byte("aaa")), iceberg.LessThanEqual(truncBin, []byte("aa"))},
+		{iceberg.LessThanEqual(ref, []byte("aaa")), iceberg.LessThanEqual(truncBin, []byte("aa"))},
+		{iceberg.GreaterThan(ref, []byte("aaa")), iceberg.GreaterThanEqual(truncBin, []byte("aa"))},
+		{iceberg.GreaterThanEqual(ref, []byte("aaa")), iceberg.GreaterThanEqual(truncBin, []byte("aa"))},
+		{iceberg.EqualTo(ref, []byte("aaa")), iceberg.EqualTo(truncBin, []byte("aa"))},
+		{iceberg.NotEqualTo(ref, []byte("aaa")), iceberg.AlwaysTrue{}},
+		{iceberg.IsIn(ref, []byte("aaa"), []byte("aab")), iceberg.EqualTo(truncBin, []byte("aa"))},
+		{iceberg.NotIn(ref, []byte("aaa"), []byte("aab")), iceberg.AlwaysTrue{}},
+		// prefix shorter than width: keep NOT STARTS WITH on the truncated field.
+		{notStartsWith(ref, "a"), notStartsWith(truncBin, "a")},
+		// prefix exactly the width: equivalent to != on the partition value.
+		{notStartsWith(ref, "aa"), iceberg.NotEqualTo(truncBin, []byte("aa"))},
+		// prefix longer than width: not projectable, must not prune.
+		{notStartsWith(ref, "aaa"), iceberg.AlwaysTrue{}},
+	}
+
+	project := newInclusiveProjection(schema, spec, true)
+	for _, tt := range tests {
+		p.Run(tt.pred.String(), func() {
+			expr, err := project(tt.pred)
+			p.Require().NoError(err)
+			p.Truef(tt.expected.Equals(expr), "expected: %s\ngot: %s", tt.expected, expr)
+		})
+	}
+}
+
+func (p *ProjectionTestSuite) TestIntTruncateProjection() {
+	schema, spec := p.schema(), p.truncateIntSpec()
+
+	ref, idTrunc := iceberg.Reference("id"), iceberg.Reference("id_trunc")
+	tests := []struct {
+		pred, expected iceberg.BooleanExpression
+	}{
+		{iceberg.NotNull(ref), iceberg.NotNull(idTrunc)},
+		{iceberg.IsNull(ref), iceberg.IsNull(idTrunc)},
+		{iceberg.LessThan(ref, int32(10)), iceberg.LessThanEqual(idTrunc, int64(0))},
+		{iceberg.LessThanEqual(ref, int32(10)), iceberg.LessThanEqual(idTrunc, int64(10))},
+		{iceberg.GreaterThan(ref, int32(9)), iceberg.GreaterThanEqual(idTrunc, int64(10))},
+		{iceberg.GreaterThanEqual(ref, int32(10)), iceberg.GreaterThanEqual(idTrunc, int64(10))},
+		{iceberg.EqualTo(ref, int32(15)), iceberg.EqualTo(idTrunc, int64(10))},
+		{iceberg.NotEqualTo(ref, int32(15)), iceberg.AlwaysTrue{}},
+		{iceberg.IsIn(ref, int32(15), 16), iceberg.EqualTo(idTrunc, int64(10))},
+		{iceberg.NotIn(ref, int32(15), 16), iceberg.AlwaysTrue{}},
+	}
+
+	project := newInclusiveProjection(schema, spec, true)
+	for _, tt := range tests {
+		p.Run(tt.pred.String(), func() {
+			expr, err := project(tt.pred)
+			p.Require().NoError(err)
+			p.Truef(tt.expected.Equals(expr), "expected: %s\ngot: %s", tt.expected, expr)
+		})
+	}
+}
+
+func (p *ProjectionTestSuite) TestProjectionCaseSensitive() {
+	schema, spec := p.schema(), p.idSpec()
+	project := newInclusiveProjection(schema, spec, true)
+	_, err := project(iceberg.NotNull(iceberg.Reference("ID")))
+	p.ErrorIs(err, iceberg.ErrInvalidSchema)
+	p.ErrorContains(err, "could not bind reference 'ID', caseSensitive=true")
+}
+
+func (p *ProjectionTestSuite) TestProjectionCaseInsensitive() {
+	schema, spec := p.schema(), p.idSpec()
+	project := newInclusiveProjection(schema, spec, false)
+	expr, err := project(iceberg.NotNull(iceberg.Reference("ID")))
+	p.Require().NoError(err)
+	p.True(expr.Equals(iceberg.NotNull(iceberg.Reference("id_part"))))
+}
+
+// Unknown partition transforms must not prune: Project returns nil, which
+// projects to AlwaysTrue.
+func (p *ProjectionTestSuite) TestUnknownTransformProjection() {
+	project := newInclusiveProjection(p.schema(), p.unknownSpec(), true)
+	expr, err := project(iceberg.LessThan(iceberg.Reference("id"), int64(5)))
+	p.Require().NoError(err)
+	p.Equal(iceberg.AlwaysTrue{}, expr)
+}
+
+// An unknown field alongside a usable one must not disable the usable one's
+// pruning, and must not add a term of its own.
+func (p *ProjectionTestSuite) TestMixedSpecUnknownTransformProjection() {
+	spec := p.bucketAndUnknownSpec()
+	project := newInclusiveProjection(p.schema(), spec, true)
+
+	expr, err := project(iceberg.EqualTo(iceberg.Reference("id"), int64(5)))
+	p.Require().NoError(err)
+	p.True(expr.Equals(iceberg.EqualTo(iceberg.Reference("id_bucket"), int32(3))))
+}
+
+func (p *ProjectionTestSuite) TestProjectEmptySpec() {
+	project := newInclusiveProjection(p.schema(), p.emptySpec(), true)
+	expr, err := project(iceberg.NewAnd(iceberg.LessThan(iceberg.Reference("id"), int32(5)),
+		iceberg.NotNull(iceberg.Reference("data"))))
+	p.Require().NoError(err)
+	p.Equal(iceberg.AlwaysTrue{}, expr)
+}
+
+func (p *ProjectionTestSuite) TestAndProjectionMultipleFields() {
+	project := newInclusiveProjection(p.schema(), p.idAndBucketSpec(), true)
+	expr, err := project(iceberg.NewAnd(iceberg.LessThan(iceberg.Reference("id"),
+		int32(5)), iceberg.IsIn(iceberg.Reference("data"), "a", "b", "c")))
+	p.Require().NoError(err)
+
+	p.True(expr.Equals(iceberg.NewAnd(iceberg.LessThan(iceberg.Reference("id_part"), int64(5)),
+		iceberg.IsIn(iceberg.Reference("data_bucket"), int32(2), 3, 15))))
+}
+
+func (p *ProjectionTestSuite) TestOrProjectionMultipleFields() {
+	project := newInclusiveProjection(p.schema(), p.idAndBucketSpec(), true)
+	expr, err := project(iceberg.NewOr(iceberg.LessThan(iceberg.Reference("id"), int32(5)),
+		iceberg.IsIn(iceberg.Reference("data"), "a", "b", "c")))
+	p.Require().NoError(err)
+
+	p.True(expr.Equals(iceberg.NewOr(iceberg.LessThan(iceberg.Reference("id_part"), int64(5)),
+		iceberg.IsIn(iceberg.Reference("data_bucket"), int32(2), 3, 15))))
+}
+
+func (p *ProjectionTestSuite) TestNotProjectionMultipleFields() {
+	project := newInclusiveProjection(p.schema(), p.idAndBucketSpec(), true)
+	// not causes In to be rewritten to NotIn, which cannot be projected
+	expr, err := project(iceberg.NewNot(iceberg.NewOr(iceberg.LessThan(iceberg.Reference("id"), int64(5)),
+		iceberg.IsIn(iceberg.Reference("data"), "a", "b", "c"))))
+	p.Require().NoError(err)
+
+	p.True(expr.Equals(iceberg.GreaterThanEqual(iceberg.Reference("id_part"), int64(5))))
+}
+
+func (p *ProjectionTestSuite) TestPartialProjectedFields() {
+	project := newInclusiveProjection(p.schema(), p.idSpec(), true)
+	expr, err := project(iceberg.NewAnd(iceberg.LessThan(iceberg.Reference("id"), int32(5)),
+		iceberg.IsIn(iceberg.Reference("data"), "a", "b", "c")))
+	p.Require().NoError(err)
+	p.True(expr.Equals(iceberg.LessThan(iceberg.Reference("id_part"), int64(5))))
+}
+
+type mockDataFile struct {
+	path        string
+	contentType iceberg.ManifestEntryContent
+	format      iceberg.FileFormat
+	partition   map[int]any
+	count       int64
+	columnSizes map[int]int64
+	filesize    int64
+	valueCounts map[int]int64
+	nullCounts  map[int]int64
+	nanCounts   map[int]int64
+	lowerBounds map[int][]byte
+	upperBounds map[int][]byte
+
+	specid      int32
+	sortOrderID *int
+}
+
+func (m *mockDataFile) ContentType() iceberg.ManifestEntryContent { return m.contentType }
+func (m *mockDataFile) FilePath() string                          { return m.path }
+func (m *mockDataFile) FileFormat() iceberg.FileFormat            { return m.format }
+func (m *mockDataFile) Partition() map[int]any                    { return m.partition }
+func (m *mockDataFile) Count() int64                              { return m.count }
+func (m *mockDataFile) FileSizeBytes() int64                      { return m.filesize }
+func (m *mockDataFile) ColumnSizes() map[int]int64                { return m.columnSizes }
+func (m *mockDataFile) ValueCounts() map[int]int64                { return m.valueCounts }
+func (m *mockDataFile) NullValueCounts() map[int]int64            { return m.nullCounts }
+func (m *mockDataFile) NaNValueCounts() map[int]int64             { return m.nanCounts }
+func (*mockDataFile) DistinctValueCounts() map[int]int64          { return nil }
+func (m *mockDataFile) LowerBoundValues() map[int][]byte          { return m.lowerBounds }
+func (m *mockDataFile) UpperBoundValues() map[int][]byte          { return m.upperBounds }
+func (*mockDataFile) KeyMetadata() []byte                         { return nil }
+func (*mockDataFile) SplitOffsets() []int64                       { return nil }
+func (*mockDataFile) EqualityFieldIDs() []int                     { return nil }
+func (m *mockDataFile) SortOrderID() *int                         { return m.sortOrderID }
+func (m *mockDataFile) SpecID() int32                             { return m.specid }
+func (*mockDataFile) FirstRowID() *int64                          { return nil }
+func (*mockDataFile) ReferencedDataFile() *string                 { return nil }
+func (*mockDataFile) ContentOffset() *int64                       { return nil }
+func (*mockDataFile) ContentSizeInBytes() *int64                  { return nil }
+
+type InclusiveMetricsTestSuite struct {
+	suite.Suite
+
+	schemaDataFile *iceberg.Schema
+	dataFiles      [4]iceberg.DataFile
+
+	schemaDataFileNan *iceberg.Schema
+	dataFileNan       iceberg.DataFile
+}
+
+func (suite *InclusiveMetricsTestSuite) SetupSuite() {
+	suite.schemaDataFile = iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "no_stats", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+		iceberg.NestedField{ID: 3, Name: "required", Type: iceberg.PrimitiveTypes.String, Required: true},
+		iceberg.NestedField{ID: 4, Name: "all_nulls", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 5, Name: "some_nulls", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 6, Name: "no_nulls", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 7, Name: "all_nans", Type: iceberg.PrimitiveTypes.Float64},
+		iceberg.NestedField{ID: 8, Name: "some_nans", Type: iceberg.PrimitiveTypes.Float32},
+		iceberg.NestedField{ID: 9, Name: "no_nans", Type: iceberg.PrimitiveTypes.Float32},
+		iceberg.NestedField{ID: 10, Name: "all_nulls_double", Type: iceberg.PrimitiveTypes.Float64},
+		iceberg.NestedField{ID: 11, Name: "all_nans_v1_stats", Type: iceberg.PrimitiveTypes.Float32},
+		iceberg.NestedField{ID: 12, Name: "nan_and_null_only", Type: iceberg.PrimitiveTypes.Float64},
+		iceberg.NestedField{ID: 13, Name: "no_nan_stats", Type: iceberg.PrimitiveTypes.Float64},
+		iceberg.NestedField{ID: 14, Name: "some_empty", Type: iceberg.PrimitiveTypes.String},
+	)
+
+	var (
+		IntMin, _   = iceberg.Int32Literal(IntMinValue).MarshalBinary()
+		IntMax, _   = iceberg.Int32Literal(IntMaxValue).MarshalBinary()
+		FltNan, _   = iceberg.Float32Literal(float32(math.NaN())).MarshalBinary()
+		DblNan, _   = iceberg.Float64Literal(math.NaN()).MarshalBinary()
+		FltSeven, _ = iceberg.Float32Literal(7).MarshalBinary()
+		DblSeven, _ = iceberg.Float64Literal(7).MarshalBinary()
+		FltMax, _   = iceberg.Float32Literal(22).MarshalBinary()
+	)
+
+	suite.dataFiles = [4]iceberg.DataFile{
+		&mockDataFile{
+			path:     "file_1.parquet",
+			format:   iceberg.ParquetFile,
+			count:    50,
+			filesize: 3,
+			valueCounts: map[int]int64{
+				4: 50, 5: 50, 6: 50, 7: 50, 8: 50, 9: 50,
+				10: 50, 11: 50, 12: 50, 13: 50, 14: 50,
+			},
+			nullCounts: map[int]int64{4: 50, 5: 10, 6: 0, 10: 50, 11: 0, 12: 1, 14: 8},
+			nanCounts:  map[int]int64{7: 50, 8: 10, 9: 0},
+			lowerBounds: map[int][]byte{
+				1:  IntMin,
+				11: FltNan,
+				12: DblNan,
+				14: {},
+			},
+			upperBounds: map[int][]byte{
+				1:  IntMax,
+				11: FltNan,
+				12: DblNan,
+				14: []byte("房东整租霍营小区二层两居室"),
+			},
+		},
+		&mockDataFile{
+			path:        "file_2.parquet",
+			format:      iceberg.ParquetFile,
+			count:       50,
+			filesize:    3,
+			valueCounts: map[int]int64{3: 20},
+			nullCounts:  map[int]int64{3: 2},
+			nanCounts:   nil,
+			lowerBounds: map[int][]byte{3: {'a', 'a'}},
+			upperBounds: map[int][]byte{3: {'d', 'C'}},
+		},
+		&mockDataFile{
+			path:        "file_3.parquet",
+			format:      iceberg.ParquetFile,
+			count:       50,
+			filesize:    3,
+			valueCounts: map[int]int64{3: 20},
+			nullCounts:  map[int]int64{3: 2},
+			nanCounts:   nil,
+			lowerBounds: map[int][]byte{3: []byte("1str1")},
+			upperBounds: map[int][]byte{3: []byte("3str3")},
+		},
+		&mockDataFile{
+			path:        "file_4.parquet",
+			format:      iceberg.ParquetFile,
+			count:       50,
+			filesize:    3,
+			valueCounts: map[int]int64{3: 20},
+			nullCounts:  map[int]int64{3: 2},
+			nanCounts:   nil,
+			lowerBounds: map[int][]byte{3: []byte("abc")},
+			upperBounds: map[int][]byte{3: []byte("イロハニホヘト")},
+		},
+	}
+
+	suite.schemaDataFileNan = iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "all_nan", Type: iceberg.PrimitiveTypes.Float64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "max_nan", Type: iceberg.PrimitiveTypes.Float64, Required: true},
+		iceberg.NestedField{ID: 3, Name: "min_max_nan", Type: iceberg.PrimitiveTypes.Float32},
+		iceberg.NestedField{ID: 4, Name: "all_nan_null_bounds", Type: iceberg.PrimitiveTypes.Float64, Required: true},
+		iceberg.NestedField{ID: 5, Name: "some_nan_correct_bounds", Type: iceberg.PrimitiveTypes.Float32},
+	)
+
+	suite.dataFileNan = &mockDataFile{
+		path:        "file.avro",
+		format:      iceberg.AvroFile,
+		count:       50,
+		filesize:    3,
+		columnSizes: map[int]int64{1: 10, 2: 10, 3: 10, 4: 10, 5: 10},
+		valueCounts: map[int]int64{1: 10, 2: 10, 3: 10, 4: 10, 5: 10},
+		nullCounts:  map[int]int64{1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+		nanCounts:   map[int]int64{1: 10, 4: 10, 5: 5},
+		lowerBounds: map[int][]byte{
+			1: DblNan,
+			2: DblSeven,
+			3: FltNan,
+			5: FltSeven,
+		},
+		upperBounds: map[int][]byte{
+			1: DblNan,
+			2: DblNan,
+			3: FltNan,
+			5: FltMax,
+		},
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestAllNull() {
+	allNull, someNull, noNull := iceberg.Reference("all_nulls"), iceberg.Reference("some_nulls"), iceberg.Reference("no_nulls")
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NotNull(allNull), false, "should skip: no non-null value in all null column"},
+		{iceberg.LessThan(allNull, "a"), false, "should skip: lessThan on all null column"},
+		{iceberg.LessThanEqual(allNull, "a"), false, "should skip: lessThanEqual on all null column"},
+		{iceberg.GreaterThan(allNull, "a"), false, "should skip: greaterThan on all null column"},
+		{iceberg.GreaterThanEqual(allNull, "a"), false, "should skip: greaterThanEqual on all null column"},
+		{iceberg.EqualTo(allNull, "a"), false, "should skip: equal on all null column"},
+		{iceberg.NotNull(someNull), true, "should read: column with some nulls contains a non-null value"},
+		{iceberg.NotNull(noNull), true, "should read: non-null column contains a non-null value"},
+		{iceberg.StartsWith(allNull, "asad"), false, "should skip: starts with on all null column"},
+		{iceberg.NotStartsWith(allNull, "asad"), true, "should read: notStartsWith on all null column"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestNoNulls() {
+	allNull, someNull, noNull := iceberg.Reference("all_nulls"), iceberg.Reference("some_nulls"), iceberg.Reference("no_nulls")
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.IsNull(allNull), true, "should read: at least one null value in all null column"},
+		{iceberg.IsNull(someNull), true, "should read: column with some nulls contains a null value"},
+		{iceberg.IsNull(noNull), false, "should skip: non-null column contains no null values"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestIsNan() {
+	allNan, someNan, noNan := iceberg.Reference("all_nans"), iceberg.Reference("some_nans"), iceberg.Reference("no_nans")
+	allNullsDbl, noNanStats := iceberg.Reference("all_nulls_double"), iceberg.Reference("no_nan_stats")
+	allNansV1, nanNullOnly := iceberg.Reference("all_nans_v1_stats"), iceberg.Reference("nan_and_null_only")
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.IsNaN(allNan), true, "should read: at least one nan value in all nan column"},
+		{iceberg.IsNaN(someNan), true, "should read: at least one nan value in some nan column"},
+		{iceberg.IsNaN(noNan), false, "should skip: no-nans column has no nans"},
+		{iceberg.IsNaN(allNullsDbl), false, "should skip: all-null column doesn't contain nan values"},
+		{iceberg.IsNaN(noNanStats), true, "should read: no guarantee if contains nan without stats"},
+		{iceberg.IsNaN(allNansV1), true, "should read: at least one nan value in all nan column"},
+		{iceberg.IsNaN(nanNullOnly), true, "should read: at least one nan value in nan and nulls only column"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestNotNaN() {
+	allNan, someNan, noNan := iceberg.Reference("all_nans"), iceberg.Reference("some_nans"), iceberg.Reference("no_nans")
+	allNullsDbl, noNanStats := iceberg.Reference("all_nulls_double"), iceberg.Reference("no_nan_stats")
+	allNansV1, nanNullOnly := iceberg.Reference("all_nans_v1_stats"), iceberg.Reference("nan_and_null_only")
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NotNaN(allNan), false, "should skip: column with all nans will not contain non-nan"},
+		{iceberg.NotNaN(someNan), true, "should read: at least one non-nan value in some nan column"},
+		{iceberg.NotNaN(noNan), true, "should read: at least one non-nan value in no nan column"},
+		{iceberg.NotNaN(allNullsDbl), true, "should read: at least one non-nan value in all null column"},
+		{iceberg.NotNaN(noNanStats), true, "should read: no guarantee if contains nan without stats"},
+		{iceberg.NotNaN(allNansV1), true, "should read: no guarantee"},
+		{iceberg.NotNaN(nanNullOnly), true, "should read: at least one null value in nan and nulls only column"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestRequiredColumn() {
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NotNull(iceberg.Reference("required")), true, "should read: required columns are always non-null"},
+		{iceberg.IsNull(iceberg.Reference("required")), false, "should skip: required columns are always non-null"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestMissingColumn() {
+	_, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, iceberg.LessThan(iceberg.Reference("missing"), int32(22)), true, true)
+	suite.ErrorIs(err, iceberg.ErrInvalidSchema)
+}
+
+func (suite *InclusiveMetricsTestSuite) TestMissingStats() {
+	noStatsSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 2, Name: "no_stats", Type: iceberg.PrimitiveTypes.Float64})
+
+	noStatsFile := &mockDataFile{
+		path:   "file_1.parquet",
+		format: iceberg.ParquetFile,
+		count:  50,
+	}
+
+	ref := iceberg.Reference("no_stats")
+	tests := []iceberg.BooleanExpression{
+		iceberg.LessThan(ref, int32(5)),
+		iceberg.LessThanEqual(ref, int32(30)),
+		iceberg.EqualTo(ref, int32(70)),
+		iceberg.GreaterThan(ref, int32(78)),
+		iceberg.GreaterThanEqual(ref, int32(90)),
+		iceberg.NotEqualTo(ref, int32(101)),
+		iceberg.IsNull(ref),
+		iceberg.NotNull(ref),
+		iceberg.IsNaN(ref),
+		iceberg.NotNaN(ref),
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(noStatsSchema, tt, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(noStatsFile)
+			suite.Require().NoError(err)
+			suite.True(shouldRead, "should read when stats are missing")
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestZeroRecordFileStats() {
+	zeroRecordFile := &mockDataFile{
+		path:   "file_1.parquet",
+		format: iceberg.ParquetFile,
+		count:  0,
+	}
+
+	ref := iceberg.Reference("no_stats")
+	tests := []iceberg.BooleanExpression{
+		iceberg.LessThan(ref, int32(5)),
+		iceberg.LessThanEqual(ref, int32(30)),
+		iceberg.EqualTo(ref, int32(70)),
+		iceberg.GreaterThan(ref, int32(78)),
+		iceberg.GreaterThanEqual(ref, int32(90)),
+		iceberg.NotEqualTo(ref, int32(101)),
+		iceberg.IsNull(ref),
+		iceberg.NotNull(ref),
+		iceberg.IsNaN(ref),
+		iceberg.NotNaN(ref),
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt, true, false)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(zeroRecordFile)
+			suite.Require().NoError(err)
+			suite.False(shouldRead, "should skip datafile without records")
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestNot() {
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NewNot(iceberg.LessThan(iceberg.Reference("id"), IntMinValue-25)), true, "should read: not(false)"},
+		{iceberg.NewNot(iceberg.GreaterThan(iceberg.Reference("id"), IntMinValue-25)), false, "should skip: not(true)"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestAnd() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NewAnd(
+			iceberg.LessThan(ref, IntMinValue-25),
+			iceberg.GreaterThanEqual(ref, IntMinValue-30)), false, "should skip: and(false, true)"},
+		{iceberg.NewAnd(
+			iceberg.LessThan(ref, IntMinValue-25),
+			iceberg.GreaterThanEqual(ref, IntMinValue+1)), false, "should skip: and(false, false)"},
+		{iceberg.NewAnd(
+			iceberg.GreaterThan(ref, IntMinValue-25),
+			iceberg.LessThanEqual(ref, IntMinValue)), true, "should read: and(true, true)"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestOr() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NewOr(
+			iceberg.LessThan(ref, IntMinValue-25),
+			iceberg.GreaterThanEqual(ref, IntMaxValue+1)), false, "should skip: or(false, false)"},
+		{iceberg.NewOr(
+			iceberg.LessThan(ref, IntMinValue-25),
+			iceberg.GreaterThanEqual(ref, IntMaxValue-19)), true, "should read: or(false, true)"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestIntLt() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.LessThan(ref, IntMinValue-25), false, "should skip: id range below lower bound (5 < 30)"},
+		{iceberg.LessThan(ref, IntMinValue), false, "should skip: id range below lower bound (30 is not < 30)"},
+		{iceberg.LessThan(ref, IntMinValue+1), true, "should read: one possible id"},
+		{iceberg.LessThan(ref, IntMaxValue), true, "should read: many possible ids"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestIntLtEq() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.LessThanEqual(ref, IntMinValue-25), false, "should skip: id range below lower bound (5 < 30)"},
+		{iceberg.LessThanEqual(ref, IntMinValue-1), false, "should skip: id range below lower bound (29 is not <= 30)"},
+		{iceberg.LessThanEqual(ref, IntMinValue), true, "should read: one possible id"},
+		{iceberg.LessThanEqual(ref, IntMaxValue), true, "should read: many possible ids"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestIntGt() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.GreaterThan(ref, IntMaxValue+6), false, "should skip: id range above upper bound (85 > 79)"},
+		{iceberg.GreaterThan(ref, IntMaxValue), false, "should skip: id range above upper bound (79 is not > 79)"},
+		{iceberg.GreaterThan(ref, IntMinValue-1), true, "should read: one possible id"},
+		{iceberg.GreaterThan(ref, IntMaxValue-4), true, "should read: many possible ids"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestIntGtEq() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.GreaterThanEqual(ref, IntMaxValue+6), false, "should skip: id range above upper bound (85 < 79)"},
+		{iceberg.GreaterThanEqual(ref, IntMaxValue+1), false, "should skip: id range above upper bound (80 > 79)"},
+		{iceberg.GreaterThanEqual(ref, IntMaxValue), true, "should read: one possible id"},
+		{iceberg.GreaterThanEqual(ref, IntMaxValue-4), true, "should read: many possible ids"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestIntEq() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.EqualTo(ref, IntMinValue-25), false, "should skip: id range below lower bound"},
+		{iceberg.EqualTo(ref, IntMinValue-1), false, "should skip: id range below lower bound"},
+		{iceberg.EqualTo(ref, IntMinValue), true, "should read: id equal to lower bound"},
+		{iceberg.EqualTo(ref, IntMaxValue-4), true, "should read: id between lower and upper bounds"},
+		{iceberg.EqualTo(ref, IntMaxValue), true, "should read: id equal to upper bound"},
+		{iceberg.EqualTo(ref, IntMaxValue+1), false, "should skip: id above upper bound"},
+		{iceberg.EqualTo(ref, IntMaxValue+6), false, "should skip: id above upper bound"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestIntNeq() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NotEqualTo(ref, IntMinValue-25), true, "should read: id range below lower bound"},
+		{iceberg.NotEqualTo(ref, IntMinValue-1), true, "should read: id range below lower bound"},
+		{iceberg.NotEqualTo(ref, IntMinValue), true, "should read: id equal to lower bound"},
+		{iceberg.NotEqualTo(ref, IntMaxValue-4), true, "should read: id between lower and upper bounds"},
+		{iceberg.NotEqualTo(ref, IntMaxValue), true, "should read: id equal to upper bound"},
+		{iceberg.NotEqualTo(ref, IntMaxValue+1), true, "should read: id above upper bound"},
+		{iceberg.NotEqualTo(ref, IntMaxValue+6), true, "should read: id above upper bound"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestIntNeqRewritten() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.EqualTo(ref, IntMinValue-25), true, "should read: id range below lower bound"},
+		{iceberg.EqualTo(ref, IntMinValue-1), true, "should read: id range below lower bound"},
+		{iceberg.EqualTo(ref, IntMinValue), true, "should read: id equal to lower bound"},
+		{iceberg.EqualTo(ref, IntMaxValue-4), true, "should read: id between lower and upper bounds"},
+		{iceberg.EqualTo(ref, IntMaxValue), true, "should read: id equal to upper bound"},
+		{iceberg.EqualTo(ref, IntMaxValue+1), true, "should read: id above upper bound"},
+		{iceberg.EqualTo(ref, IntMaxValue+6), true, "should read: id above upper bound"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, iceberg.NewNot(tt.expr), true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestIntNeqRewrittenCaseInsensitive() {
+	ref := iceberg.Reference("ID")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.EqualTo(ref, IntMinValue-25), true, "should read: id range below lower bound"},
+		{iceberg.EqualTo(ref, IntMinValue-1), true, "should read: id range below lower bound"},
+		{iceberg.EqualTo(ref, IntMinValue), true, "should read: id equal to lower bound"},
+		{iceberg.EqualTo(ref, IntMaxValue-4), true, "should read: id between lower and upper bounds"},
+		{iceberg.EqualTo(ref, IntMaxValue), true, "should read: id equal to upper bound"},
+		{iceberg.EqualTo(ref, IntMaxValue+1), true, "should read: id above upper bound"},
+		{iceberg.EqualTo(ref, IntMaxValue+6), true, "should read: id above upper bound"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, iceberg.NewNot(tt.expr), false, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestInMetrics() {
+	ref := iceberg.Reference("id")
+
+	ids := make([]int32, 400)
+	for i := range ids {
+		ids[i] = int32(i)
+	}
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.IsIn(ref, IntMinValue-25, IntMinValue-24), false, "should skip: id below lower bound"},
+		{iceberg.IsIn(ref, IntMinValue-2, IntMinValue-1), false, "should skip: id below lower bound"},
+		{iceberg.IsIn(ref, IntMinValue-1, IntMinValue), true, "should read: id equal to lower bound"},
+		{iceberg.IsIn(ref, IntMaxValue-4, IntMaxValue-3), true, "should read: id between upper and lower bounds"},
+		{iceberg.IsIn(ref, IntMaxValue, IntMaxValue+1), true, "should read: id equal to upper bound"},
+		{iceberg.IsIn(ref, int64(IntMaxValue), int64(math.MaxInt32)+1), true, "should read: ignore value outside int32 range"},
+		{iceberg.IsIn(ref, IntMaxValue+1, IntMaxValue+2), false, "should skip: id above upper bound"},
+		{iceberg.IsIn(ref, IntMaxValue+6, IntMaxValue+7), false, "should skip: id above upper bound"},
+		{iceberg.IsIn(iceberg.Reference("all_nulls"), "abc", "def"), false, "should skip: in on all nulls column"},
+		{iceberg.IsIn(iceberg.Reference("some_nulls"), "abc", "def"), true, "should read: in on some nulls column"},
+		{iceberg.IsIn(iceberg.Reference("no_nulls"), "abc", "def"), true, "should read: in on no nulls column"},
+		{iceberg.IsIn(ref, ids...), true, "should read: large in expression"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestNotInMetrics() {
+	ref := iceberg.Reference("id")
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NotIn(ref, IntMinValue-25, IntMinValue-24), true, "should read: id below lower bound"},
+		{iceberg.NotIn(ref, IntMinValue-2, IntMinValue-1), true, "should read: id below lower bound"},
+		{iceberg.NotIn(ref, IntMinValue-1, IntMinValue), true, "should read: id equal to lower bound"},
+		{iceberg.NotIn(ref, IntMaxValue-4, IntMaxValue-3), true, "should read: id between upper and lower bounds"},
+		{iceberg.NotIn(ref, IntMaxValue, IntMaxValue+1), true, "should read: id equal to upper bound"},
+		{iceberg.NotIn(ref, IntMaxValue+1, IntMaxValue+2), true, "should read: id above upper bound"},
+		{iceberg.NotIn(ref, IntMaxValue+6, IntMaxValue+7), true, "should read: id above upper bound"},
+		{iceberg.NotIn(iceberg.Reference("all_nulls"), "abc", "def"), true, "should read: in on all nulls column"},
+		{iceberg.NotIn(iceberg.Reference("some_nulls"), "abc", "def"), true, "should read: in on some nulls column"},
+		{iceberg.NotIn(iceberg.Reference("no_nulls"), "abc", "def"), true, "should read: in on no nulls column"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestLessAndLessEqualNans() {
+	type Op func(iceberg.UnboundTerm, int32) iceberg.UnboundPredicate
+	for _, operator := range []Op{iceberg.LessThan[int32], iceberg.LessThanEqual[int32]} {
+		tests := []struct {
+			expr     iceberg.BooleanExpression
+			expected bool
+			msg      string
+		}{
+			{operator(iceberg.Reference("all_nan"), int32(1)), false, "should skip: all nan column doesn't contain number"},
+			{operator(iceberg.Reference("max_nan"), int32(1)), false, "should skip: 1 is smaller than lower bound"},
+			{operator(iceberg.Reference("max_nan"), int32(10)), true, "should read: 10 is larger than lower bound"},
+			{operator(iceberg.Reference("min_max_nan"), int32(1)), true, "should read: no visibility"},
+			{operator(iceberg.Reference("all_nan_null_bounds"), int32(1)), false, "should skip: all nan column doesn't contain number"},
+			{operator(iceberg.Reference("some_nan_correct_bounds"), int32(1)), false, "should skip: 1 is smaller than lower bound"},
+			{operator(iceberg.Reference("some_nan_correct_bounds"), int32(10)), true, "should read: 10 is larger than lower bound"},
+		}
+
+		for _, tt := range tests {
+			suite.Run(tt.expr.String(), func() {
+				eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFileNan, tt.expr, true, true)
+				suite.Require().NoError(err)
+				shouldRead, err := eval(suite.dataFileNan)
+				suite.Require().NoError(err)
+				suite.Equal(tt.expected, shouldRead, tt.msg)
+			})
+		}
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestGreaterAndGreaterEqualNans() {
+	type Op func(iceberg.UnboundTerm, int32) iceberg.UnboundPredicate
+	for _, operator := range []Op{iceberg.GreaterThan[int32], iceberg.GreaterThanEqual[int32]} {
+		tests := []struct {
+			expr     iceberg.BooleanExpression
+			expected bool
+			msg      string
+		}{
+			{operator(iceberg.Reference("all_nan"), int32(1)), false, "should skip: all nan column doesn't contain number"},
+			{operator(iceberg.Reference("max_nan"), int32(1)), true, "should read: upper bound is larger than 1"},
+			{operator(iceberg.Reference("max_nan"), int32(10)), true, "should read: 10 is smaller than upper bound"},
+			{operator(iceberg.Reference("min_max_nan"), int32(1)), true, "should read: no visibility"},
+			{operator(iceberg.Reference("all_nan_null_bounds"), int32(1)), false, "should skip: all nan column doesn't contain number"},
+			{operator(iceberg.Reference("some_nan_correct_bounds"), int32(1)), true, "should read: 1 is smaller than upper bound"},
+			{operator(iceberg.Reference("some_nan_correct_bounds"), int32(10)), true, "should read: 10 is smaller than upper bound"},
+			{operator(iceberg.Reference("all_nan"), int32(30)), false, "should skip: 30 is larger than upper bound"},
+		}
+
+		for _, tt := range tests {
+			suite.Run(tt.expr.String(), func() {
+				eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFileNan, tt.expr, true, true)
+				suite.Require().NoError(err)
+				shouldRead, err := eval(suite.dataFileNan)
+				suite.Require().NoError(err)
+				suite.Equal(tt.expected, shouldRead, tt.msg)
+			})
+		}
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestEqualsNans() {
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.EqualTo(iceberg.Reference("all_nan"), int32(1)), false, "should skip: all nan column doesn't contain number"},
+		{iceberg.EqualTo(iceberg.Reference("max_nan"), int32(1)), false, "should skip: 1 is smaller than lower bound"},
+		{iceberg.EqualTo(iceberg.Reference("max_nan"), int32(10)), true, "should read: 10 is within bounds"},
+		{iceberg.EqualTo(iceberg.Reference("min_max_nan"), int32(1)), true, "should read: no visibility"},
+		{iceberg.EqualTo(iceberg.Reference("all_nan_null_bounds"), int32(1)), false, "should skip: all nan column doesn't contain number"},
+		{iceberg.EqualTo(iceberg.Reference("some_nan_correct_bounds"), int32(1)), false, "should skip: 1 is smaller than lower bound"},
+		{iceberg.EqualTo(iceberg.Reference("some_nan_correct_bounds"), int32(10)), true, "should read: 10 within bounds"},
+		{iceberg.EqualTo(iceberg.Reference("all_nan"), int32(30)), false, "should skip: 30 is larger than upper bound"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFileNan, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFileNan)
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestNotEqualsNans() {
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NotEqualTo(iceberg.Reference("all_nan"), int32(1)), true, "should read: no visibility"},
+		{iceberg.NotEqualTo(iceberg.Reference("max_nan"), int32(1)), true, "should read: no visibility"},
+		{iceberg.NotEqualTo(iceberg.Reference("max_nan"), int32(10)), true, "should read: no visibility"},
+		{iceberg.NotEqualTo(iceberg.Reference("min_max_nan"), int32(1)), true, "should read: no visibility"},
+		{iceberg.NotEqualTo(iceberg.Reference("all_nan_null_bounds"), int32(1)), true, "should read: no visibility"},
+		{iceberg.NotEqualTo(iceberg.Reference("some_nan_correct_bounds"), int32(1)), true, "should read: no visibility"},
+		{iceberg.NotEqualTo(iceberg.Reference("some_nan_correct_bounds"), int32(10)), true, "should read: no visibility"},
+		{iceberg.NotEqualTo(iceberg.Reference("all_nan"), int32(30)), true, "should read: no visibility"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFileNan, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFileNan)
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestInWithNans() {
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.IsIn(iceberg.Reference("all_nan"), int32(1), 10, 30), false, "should skip: all nan column doesn't contain number"},
+		{iceberg.IsIn(iceberg.Reference("max_nan"), int32(1), 10, 30), true, "should read: 10 and 30 are greater than lower bound"},
+		{iceberg.IsIn(iceberg.Reference("min_max_nan"), int32(1), 10, 30), true, "should read: no visibility"},
+		{iceberg.IsIn(iceberg.Reference("all_nan_null_bounds"), int32(1), 10, 30), false, "should skip: all nan column doesn't contain number"},
+		{iceberg.IsIn(iceberg.Reference("some_nan_correct_bounds"), int32(1), 10, 30), true, "should read: 10 within bounds"},
+		{iceberg.IsIn(iceberg.Reference("some_nan_correct_bounds"), int32(1), 30), false, "should skip: 1 and 30 not within bounds"},
+		{iceberg.IsIn(iceberg.Reference("some_nan_correct_bounds"), int32(5), 7), true, "should read: overlap with lower bound"},
+		{iceberg.IsIn(iceberg.Reference("some_nan_correct_bounds"), int32(22), 25), true, "should read: overlap with upper bound"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFileNan, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFileNan)
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestNotInWithNans() {
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NotIn(iceberg.Reference("all_nan"), int32(1), 10, 30), true, "should read: no visibility"},
+		{iceberg.NotIn(iceberg.Reference("max_nan"), int32(1), 10, 30), true, "should read: no visibility"},
+		{iceberg.NotIn(iceberg.Reference("min_max_nan"), int32(1), 10, 30), true, "should read: no visibility"},
+		{iceberg.NotIn(iceberg.Reference("all_nan_null_bounds"), int32(1), 10, 30), true, "should read: no visibility"},
+		{iceberg.NotIn(iceberg.Reference("some_nan_correct_bounds"), int32(1), 10, 30), true, "should read: no visibility"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFileNan, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFileNan)
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestStartsWith() {
+	ref, refEmpty := iceberg.Reference("required"), iceberg.Reference("some_empty")
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		dataFile iceberg.DataFile
+		msg      string
+	}{
+		{iceberg.StartsWith(ref, "a"), true, suite.dataFiles[0], "should read: no stats"},
+		{iceberg.StartsWith(ref, "a"), true, suite.dataFiles[1], "should read: range matches"},
+		{iceberg.StartsWith(ref, "aa"), true, suite.dataFiles[1], "should read: range matches"},
+		{iceberg.StartsWith(ref, "aaa"), true, suite.dataFiles[1], "should read: range matches"},
+		{iceberg.StartsWith(ref, "1s"), true, suite.dataFiles[2], "should read: range matches"},
+		{iceberg.StartsWith(ref, "1str1x"), true, suite.dataFiles[2], "should read: range matches"},
+		{iceberg.StartsWith(ref, "ff"), true, suite.dataFiles[3], "should read: range matches"},
+		{iceberg.StartsWith(ref, "aB"), false, suite.dataFiles[1], "should skip: range doesn't match"},
+		{iceberg.StartsWith(ref, "dWx"), false, suite.dataFiles[1], "should skip: range doesn't match"},
+		{iceberg.StartsWith(ref, "5"), false, suite.dataFiles[2], "should skip: range doesn't match"},
+		{iceberg.StartsWith(ref, "3str3x"), false, suite.dataFiles[2], "should skip: range doesn't match"},
+		{iceberg.StartsWith(refEmpty, "房东整租霍"), true, suite.dataFiles[0], "should read: range matches"},
+		{iceberg.StartsWith(iceberg.Reference("all_nulls"), ""), false, suite.dataFiles[0], "should skip: range doesn't match"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(tt.dataFile)
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *InclusiveMetricsTestSuite) TestNotStartsWith() {
+	ref, refEmpty := iceberg.Reference("required"), iceberg.Reference("some_empty")
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		dataFile iceberg.DataFile
+		msg      string
+	}{
+		{iceberg.NotStartsWith(ref, "a"), true, suite.dataFiles[0], "should read: no stats"},
+		{iceberg.NotStartsWith(ref, "a"), true, suite.dataFiles[1], "should read: range matches"},
+		{iceberg.NotStartsWith(ref, "aa"), true, suite.dataFiles[1], "should read: range matches"},
+		{iceberg.NotStartsWith(ref, "aaa"), true, suite.dataFiles[1], "should read: range matches"},
+		{iceberg.NotStartsWith(ref, "1s"), true, suite.dataFiles[2], "should read: range matches"},
+		{iceberg.NotStartsWith(ref, "1str1x"), true, suite.dataFiles[2], "should read: range matches"},
+		{iceberg.NotStartsWith(ref, "ff"), true, suite.dataFiles[3], "should read: range matches"},
+		{iceberg.NotStartsWith(ref, "aB"), true, suite.dataFiles[1], "should read: range doesn't match"},
+		{iceberg.NotStartsWith(ref, "dWx"), true, suite.dataFiles[1], "should read: range doesn't match"},
+		{iceberg.NotStartsWith(ref, "5"), true, suite.dataFiles[2], "should read: range doesn't match"},
+		{iceberg.NotStartsWith(ref, "3str3x"), true, suite.dataFiles[2], "should read: range doesn't match"},
+		{iceberg.NotStartsWith(refEmpty, "房东整租霍"), true, suite.dataFiles[0], "should read: range matches"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newInclusiveMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(tt.dataFile)
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+type StrictMetricsTestSuite struct {
+	suite.Suite
+
+	schemaDataFile *iceberg.Schema
+	dataFiles      [3]iceberg.DataFile
+
+	schemaDataFileNan *iceberg.Schema
+	dataFileNan       iceberg.DataFile
+}
+
+func (suite *StrictMetricsTestSuite) SetupSuite() {
+	suite.schemaDataFile = iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "no_stats", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+		iceberg.NestedField{ID: 3, Name: "required", Type: iceberg.PrimitiveTypes.String, Required: true},
+		iceberg.NestedField{ID: 4, Name: "all_nulls", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 5, Name: "some_nulls", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 6, Name: "no_nulls", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 7, Name: "always_5", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 8, Name: "all_nans", Type: iceberg.PrimitiveTypes.Float64},
+		iceberg.NestedField{ID: 9, Name: "some_nans", Type: iceberg.PrimitiveTypes.Float32},
+		iceberg.NestedField{ID: 10, Name: "no_nans", Type: iceberg.PrimitiveTypes.Float32},
+		iceberg.NestedField{ID: 11, Name: "all_nulls_double", Type: iceberg.PrimitiveTypes.Float64},
+		iceberg.NestedField{ID: 12, Name: "all_nans_v1_stats", Type: iceberg.PrimitiveTypes.Float32},
+		iceberg.NestedField{ID: 13, Name: "nan_and_null_only", Type: iceberg.PrimitiveTypes.Float64},
+		iceberg.NestedField{ID: 14, Name: "no_nan_stats", Type: iceberg.PrimitiveTypes.Float64},
+	)
+
+	var (
+		IntMin, _   = iceberg.Int32Literal(IntMinValue).MarshalBinary()
+		IntMax, _   = iceberg.Int32Literal(IntMaxValue).MarshalBinary()
+		IntFive, _  = iceberg.Int32Literal(5).MarshalBinary()
+		FltNan, _   = iceberg.Float32Literal(float32(math.NaN())).MarshalBinary()
+		DblNan, _   = iceberg.Float64Literal(math.NaN()).MarshalBinary()
+		FltSeven, _ = iceberg.Float32Literal(7).MarshalBinary()
+		DblSeven, _ = iceberg.Float64Literal(7).MarshalBinary()
+		FltMax, _   = iceberg.Float32Literal(22).MarshalBinary()
+	)
+
+	suite.dataFiles = [3]iceberg.DataFile{
+		&mockDataFile{
+			path:     "file_1.parquet",
+			format:   iceberg.ParquetFile,
+			count:    50,
+			filesize: 3,
+			valueCounts: map[int]int64{
+				4: 50, 5: 50, 6: 50, 8: 50, 9: 50,
+				10: 50, 11: 50, 12: 50, 13: 50, 14: 50,
+			},
+			nullCounts: map[int]int64{4: 50, 5: 10, 6: 0, 7: 0, 11: 50, 12: 0, 13: 1},
+			nanCounts:  map[int]int64{8: 50, 9: 10, 10: 0},
+			lowerBounds: map[int][]byte{
+				1:  IntMin,
+				7:  IntFive,
+				12: FltNan,
+				13: DblNan,
+			},
+			upperBounds: map[int][]byte{
+				1:  IntMax,
+				7:  IntFive,
+				12: FltNan,
+				14: DblNan,
+			},
+		},
+		&mockDataFile{
+			path:        "file_2.parquet",
+			format:      iceberg.ParquetFile,
+			count:       50,
+			filesize:    3,
+			valueCounts: map[int]int64{4: 50, 5: 50, 6: 50, 8: 50},
+			nullCounts:  map[int]int64{4: 50, 5: 10, 6: 0},
+			nanCounts:   nil,
+			lowerBounds: map[int][]byte{5: {'b', 'b', 'b'}},
+			upperBounds: map[int][]byte{5: {'e', 'e', 'e'}},
+		},
+		&mockDataFile{
+			path:        "file_3.parquet",
+			format:      iceberg.ParquetFile,
+			count:       50,
+			filesize:    3,
+			valueCounts: map[int]int64{4: 50, 5: 50, 6: 50},
+			nullCounts:  map[int]int64{4: 50, 5: 10, 6: 0},
+			nanCounts:   nil,
+			lowerBounds: map[int][]byte{5: {'b', 'b', 'b'}},
+			upperBounds: map[int][]byte{5: {'e', 'e', 'e'}},
+		},
+	}
+
+	suite.schemaDataFileNan = iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "all_nan", Type: iceberg.PrimitiveTypes.Float64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "max_nan", Type: iceberg.PrimitiveTypes.Float64, Required: true},
+		iceberg.NestedField{ID: 3, Name: "min_max_nan", Type: iceberg.PrimitiveTypes.Float32},
+		iceberg.NestedField{ID: 4, Name: "all_nan_null_bounds", Type: iceberg.PrimitiveTypes.Float64, Required: true},
+		iceberg.NestedField{ID: 5, Name: "some_nan_correct_bounds", Type: iceberg.PrimitiveTypes.Float32},
+	)
+
+	suite.dataFileNan = &mockDataFile{
+		path:        "file.avro",
+		format:      iceberg.AvroFile,
+		count:       50,
+		filesize:    3,
+		columnSizes: map[int]int64{1: 10, 2: 10, 3: 10, 4: 10, 5: 10},
+		valueCounts: map[int]int64{1: 10, 2: 10, 3: 10, 4: 10, 5: 10},
+		nullCounts:  map[int]int64{1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+		nanCounts:   map[int]int64{1: 10, 4: 10, 5: 5},
+		lowerBounds: map[int][]byte{
+			1: DblNan,
+			2: DblSeven,
+			3: FltNan,
+			5: FltSeven,
+		},
+		upperBounds: map[int][]byte{
+			1: DblNan,
+			2: DblNan,
+			3: FltNan,
+			5: FltMax,
+		},
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestAllNull() {
+	allNull, someNull, noNull := iceberg.Reference("all_nulls"), iceberg.Reference("some_nulls"), iceberg.Reference("no_nulls")
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NotNull(allNull), false, "should skip: no non-null value in all null column"},
+		{iceberg.NotNull(someNull), false, "should skip: column with some nulls contains a non-null value"},
+		{iceberg.NotNull(noNull), true, "should read: non-null column contains no null values"},
+		{iceberg.NotEqualTo(allNull, "a"), true, "should read: notEqual on all nulls column"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestNoNulls() {
+	allNull, someNull, noNull := iceberg.Reference("all_nulls"), iceberg.Reference("some_nulls"), iceberg.Reference("no_nulls")
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.IsNull(allNull), true, "should read: all values are null"},
+		{iceberg.IsNull(someNull), false, "should skip: not all values are null"},
+		{iceberg.IsNull(noNull), false, "should skip: no values are null"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestSomeNulls() {
+	someNull := iceberg.Reference("some_nulls")
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		dataFile int
+		expected bool
+		msg      string
+	}{
+		{iceberg.LessThan(someNull, "ggg"), 1, false, "should skip: some values are null"},
+		{iceberg.LessThanEqual(someNull, "ggg"), 1, false, "should skip: some values are null"},
+		{iceberg.GreaterThan(someNull, "aaa"), 1, false, "should skip: some values are null"},
+		{iceberg.GreaterThanEqual(someNull, "bbb"), 1, false, "should skip: some values are null"},
+		{iceberg.EqualTo(someNull, "bbb"), 2, false, "should skip: some values are null"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[tt.dataFile])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestIsNan() {
+	allNan, someNan, noNan := iceberg.Reference("all_nans"), iceberg.Reference("some_nans"), iceberg.Reference("no_nans")
+	allNullsDbl, noNanStats := iceberg.Reference("all_nulls_double"), iceberg.Reference("no_nan_stats")
+	allNansV1, nanNullOnly := iceberg.Reference("all_nans_v1_stats"), iceberg.Reference("nan_and_null_only")
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.IsNaN(allNan), true, "should read: all values are nan"},
+		{iceberg.IsNaN(someNan), false, "should skip:  at least one non-nan value in some nan column"},
+		{iceberg.IsNaN(noNan), false, "should skip: at least one non-nan value in no nan column"},
+		{iceberg.IsNaN(allNullsDbl), false, "should skip: at least one non-nan value in all null column"},
+		{iceberg.IsNaN(noNanStats), false, "should skip: cannot determine without nan stats"},
+		{iceberg.IsNaN(allNansV1), false, "should skip: cannot determine without nan stats"},
+		{iceberg.IsNaN(nanNullOnly), false, "should skip: null values are not nan"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestNotNaN() {
+	allNan, someNan, noNan := iceberg.Reference("all_nans"), iceberg.Reference("some_nans"), iceberg.Reference("no_nans")
+	allNullsDbl, noNanStats := iceberg.Reference("all_nulls_double"), iceberg.Reference("no_nan_stats")
+	allNansV1, nanNullOnly := iceberg.Reference("all_nans_v1_stats"), iceberg.Reference("nan_and_null_only")
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NotNaN(allNan), false, "should skip: all values are nan"},
+		{iceberg.NotNaN(someNan), false, "should skip: at least one nan value in some nan column"},
+		{iceberg.NotNaN(noNan), true, "should read: no value is nan"},
+		{iceberg.NotNaN(allNullsDbl), true, "should read: no nan value in all null column"},
+		{iceberg.NotNaN(noNanStats), false, "should skip: cannot determine without nan stats"},
+		{iceberg.NotNaN(allNansV1), false, "should skip: all values are nan"},
+		{iceberg.NotNaN(nanNullOnly), false, "should skip: null values are not nan"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestRequiredColumn() {
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NotNull(iceberg.Reference("required")), true, "should read: required columns are always non-null"},
+		{iceberg.IsNull(iceberg.Reference("required")), false, "should skip: required columns are always non-null"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestMissingColumn() {
+	_, err := newStrictMetricsEvaluator(suite.schemaDataFile, iceberg.LessThan(iceberg.Reference("missing"), int32(22)), true, true)
+	suite.ErrorIs(err, iceberg.ErrInvalidSchema)
+}
+
+func (suite *StrictMetricsTestSuite) TestMissingStats() {
+	noStatsSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 2, Name: "no_stats", Type: iceberg.PrimitiveTypes.Float64})
+
+	noStatsFile := &mockDataFile{
+		path:   "file_1.parquet",
+		format: iceberg.ParquetFile,
+		count:  50,
+	}
+
+	ref := iceberg.Reference("no_stats")
+	tests := []iceberg.BooleanExpression{
+		iceberg.LessThan(ref, int32(5)),
+		iceberg.LessThanEqual(ref, int32(30)),
+		iceberg.EqualTo(ref, int32(70)),
+		iceberg.GreaterThan(ref, int32(78)),
+		iceberg.GreaterThanEqual(ref, int32(90)),
+		iceberg.NotEqualTo(ref, int32(101)),
+		iceberg.IsNull(ref),
+		iceberg.NotNull(ref),
+		iceberg.IsNaN(ref),
+		iceberg.NotNaN(ref),
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.String(), func() {
+			eval, err := newStrictMetricsEvaluator(noStatsSchema, tt, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(noStatsFile)
+			suite.Require().NoError(err)
+			suite.False(shouldRead, "should not read when stats are missing")
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestMissingNullCounts() {
+	var (
+		IntOne, _ = iceberg.Int32Literal(1).MarshalBinary()
+		IntTwo, _ = iceberg.Int32Literal(2).MarshalBinary()
+	)
+
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "optional_id", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 2, Name: "required_id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	file := &mockDataFile{
+		path:        "file_1.parquet",
+		format:      iceberg.ParquetFile,
+		count:       2,
+		valueCounts: map[int]int64{1: 2, 2: 2},
+		nullCounts:  map[int]int64{2: 0},
+		lowerBounds: map[int][]byte{1: IntOne, 2: IntOne},
+		upperBounds: map[int][]byte{1: IntTwo, 2: IntTwo},
+	}
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.GreaterThan(iceberg.Reference("optional_id"), int32(0)), false, "should skip: optional field missing null count may contain nulls"},
+		{iceberg.EqualTo(iceberg.Reference("optional_id"), int32(1)), false, "should skip: optional field missing null count may contain nulls"},
+		{iceberg.IsIn(iceberg.Reference("optional_id"), int32(1), int32(2)), false, "should skip: optional field missing null count may contain nulls"},
+		{iceberg.GreaterThan(iceberg.Reference("required_id"), int32(0)), true, "should read: required field cannot contain nulls"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(schema, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(file)
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestMissingNaNCounts() {
+	var (
+		FltOne, _ = iceberg.Float32Literal(1).MarshalBinary()
+		FltTwo, _ = iceberg.Float32Literal(2).MarshalBinary()
+	)
+
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "maybe_nan", Type: iceberg.PrimitiveTypes.Float32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "no_nan", Type: iceberg.PrimitiveTypes.Float32, Required: true},
+	)
+	file := &mockDataFile{
+		path:        "file_1.parquet",
+		format:      iceberg.ParquetFile,
+		count:       2,
+		valueCounts: map[int]int64{1: 2, 2: 2},
+		nullCounts:  map[int]int64{1: 0, 2: 0},
+		nanCounts:   map[int]int64{2: 0},
+		lowerBounds: map[int][]byte{1: FltOne, 2: FltOne},
+		upperBounds: map[int][]byte{1: FltTwo, 2: FltTwo},
+	}
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.GreaterThan(iceberg.Reference("maybe_nan"), float32(0)), false, "should skip: float field missing NaN count may contain NaNs"},
+		{iceberg.GreaterThan(iceberg.Reference("no_nan"), float32(0)), true, "should read: known zero NaN count and bounds prove all values match"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(schema, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(file)
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestNegativePredicatesWithMixedNullsAndNaNs() {
+	var (
+		IntFive, _ = iceberg.Int32Literal(5).MarshalBinary()
+		FltFive, _ = iceberg.Float32Literal(5).MarshalBinary()
+	)
+
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "mixed_nulls", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 2, Name: "all_nulls", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 3, Name: "mixed_nans", Type: iceberg.PrimitiveTypes.Float32, Required: true},
+		iceberg.NestedField{ID: 4, Name: "all_nans", Type: iceberg.PrimitiveTypes.Float32, Required: true},
+	)
+	file := &mockDataFile{
+		path:        "file_1.parquet",
+		format:      iceberg.ParquetFile,
+		count:       2,
+		valueCounts: map[int]int64{1: 2, 2: 2, 3: 2, 4: 2},
+		nullCounts:  map[int]int64{1: 1, 2: 2, 3: 0, 4: 0},
+		nanCounts:   map[int]int64{3: 1, 4: 2},
+		lowerBounds: map[int][]byte{1: IntFive, 3: FltFive},
+		upperBounds: map[int][]byte{1: IntFive, 3: FltFive},
+	}
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NotEqualTo(iceberg.Reference("mixed_nulls"), int32(5)), false, "should skip: mixed nulls do not prove all rows match notEqual"},
+		{iceberg.NotIn(iceberg.Reference("mixed_nulls"), int32(5)), false, "should skip: mixed nulls do not prove all rows match notIn"},
+		{iceberg.NotEqualTo(iceberg.Reference("all_nulls"), int32(5)), true, "should read: all-null column matches notEqual"},
+		{iceberg.NotIn(iceberg.Reference("all_nulls"), int32(5)), true, "should read: all-null column matches notIn"},
+		{iceberg.NotEqualTo(iceberg.Reference("mixed_nans"), float32(5)), false, "should skip: mixed NaNs do not prove all rows match notEqual"},
+		{iceberg.NotIn(iceberg.Reference("mixed_nans"), float32(5)), false, "should skip: mixed NaNs do not prove all rows match notIn"},
+		{iceberg.NotEqualTo(iceberg.Reference("all_nans"), float32(5)), true, "should read: all-NaN column matches notEqual"},
+		{iceberg.NotIn(iceberg.Reference("all_nans"), float32(5)), true, "should read: all-NaN column matches notIn"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(schema, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(file)
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestZeroRecordFileStats() {
+	zeroRecordFile := &mockDataFile{
+		path:   "file_1.parquet",
+		format: iceberg.ParquetFile,
+		count:  0,
+	}
+
+	ref := iceberg.Reference("no_stats")
+	tests := []iceberg.BooleanExpression{
+		iceberg.LessThan(ref, int32(5)),
+		iceberg.LessThanEqual(ref, int32(30)),
+		iceberg.EqualTo(ref, int32(70)),
+		iceberg.GreaterThan(ref, int32(78)),
+		iceberg.GreaterThanEqual(ref, int32(90)),
+		iceberg.NotEqualTo(ref, int32(101)),
+		iceberg.IsNull(ref),
+		iceberg.NotNull(ref),
+		iceberg.IsNaN(ref),
+		iceberg.NotNaN(ref),
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt, true, false)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(zeroRecordFile)
+			suite.Require().NoError(err)
+			suite.True(shouldRead, "should match datafile without records")
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestNot() {
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NewNot(iceberg.LessThan(iceberg.Reference("id"), IntMinValue-25)), true, "should read: not(false)"},
+		{iceberg.NewNot(iceberg.GreaterThan(iceberg.Reference("id"), IntMinValue-25)), false, "should skip: not(true)"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestAnd() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NewAnd(
+			iceberg.GreaterThan(ref, IntMinValue-25),
+			iceberg.LessThanEqual(ref, IntMinValue)), false, "should skip: range may not overlap data"},
+		{iceberg.NewAnd(
+			iceberg.LessThan(ref, IntMinValue-25),
+			iceberg.GreaterThanEqual(ref, IntMinValue-30)), false, "should skip: range does not overlap data"},
+		{iceberg.NewAnd(
+			iceberg.LessThan(ref, IntMaxValue+6),
+			iceberg.GreaterThanEqual(ref, IntMinValue-30)), true, "should match: range includes all data"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestOr() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NewOr(
+			iceberg.LessThan(ref, IntMinValue-25),
+			iceberg.GreaterThanEqual(ref, IntMaxValue+1)), false, "should skip: no matching values"},
+		{iceberg.NewOr(
+			iceberg.LessThan(ref, IntMinValue-25),
+			iceberg.GreaterThanEqual(ref, IntMaxValue-19)), false, "should skip: some values do not match"},
+		{iceberg.NewOr(
+			iceberg.LessThan(ref, IntMinValue-25),
+			iceberg.GreaterThanEqual(ref, IntMinValue)), true, "should match: all values match"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestIntLt() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.LessThan(ref, IntMinValue), false, "should skip: always false"},
+		{iceberg.LessThan(ref, IntMinValue+1), false, "should skip: 32 and greater not in range"},
+		{iceberg.LessThan(ref, IntMaxValue), false, "should skip: 79 not in range"},
+		{iceberg.LessThan(ref, IntMaxValue+1), true, "should read: all values in range"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestIntLtEq() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.LessThanEqual(ref, IntMinValue-1), false, "should skip: always false"},
+		{iceberg.LessThanEqual(ref, IntMinValue), false, "should skip: 31 and greater not in range"},
+		{iceberg.LessThanEqual(ref, IntMaxValue), true, "should read: all values in range"},
+		{iceberg.LessThanEqual(ref, IntMaxValue+1), true, "should read: all values in range"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestIntGt() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.GreaterThan(ref, IntMaxValue), false, "should skip: always false"},
+		{iceberg.GreaterThan(ref, IntMaxValue-1), false, "should skip: 77 and less not in range"},
+		{iceberg.GreaterThan(ref, IntMinValue), false, "should skip: 30 not in range"},
+		{iceberg.GreaterThan(ref, IntMinValue-1), true, "should read: all values in range"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestIntGtEq() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.GreaterThanEqual(ref, IntMaxValue+1), false, "should skip: no values in range"},
+		{iceberg.GreaterThanEqual(ref, IntMaxValue), false, "should skip: 78 and lower are not in range"},
+		{iceberg.GreaterThanEqual(ref, IntMinValue+1), false, "should skip: 30 not in range"},
+		{iceberg.GreaterThanEqual(ref, IntMinValue), true, "should read: all values in range"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestIntEq() {
+	id, alwaysFive := iceberg.Reference("id"), iceberg.Reference("always_5")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.EqualTo(id, IntMinValue-25), false, "should skip: all values != 5"},
+		{iceberg.EqualTo(id, IntMinValue), false, "should skip: some values != 30"},
+		{iceberg.EqualTo(id, IntMinValue-4), false, "should skip: some values != 75"},
+		{iceberg.EqualTo(id, IntMaxValue), false, "should skip: some values != 79"},
+		{iceberg.EqualTo(id, IntMaxValue+1), false, "should skip: some values != 80"},
+		{iceberg.EqualTo(alwaysFive, IntMinValue-25), true, "should read: all values == 5"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestIntNeq() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NotEqualTo(ref, IntMinValue-25), true, "should read: no values == 5"},
+		{iceberg.NotEqualTo(ref, IntMinValue-1), true, "should read: no values == 39"},
+		{iceberg.NotEqualTo(ref, IntMinValue), false, "should skip: some value may be == 30"},
+		{iceberg.NotEqualTo(ref, IntMaxValue-4), false, "should skip: some value may be == 75"},
+		{iceberg.NotEqualTo(ref, IntMaxValue), false, "should skip: some value may be == 79"},
+		{iceberg.NotEqualTo(ref, IntMaxValue+1), true, "should read: no values == 80"},
+		{iceberg.NotEqualTo(ref, IntMaxValue+6), true, "should read: no values == 85"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestIntNeqRewritten() {
+	ref := iceberg.Reference("id")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.EqualTo(ref, IntMinValue-25), true, "should read: no values == 5"},
+		{iceberg.EqualTo(ref, IntMinValue-1), true, "should read: no values == 39"},
+		{iceberg.EqualTo(ref, IntMinValue), false, "should skip: some value may be == 30"},
+		{iceberg.EqualTo(ref, IntMaxValue-4), false, "should skip: some value may be == 75"},
+		{iceberg.EqualTo(ref, IntMaxValue), false, "should skip: some value may be == 79"},
+		{iceberg.EqualTo(ref, IntMaxValue+1), true, "should read: no values == 80"},
+		{iceberg.EqualTo(ref, IntMaxValue+6), true, "should read: no values == 85"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, iceberg.NewNot(tt.expr), true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestIntNeqRewrittenCaseInsensitive() {
+	ref := iceberg.Reference("ID")
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.EqualTo(ref, IntMinValue-25), true, "should read: no values == 5"},
+		{iceberg.EqualTo(ref, IntMinValue-1), true, "should read: no values == 39"},
+		{iceberg.EqualTo(ref, IntMinValue), false, "should skip: some value may be == 30"},
+		{iceberg.EqualTo(ref, IntMaxValue-4), false, "should skip: some value may be == 75"},
+		{iceberg.EqualTo(ref, IntMaxValue), false, "should skip: some value may be == 79"},
+		{iceberg.EqualTo(ref, IntMaxValue+1), true, "should read: no values == 80"},
+		{iceberg.EqualTo(ref, IntMaxValue+6), true, "should read: no values == 85"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, iceberg.NewNot(tt.expr), false, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestInMetrics() {
+	ref := iceberg.Reference("id")
+
+	ids := make([]int32, 400)
+	for i := range ids {
+		ids[i] = int32(i)
+	}
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.IsIn(ref, IntMinValue-25, IntMinValue-24), false, "should skip: all values != 5 and != 6"},
+		{iceberg.IsIn(ref, IntMinValue-1, IntMinValue), false, "should skip: some values != 30 and != 31"},
+		{iceberg.IsIn(ref, IntMaxValue-4, IntMaxValue-3), false, "should skip: some values != 75 and != 76"},
+		{iceberg.IsIn(ref, IntMaxValue, IntMaxValue+1), false, "should skip: some values != 78 and != 79"},
+		{iceberg.IsIn(ref, IntMaxValue+1, IntMaxValue+2), false, "should skip: some values != 80 and != 81"},
+		{iceberg.IsIn(iceberg.Reference("always_5"), int32(5), int32(6)), true, "should read: all values == 5"},
+		{iceberg.IsIn(iceberg.Reference("all_nulls"), "abc", "def"), false, "should skip: in on all nulls column"},
+		{iceberg.IsIn(iceberg.Reference("some_nulls"), "abc", "def"), false, "should skip: in on some nulls column"},
+		{iceberg.IsIn(iceberg.Reference("no_nulls"), "abc", "def"), false, "should skip: in on no nulls column"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func (suite *StrictMetricsTestSuite) TestNotInMetrics() {
+	ref := iceberg.Reference("id")
+
+	tests := []struct {
+		expr     iceberg.BooleanExpression
+		expected bool
+		msg      string
+	}{
+		{iceberg.NotIn(ref, IntMinValue-1, IntMinValue), false, "should skip: some values may be == 30"},
+		{iceberg.NotIn(ref, IntMaxValue-4, IntMaxValue-3), false, "should skip: some value may be == 75 or == 76"},
+		{iceberg.NotIn(ref, IntMaxValue, IntMaxValue+1), false, "should skip: some value may be == 79"},
+		{iceberg.NotIn(ref, int64(IntMaxValue), int64(IntMaxValue-1), int64(math.MaxInt32)+1), false, "should skip: in-range values remain after ignoring value outside int32 range"},
+		{iceberg.NotIn(ref, IntMaxValue+1, IntMaxValue+2), true, "should read: no values == 80 or == 81"},
+		{iceberg.NotIn(iceberg.Reference("always_5"), int32(5), int32(6)), false, "should skip: all values == 5"},
+		{iceberg.NotIn(iceberg.Reference("all_nulls"), "abc", "def"), true, "should read: notIn on all nulls column"},
+		{iceberg.NotIn(iceberg.Reference("some_nulls"), "abc", "def"), false, "should skip: notIn on some nulls column"},
+		{iceberg.NotIn(iceberg.Reference("no_nulls"), "abc", "def"), false, "should read: notIn on no nulls column"},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.expr.String(), func() {
+			eval, err := newStrictMetricsEvaluator(suite.schemaDataFile, tt.expr, true, true)
+			suite.Require().NoError(err)
+			shouldRead, err := eval(suite.dataFiles[0])
+			suite.Require().NoError(err)
+			suite.Equal(tt.expected, shouldRead, tt.msg)
+		})
+	}
+}
+
+func TestEvaluators(t *testing.T) {
+	suite.Run(t, &ProjectionTestSuite{})
+	suite.Run(t, &InclusiveMetricsTestSuite{})
+	suite.Run(t, &StrictMetricsTestSuite{})
+}
+
+func TestMetricsEvaluatorsKeepTransformedTerms(t *testing.T) {
+	categoryMin, err := iceberg.StringLiteral("books").MarshalBinary()
+	require.NoError(t, err)
+	categoryMax := append([]byte(nil), categoryMin...)
+
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "category", Type: iceberg.PrimitiveTypes.String, Required: true},
+	)
+	file := &mockDataFile{
+		count:       1,
+		valueCounts: map[int]int64{1: 1},
+		nullCounts:  map[int]int64{1: 0},
+		lowerBounds: map[int][]byte{1: categoryMin},
+		upperBounds: map[int][]byte{1: categoryMax},
+	}
+	term := iceberg.NewUnboundTransform(iceberg.TruncateTransform{Width: 3}, iceberg.Reference("category"))
+
+	inclusive, err := newInclusiveMetricsEvaluator(schema, iceberg.EqualTo(term, "boo"), true, true)
+	require.NoError(t, err)
+	keep, err := inclusive(file)
+	require.NoError(t, err)
+	assert.True(t, keep)
+
+	strict, err := newStrictMetricsEvaluator(schema, iceberg.NotEqualTo(term, "boo"), true, true)
+	require.NoError(t, err)
+	mustMatch, err := strict(file)
+	require.NoError(t, err)
+	assert.False(t, mustMatch)
+}
+
+func TestManifestEvaluatorKeepsTransformedTerms(t *testing.T) {
+	lower, err := iceberg.StringLiteral("books").MarshalBinary()
+	require.NoError(t, err)
+	upper := append([]byte(nil), lower...)
+
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "category", Type: iceberg.PrimitiveTypes.String, Required: true},
+	)
+	term := iceberg.NewUnboundTransform(iceberg.TruncateTransform{Width: 3}, iceberg.Reference("category"))
+	bound, err := iceberg.BindExpr(schema, iceberg.EqualTo(term, "boo"), true)
+	require.NoError(t, err)
+
+	visitor := &manifestEvalVisitor{
+		partitionFields: []iceberg.FieldSummary{{
+			LowerBound: &lower,
+			UpperBound: &upper,
+		}},
+	}
+	keep, err := iceberg.VisitExprEvaluator(bound, visitor)
+	require.NoError(t, err)
+	assert.True(t, keep)
+}
+
+func TestGetCmpLiteralRejectsGeo(t *testing.T) {
+	// Little-endian float64 X,Y - a valid geospatial single-value bound that
+	// must never be routed into an ordering comparison.
+	coords := make([]byte, 16)
+	binary.LittleEndian.PutUint64(coords[0:8], math.Float64bits(1))
+	binary.LittleEndian.PutUint64(coords[8:16], math.Float64bits(2))
+
+	lit, err := iceberg.LiteralFromBytes(iceberg.GeometryType{}, coords)
+	require.NoError(t, err)
+
+	// getCmpLiteral must reject geo explicitly rather than silently comparing
+	// coordinate bytes with bytes.Compare.
+	assert.PanicsWithError(t, "type error: geometry/geography has no ordering, cannot compare geometry bounds",
+		func() { getCmpLiteral(lit) })
+}
+
+func TestLiteralToPhysBytes(t *testing.T) {
+	t.Run("int32", func(t *testing.T) {
+		b, ok := literalToPhysBytes(iceberg.Int32Literal(1))
+		require.True(t, ok)
+		assert.Equal(t, []byte{0x01, 0x00, 0x00, 0x00}, b)
+	})
+
+	t.Run("int64", func(t *testing.T) {
+		b, ok := literalToPhysBytes(iceberg.Int64Literal(1))
+		require.True(t, ok)
+		assert.Equal(t, []byte{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, b)
+	})
+
+	t.Run("float32", func(t *testing.T) {
+		b, ok := literalToPhysBytes(iceberg.Float32Literal(1.0))
+		require.True(t, ok)
+		assert.Equal(t, 4, len(b))
+	})
+
+	t.Run("float64", func(t *testing.T) {
+		b, ok := literalToPhysBytes(iceberg.Float64Literal(1.0))
+		require.True(t, ok)
+		assert.Equal(t, 8, len(b))
+	})
+
+	t.Run("string", func(t *testing.T) {
+		b, ok := literalToPhysBytes(iceberg.StringLiteral("hello"))
+		require.True(t, ok)
+		assert.Equal(t, []byte("hello"), b)
+	})
+
+	t.Run("binary", func(t *testing.T) {
+		b, ok := literalToPhysBytes(iceberg.BinaryLiteral([]byte{0xDE, 0xAD}))
+		require.True(t, ok)
+		assert.Equal(t, []byte{0xDE, 0xAD}, b)
+	})
+
+	t.Run("boolean_unsupported", func(t *testing.T) {
+		_, ok := literalToPhysBytes(iceberg.BoolLiteral(true))
+		assert.False(t, ok)
+	})
+}
+
+func TestBloomPredicateCollector(t *testing.T) {
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+
+	bind := func(expr iceberg.BooleanExpression) iceberg.BooleanExpression {
+		bound, err := iceberg.BindExpr(sc, expr, true)
+		require.NoError(t, err)
+
+		return bound
+	}
+
+	t.Run("EqualTo produces one predicate with one hash entry", func(t *testing.T) {
+		expr := bind(iceberg.EqualTo(iceberg.Reference("id"), int64(42)))
+		preds, err := newBloomFilterPredicates(expr)
+		require.NoError(t, err)
+		require.Len(t, preds, 1)
+		assert.Equal(t, 1, preds[0].FieldID)
+		assert.Len(t, preds[0].PhysBytes, 1)
+	})
+
+	t.Run("In produces one predicate with multiple hash entries", func(t *testing.T) {
+		expr := bind(iceberg.IsIn(iceberg.Reference("id"), int64(1), int64(2), int64(3)))
+		preds, err := newBloomFilterPredicates(expr)
+		require.NoError(t, err)
+		require.Len(t, preds, 1)
+		assert.Equal(t, 1, preds[0].FieldID)
+		assert.Len(t, preds[0].PhysBytes, 3)
+	})
+
+	t.Run("And merges predicates from both sides", func(t *testing.T) {
+		expr := bind(iceberg.NewAnd(
+			iceberg.EqualTo(iceberg.Reference("id"), int64(1)),
+			iceberg.EqualTo(iceberg.Reference("name"), "alice"),
+		))
+		preds, err := newBloomFilterPredicates(expr)
+		require.NoError(t, err)
+		assert.Len(t, preds, 2)
+	})
+
+	t.Run("Or returns nil — cannot prune on disjunction", func(t *testing.T) {
+		expr := bind(iceberg.NewOr(
+			iceberg.EqualTo(iceberg.Reference("id"), int64(1)),
+			iceberg.EqualTo(iceberg.Reference("name"), "alice"),
+		))
+		preds, err := newBloomFilterPredicates(expr)
+		require.NoError(t, err)
+		assert.Empty(t, preds)
+	})
+
+	t.Run("NOT(NotEqual) is normalized to Equal", func(t *testing.T) {
+		expr := bind(iceberg.NewNot(
+			iceberg.NotEqualTo(iceberg.Reference("id"), int64(42))))
+		preds, err := newBloomFilterPredicates(expr)
+		require.NoError(t, err)
+		require.Len(t, preds, 1)
+		assert.Equal(t, 1, preds[0].FieldID)
+		assert.Len(t, preds[0].PhysBytes, 1)
+	})
+
+	t.Run("NOT(NotIn) is normalized to In", func(t *testing.T) {
+		expr := bind(iceberg.NewNot(
+			iceberg.NotIn(iceberg.Reference("id"), int64(1), int64(2))))
+		preds, err := newBloomFilterPredicates(expr)
+		require.NoError(t, err)
+		require.Len(t, preds, 1)
+		assert.Equal(t, 1, preds[0].FieldID)
+		assert.Len(t, preds[0].PhysBytes, 2)
+	})
+
+	t.Run("NOT(Equal) remains unsupported", func(t *testing.T) {
+		expr := bind(iceberg.NewNot(
+			iceberg.EqualTo(iceberg.Reference("id"), int64(42))))
+		preds, err := newBloomFilterPredicates(expr)
+		require.NoError(t, err)
+		assert.Empty(t, preds)
+	})
+
+	t.Run("AlwaysTrue returns nil", func(t *testing.T) {
+		preds, err := newBloomFilterPredicates(iceberg.AlwaysTrue{})
+		require.NoError(t, err)
+		assert.Empty(t, preds)
+	})
+
+	t.Run("range predicate returns nil", func(t *testing.T) {
+		expr := bind(iceberg.GreaterThan(iceberg.Reference("id"), int64(5)))
+		preds, err := newBloomFilterPredicates(expr)
+		require.NoError(t, err)
+		assert.Empty(t, preds)
+	})
+
+	t.Run("transform predicate returns nil", func(t *testing.T) {
+		term := iceberg.NewUnboundTransform(iceberg.TruncateTransform{Width: 3}, iceberg.Reference("name"))
+		expr := bind(iceberg.EqualTo(term, "ali"))
+		preds, err := newBloomFilterPredicates(expr)
+		require.NoError(t, err)
+		assert.Empty(t, preds)
+	})
+}
+
+// TestVariantExtractPruningGuards confirms extract terms are never pruned by null/nan-count guards.
+func TestVariantExtractPruningGuards(t *testing.T) {
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}},
+	)
+	extI := iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64)
+	extF := iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Float64)
+	extS := iceberg.Extract("payload", "$.b", iceberg.PrimitiveTypes.String)
+
+	for _, tt := range []struct {
+		name string
+		expr iceberg.BooleanExpression
+		file *mockDataFile
+	}{
+		{"is_null", iceberg.IsNull(extI), &mockDataFile{count: 10, valueCounts: map[int]int64{2: 10}, nullCounts: map[int]int64{2: 0}}},
+		{"is_nan", iceberg.IsNaN(extF), &mockDataFile{count: 10, valueCounts: map[int]int64{2: 10}, nanCounts: map[int]int64{2: 0}}},
+		{"not_nan", iceberg.NotNaN(extF), &mockDataFile{count: 10, valueCounts: map[int]int64{2: 10}, nanCounts: map[int]int64{2: 10}}},
+		{"not_starts_with", iceberg.NotStartsWith(extS, "r"), &mockDataFile{count: 10, valueCounts: map[int]int64{2: 10}, nullCounts: map[int]int64{99: 0}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			eval, err := newInclusiveMetricsEvaluator(sc, tt.expr, true, true)
+			require.NoError(t, err)
+			res, err := eval(tt.file)
+			require.NoError(t, err)
+			assert.Equal(t, rowsMightMatch, res, "variant extract guard must never prune")
+		})
+	}
+}
+
+// TestStrictMetricsExtractNeverMatches confirms the strict evaluator treats extract terms
+// conservatively (rowsMightNotMatch) instead of decoding the variant bytes and erroring.
+func TestStrictMetricsExtractNeverMatches(t *testing.T) {
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}},
+	)
+
+	var b variant.Builder
+	start := b.Offset()
+	entries := []variant.FieldEntry{b.NextField(start, "$['a']")}
+	require.NoError(t, b.AppendInt(5))
+	require.NoError(t, b.FinishObject(start, entries))
+	v, err := b.Build()
+	require.NoError(t, err)
+	bound := append(append([]byte{}, v.Metadata().Bytes()...), v.Bytes()...)
+
+	// A variant column carrying bounds: boundFor must decode it without erroring.
+	file := &mockDataFile{
+		count:       10,
+		valueCounts: map[int]int64{2: 10},
+		nullCounts:  map[int]int64{2: 0},
+		lowerBounds: map[int][]byte{2: bound},
+		upperBounds: map[int][]byte{2: bound},
+	}
+
+	expr := iceberg.EqualTo(iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64), int64(5))
+	eval, err := newStrictMetricsEvaluator(sc, expr, true, true)
+	require.NoError(t, err)
+
+	res, err := eval(file)
+	require.NoError(t, err)
+	assert.Equal(t, rowsMightNotMatch, res)
+}
+
+// TestInclusiveMetricsExtractPrunes proves the actual pushdown skip: a file whose shredded
+// $.a bounds exclude the queried value is pruned (rowsCannotMatch), not merely residual-filtered.
+func TestInclusiveMetricsExtractPrunes(t *testing.T) {
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}},
+	)
+
+	// A shredded variant bound is a variant object keyed by the normalized sub-path.
+	mkBound := func(val int64) []byte {
+		var b variant.Builder
+		start := b.Offset()
+		entries := []variant.FieldEntry{b.NextField(start, "$['a']")}
+		require.NoError(t, b.AppendInt(val))
+		require.NoError(t, b.FinishObject(start, entries))
+		v, err := b.Build()
+		require.NoError(t, err)
+
+		return append(append([]byte{}, v.Metadata().Bytes()...), v.Bytes()...)
+	}
+	// File carries $.a in [10, 100].
+	file := &mockDataFile{
+		count:       10,
+		valueCounts: map[int]int64{2: 10},
+		nullCounts:  map[int]int64{2: 0},
+		lowerBounds: map[int][]byte{2: mkBound(10)},
+		upperBounds: map[int][]byte{2: mkBound(100)},
+	}
+	ext := iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64)
+
+	for _, tt := range []struct {
+		name string
+		expr iceberg.BooleanExpression
+		want bool
+	}{
+		{"eq below lower prunes", iceberg.EqualTo(ext, int64(5)), rowsCannotMatch},
+		{"eq above upper prunes", iceberg.EqualTo(ext, int64(500)), rowsCannotMatch},
+		{"eq within bounds keeps", iceberg.EqualTo(ext, int64(50)), rowsMightMatch},
+		{"less below lower prunes", iceberg.LessThan(ext, int64(5)), rowsCannotMatch},
+		{"greater above upper prunes", iceberg.GreaterThan(ext, int64(500)), rowsCannotMatch},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			eval, err := newInclusiveMetricsEvaluator(sc, tt.expr, true, true)
+			require.NoError(t, err)
+			res, err := eval(file)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, res)
+		})
+	}
+}
+
+// TestInclusiveMetricsExtractNotNull pins the VisitNotNull asymmetry: NotNull(extract) may
+// prune only when the whole variant column is null, and must keep an otherwise-populated one.
+func TestInclusiveMetricsExtractNotNull(t *testing.T) {
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}},
+	)
+	ext := iceberg.NotNull(iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64))
+
+	// All-null variant column: no row has any sub-path, so NotNull cannot match -> prune.
+	allNull := &mockDataFile{count: 10, valueCounts: map[int]int64{2: 10}, nullCounts: map[int]int64{2: 10}}
+	eval, err := newInclusiveMetricsEvaluator(sc, ext, true, true)
+	require.NoError(t, err)
+	res, err := eval(allNull)
+	require.NoError(t, err)
+	assert.Equal(t, rowsCannotMatch, res, "all-null variant column prunes NotNull(extract)")
+
+	// Populated column: the sub-path may be present, so the file must be kept even though
+	// the column has zero nulls (the column being non-null says nothing about $.a).
+	populated := &mockDataFile{count: 10, valueCounts: map[int]int64{2: 10}, nullCounts: map[int]int64{2: 0}}
+	eval, err = newInclusiveMetricsEvaluator(sc, ext, true, true)
+	require.NoError(t, err)
+	res, err = eval(populated)
+	require.NoError(t, err)
+	assert.Equal(t, rowsMightMatch, res, "populated variant column must not prune NotNull(extract)")
+}

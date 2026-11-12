@@ -842,3 +842,48 @@ func TestRowValuesWithoutNormalization(t *testing.T) {
 		})
 	}
 }
+
+func TestInvalidateColumnsPreservesOtherCarryAndTombstones(t *testing.T) {
+	before := carryUsage.Load()
+	stream := testConfiguredStream(true)
+	stream.StreamMetadata.UseSourceColumnNames = false
+	changed, unchanged := "Payload Value", "Keep Value"
+	resolver := &unavailableValuesResolver{
+		stream:  stream,
+		tracked: map[string]struct{}{changed: {}, unchanged: {}},
+		carry:   make(map[string]*carryRow),
+	}
+	t.Cleanup(resolver.Close)
+	resolver.remember("mixed", changed, "dropped bytes")
+	resolver.remember("mixed", unchanged, "retained bytes")
+	resolver.remember("changed-only", changed, []byte{1, 2, 3})
+	resolver.remember("null-only", changed, nil)
+	resolver.tombstone("deleted")
+	tombstone := resolver.carry["deleted"]
+	retained := resolver.carry["mixed"]
+	removed := valueSize("dropped bytes") + resolver.carry["changed-only"].size("changed-only") + resolver.carry["null-only"].size("null-only")
+	previousBytes := resolver.carryBytes
+
+	// The public callback supplies destination names, while carry and tracked
+	// retain source names. Duplicate names must not double-release accounting.
+	resolver.InvalidateColumns([]string{stream.ResolveColumnName(changed), stream.ResolveColumnName(changed), "unknown"})
+	require.NotContains(t, resolver.tracked, changed)
+	require.Contains(t, resolver.tracked, unchanged)
+	require.Same(t, retained, resolver.carry["mixed"])
+	require.Equal(t, map[string]any{unchanged: "retained bytes"}, resolver.carry["mixed"].values)
+	require.NotContains(t, resolver.carry, "changed-only")
+	require.NotContains(t, resolver.carry, "null-only")
+	require.Same(t, tombstone, resolver.carry["deleted"])
+	require.True(t, tombstone.deleted)
+	require.Equal(t, previousBytes-removed, resolver.carryBytes)
+	require.Equal(t, before+resolver.carryBytes, carryUsage.Load())
+
+	resolver.InvalidateColumns([]string{stream.ResolveColumnName(unchanged)})
+	require.Empty(t, resolver.tracked)
+	require.Len(t, resolver.carry, 1)
+	require.Same(t, tombstone, resolver.carry["deleted"])
+	require.Equal(t, tombstone.size("deleted"), resolver.carryBytes)
+	require.Equal(t, before+resolver.carryBytes, carryUsage.Load())
+	resolver.InvalidateColumns([]string{stream.ResolveColumnName(changed)})
+	require.Equal(t, before+resolver.carryBytes, carryUsage.Load(), "repeated invalidation must not release bytes twice")
+}

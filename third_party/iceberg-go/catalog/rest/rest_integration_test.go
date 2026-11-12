@@ -1,0 +1,514 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//go:build integration
+
+package rest_test
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"strings"
+	"testing"
+
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/catalog/rest"
+	"github.com/apache/iceberg-go/io"
+	_ "github.com/apache/iceberg-go/io/gocloud"
+	"github.com/apache/iceberg-go/table"
+	"github.com/apache/iceberg-go/view"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+)
+
+type RestIntegrationSuite struct {
+	suite.Suite
+
+	ctx context.Context
+	cat *rest.Catalog
+}
+
+const TestNamespaceIdent = "rest-integration-test"
+
+func (s *RestIntegrationSuite) loadCatalog(ctx context.Context) *rest.Catalog {
+	cat, err := catalog.Load(ctx, "local", iceberg.Properties{
+		"type":               "rest",
+		"uri":                "http://localhost:8181",
+		io.S3Region:          "us-east-1",
+		io.S3AccessKeyID:     "admin",
+		io.S3SecretAccessKey: "password",
+	})
+	s.Require().NoError(err)
+	s.Require().IsType(&rest.Catalog{}, cat)
+	return cat.(*rest.Catalog)
+}
+
+func (s *RestIntegrationSuite) SetupTest() {
+	s.ctx = context.Background()
+	if strings.Contains(s.T().Name(), "/TestScanPlanningJava") {
+		return
+	}
+
+	s.cat = s.loadCatalog(s.ctx)
+}
+
+var tableSchemaNested = iceberg.NewSchemaWithIdentifiers(1,
+	[]int{1},
+	iceberg.NestedField{
+		ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.String, Required: true,
+	},
+	iceberg.NestedField{
+		ID: 2, Name: "bar", Type: iceberg.PrimitiveTypes.Int32, Required: true,
+	},
+	iceberg.NestedField{
+		ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool, Required: false,
+	},
+	iceberg.NestedField{
+		ID: 4, Name: "qux", Required: true, Type: &iceberg.ListType{
+			ElementID: 5, Element: iceberg.PrimitiveTypes.String, ElementRequired: true,
+		},
+	},
+	iceberg.NestedField{
+		ID: 6, Name: "quux",
+		Type: &iceberg.MapType{
+			KeyID:   7,
+			KeyType: iceberg.PrimitiveTypes.String,
+			ValueID: 8,
+			ValueType: &iceberg.MapType{
+				KeyID:         9,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       10,
+				ValueType:     iceberg.PrimitiveTypes.Int32,
+				ValueRequired: true,
+			},
+			ValueRequired: true,
+		},
+		Required: true,
+	},
+	iceberg.NestedField{
+		ID: 11, Name: "location", Type: &iceberg.ListType{
+			ElementID: 12, Element: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 13, Name: "latitude", Type: iceberg.PrimitiveTypes.Float32, Required: false},
+					{ID: 14, Name: "longitude", Type: iceberg.PrimitiveTypes.Float32, Required: false},
+				},
+			},
+			ElementRequired: true,
+		},
+		Required: true,
+	},
+	iceberg.NestedField{
+		ID:   15,
+		Name: "person",
+		Type: &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 16, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false},
+				{ID: 17, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+			},
+		},
+		Required: false,
+	},
+)
+
+func (s *RestIntegrationSuite) ensureNamespace() {
+	exists, err := s.cat.CheckNamespaceExists(s.ctx, catalog.ToIdentifier(TestNamespaceIdent))
+	s.Require().NoError(err)
+	if exists {
+		s.Require().NoError(s.cat.DropNamespace(s.ctx, catalog.ToIdentifier(TestNamespaceIdent)))
+	}
+
+	s.NoError(s.cat.CreateNamespace(s.ctx, catalog.ToIdentifier(TestNamespaceIdent),
+		iceberg.Properties{"foo": "bar", "prop": "yes"}))
+}
+
+func (s *RestIntegrationSuite) TestCreateNamespace() {
+	exists, err := s.cat.CheckNamespaceExists(s.ctx, catalog.ToIdentifier(TestNamespaceIdent))
+	s.Require().NoError(err)
+	if exists {
+		s.Require().NoError(s.cat.DropNamespace(s.ctx, catalog.ToIdentifier(TestNamespaceIdent)))
+	}
+
+	s.NoError(s.cat.CreateNamespace(s.ctx, catalog.ToIdentifier(TestNamespaceIdent), nil))
+	s.NoError(s.cat.DropNamespace(s.ctx, catalog.ToIdentifier(TestNamespaceIdent)))
+}
+
+func (s *RestIntegrationSuite) TestLoadNamespaceProps() {
+	s.ensureNamespace()
+
+	props, err := s.cat.LoadNamespaceProperties(s.ctx, catalog.ToIdentifier(TestNamespaceIdent))
+	s.Require().NoError(err)
+	s.Require().NotNil(props)
+	s.Equal("bar", props["foo"])
+	s.Equal("yes", props["prop"])
+}
+
+func (s *RestIntegrationSuite) TestUpdateNamespaceProps() {
+	s.ensureNamespace()
+
+	summary, err := s.cat.UpdateNamespaceProperties(s.ctx, catalog.ToIdentifier(TestNamespaceIdent),
+		[]string{"abc"}, iceberg.Properties{"prop": "no"})
+	s.Require().NoError(err)
+	s.Equal(catalog.PropertiesUpdateSummary{
+		Removed: []string{},
+		Updated: []string{"prop"},
+		Missing: []string{"abc"},
+	}, summary)
+}
+
+func (s *RestIntegrationSuite) TestCreateTable() {
+	s.ensureNamespace()
+
+	tbl, err := s.cat.CreateTable(s.ctx,
+		catalog.ToIdentifier(TestNamespaceIdent, "test-create-table"),
+		tableSchemaSimple, catalog.WithProperties(iceberg.Properties{"foobar": "baz"}))
+	s.Require().NoError(err)
+	s.Require().NotNil(tbl)
+
+	s.Equal("s3://warehouse/rest-integration-test/test-create-table", tbl.Location())
+	s.Equal("baz", tbl.Properties()["foobar"])
+
+	exists, err := s.cat.CheckTableExists(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-create-table"))
+	s.Require().NoError(err)
+	s.True(exists)
+
+	s.Require().NoError(s.cat.DropTable(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-create-table")))
+}
+
+func (s *RestIntegrationSuite) TestCreateView() {
+	s.ensureNamespace()
+
+	const location = "s3://warehouse/iceberg"
+	// create a table first
+	tbl, err := s.cat.CreateTable(s.ctx,
+		catalog.ToIdentifier(TestNamespaceIdent, "test-table"),
+		tableSchemaSimple, catalog.WithProperties(iceberg.Properties{"foobar": "baz"}),
+		catalog.WithLocation(location))
+	s.Require().NoError(err)
+	s.Require().NotNil(tbl)
+
+	s.Equal(location, tbl.Location())
+	s.Equal("baz", tbl.Properties()["foobar"])
+
+	exists, err := s.cat.CheckTableExists(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-table"))
+	s.Require().NoError(err)
+	s.True(exists)
+
+	// Create a view
+	viewRepr := view.NewRepresentation(fmt.Sprintf("SELECT * FROM  %s.%s", TestNamespaceIdent, "test-table"), "trino")
+	viewVersion, err := view.NewVersion(1, 1, []view.Representation{viewRepr}, table.Identifier{TestNamespaceIdent})
+	s.Require().NoError(err)
+
+	_, err = s.cat.CreateView(s.ctx,
+		catalog.ToIdentifier(TestNamespaceIdent, "test-view"),
+		viewVersion,
+		tableSchemaSimple,
+		catalog.WithViewProperties(iceberg.Properties{"foobar": "baz"}))
+	s.Require().NoError(err)
+
+	exists, err = s.cat.CheckViewExists(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view"))
+	s.Require().NoError(err)
+	s.True(exists)
+
+	s.Require().NoError(s.cat.DropTable(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-table")))
+	s.Require().NoError(s.cat.DropView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view")))
+}
+
+func (s *RestIntegrationSuite) TestUpdateView() {
+	s.ensureNamespace()
+
+	const location = "s3://warehouse/iceberg"
+	testProps := iceberg.Properties{"foobar": "baz"}
+
+	// create a table first
+	tbl, err := s.cat.CreateTable(s.ctx,
+		catalog.ToIdentifier(TestNamespaceIdent, "test-table"),
+		tableSchemaSimple, catalog.WithProperties(iceberg.Properties{"foobar": "baz"}),
+		catalog.WithLocation(location))
+	s.Require().NoError(err)
+	s.Require().NotNil(tbl)
+
+	s.Equal(location, tbl.Location())
+	s.Equal("baz", tbl.Properties()["foobar"])
+
+	exists, err := s.cat.CheckTableExists(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-table"))
+	s.Require().NoError(err)
+	s.True(exists)
+
+	// Create a view
+	viewRepr := view.NewRepresentation(fmt.Sprintf("SELECT * FROM  %s.%s", TestNamespaceIdent, "test-table"), "trino")
+	defaultViewNS := catalog.ToIdentifier(location, TestNamespaceIdent)
+	viewVersion, err := view.NewVersion(1, 1, []view.Representation{viewRepr}, defaultViewNS)
+
+	viewIdent := catalog.ToIdentifier(TestNamespaceIdent, "test-view")
+	createdView, err := s.cat.CreateView(s.ctx,
+		viewIdent,
+		viewVersion,
+		tableSchemaSimple,
+		catalog.WithViewLocation(location), catalog.WithViewProperties(testProps))
+	s.Require().NoError(err)
+
+	// Create new builder from created view, and add a new representation
+	builder, err := view.MetadataBuilderFromBase(createdView.Metadata())
+	s.Require().NoError(err)
+
+	// Add new representation and build the updated view metadata
+	newRepr := viewRepr
+	newRepr.Dialect = "spark"
+	updatedVersion := createdView.Metadata().CurrentVersion().Clone()
+	updatedVersion.Representations = append(updatedVersion.Representations, newRepr)
+	updatedMD, err := builder.AddVersion(updatedVersion).SetCurrentVersionID(view.LastAddedID).Build()
+	s.Require().NoError(err)
+
+	// Update the view
+	updatedView, err := s.cat.UpdateView(s.ctx,
+		viewIdent,
+		view.Requirements{view.AssertViewUUID(createdView.Metadata().ViewUUID())},
+		updatedMD.Changes)
+	s.Require().NoError(err)
+	s.Equal(viewIdent, updatedView.Identifier())
+	s.Equal(location, updatedView.Location())
+	s.True(updatedMD.Equals(updatedView.Metadata()))
+	s.Equal(testProps, updatedView.Properties())
+
+	// Cleanup
+	s.Require().NoError(s.cat.DropTable(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-table")))
+	s.Require().NoError(s.cat.DropView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view")))
+}
+
+func (s *RestIntegrationSuite) TestRenameView() {
+	s.ensureNamespace()
+
+	const location = "s3://warehouse/iceberg"
+	tbl, err := s.cat.CreateTable(s.ctx,
+		catalog.ToIdentifier(TestNamespaceIdent, "test-table"),
+		tableSchemaSimple, catalog.WithProperties(iceberg.Properties{"foobar": "baz"}),
+		catalog.WithLocation(location))
+	s.Require().NoError(err)
+	s.Require().NotNil(tbl)
+
+	// Create a view to rename
+	fromIdent := catalog.ToIdentifier(TestNamespaceIdent, "test-view")
+	toIdent := catalog.ToIdentifier(TestNamespaceIdent, "renamed-view")
+
+	viewRepr := view.NewRepresentation(fmt.Sprintf("SELECT * FROM %s.%s", TestNamespaceIdent, "test-table"), "trino")
+	viewVersion, err := view.NewVersion(1, 1, []view.Representation{viewRepr}, table.Identifier{TestNamespaceIdent})
+	s.Require().NoError(err)
+
+	created, err := s.cat.CreateView(s.ctx, fromIdent, viewVersion, tableSchemaSimple,
+		catalog.WithViewProperties(iceberg.Properties{"foobar": "baz"}))
+	s.Require().NoError(err)
+
+	// Rename it
+	renamed, err := s.cat.RenameView(s.ctx, fromIdent, toIdent)
+	s.Require().NoError(err)
+	s.Equal(toIdent, renamed.Identifier())
+	s.Equal(created.Metadata().ViewUUID(), renamed.Metadata().ViewUUID())
+	// A rename moves the pointer, it must not rewrite the metadata.
+	s.Equal(created.MetadataLocation(), renamed.MetadataLocation())
+
+	// The old name is gone, the new one exists
+	exists, err := s.cat.CheckViewExists(s.ctx, fromIdent)
+	s.Require().NoError(err)
+	s.False(exists)
+
+	exists, err = s.cat.CheckViewExists(s.ctx, toIdent)
+	s.Require().NoError(err)
+	s.True(exists)
+
+	// Cleanup
+	s.Require().NoError(s.cat.DropTable(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-table")))
+	s.Require().NoError(s.cat.DropView(s.ctx, toIdent))
+}
+
+func (s *RestIntegrationSuite) TestWriteCommitTable() {
+	s.ensureNamespace()
+
+	const expectedLocation = "s3://warehouse/rest-integration-test/test-write-commit-table"
+
+	tbl, err := s.cat.CreateTable(s.ctx,
+		catalog.ToIdentifier(TestNamespaceIdent, "test-write-commit-table"),
+		tableSchemaNested)
+	s.Require().NoError(err)
+	s.Require().NotNil(tbl)
+
+	defer func() {
+		s.Require().NoError(s.cat.DropTable(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-write-commit-table")))
+	}()
+
+	s.Equal(expectedLocation, tbl.Location())
+
+	arrSchema, err := table.SchemaToArrowSchema(tableSchemaNested, nil, false, false)
+	s.Require().NoError(err)
+
+	table, err := array.TableFromJSON(memory.DefaultAllocator, arrSchema,
+		[]string{`[
+		{
+			"foo": "foo_string",
+			"bar": 123,
+			"baz": true,
+			"qux": ["a", "b", "c"],
+			"quux": [{"key": "gopher", "value": [
+				{"key": "golang", "value": "1337"}]}],
+			"location": [{"latitude": 37.7749, "longitude": -122.4194}],
+			"person": {"name": "gopher", "age": 10}
+		}
+	]`})
+	s.Require().NoError(err)
+	defer table.Release()
+
+	pqfile, err := url.JoinPath(expectedLocation, "data", "test_commit_table_data", "test.parquet")
+	s.Require().NoError(err)
+
+	fw, err := mustFS(s.T(), tbl).(io.WriteFileIO).Create(pqfile)
+	s.Require().NoError(err)
+	s.Require().NoError(pqarrow.WriteTable(table, fw, table.NumRows(),
+		nil, pqarrow.DefaultWriterProps()))
+	defer mustFS(s.T(), tbl).Remove(pqfile)
+
+	txn := tbl.NewTransaction()
+	s.Require().NoError(txn.AddFiles(s.ctx, []string{pqfile}, nil, false))
+	updated, err := txn.Commit(s.ctx)
+	s.Require().NoError(err)
+
+	mf := []iceberg.ManifestFile{}
+	for m, err := range updated.AllManifests(s.ctx) {
+		s.Require().NoError(err)
+		s.Require().NotNil(m)
+		mf = append(mf, m)
+	}
+
+	s.Len(mf, 1)
+	s.EqualValues(1, mf[0].AddedDataFiles())
+	entries := make([]iceberg.ManifestEntry, 0, 1)
+	for entry, err := range mf[0].Entries(mustFS(s.T(), updated), false) {
+		s.Require().NoError(err)
+		entries = append(entries, entry)
+	}
+
+	s.Len(entries, 1)
+	s.Equal(pqfile, entries[0].DataFile().FilePath())
+}
+
+func (s *RestIntegrationSuite) writeParquetFile(tbl *table.Table, schema *iceberg.Schema, subpath string) string {
+	s.T().Helper()
+
+	arrSchema, err := table.SchemaToArrowSchema(schema, nil, false, false)
+	s.Require().NoError(err)
+
+	arrowTbl, err := array.TableFromJSON(memory.DefaultAllocator, arrSchema,
+		[]string{`[
+		{"foo": "hello", "bar": 1, "baz": true},
+		{"foo": "world", "bar": 2, "baz": false}
+	]`})
+	s.Require().NoError(err)
+	defer arrowTbl.Release()
+
+	pqfile, err := url.JoinPath(tbl.Location(), "data", subpath, "test.parquet")
+	s.Require().NoError(err)
+
+	fw, err := mustFS(s.T(), tbl).(io.WriteFileIO).Create(pqfile)
+	s.Require().NoError(err)
+	s.Require().NoError(pqarrow.WriteTable(arrowTbl, fw, arrowTbl.NumRows(),
+		nil, pqarrow.DefaultWriterProps()))
+
+	return pqfile
+}
+
+func (s *RestIntegrationSuite) TestMultiTableCommit() {
+	s.ensureNamespace()
+
+	const location = "s3://warehouse/iceberg"
+	tbl1Ident := catalog.ToIdentifier(TestNamespaceIdent, "multi-txn-table-1")
+	tbl2Ident := catalog.ToIdentifier(TestNamespaceIdent, "multi-txn-table-2")
+
+	tbl1, err := s.cat.CreateTable(s.ctx, tbl1Ident, tableSchemaSimple,
+		catalog.WithLocation(location+"/multi-txn-1"))
+	s.Require().NoError(err)
+	s.Require().NotNil(tbl1)
+	defer func() {
+		s.Require().NoError(s.cat.DropTable(s.ctx, tbl1Ident))
+	}()
+
+	tbl2, err := s.cat.CreateTable(s.ctx, tbl2Ident, tableSchemaSimple,
+		catalog.WithLocation(location+"/multi-txn-2"))
+	s.Require().NoError(err)
+	s.Require().NotNil(tbl2)
+	defer func() {
+		s.Require().NoError(s.cat.DropTable(s.ctx, tbl2Ident))
+	}()
+
+	// Write a parquet data file for each table.
+	pq1 := s.writeParquetFile(tbl1, tableSchemaSimple, "multi-txn-1")
+	defer mustFS(s.T(), tbl1).Remove(pq1)
+
+	pq2 := s.writeParquetFile(tbl2, tableSchemaSimple, "multi-txn-2")
+	defer mustFS(s.T(), tbl2).Remove(pq2)
+
+	// Build transactions that add data files to each table.
+	tx1 := tbl1.NewTransaction()
+	s.Require().NoError(tx1.AddFiles(s.ctx, []string{pq1}, nil, false))
+
+	tx2 := tbl2.NewTransaction()
+	s.Require().NoError(tx2.AddFiles(s.ctx, []string{pq2}, nil, false))
+
+	// Commit both atomically via MultiTableTransaction.
+	mtx, err := catalog.NewMultiTableTransaction(s.cat)
+	s.Require().NoError(err)
+	s.Require().NoError(mtx.AddTransaction(tx1))
+	s.Require().NoError(mtx.AddTransaction(tx2))
+	s.Require().NoError(mtx.Commit(s.ctx))
+
+	// Reload tables and verify each has one snapshot with the data file.
+	loaded1, err := s.cat.LoadTable(s.ctx, tbl1Ident)
+	s.Require().NoError(err)
+	s.Require().NotNil(loaded1.CurrentSnapshot())
+
+	mf1 := []iceberg.ManifestFile{}
+	for m, err := range loaded1.AllManifests(s.ctx) {
+		s.Require().NoError(err)
+		mf1 = append(mf1, m)
+	}
+	s.Len(mf1, 1)
+	s.EqualValues(1, mf1[0].AddedDataFiles())
+
+	loaded2, err := s.cat.LoadTable(s.ctx, tbl2Ident)
+	s.Require().NoError(err)
+	s.Require().NotNil(loaded2.CurrentSnapshot())
+
+	mf2 := []iceberg.ManifestFile{}
+	for m, err := range loaded2.AllManifests(s.ctx) {
+		s.Require().NoError(err)
+		mf2 = append(mf2, m)
+	}
+	s.Len(mf2, 1)
+	s.EqualValues(1, mf2[0].AddedDataFiles())
+}
+
+func mustFS(t *testing.T, tbl *table.Table) io.IO {
+	r, err := tbl.FS(context.Background())
+	require.NoError(t, err)
+	return r
+}
+
+func TestRestIntegration(t *testing.T) {
+	suite.Run(t, new(RestIntegrationSuite))
+}

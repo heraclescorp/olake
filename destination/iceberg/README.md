@@ -6,9 +6,12 @@ Writes to apache-iceberg. This writer takes configuration of catalog and s3 buck
 
 The destination uses Apache Iceberg Go v0.7.0 and Arrow Go to write Parquet files and commit directly to the catalog. It does not launch a JVM or use a gRPC writer service.
 
+The SDK source and its Apache license are retained in `third_party/iceberg-go`. Explicit module replacements use that tree in the root and every connector. The local patches preserve exact integer defaults across JSON/Arrow projection and serialize temporal defaults in Iceberg's standard ISO format.
+
 - Backfill appends data files.
 - CDC supports equality deletes, positional deletes, and Iceberg v3 deletion vectors. Deletes retain OLake's soft-delete rows.
 - Recovery metadata and data/delete files publish in the same catalog transaction. Positional/deletion-vector modes preserve the durable Pebble index, rebuild it from the committed snapshot when necessary, and recover unchanged PostgreSQL TOAST values.
+- Source-column changes honor `drop_removed_columns`, keep identifier/partition/sort source columns, and assign fresh IDs on drop/re-add. Version 3 preserves historical initial defaults without applying them to later NULL writes; version 2 logs a warning and leaves historical rows NULL rather than upgrading implicitly. Changed columns invalidate TOAST carry values; unchanged carry and deletion tombstones remain intact.
 - REST (including S3 Tables and Unity), Glue, JDBC PostgreSQL/SQLite, Hive, and Hadoop catalogs use native adapters. S3, GCS, local files, and HDFS use native FileIO. Managed REST catalogs choose physical table locations; `iceberg_s3_path` remains the warehouse identifier for their catalog configuration.
 - HTTP diagnostics emit one `iceberg_http` event per wire attempt with status, latency, request ID, and retry/conflict outcome. Credentials, query strings, headers, and bodies are omitted. REST throttling retries are bounded; ambiguous commit failures are not blindly replayed.
 

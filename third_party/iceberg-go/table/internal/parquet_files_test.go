@@ -1,0 +1,3273 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package internal_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	iofs "io/fs"
+	"math"
+	"math/big"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/file"
+	"github.com/apache/arrow-go/v18/parquet/metadata"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+	"github.com/apache/arrow-go/v18/parquet/schema"
+	"github.com/apache/arrow-go/v18/parquet/variant"
+	"github.com/apache/iceberg-go"
+	internal2 "github.com/apache/iceberg-go/internal"
+	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/table"
+	"github.com/apache/iceberg-go/table/internal"
+	"github.com/geoarrow/geoarrow-go"
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/twpayne/go-geom/encoding/wkb"
+	"github.com/twpayne/go-geom/encoding/wkt"
+)
+
+type abortTestFile struct {
+	bytes.Buffer
+	closeErr error
+}
+
+func (f *abortTestFile) Close() error {
+	return f.closeErr
+}
+
+type trackingOpenFile struct {
+	*bytes.Reader
+	closeErr error
+	closed   bool
+	readAt   int
+}
+
+func (f *trackingOpenFile) Close() error {
+	f.closed = true
+
+	return f.closeErr
+}
+
+func (f *trackingOpenFile) ReadAt(p []byte, off int64) (int, error) {
+	f.readAt++
+
+	return f.Reader.ReadAt(p, off)
+}
+
+func (f *trackingOpenFile) Stat() (iofs.FileInfo, error) {
+	return nil, nil
+}
+
+func (f *trackingOpenFile) ReadFrom(r io.Reader) (n int64, err error) {
+	return 0, nil
+}
+
+func (f *trackingOpenFile) Write(p []byte) (n int, err error) {
+	return len(p), nil
+}
+
+type trackingFileSystem struct {
+	file *trackingOpenFile
+}
+
+func (f *trackingFileSystem) Open(name string) (iceio.File, error) {
+	return f.file, nil
+}
+
+func (f *trackingFileSystem) Remove(name string) error {
+	return nil
+}
+
+func mustParquetBytesWithInvalidArrowSchema(t *testing.T) []byte {
+	t.Helper()
+
+	fields := schema.FieldList{
+		schema.NewInt32Node("id", parquet.Repetitions.Required, 1),
+	}
+	sc, err := schema.NewGroupNode("schema", parquet.Repetitions.Required, fields, -1)
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	w := file.NewParquetWriter(&buf, sc)
+	require.NoError(t, w.AppendKeyValueMetadata("ARROW:schema", "not-base64"))
+
+	rowGroup, err := w.AppendRowGroupChecked()
+	require.NoError(t, err)
+	column, err := rowGroup.NextColumn()
+	require.NoError(t, err)
+
+	cw := column.(*file.Int32ColumnChunkWriter)
+	_, err = cw.WriteBatch([]int32{1}, nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, cw.Close())
+	require.NoError(t, rowGroup.Close())
+	require.NoError(t, w.Close())
+
+	return buf.Bytes()
+}
+
+func newAbortTestWriter(t *testing.T, fs iceio.WriteFileIO, fileName string) internal.FileWriter {
+	t.Helper()
+
+	fm := internal.GetFileFormat(iceberg.ParquetFile)
+	icebergSchema := iceberg.NewSchema(0, iceberg.NestedField{
+		ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: false,
+	})
+	arrowSchema, err := table.SchemaToArrowSchema(icebergSchema, nil, true, false)
+	require.NoError(t, err)
+
+	writer, err := fm.NewFileWriter(context.Background(), fs, nil, internal.WriteFileInfo{
+		FileSchema: icebergSchema,
+		Spec:       *iceberg.UnpartitionedSpec,
+		FileName:   fileName,
+		WriteProps: fm.GetWriteProperties(iceberg.Properties{}),
+	}, arrowSchema)
+	require.NoError(t, err)
+
+	return writer
+}
+
+func constructTestTablePrimitiveTypes(t *testing.T) (*metadata.FileMetaData, table.Metadata) {
+	tableMeta, err := table.ParseMetadataString(`{
+        "format-version": 2,
+        "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+        "last-sequence-number": 0,
+        "location": "s3://bucket/test/location",
+        "last-column-id": 7,
+        "current-schema-id": 0,
+        "schemas": [
+            {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [
+                    {"id": 1, "name": "booleans", "required": false, "type": "boolean"},
+                    {"id": 2, "name": "ints", "required": false, "type": "int"},
+                    {"id": 3, "name": "longs", "required": false, "type": "long"},
+                    {"id": 4, "name": "floats", "required": false, "type": "float"},
+                    {"id": 5, "name": "doubles", "required": false, "type": "double"},
+                    {"id": 6, "name": "dates", "required": false, "type": "date"},
+                    {"id": 7, "name": "times", "required": false, "type": "time"},
+                    {"id": 8, "name": "timestamps", "required": false, "type": "timestamp"},
+                    {"id": 9, "name": "timestamptzs", "required": false, "type": "timestamptz"},
+                    {"id": 10, "name": "strings", "required": false, "type": "string"},
+                    {"id": 11, "name": "uuids", "required": false, "type": "uuid"},
+                    {"id": 12, "name": "binaries", "required": false, "type": "binary"},
+					{"id": 13, "name": "small_dec", "required": false, "type": "decimal(8, 2)"},
+					{"id": 14, "name": "med_dec", "required": false, "type": "decimal(16, 2)"},
+					{"id": 15, "name": "large_dec", "required": false, "type": "decimal(24, 2)"}
+                ]
+            }
+        ],
+		"last-partition-id": 0,	
+		"last-updated-ms": -1,
+        "default-spec-id": 0,
+		"default-sort-order-id": 0,
+		"sort-orders": [{"order-id": 0, "fields": []}],
+        "partition-specs": [{"spec-id": 0, "fields": []}],
+        "properties": {}
+	}`)
+	require.NoError(t, err)
+
+	arrowSchema, err := table.SchemaToArrowSchema(tableMeta.Schemas()[0], nil, true, false)
+	require.NoError(t, err)
+
+	rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrowSchema, strings.NewReader(`[
+		{
+			"booleans": true, 
+			"ints": 23,
+			"longs": 54,
+			"floats": 454.1223,
+			"doubles": 8542.12,
+			"dates": "2022-01-02",
+			"times": "17:30:34",
+			"timestamps": "2022-01-02T17:30:34.399",
+			"timestamptzs": "2022-01-02T17:30:34.399Z",
+			"strings": "hello",
+			"uuids": "`+uuid.NewMD5(uuid.NameSpaceDNS, []byte("foo")).String()+`",
+			"binaries": "aGVsbG8=",
+			"small_dec": "123456.78",
+			"med_dec": "12345678901234.56",
+			"large_dec": "1234567890123456789012.34"
+		},
+		{
+			"booleans": false,
+			"ints": 89,
+			"longs": 2,
+			"floats": 24342.29,
+			"doubles": -43.9,
+			"dates": "2023-02-04",
+			"times": "13:21:04",
+			"timestamps": "2023-02-04T13:21:04.354",
+			"timestamptzs": "2023-02-04T13:21:04.354Z",
+			"strings": "world",
+			"uuids": "`+uuid.NewMD5(uuid.NameSpaceDNS, []byte("bar")).String()+`",
+			"binaries": "d29ybGQ=",
+			"small_dec": "876543.21",
+			"med_dec": "65432109876543.21",
+			"large_dec": "4321098765432109876543.21"
+		}
+	]`))
+	require.NoError(t, err)
+	defer rec.Release()
+
+	var buf bytes.Buffer
+	wr, err := pqarrow.NewFileWriter(arrowSchema, &buf,
+		parquet.NewWriterProperties(parquet.WithStats(true)),
+		pqarrow.DefaultWriterProps())
+	require.NoError(t, err)
+
+	require.NoError(t, wr.Write(rec))
+	require.NoError(t, wr.Close())
+
+	rdr, err := file.NewParquetReader(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+	defer rdr.Close()
+
+	return rdr.MetaData(), tableMeta
+}
+
+func TestParquetOpenClosesFileOnNewParquetReaderFailure(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	mockFile := &trackingOpenFile{
+		Reader: bytes.NewReader([]byte("not-a-parquet-file")),
+	}
+	mockIO := &trackingFileSystem{file: mockFile}
+
+	_, err := format.Open(context.Background(), mockIO, "bad.parquet")
+	require.Error(t, err)
+	assert.True(t, mockFile.closed)
+}
+
+func TestParquetOpenClosesFileOnNewFileReaderFailure(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	mockFile := &trackingOpenFile{
+		Reader: bytes.NewReader(mustParquetBytesWithInvalidArrowSchema(t)),
+	}
+	mockIO := &trackingFileSystem{file: mockFile}
+
+	_, err := format.Open(context.Background(), mockIO, "bad.parquet")
+	require.Error(t, err)
+	assert.True(t, mockFile.closed)
+}
+
+func TestParquetGetReaderClosesFileOnNewParquetReaderFailure(t *testing.T) {
+	data := []byte("not-a-parquet-file")
+	mockFile := &trackingOpenFile{
+		Reader: bytes.NewReader(data),
+	}
+	mockIO := &trackingFileSystem{file: mockFile}
+
+	builder, err := iceberg.NewDataFileBuilder(
+		*iceberg.UnpartitionedSpec,
+		iceberg.EntryContentData,
+		"bad.parquet",
+		iceberg.ParquetFile,
+		nil,
+		nil,
+		nil,
+		1,
+		int64(len(data)),
+	)
+	require.NoError(t, err)
+
+	fileSource, err := internal.GetFile(context.Background(), mockIO, builder.Build(), false)
+	require.NoError(t, err)
+
+	_, err = fileSource.GetReader(context.Background())
+	require.Error(t, err)
+	assert.True(t, mockFile.closed)
+}
+
+func TestParquetGetReaderClosesFileOnNewFileReaderFailure(t *testing.T) {
+	data := mustParquetBytesWithInvalidArrowSchema(t)
+	mockFile := &trackingOpenFile{
+		Reader: bytes.NewReader(data),
+	}
+	mockIO := &trackingFileSystem{file: mockFile}
+
+	builder, err := iceberg.NewDataFileBuilder(
+		*iceberg.UnpartitionedSpec,
+		iceberg.EntryContentData,
+		"bad.parquet",
+		iceberg.ParquetFile,
+		nil,
+		nil,
+		nil,
+		1,
+		int64(len(data)),
+	)
+	require.NoError(t, err)
+
+	fileSource, err := internal.GetFile(context.Background(), mockIO, builder.Build(), false)
+	require.NoError(t, err)
+
+	_, err = fileSource.GetReader(context.Background())
+	require.Error(t, err)
+	assert.True(t, mockFile.closed)
+}
+
+func TestParquetGetReaderReusesMetadataWithinContext(t *testing.T) {
+	data := buildBloomTestParquet(t, 2)
+	mockFile := &trackingOpenFile{Reader: bytes.NewReader(data)}
+	mockIO := &trackingFileSystem{file: mockFile}
+
+	builder, err := iceberg.NewDataFileBuilder(
+		*iceberg.UnpartitionedSpec,
+		iceberg.EntryContentData,
+		"data.parquet",
+		iceberg.ParquetFile,
+		nil,
+		nil,
+		nil,
+		4,
+		int64(len(data)),
+	)
+	require.NoError(t, err)
+
+	fileSource, err := internal.GetFile(context.Background(), mockIO, builder.Build(), false)
+	require.NoError(t, err)
+
+	ctx := internal.WithParquetMetadataCache(context.Background())
+	first, err := fileSource.GetReader(ctx)
+	require.NoError(t, err)
+	firstReadAt := mockFile.readAt
+	require.Positive(t, firstReadAt)
+
+	second, err := fileSource.GetReader(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, firstReadAt, mockFile.readAt,
+		"the second reader should reuse the parsed footer metadata")
+
+	require.NoError(t, first.Close())
+	require.NoError(t, second.Close())
+}
+
+func assertBounds[T iceberg.LiteralType](t *testing.T, bound []byte, typ iceberg.Type, expected T) {
+	lit, err := iceberg.LiteralFromBytes(typ, bound)
+	require.NoError(t, err)
+	assert.Equal(t, expected, lit.(iceberg.TypedLiteral[T]).Value())
+}
+
+func toDate(tm time.Time) iceberg.Date {
+	return iceberg.Date(tm.Truncate(24*time.Hour).Unix() / int64((time.Hour * 24).Seconds()))
+}
+
+func getCollector() map[int]internal.StatisticsCollector {
+	modeTrunc := internal.MetricsMode{Typ: internal.MetricModeTruncate, Len: 2}
+	modeFull := internal.MetricsMode{Typ: internal.MetricModeFull}
+
+	return map[int]internal.StatisticsCollector{
+		1: {
+			FieldID:    1,
+			Mode:       modeFull,
+			ColName:    "booleans",
+			IcebergTyp: iceberg.PrimitiveTypes.Bool,
+		},
+		2: {
+			FieldID:    2,
+			Mode:       modeFull,
+			ColName:    "ints",
+			IcebergTyp: iceberg.PrimitiveTypes.Int32,
+		},
+		3: {
+			FieldID:    3,
+			Mode:       modeFull,
+			ColName:    "longs",
+			IcebergTyp: iceberg.PrimitiveTypes.Int64,
+		},
+		4: {
+			FieldID:    4,
+			Mode:       modeFull,
+			ColName:    "floats",
+			IcebergTyp: iceberg.PrimitiveTypes.Float32,
+		},
+		5: {
+			FieldID:    5,
+			Mode:       modeFull,
+			ColName:    "doubles",
+			IcebergTyp: iceberg.PrimitiveTypes.Float64,
+		},
+		6: {
+			FieldID:    6,
+			Mode:       modeFull,
+			ColName:    "dates",
+			IcebergTyp: iceberg.PrimitiveTypes.Date,
+		},
+		7: {
+			FieldID:    7,
+			Mode:       modeFull,
+			ColName:    "times",
+			IcebergTyp: iceberg.PrimitiveTypes.Time,
+		},
+		8: {
+			FieldID:    8,
+			Mode:       modeFull,
+			ColName:    "timestamps",
+			IcebergTyp: iceberg.PrimitiveTypes.Timestamp,
+		},
+		9: {
+			FieldID:    9,
+			Mode:       modeFull,
+			ColName:    "timestamptzs",
+			IcebergTyp: iceberg.PrimitiveTypes.TimestampTz,
+		},
+		10: {
+			FieldID:    10,
+			Mode:       modeTrunc,
+			ColName:    "strings",
+			IcebergTyp: iceberg.PrimitiveTypes.String,
+		},
+		11: {
+			FieldID:    11,
+			Mode:       modeFull,
+			ColName:    "uuids",
+			IcebergTyp: iceberg.PrimitiveTypes.UUID,
+		},
+		12: {
+			FieldID:    12,
+			Mode:       modeTrunc,
+			ColName:    "binaries",
+			IcebergTyp: iceberg.PrimitiveTypes.Binary,
+		},
+		13: {
+			FieldID:    13,
+			Mode:       modeFull,
+			ColName:    "small_dec",
+			IcebergTyp: iceberg.DecimalTypeOf(8, 2),
+		},
+		14: {
+			FieldID:    14,
+			Mode:       modeFull,
+			ColName:    "med_dec",
+			IcebergTyp: iceberg.DecimalTypeOf(16, 2),
+		},
+		15: {
+			FieldID:    15,
+			Mode:       modeFull,
+			ColName:    "large_dec",
+			IcebergTyp: iceberg.DecimalTypeOf(24, 2),
+		},
+	}
+}
+
+// TestMetricsSkipColumnOutsidePlan: only a reserved row-lineage
+// metadata column (e.g. a writer-materialized _row_id, which is never
+// part of the table schema) may appear in a file without a
+// metrics-plan entry; it must be skipped entirely, not aggregated
+// through a zero-value collector (whose nil Iceberg type panics inside
+// the stats aggregator). Any other field id missing from the plan is a
+// plan/file mismatch and must fail loudly.
+func TestMetricsSkipColumnOutsidePlan(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	t.Run("reserved lineage column is skipped", func(t *testing.T) {
+		meta, tblMeta := constructTestTablePrimitiveTypes(t)
+		mapping, err := format.PathToIDMapping(tblMeta.CurrentSchema())
+		require.NoError(t, err)
+
+		// Simulate a writer-materialized lineage column: the file column
+		// "binaries" resolves to the reserved _row_id field id, which has
+		// no entry in the metrics plan.
+		mapping["binaries"] = iceberg.RowIDFieldID
+		collector := getCollector()
+		delete(collector, 12)
+
+		stats := format.DataFileStatsFromMeta(internal.Metadata(meta), collector, mapping, nil, nil)
+		df := stats.ToDataFile(internal.DataFileOpts{
+			Schema:   tblMeta.CurrentSchema(),
+			Spec:     tblMeta.PartitionSpec(),
+			Path:     "fake-path.parquet",
+			Format:   iceberg.ParquetFile,
+			Content:  iceberg.EntryContentData,
+			FileSize: meta.GetSourceFileSize(),
+		})
+
+		for _, id := range []int{12, iceberg.RowIDFieldID} {
+			assert.NotContains(t, df.ValueCounts(), id)
+			assert.NotContains(t, df.NullValueCounts(), id)
+			assert.NotContains(t, df.ColumnSizes(), id)
+			assert.NotContains(t, df.LowerBoundValues(), id)
+			assert.NotContains(t, df.UpperBoundValues(), id)
+		}
+		assert.Len(t, df.ValueCounts(), 14)
+		assert.Len(t, df.LowerBoundValues(), 14)
+	})
+
+	t.Run("non-reserved column missing from plan fails", func(t *testing.T) {
+		meta, tblMeta := constructTestTablePrimitiveTypes(t)
+		mapping, err := format.PathToIDMapping(tblMeta.CurrentSchema())
+		require.NoError(t, err)
+
+		collector := getCollector()
+		delete(collector, 12) // "binaries" is a schema column: mismatch
+
+		assert.PanicsWithError(t, `field id 12 (column "binaries") not found in the metrics plan`, func() {
+			format.DataFileStatsFromMeta(internal.Metadata(meta), collector, mapping, nil, nil)
+		})
+	})
+}
+
+func TestMetricsPrimitiveTypes(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	meta, tblMeta := constructTestTablePrimitiveTypes(t)
+	require.NotNil(t, tblMeta)
+	require.NotNil(t, meta)
+
+	mapping, err := format.PathToIDMapping(tblMeta.CurrentSchema())
+	require.NoError(t, err)
+
+	stats := format.DataFileStatsFromMeta(internal.Metadata(meta), getCollector(), mapping, nil, nil)
+	const sortOrderID = 7
+	df := stats.ToDataFile(internal.DataFileOpts{
+		Schema:      tblMeta.CurrentSchema(),
+		Spec:        tblMeta.PartitionSpec(),
+		Path:        "fake-path.parquet",
+		Format:      iceberg.ParquetFile,
+		Content:     iceberg.EntryContentData,
+		FileSize:    meta.GetSourceFileSize(),
+		SortOrderID: sortOrderID,
+	})
+
+	require.NotNil(t, df.SortOrderID())
+	assert.Equal(t, sortOrderID, *df.SortOrderID())
+
+	assert.Len(t, df.ValueCounts(), 15)
+	assert.Len(t, df.NullValueCounts(), 15)
+	assert.Len(t, df.NaNValueCounts(), 0)
+
+	assert.Len(t, df.LowerBoundValues(), 15)
+	assertBounds(t, df.LowerBoundValues()[1], iceberg.PrimitiveTypes.Bool, false)
+	assertBounds(t, df.LowerBoundValues()[2], iceberg.PrimitiveTypes.Int32, int32(23))
+	assertBounds(t, df.LowerBoundValues()[3], iceberg.PrimitiveTypes.Int64, int64(2))
+	assertBounds(t, df.LowerBoundValues()[4], iceberg.PrimitiveTypes.Float32, float32(454.1223))
+	assertBounds(t, df.LowerBoundValues()[5], iceberg.PrimitiveTypes.Float64, -43.9)
+	assertBounds(t, df.LowerBoundValues()[6], iceberg.PrimitiveTypes.Date,
+		toDate(time.Date(2022, time.January, 2, 0, 0, 0, 0, time.UTC)))
+	assertBounds(t, df.LowerBoundValues()[7], iceberg.PrimitiveTypes.Time,
+		iceberg.Time(time.Duration(13*time.Hour+21*time.Minute+4*time.Second).Microseconds()))
+	assertBounds(t, df.LowerBoundValues()[8], iceberg.PrimitiveTypes.Timestamp,
+		iceberg.Timestamp(time.Date(2022, time.January, 2, 17, 30, 34, 399000000, time.UTC).UnixMicro()))
+	assertBounds(t, df.LowerBoundValues()[9], iceberg.PrimitiveTypes.TimestampTz,
+		iceberg.Timestamp(time.Date(2022, time.January, 2, 17, 30, 34, 399000000, time.UTC).UnixMicro()))
+	assertBounds(t, df.LowerBoundValues()[10], iceberg.PrimitiveTypes.String, "he")
+	assertBounds(t, df.LowerBoundValues()[11], iceberg.PrimitiveTypes.UUID,
+		uuid.NewMD5(uuid.NameSpaceDNS, []byte("foo")))
+	assertBounds(t, df.LowerBoundValues()[12], iceberg.PrimitiveTypes.Binary, []byte("he"))
+	assertBounds(t, df.LowerBoundValues()[13], iceberg.DecimalTypeOf(8, 2), iceberg.Decimal{
+		Val:   decimal128.FromI64(12345678),
+		Scale: 2,
+	})
+	assertBounds(t, df.LowerBoundValues()[14], iceberg.DecimalTypeOf(16, 2), iceberg.Decimal{
+		Val:   decimal128.FromI64(1234567890123456),
+		Scale: 2,
+	})
+	expected, _ := (&big.Int{}).SetString("123456789012345678901234", 10)
+	assertBounds(t, df.LowerBoundValues()[15], iceberg.DecimalTypeOf(24, 2), iceberg.Decimal{
+		Val:   decimal128.FromBigInt(expected),
+		Scale: 2,
+	})
+
+	assert.Len(t, df.UpperBoundValues(), 15)
+	assertBounds(t, df.UpperBoundValues()[1], iceberg.PrimitiveTypes.Bool, true)
+	assertBounds(t, df.UpperBoundValues()[2], iceberg.PrimitiveTypes.Int32, int32(89))
+	assertBounds(t, df.UpperBoundValues()[3], iceberg.PrimitiveTypes.Int64, int64(54))
+	assertBounds(t, df.UpperBoundValues()[4], iceberg.PrimitiveTypes.Float32, float32(24342.29))
+	assertBounds(t, df.UpperBoundValues()[5], iceberg.PrimitiveTypes.Float64, 8542.12)
+	assertBounds(t, df.UpperBoundValues()[6], iceberg.PrimitiveTypes.Date,
+		toDate(time.Date(2023, time.February, 4, 0, 0, 0, 0, time.UTC)))
+	assertBounds(t, df.UpperBoundValues()[7], iceberg.PrimitiveTypes.Time,
+		iceberg.Time(time.Duration(17*time.Hour+30*time.Minute+34*time.Second).Microseconds()))
+	assertBounds(t, df.UpperBoundValues()[8], iceberg.PrimitiveTypes.Timestamp,
+		iceberg.Timestamp(time.Date(2023, time.February, 4, 13, 21, 4, 354000000, time.UTC).UnixMicro()))
+	assertBounds(t, df.UpperBoundValues()[9], iceberg.PrimitiveTypes.TimestampTz,
+		iceberg.Timestamp(time.Date(2023, time.February, 4, 13, 21, 4, 354000000, time.UTC).UnixMicro()))
+	assertBounds(t, df.UpperBoundValues()[10], iceberg.PrimitiveTypes.String, "wp")
+	assertBounds(t, df.UpperBoundValues()[11], iceberg.PrimitiveTypes.UUID,
+		uuid.NewMD5(uuid.NameSpaceDNS, []byte("bar")))
+	assertBounds(t, df.UpperBoundValues()[12], iceberg.PrimitiveTypes.Binary, []byte("wp"))
+	assertBounds(t, df.UpperBoundValues()[13], iceberg.DecimalTypeOf(8, 2), iceberg.Decimal{
+		Val:   decimal128.FromI64(87654321),
+		Scale: 2,
+	})
+	assertBounds(t, df.UpperBoundValues()[14], iceberg.DecimalTypeOf(16, 2), iceberg.Decimal{
+		Val:   decimal128.FromI64(6543210987654321),
+		Scale: 2,
+	})
+	expectedUpper, _ := (&big.Int{}).SetString("432109876543210987654321", 10)
+	assertBounds(t, df.UpperBoundValues()[15], iceberg.DecimalTypeOf(24, 2), iceberg.Decimal{
+		Val:   decimal128.FromBigInt(expectedUpper),
+		Scale: 2,
+	})
+}
+
+func TestDataFileStatsFromMetaWithMalformedUUIDStats(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	meta, tblMeta := constructTestTablePrimitiveTypes(t)
+	require.NotNil(t, tblMeta)
+	require.NotNil(t, meta)
+
+	mapping, err := format.PathToIDMapping(tblMeta.CurrentSchema())
+	require.NoError(t, err)
+
+	collector := getCollector()
+	found := false
+	for _, rg := range meta.RowGroups {
+		for _, col := range rg.Columns {
+			if col == nil || col.MetaData == nil || col.MetaData.Statistics == nil {
+				continue
+			}
+			path := col.MetaData.GetPathInSchema()
+			if len(path) == 1 && path[0] == "uuids" {
+				col.MetaData.Statistics.Min = []byte{0x01}
+				col.MetaData.Statistics.Max = []byte{0x02}
+				col.MetaData.Statistics.MinValue = []byte{0x01}
+				col.MetaData.Statistics.MaxValue = []byte{0x02}
+				found = true
+			}
+		}
+	}
+	require.True(t, found, "failed to inject malformed UUID stats")
+
+	var fileStats *internal.DataFileStatistics
+	assert.NotPanics(t, func() {
+		fileStats = format.DataFileStatsFromMeta(internal.Metadata(meta), collector, mapping, nil, nil)
+	})
+	require.NotNil(t, fileStats)
+	require.NotContains(t, fileStats.ColAggs, 11)
+
+	dataFile := fileStats.ToDataFile(internal.DataFileOpts{
+		Schema:      tblMeta.CurrentSchema(),
+		Spec:        tblMeta.PartitionSpec(),
+		Path:        "fake-path.parquet",
+		Format:      iceberg.ParquetFile,
+		Content:     iceberg.EntryContentData,
+		FileSize:    meta.GetSourceFileSize(),
+		SortOrderID: 7,
+	})
+
+	assert.Len(t, dataFile.LowerBoundValues(), len(collector)-1)
+	assert.NotContains(t, dataFile.LowerBoundValues(), 11)
+	assert.NotContains(t, dataFile.UpperBoundValues(), 11)
+}
+
+func TestDataFileStatsFromMetaWithMalformedFixedLenDecimalStats(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	meta, tblMeta := constructTestTablePrimitiveTypes(t)
+	require.NotNil(t, tblMeta)
+	require.NotNil(t, meta)
+
+	mapping, err := format.PathToIDMapping(tblMeta.CurrentSchema())
+	require.NoError(t, err)
+
+	collector := getCollector()
+	found := false
+	for _, rg := range meta.RowGroups {
+		for _, col := range rg.Columns {
+			if col == nil || col.MetaData == nil || col.MetaData.Statistics == nil {
+				continue
+			}
+			path := col.MetaData.GetPathInSchema()
+			if len(path) == 1 && path[0] == "large_dec" {
+				col.MetaData.Statistics.Min = []byte{0x01}
+				col.MetaData.Statistics.Max = []byte{0x02}
+				col.MetaData.Statistics.MinValue = []byte{0x01}
+				col.MetaData.Statistics.MaxValue = []byte{0x02}
+				found = true
+			}
+		}
+	}
+	require.True(t, found, "failed to inject malformed fixed-len decimal stats")
+
+	var fileStats *internal.DataFileStatistics
+	assert.NotPanics(t, func() {
+		fileStats = format.DataFileStatsFromMeta(internal.Metadata(meta), collector, mapping, nil, nil)
+	})
+	require.NotNil(t, fileStats)
+	require.NotContains(t, fileStats.ColAggs, 15)
+
+	dataFile := fileStats.ToDataFile(internal.DataFileOpts{
+		Schema:      tblMeta.CurrentSchema(),
+		Spec:        tblMeta.PartitionSpec(),
+		Path:        "fake-path.parquet",
+		Format:      iceberg.ParquetFile,
+		Content:     iceberg.EntryContentData,
+		FileSize:    meta.GetSourceFileSize(),
+		SortOrderID: 7,
+	})
+
+	assert.Len(t, dataFile.LowerBoundValues(), len(collector)-1)
+	assert.NotContains(t, dataFile.LowerBoundValues(), 15)
+	assert.NotContains(t, dataFile.UpperBoundValues(), 15)
+}
+
+func TestDataFileStatsFromMetaDoesNotSkipInvalidatedColumnMetadata(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	meta, tblMeta := constructTestTablePrimitiveTypes(t)
+	mapping, err := format.PathToIDMapping(tblMeta.CurrentSchema())
+	require.NoError(t, err)
+
+	const columnPos = 1
+	meta.RowGroups[0].Columns[columnPos].MetaData.Statistics = nil
+
+	secondRowGroup := *meta.RowGroups[0]
+	secondRowGroup.Columns = append(secondRowGroup.Columns[:0:0], secondRowGroup.Columns...)
+	secondRowGroup.Columns[columnPos] = nil
+	meta.RowGroups = append(meta.RowGroups, &secondRowGroup)
+
+	assert.Panics(t, func() {
+		format.DataFileStatsFromMeta(internal.Metadata(meta), getCollector(), mapping, nil, nil)
+	})
+}
+
+// TestNanosecondTimestampMetrics tests that nanosecond timestamp types (v3)
+// are correctly handled for Parquet stats collection and physical type mapping.
+func TestNanosecondTimestampMetrics(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	tableMeta, err := table.ParseMetadataString(`{
+		"format-version": 3,
+		"table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+		"last-sequence-number": 0,
+		"location": "s3://bucket/test/location",
+		"last-column-id": 2,
+		"current-schema-id": 0,
+		"next-row-id": 0,
+		"schemas": [
+			{
+				"type": "struct",
+				"schema-id": 0,
+				"fields": [
+					{"id": 1, "name": "ts_ns", "required": false, "type": "timestamp_ns"},
+					{"id": 2, "name": "tstz_ns", "required": false, "type": "timestamptz_ns"}
+				]
+			}
+		],
+		"last-partition-id": 0,
+		"last-updated-ms": -1,
+		"default-spec-id": 0,
+		"default-sort-order-id": 0,
+		"sort-orders": [{"order-id": 0, "fields": []}],
+		"partition-specs": [{"spec-id": 0, "fields": []}],
+		"properties": {}
+	}`)
+	require.NoError(t, err)
+
+	arrowSchema, err := table.SchemaToArrowSchema(tableMeta.Schemas()[0], nil, true, false)
+	require.NoError(t, err)
+
+	// Build records manually using Arrow builders since JSON parsing for
+	// nanosecond timestamps needs explicit int64 values (nanoseconds since epoch).
+	mem := memory.DefaultAllocator
+	bldr := array.NewRecordBuilder(mem, arrowSchema)
+	defer bldr.Release()
+
+	// 2022-01-02T17:30:34.399000000 in nanoseconds since epoch
+	ts1 := time.Date(2022, time.January, 2, 17, 30, 34, 399000000, time.UTC).UnixNano()
+	// 2023-02-04T13:21:04.354000000 in nanoseconds since epoch
+	ts2 := time.Date(2023, time.February, 4, 13, 21, 4, 354000000, time.UTC).UnixNano()
+
+	bldr.Field(0).(*array.TimestampBuilder).Append(arrow.Timestamp(ts1))
+	bldr.Field(1).(*array.TimestampBuilder).Append(arrow.Timestamp(ts1))
+
+	bldr.Field(0).(*array.TimestampBuilder).Append(arrow.Timestamp(ts2))
+	bldr.Field(1).(*array.TimestampBuilder).Append(arrow.Timestamp(ts2))
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	var buf bytes.Buffer
+	wr, err := pqarrow.NewFileWriter(arrowSchema, &buf,
+		parquet.NewWriterProperties(parquet.WithStats(true)),
+		pqarrow.DefaultWriterProps())
+	require.NoError(t, err)
+
+	require.NoError(t, wr.Write(rec))
+	require.NoError(t, wr.Close())
+
+	rdr, err := file.NewParquetReader(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+	defer rdr.Close()
+
+	meta := rdr.MetaData()
+
+	mapping, err := format.PathToIDMapping(tableMeta.CurrentSchema())
+	require.NoError(t, err)
+
+	modeFull := internal.MetricsMode{Typ: internal.MetricModeFull}
+	collector := map[int]internal.StatisticsCollector{
+		1: {FieldID: 1, Mode: modeFull, ColName: "ts_ns", IcebergTyp: iceberg.PrimitiveTypes.TimestampNs},
+		2: {FieldID: 2, Mode: modeFull, ColName: "tstz_ns", IcebergTyp: iceberg.PrimitiveTypes.TimestampTzNs},
+	}
+
+	stats := format.DataFileStatsFromMeta(internal.Metadata(meta), collector, mapping, nil, nil)
+	df := stats.ToDataFile(internal.DataFileOpts{
+		Schema:   tableMeta.CurrentSchema(),
+		Spec:     tableMeta.PartitionSpec(),
+		Path:     "fake-path.parquet",
+		Format:   iceberg.ParquetFile,
+		Content:  iceberg.EntryContentData,
+		FileSize: meta.GetSourceFileSize(),
+	})
+
+	assert.Len(t, df.ValueCounts(), 2)
+	assert.Len(t, df.NullValueCounts(), 2)
+
+	assert.Len(t, df.LowerBoundValues(), 2)
+	assertBounds(t, df.LowerBoundValues()[1], iceberg.PrimitiveTypes.TimestampNs, iceberg.TimestampNano(ts1))
+	assertBounds(t, df.LowerBoundValues()[2], iceberg.PrimitiveTypes.TimestampTzNs, iceberg.TimestampNano(ts1))
+
+	assert.Len(t, df.UpperBoundValues(), 2)
+	assertBounds(t, df.UpperBoundValues()[1], iceberg.PrimitiveTypes.TimestampNs, iceberg.TimestampNano(ts2))
+	assertBounds(t, df.UpperBoundValues()[2], iceberg.PrimitiveTypes.TimestampTzNs, iceberg.TimestampNano(ts2))
+}
+
+// TestDecimalPhysicalTypes tests that decimals stored as INT32/INT64 physical types
+// are correctly handled. This is important because Parquet allows decimals with
+// precision <= 9 to be stored as INT32, and precision <= 18 as INT64.
+func TestDecimalPhysicalTypes(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	tests := []struct {
+		name         string
+		precision    int
+		scale        int
+		physicalType parquet.Type
+		values       []int64 // unscaled values
+		expectedMin  int64
+		expectedMax  int64
+	}{
+		{
+			name:         "decimal_as_int32",
+			precision:    7,
+			scale:        2,
+			physicalType: parquet.Types.Int32,
+			values:       []int64{12345, 67890}, // represents 123.45, 678.90
+			expectedMin:  12345,
+			expectedMax:  67890,
+		},
+		{
+			name:         "decimal_as_int64",
+			precision:    15,
+			scale:        2,
+			physicalType: parquet.Types.Int64,
+			values:       []int64{123456789012345, 987654321098765},
+			expectedMin:  123456789012345,
+			expectedMax:  987654321098765,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a Parquet file with decimal stored as INT32 or INT64
+			var buf bytes.Buffer
+
+			// Build a custom schema with decimal logical type
+			decType := schema.NewDecimalLogicalType(int32(tt.precision), int32(tt.scale))
+			var node schema.Node
+			var err error
+			if tt.physicalType == parquet.Types.Int32 {
+				node, err = schema.NewPrimitiveNodeLogical("value", parquet.Repetitions.Required,
+					decType, parquet.Types.Int32, 0, 1)
+			} else {
+				node, err = schema.NewPrimitiveNodeLogical("value", parquet.Repetitions.Required,
+					decType, parquet.Types.Int64, 0, 1)
+			}
+			require.NoError(t, err)
+
+			rootNode, err := schema.NewGroupNode("schema", parquet.Repetitions.Required, schema.FieldList{node}, -1)
+			require.NoError(t, err)
+
+			// Write the parquet file
+			writer := file.NewParquetWriter(&buf,
+				rootNode,
+				file.WithWriterProps(parquet.NewWriterProperties(parquet.WithStats(true))))
+
+			rgw, err := writer.AppendRowGroupChecked()
+			require.NoError(t, err)
+			colWriter, err := rgw.NextColumn()
+			require.NoError(t, err)
+
+			if tt.physicalType == parquet.Types.Int32 {
+				int32Writer := colWriter.(*file.Int32ColumnChunkWriter)
+				vals := make([]int32, len(tt.values))
+				for i, v := range tt.values {
+					vals[i] = int32(v)
+				}
+				_, err = int32Writer.WriteBatch(vals, nil, nil)
+			} else {
+				int64Writer := colWriter.(*file.Int64ColumnChunkWriter)
+				_, err = int64Writer.WriteBatch(tt.values, nil, nil)
+			}
+			require.NoError(t, err)
+
+			require.NoError(t, colWriter.Close())
+			require.NoError(t, rgw.Close())
+			require.NoError(t, writer.Close())
+
+			// Read back and get metadata
+			rdr, err := file.NewParquetReader(bytes.NewReader(buf.Bytes()))
+			require.NoError(t, err)
+			defer rdr.Close()
+
+			meta := rdr.MetaData()
+
+			// Create table metadata with decimal type
+			tableMeta, err := table.ParseMetadataString(fmt.Sprintf(`{
+				"format-version": 2,
+				"table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+				"last-sequence-number": 0,
+				"location": "s3://bucket/test/location",
+				"last-column-id": 1,
+				"current-schema-id": 0,
+				"schemas": [
+					{
+						"type": "struct",
+						"schema-id": 0,
+						"fields": [
+							{"id": 1, "name": "value", "required": true, "type": "decimal(%d, %d)"}
+						]
+					}
+				],
+				"last-partition-id": 0,
+				"last-updated-ms": -1,
+				"default-spec-id": 0,
+				"default-sort-order-id": 0,
+				"sort-orders": [{"order-id": 0, "fields": []}],
+				"partition-specs": [{"spec-id": 0, "fields": []}],
+				"properties": {}
+			}`, tt.precision, tt.scale))
+			require.NoError(t, err)
+
+			mapping, err := format.PathToIDMapping(tableMeta.CurrentSchema())
+			require.NoError(t, err)
+
+			collector := map[int]internal.StatisticsCollector{
+				1: {
+					FieldID:    1,
+					Mode:       internal.MetricsMode{Typ: internal.MetricModeFull},
+					ColName:    "value",
+					IcebergTyp: iceberg.DecimalTypeOf(tt.precision, tt.scale),
+				},
+			}
+
+			// This should not panic - the fix allows INT32/INT64 physical types for decimals
+			stats := format.DataFileStatsFromMeta(internal.Metadata(meta), collector, mapping, nil, nil)
+			require.NotNil(t, stats)
+
+			df := stats.ToDataFile(internal.DataFileOpts{
+				Schema:   tableMeta.CurrentSchema(),
+				Spec:     tableMeta.PartitionSpec(),
+				Path:     "test.parquet",
+				Format:   iceberg.ParquetFile,
+				Content:  iceberg.EntryContentData,
+				FileSize: meta.GetSourceFileSize(),
+			})
+
+			// Verify bounds are correctly extracted
+			require.Contains(t, df.LowerBoundValues(), 1)
+			require.Contains(t, df.UpperBoundValues(), 1)
+
+			// Verify the actual values
+			minLit, err := iceberg.LiteralFromBytes(iceberg.DecimalTypeOf(tt.precision, tt.scale), df.LowerBoundValues()[1])
+			require.NoError(t, err)
+			minDec := minLit.(iceberg.TypedLiteral[iceberg.Decimal]).Value()
+			assert.Equal(t, uint64(tt.expectedMin), minDec.Val.LowBits())
+			assert.Equal(t, tt.scale, minDec.Scale)
+
+			maxLit, err := iceberg.LiteralFromBytes(iceberg.DecimalTypeOf(tt.precision, tt.scale), df.UpperBoundValues()[1])
+			require.NoError(t, err)
+			maxDec := maxLit.(iceberg.TypedLiteral[iceberg.Decimal]).Value()
+			assert.Equal(t, uint64(tt.expectedMax), maxDec.Val.LowBits())
+			assert.Equal(t, tt.scale, maxDec.Scale)
+		})
+	}
+}
+
+func geoArrowCRS(s string) json.RawMessage {
+	raw, _ := json.Marshal(s)
+
+	return raw
+}
+
+func assertGeoArrowWKBType(t *testing.T, dt arrow.DataType, storage arrow.DataType, want geoarrow.Metadata) *geoarrow.WKBType {
+	t.Helper()
+
+	wkbType, ok := dt.(*geoarrow.WKBType)
+	require.True(t, ok, "expected *geoarrow.WKBType, got %T", dt)
+	assert.Equal(t, "geoarrow.wkb", wkbType.ExtensionName())
+	assert.True(t, arrow.TypeEqual(storage, wkbType.StorageType()))
+	meta := wkbType.Metadata()
+	assert.Equal(t, want.CRS, meta.CRS)
+	assert.Equal(t, want.Edges, meta.Edges)
+	if want.CRSType != "" {
+		assert.Equal(t, want.CRSType, meta.CRSType)
+	}
+	if want.Edges == geoarrow.EdgePlanar {
+		assert.NotEqual(t, geoarrow.EdgeSpherical, meta.Edges)
+	}
+
+	return wkbType
+}
+
+func assertWKBValues(t *testing.T, col arrow.Array, wants ...geoarrow.WKBBytes) {
+	t.Helper()
+
+	arr, ok := col.(*geoarrow.WKBArray)
+	require.True(t, ok, "expected *geoarrow.WKBArray, got %T", col)
+	require.Equal(t, len(wants), arr.Len())
+
+	for i, want := range wants {
+		if want == nil {
+			assert.Nil(t, arr.Value(i), "row %d", i)
+
+			continue
+		}
+		assert.Equal(t, want, arr.Value(i), "row %d", i)
+	}
+}
+
+func TestParquetGeoArrowExtensionMetadataRoundTrip(t *testing.T) {
+	geomType, err := iceberg.GeometryTypeOf("srid:4326")
+	require.NoError(t, err)
+
+	geogType, err := iceberg.GeographyTypeOf("srid:4326", "vincenty")
+	require.NoError(t, err)
+
+	iceSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+		iceberg.NestedField{ID: 2, Name: "geom", Type: geomType, Required: false},
+		iceberg.NestedField{ID: 3, Name: "geog", Type: geogType, Required: false},
+		iceberg.NestedField{ID: 4, Name: "default_geom", Type: iceberg.GeometryType{}, Required: false},
+		iceberg.NestedField{ID: 5, Name: "default_geog", Type: iceberg.GeographyType{}, Required: false},
+	)
+
+	arrowSchema, err := table.SchemaToArrowSchema(iceSchema, nil, true, false)
+	require.NoError(t, err)
+
+	geomWKB, err := wktToWKB("POINT (30 10)")
+	require.NoError(t, err)
+	geogWKB, err := wktToWKB("POINT (20 5)")
+	require.NoError(t, err)
+	defaultGeomWKB, err := wktToWKB("POINT (10 20)")
+	require.NoError(t, err)
+	defaultGeogWKB, err := wktToWKB("POINT (40 15)")
+	require.NoError(t, err)
+
+	rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrowSchema, strings.NewReader(`[
+		{
+			"id": 1,
+			"geom": "`+geomWKB.String()+`",
+			"geog": "`+geogWKB.String()+`",
+			"default_geom": "`+defaultGeomWKB.String()+`",
+			"default_geog": "`+defaultGeogWKB.String()+`"
+		},
+		{
+			"id": null,
+			"geom": null,
+			"geog": "`+geogWKB.String()+`",
+			"default_geom": "`+defaultGeomWKB.String()+`",
+			"default_geog": null
+		}
+	]`))
+	require.NoError(t, err)
+	defer rec.Release()
+
+	arrProps := pqarrow.NewArrowWriterProperties(
+		pqarrow.WithAllocator(memory.DefaultAllocator),
+		pqarrow.WithStoreSchema(),
+	)
+	var buf bytes.Buffer
+	wr, err := pqarrow.NewFileWriter(arrowSchema, &buf,
+		parquet.NewWriterProperties(parquet.WithStats(true)),
+		arrProps)
+	require.NoError(t, err)
+	require.NoError(t, wr.Write(rec))
+	require.NoError(t, wr.Close())
+
+	pqRdr, err := file.NewParquetReader(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+	defer pqRdr.Close()
+
+	arrRdr, err := pqarrow.NewFileReader(pqRdr, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	require.NoError(t, err)
+	fr := internal.WrapParquetFileReader(arrRdr)
+
+	tbl, err := fr.ReadTable(context.Background())
+	require.NoError(t, err)
+	defer tbl.Release()
+
+	roundTripSchema := tbl.Schema()
+
+	tests := []struct {
+		name     string
+		idx      int
+		wantMeta geoarrow.Metadata
+	}{
+		{
+			name: "explicit_srid_geometry", idx: 1,
+			wantMeta: geoarrow.Metadata{CRS: geoArrowCRS("4326"), CRSType: geoarrow.CRSTypeSRID, Edges: geoarrow.EdgePlanar},
+		},
+		{
+			name: "explicit_srid_geography", idx: 2,
+			wantMeta: geoarrow.Metadata{CRS: geoArrowCRS("4326"), CRSType: geoarrow.CRSTypeSRID, Edges: geoarrow.EdgeVincenty},
+		},
+		{
+			name: "default_crs_geometry", idx: 3,
+			wantMeta: geoarrow.Metadata{CRS: geoArrowCRS("OGC:CRS84"), CRSType: geoarrow.CRSTypeAuthorityCode, Edges: geoarrow.EdgePlanar},
+		},
+		{
+			name: "default_crs_geography", idx: 4,
+			wantMeta: geoarrow.Metadata{CRS: geoArrowCRS("OGC:CRS84"), CRSType: geoarrow.CRSTypeAuthorityCode, Edges: geoarrow.EdgeSpherical},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run("metadata/"+tt.name, func(t *testing.T) {
+			origType := assertGeoArrowWKBType(t, arrowSchema.Field(tt.idx).Type, arrow.BinaryTypes.Binary, tt.wantMeta)
+			rtType := assertGeoArrowWKBType(t, roundTripSchema.Field(tt.idx).Type, arrow.BinaryTypes.Binary, tt.wantMeta)
+			assert.Equal(t, origType.Metadata(), rtType.Metadata())
+		})
+	}
+
+	rr, err := fr.GetRecords(context.Background(), nil, nil)
+	require.NoError(t, err)
+	defer rr.Release()
+	require.True(t, rr.Next())
+
+	batch := rr.RecordBatch()
+	defer batch.Release()
+	require.Equal(t, int64(2), batch.NumRows())
+
+	assertWKBValues(t, batch.Column(1), geomWKB, nil)
+	assertWKBValues(t, batch.Column(2), geogWKB, geogWKB)
+	assertWKBValues(t, batch.Column(3), defaultGeomWKB, defaultGeomWKB)
+	assertWKBValues(t, batch.Column(4), defaultGeogWKB, nil)
+}
+
+func TestWriteDataFileNormalizesEWKBOnDisk(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	ctx := compute.WithAllocator(context.Background(), mem)
+	geomType, err := iceberg.GeometryTypeOf("srid:4326")
+	require.NoError(t, err)
+
+	iceSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "geom", Type: geomType, Required: false},
+	)
+	arrowSchema, err := table.SchemaToArrowSchema(iceSchema, nil, true, false)
+	require.NoError(t, err)
+
+	isoWKB := pointWKB(t, 1, 2)
+	builder := array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
+	builder.Append(ewkbWithSRID(isoWKB, 4326))
+	builder.AppendNull()
+	storage := builder.NewArray()
+	builder.Release()
+	ext := array.NewExtensionArrayWithStorage(
+		arrowSchema.Field(0).Type.(arrow.ExtensionType), storage,
+	).(array.ExtensionArray)
+	storage.Release()
+	record := array.NewRecordBatch(arrowSchema, []arrow.Array{ext}, 2)
+	ext.Release()
+	defer record.Release()
+
+	fs := iceio.NewMemFS()
+	fm := internal.GetFileFormat(iceberg.ParquetFile)
+	_, err = fm.WriteDataFile(ctx, fs, nil, internal.WriteFileInfo{
+		FileSchema: iceSchema,
+		Spec:       *iceberg.UnpartitionedSpec,
+		FileName:   "geo.parquet",
+		StatsCols: map[int]internal.StatisticsCollector{
+			1: {FieldID: 1, IcebergTyp: geomType, ColName: "geom", Mode: internal.MetricsMode{Typ: internal.MetricModeFull}},
+		},
+		WriteProps: fm.GetWriteProperties(iceberg.Properties{}),
+		Content:    iceberg.EntryContentData,
+	}, []arrow.RecordBatch{record})
+	require.NoError(t, err)
+
+	output, err := fs.Open("geo.parquet")
+	require.NoError(t, err)
+	data, err := io.ReadAll(output)
+	closeErr := output.Close()
+	require.NoError(t, err)
+	require.NoError(t, closeErr)
+	pqReader, err := file.NewParquetReader(bytes.NewReader(data))
+	require.NoError(t, err)
+	defer pqReader.Close()
+
+	arrowReader, err := pqarrow.NewFileReader(pqReader, pqarrow.ArrowReadProperties{}, mem)
+	require.NoError(t, err)
+	reader := internal.WrapParquetFileReader(arrowReader)
+	records, err := reader.GetRecords(ctx, nil, nil)
+	require.NoError(t, err)
+	defer records.Release()
+	require.True(t, records.Next())
+
+	batch := records.RecordBatch()
+	defer batch.Release()
+	assertWKBValues(t, batch.Column(0), geoarrow.WKBBytes(isoWKB), nil)
+}
+
+func pointWKB(t *testing.T, x, y float64) []byte {
+	t.Helper()
+	geom, err := wkt.Unmarshal(fmt.Sprintf("POINT (%g %g)", x, y))
+	require.NoError(t, err)
+	wkbBytes, err := wkb.Marshal(geom, wkb.NDR)
+	require.NoError(t, err)
+
+	return wkbBytes
+}
+
+func ewkbWithSRID(isoWKB []byte, srid uint32) []byte {
+	result := make([]byte, len(isoWKB)+4)
+	copy(result[:5], isoWKB[:5])
+	binary.LittleEndian.PutUint32(result[1:5], binary.LittleEndian.Uint32(isoWKB[1:5])|0x20000000)
+	binary.LittleEndian.PutUint32(result[5:9], srid)
+	copy(result[9:], isoWKB[5:])
+
+	return result
+}
+
+func TestWriteDataFileErrOnClose(t *testing.T) {
+	ctx := context.Background()
+	fm := internal.GetFileFormat(iceberg.ParquetFile)
+	mockfs := internal2.MockFS{}
+	mockfs.Test(t)
+
+	mockfs.On("Create", "f").Return(&internal2.MockFile{
+		ErrOnClose: true,
+	}, nil)
+
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{
+			Name: "nested",
+			Type: arrow.ListOfField(arrow.Field{
+				Name: "element", Type: arrow.PrimitiveTypes.Int32, Nullable: false,
+				Metadata: arrow.NewMetadata([]string{table.ArrowParquetFieldIDKey}, []string{"2"}),
+			}),
+			Metadata: arrow.NewMetadata([]string{table.ArrowParquetFieldIDKey}, []string{"1"}),
+		},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(mem, schema)
+	bldr.Field(0).AppendNull()
+	defer bldr.Release()
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	icesc, err := table.ArrowSchemaToIceberg(schema, false, nil)
+	require.NoError(t, err)
+
+	// The stats plan must cover every non-lineage file column: the list
+	// element (field id 2) is the only parquet leaf column here.
+	statsCols := map[int]internal.StatisticsCollector{
+		2: {
+			FieldID:    2,
+			Mode:       internal.MetricsMode{Typ: internal.MetricModeFull},
+			ColName:    "nested.element",
+			IcebergTyp: iceberg.PrimitiveTypes.Int32,
+		},
+	}
+
+	_, err = fm.WriteDataFile(ctx, &mockfs, nil, internal.WriteFileInfo{
+		FileSchema: icesc,
+		Spec:       iceberg.PartitionSpec{},
+		FileName:   "f",
+		StatsCols:  statsCols,
+		WriteProps: []parquet.WriterProperty{},
+	}, []arrow.RecordBatch{rec})
+	require.ErrorContains(t, err, "error on close")
+}
+
+func TestNewFileWriterRejectsInvalidWriteProps(t *testing.T) {
+	fm := internal.GetFileFormat(iceberg.ParquetFile)
+
+	icebergSchema := iceberg.NewSchema(0, iceberg.NestedField{
+		ID:       1,
+		Name:     "id",
+		Type:     iceberg.PrimitiveTypes.Int32,
+		Required: false,
+	})
+	arrowSchema, err := table.SchemaToArrowSchema(icebergSchema, nil, true, false)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name       string
+		writeProps any
+		expected   string
+	}{
+		{
+			name:       "nil write props",
+			writeProps: nil,
+			expected:   "write properties are required",
+		},
+		{
+			name:       "wrong write props type",
+			writeProps: "bad",
+			expected:   "invalid write properties type",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			memfs := iceio.NewMemFS()
+
+			_, err = fm.NewFileWriter(context.Background(), memfs, nil, internal.WriteFileInfo{
+				FileSchema: icebergSchema,
+				FileName:   "f",
+				WriteProps: tt.writeProps,
+				Content:    iceberg.EntryContentData,
+				Spec:       *iceberg.UnpartitionedSpec,
+			}, arrowSchema)
+			require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+			require.ErrorContains(t, err, tt.expected)
+		})
+	}
+}
+
+func TestParquetFileWriterAbortRemovesFile(t *testing.T) {
+	memFS := iceio.NewMemFS()
+	fileName := "mem://abort-test/data.parquet"
+	writer := newAbortTestWriter(t, memFS, fileName)
+
+	require.NoError(t, writer.Abort())
+
+	_, err := memFS.Open(fileName)
+	require.ErrorIs(t, err, iofs.ErrNotExist)
+}
+
+func TestParquetFileWriterAbortIgnoresRemoveNotExist(t *testing.T) {
+	mockfs := internal2.MockFS{}
+	mockfs.Test(t)
+	mockfs.On("Create", "f").Return(&abortTestFile{}, nil)
+	mockfs.On("Remove", "f").Return(&iofs.PathError{
+		Op:   "remove",
+		Path: "f",
+		Err:  iofs.ErrNotExist,
+	})
+
+	writer := newAbortTestWriter(t, &mockfs, "f")
+	require.NoError(t, writer.Abort())
+	mockfs.AssertExpectations(t)
+}
+
+func TestParquetFileWriterAbortJoinsCloseAndRemoveErrors(t *testing.T) {
+	closeErr := errors.New("close failed")
+	removeErr := errors.New("remove failed")
+
+	mockfs := internal2.MockFS{}
+	mockfs.Test(t)
+	mockfs.On("Create", "f").Return(&abortTestFile{closeErr: closeErr}, nil)
+	mockfs.On("Remove", "f").Return(removeErr)
+
+	writer := newAbortTestWriter(t, &mockfs, "f")
+	err := writer.Abort()
+	require.ErrorIs(t, err, closeErr)
+	require.ErrorIs(t, err, removeErr)
+	mockfs.AssertExpectations(t)
+}
+
+func TestGetWritePropertiesPageVersion(t *testing.T) {
+	tests := []struct {
+		name             string
+		props            iceberg.Properties
+		expectedPageType file.PageType
+	}{
+		{
+			name:             "default is v2",
+			props:            iceberg.Properties{},
+			expectedPageType: file.PageTypeDataPageV2,
+		},
+		{
+			name:             "explicit v2",
+			props:            iceberg.Properties{internal.ParquetPageVersionKey: "2"},
+			expectedPageType: file.PageTypeDataPageV2,
+		},
+		{
+			name:             "explicit v1",
+			props:            iceberg.Properties{internal.ParquetPageVersionKey: "1"},
+			expectedPageType: file.PageTypeDataPage,
+		},
+		{
+			name:             "invalid falls back to v2",
+			props:            iceberg.Properties{internal.ParquetPageVersionKey: "invalid"},
+			expectedPageType: file.PageTypeDataPageV2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+			defer mem.AssertSize(t, 0)
+
+			format := internal.GetFileFormat(iceberg.ParquetFile)
+			writeProps := format.GetWriteProperties(tt.props).([]parquet.WriterProperty)
+
+			root, err := schema.NewGroupNode("schema", parquet.Repetitions.Required, schema.FieldList{
+				schema.NewInt32Node("col", parquet.Repetitions.Required, -1),
+			}, -1)
+			require.NoError(t, err)
+
+			var buf bytes.Buffer
+			pw := file.NewParquetWriter(&buf, root, file.WithWriterProps(
+				parquet.NewWriterProperties(writeProps...),
+			))
+
+			rgw, err := pw.AppendRowGroupChecked()
+			require.NoError(t, err)
+			cw, _ := rgw.NextColumn()
+			cw.(*file.Int32ColumnChunkWriter).WriteBatch(
+				[]int32{1, 2, 3}, nil, nil,
+			)
+			cw.Close()
+			rgw.Close()
+			pw.Close()
+
+			rdr, err := file.NewParquetReader(bytes.NewReader(buf.Bytes()))
+			require.NoError(t, err)
+			defer rdr.Close()
+
+			pageRdr, err := rdr.RowGroup(0).GetColumnPageReader(0)
+			require.NoError(t, err)
+
+			var dataPageType file.PageType
+			var foundDataPage bool
+			for pageRdr.Next() {
+				pt := pageRdr.Page().Type()
+				if pt == file.PageTypeDictionaryPage {
+					continue
+				}
+				dataPageType = pt
+				foundDataPage = true
+
+				break
+			}
+			require.True(t, foundDataPage, "expected a data page in row group")
+			assert.Equal(t, tt.expectedPageType, dataPageType)
+		})
+	}
+}
+
+func TestGetWritePropertiesDictionaryEnabledByDefault(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+	writeProps := format.GetWriteProperties(iceberg.Properties{}).([]parquet.WriterProperty)
+
+	root, err := schema.NewGroupNode("schema", parquet.Repetitions.Required, schema.FieldList{
+		schema.NewInt32Node("col", parquet.Repetitions.Required, -1),
+	}, -1)
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	pw := file.NewParquetWriter(&buf, root, file.WithWriterProps(
+		parquet.NewWriterProperties(writeProps...),
+	))
+
+	rgw, err := pw.AppendRowGroupChecked()
+	require.NoError(t, err)
+	cw, err := rgw.NextColumn()
+	require.NoError(t, err)
+
+	// Low-cardinality column stays dictionary-encoded (well under the dict-size limit).
+	values := make([]int32, 1024)
+	for i := range values {
+		values[i] = int32(i % 8)
+	}
+	_, err = cw.(*file.Int32ColumnChunkWriter).WriteBatch(values, nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, cw.Close())
+	require.NoError(t, rgw.Close())
+	require.NoError(t, pw.Close())
+
+	rdr, err := file.NewParquetReader(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+	defer rdr.Close()
+
+	colMeta, err := rdr.MetaData().RowGroup(0).ColumnChunk(0)
+	require.NoError(t, err)
+
+	assert.True(t, colMeta.HasDictionaryPage(),
+		"expected a dictionary page with default write properties")
+	assert.Contains(t, colMeta.Encodings(), parquet.Encodings.RLEDict,
+		"expected RLE_DICTIONARY encoding with default write properties")
+}
+
+func TestGetWritePropertiesDictionaryEncoding(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+	writerProps := func(props iceberg.Properties) *parquet.WriterProperties {
+		return parquet.NewWriterProperties(format.GetWriteProperties(props).([]parquet.WriterProperty)...)
+	}
+
+	t.Run("enabled by default", func(t *testing.T) {
+		wp := writerProps(iceberg.Properties{})
+		assert.True(t, wp.DictionaryEnabled())
+		assert.True(t, wp.DictionaryEnabledFor("any_col"))
+	})
+
+	t.Run("global opt-out", func(t *testing.T) {
+		wp := writerProps(iceberg.Properties{internal.ParquetDictEnabledKey: "false"})
+		assert.False(t, wp.DictionaryEnabled())
+		assert.False(t, wp.DictionaryEnabledFor("any_col"))
+	})
+
+	t.Run("per-column opt-out under the default", func(t *testing.T) {
+		wp := writerProps(iceberg.Properties{
+			internal.ParquetDictEncodingColumnEnabledKeyPrefix + ".name": "false",
+		})
+		assert.False(t, wp.DictionaryEnabledFor("name"))
+		assert.True(t, wp.DictionaryEnabledFor("id"), "unmentioned columns follow the global setting")
+	})
+
+	t.Run("per-column opt-in under a global opt-out", func(t *testing.T) {
+		wp := writerProps(iceberg.Properties{
+			internal.ParquetDictEnabledKey:                               "false",
+			internal.ParquetDictEncodingColumnEnabledKeyPrefix + ".id":   "true",
+			internal.ParquetDictEncodingColumnEnabledKeyPrefix + ".name": "false",
+		})
+		assert.True(t, wp.DictionaryEnabledFor("id"))
+		assert.False(t, wp.DictionaryEnabledFor("name"))
+		assert.False(t, wp.DictionaryEnabledFor("unmentioned_col"), "unmentioned columns follow the global setting")
+	})
+
+	// Java reads both keys with Boolean.parseBoolean, so only "true" enables.
+	t.Run("java boolean semantics", func(t *testing.T) {
+		for _, val := range []string{"true", "TRUE", "True"} {
+			assert.True(t, writerProps(iceberg.Properties{internal.ParquetDictEnabledKey: val}).DictionaryEnabled(), val)
+		}
+		for _, val := range []string{"false", "FALSE", "1", "yes", "", "bogus"} {
+			assert.False(t, writerProps(iceberg.Properties{internal.ParquetDictEnabledKey: val}).DictionaryEnabled(), val)
+		}
+	})
+}
+
+func TestGetWritePropertiesDictionaryEncodingRoundTrip(t *testing.T) {
+	values := make([]parquet.ByteArray, 4096)
+	for i := range values {
+		values[i] = parquet.ByteArray(fmt.Sprintf("cat_%02d", i%8))
+	}
+
+	t.Run("default writes a dictionary", func(t *testing.T) {
+		chunk := writeDictTestColumn(t, iceberg.Properties{}, values)
+		assert.True(t, chunk.hasDictPage)
+		assert.Positive(t, chunk.dictDataPages)
+		assert.Zero(t, chunk.plainDataPages)
+	})
+
+	t.Run("global opt-out writes no dictionary", func(t *testing.T) {
+		chunk := writeDictTestColumn(t, iceberg.Properties{
+			internal.ParquetDictEnabledKey: "false",
+		}, values)
+		assert.False(t, chunk.hasDictPage)
+		assert.Zero(t, chunk.dictDataPages)
+		assert.Positive(t, chunk.plainDataPages)
+	})
+
+	t.Run("per-column opt-out writes no dictionary", func(t *testing.T) {
+		chunk := writeDictTestColumn(t, iceberg.Properties{
+			internal.ParquetDictEncodingColumnEnabledKeyPrefix + "." + dictTestColumn: "false",
+		}, values)
+		assert.False(t, chunk.hasDictPage)
+		assert.Zero(t, chunk.dictDataPages)
+		assert.Positive(t, chunk.plainDataPages)
+	})
+
+	t.Run("per-column opt-in under a global opt-out writes a dictionary", func(t *testing.T) {
+		chunk := writeDictTestColumn(t, iceberg.Properties{
+			internal.ParquetDictEnabledKey:                                            "false",
+			internal.ParquetDictEncodingColumnEnabledKeyPrefix + "." + dictTestColumn: "true",
+		}, values)
+		assert.True(t, chunk.hasDictPage)
+		assert.Positive(t, chunk.dictDataPages)
+		assert.Zero(t, chunk.plainDataPages)
+	})
+}
+
+// TestGetWritePropertiesDictionaryHighCardinalityFallback guards the risk that
+// kept dictionary encoding disabled until now: with the default write properties
+// a column too distinct to dictionary encode must fall back to PLAIN, strand no
+// dictionary page, and not grow the chunk against a dictionary-disabled write.
+func TestGetWritePropertiesDictionaryHighCardinalityFallback(t *testing.T) {
+	const valueWidth = 32
+
+	// Enough distinct values to overflow the default 2 MB dictionary budget.
+	values := make([]parquet.ByteArray, 100000)
+	for i := range values {
+		b := make([]byte, valueWidth)
+		for j := range b {
+			b[j] = byte('A' + (i+j*31)%26)
+		}
+		tail := fmt.Appendf(nil, "-%07d", i)
+		copy(b[valueWidth-len(tail):], tail)
+		values[i] = parquet.ByteArray(b)
+	}
+
+	dictOn := writeDictTestColumn(t, iceberg.Properties{}, values)
+	dictOff := writeDictTestColumn(t, iceberg.Properties{
+		internal.ParquetDictEnabledKey: "false",
+	}, values)
+
+	t.Logf("dict=on compressed=%d hasDictPage=%v dictPages=%d plainPages=%d; dict=off compressed=%d",
+		dictOn.compressedSize, dictOn.hasDictPage, dictOn.dictDataPages, dictOn.plainDataPages,
+		dictOff.compressedSize)
+
+	assert.False(t, dictOn.hasDictPage, "overflowed dictionary must be discarded, not stranded in the chunk")
+	assert.Zero(t, dictOn.dictDataPages)
+	assert.Positive(t, dictOn.plainDataPages, "high-cardinality column must fall back to PLAIN")
+
+	// Discarding re-encodes the buffered values as PLAIN, so the chunk matches a
+	// dictionary-disabled write up to page-boundary rounding.
+	assert.LessOrEqual(t, dictOn.compressedSize, dictOff.compressedSize+dictOff.compressedSize/50,
+		"dictionary fallback must not grow the column chunk")
+}
+
+const dictTestColumn = "v"
+
+type dictChunkSummary struct {
+	compressedSize int64
+	hasDictPage    bool
+	dictDataPages  int
+	plainDataPages int
+}
+
+// writeDictTestColumn writes values as a single required BYTE_ARRAY column using
+// the write properties derived from tableProps, then summarizes the encodings of
+// the resulting column chunk.
+func writeDictTestColumn(t *testing.T, tableProps iceberg.Properties, values []parquet.ByteArray) dictChunkSummary {
+	t.Helper()
+
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+	writeProps := format.GetWriteProperties(tableProps).([]parquet.WriterProperty)
+	// Mirror getWriteProperties: Iceberg enables the cost-based dictionary fallback per column.
+	writeProps = append(writeProps, parquet.WithDictionaryCostFallbackFor(dictTestColumn, true))
+
+	root, err := schema.NewGroupNode("schema", parquet.Repetitions.Required, schema.FieldList{
+		schema.NewByteArrayNode(dictTestColumn, parquet.Repetitions.Required, -1),
+	}, -1)
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	pw := file.NewParquetWriter(&buf, root, file.WithWriterProps(
+		parquet.NewWriterProperties(writeProps...),
+	))
+
+	rgw, err := pw.AppendRowGroupChecked()
+	require.NoError(t, err)
+	cw, err := rgw.NextColumn()
+	require.NoError(t, err)
+	_, err = cw.(*file.ByteArrayColumnChunkWriter).WriteBatch(values, nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, cw.Close())
+	require.NoError(t, rgw.Close())
+	require.NoError(t, pw.Close())
+
+	rdr, err := file.NewParquetReader(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+	defer rdr.Close()
+
+	colMeta, err := rdr.MetaData().RowGroup(0).ColumnChunk(0)
+	require.NoError(t, err)
+
+	summary := dictChunkSummary{
+		compressedSize: colMeta.TotalCompressedSize(),
+		hasDictPage:    colMeta.HasDictionaryPage(),
+	}
+
+	pageRdr, err := rdr.RowGroup(0).GetColumnPageReader(0)
+	require.NoError(t, err)
+	for pageRdr.Next() {
+		page := pageRdr.Page()
+		if page.Type() != file.PageTypeDataPage && page.Type() != file.PageTypeDataPageV2 {
+			continue
+		}
+		switch parquet.Encoding(page.Encoding()) {
+		case parquet.Encodings.RLEDict, parquet.Encodings.PlainDict:
+			summary.dictDataPages++
+		case parquet.Encodings.Plain:
+			summary.plainDataPages++
+		}
+	}
+	require.NoError(t, pageRdr.Err())
+
+	return summary
+}
+
+func TestValidateParquetWriteProperties(t *testing.T) {
+	keys := []string{
+		internal.ParquetRowGroupSizeBytesKey,
+		internal.ParquetRowGroupLimitKey,
+		internal.ParquetPageSizeBytesKey,
+		internal.ParquetPageRowLimitKey,
+		internal.ParquetDictSizeBytesKey,
+	}
+
+	for _, key := range keys {
+		for _, value := range []string{"nope", "0", "-1"} {
+			t.Run(key+"/"+value, func(t *testing.T) {
+				err := internal.ValidateParquetWriteProperties(iceberg.Properties{key: value})
+				require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+			})
+		}
+
+		t.Run(key+"/valid", func(t *testing.T) {
+			require.NoError(t, internal.ValidateParquetWriteProperties(iceberg.Properties{key: "1"}))
+		})
+	}
+
+	for _, tt := range []struct {
+		value string
+		valid bool
+	}{
+		{value: "31", valid: false},
+		{value: "32", valid: true},
+		{value: "134217728", valid: true},
+		{value: "134217729", valid: false},
+	} {
+		t.Run(internal.ParquetBloomFilterMaxBytesKey+"/"+tt.value, func(t *testing.T) {
+			err := internal.ValidateParquetWriteProperties(iceberg.Properties{
+				internal.ParquetBloomFilterMaxBytesKey: tt.value,
+			})
+			if tt.valid {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+			}
+		})
+	}
+
+	if strconv.IntSize == 32 {
+		err := internal.ValidateParquetWriteProperties(iceberg.Properties{
+			internal.ParquetPageSizeBytesKey: "2147483648",
+		})
+		require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	}
+}
+
+func TestValidateParquetCompressionLevel(t *testing.T) {
+	t.Run("absent uses the default", func(t *testing.T) {
+		require.NoError(t, internal.ValidateParquetWriteProperties(iceberg.Properties{}))
+	})
+
+	t.Run("explicit default is valid", func(t *testing.T) {
+		require.NoError(t, internal.ValidateParquetWriteProperties(iceberg.Properties{
+			internal.ParquetCompressionLevelKey: strconv.Itoa(internal.ParquetCompressionLevelDefault),
+		}))
+	})
+
+	for _, value := range []string{"nope", "", "9223372036854775808"} {
+		t.Run("invalid/"+value, func(t *testing.T) {
+			err := internal.ValidateParquetWriteProperties(iceberg.Properties{
+				internal.ParquetCompressionLevelKey: value,
+			})
+			require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+		})
+	}
+
+	for _, tt := range []struct {
+		codec string
+		level int
+		valid bool
+	}{
+		{codec: "gzip", level: -3, valid: true},
+		{codec: "gzip", level: 9, valid: true},
+		{codec: "gzip", level: 10, valid: false},
+		{codec: "zstd", level: -5, valid: true},
+		{codec: "zstd", level: 22, valid: true},
+		{codec: "zstd", level: 23, valid: false},
+		{codec: "brotli", level: -1, valid: true},
+		{codec: "brotli", level: 0, valid: true},
+		{codec: "brotli", level: 11, valid: true},
+		{codec: "brotli", level: 12, valid: false},
+	} {
+		t.Run(fmt.Sprintf("%s/%d", tt.codec, tt.level), func(t *testing.T) {
+			err := internal.ValidateParquetWriteProperties(iceberg.Properties{
+				internal.ParquetCompressionKey:      tt.codec,
+				internal.ParquetCompressionLevelKey: strconv.Itoa(tt.level),
+			})
+			if tt.valid {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+				require.Contains(t, err.Error(), internal.ParquetCompressionLevelKey)
+				require.Contains(t, err.Error(), tt.codec)
+			}
+		})
+	}
+}
+
+func TestGetWritePropertiesBloomFilter(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	t.Run("default max bloom filter bytes", func(t *testing.T) {
+		wp := parquet.NewWriterProperties(format.GetWriteProperties(iceberg.Properties{}).([]parquet.WriterProperty)...)
+		assert.Equal(t, int64(internal.ParquetBloomFilterMaxBytesDefault), wp.MaxBloomFilterBytes())
+	})
+
+	t.Run("custom max bloom filter bytes", func(t *testing.T) {
+		props := iceberg.Properties{
+			internal.ParquetBloomFilterMaxBytesKey: "2097152",
+		}
+		wp := parquet.NewWriterProperties(format.GetWriteProperties(props).([]parquet.WriterProperty)...)
+		assert.Equal(t, int64(2097152), wp.MaxBloomFilterBytes())
+	})
+
+	t.Run("per-column bloom filter enabled", func(t *testing.T) {
+		props := iceberg.Properties{
+			internal.ParquetBloomFilterColumnEnabledKeyPrefix + ".id":   "true",
+			internal.ParquetBloomFilterColumnEnabledKeyPrefix + ".name": "false",
+		}
+		wp := parquet.NewWriterProperties(format.GetWriteProperties(props).([]parquet.WriterProperty)...)
+		assert.True(t, wp.BloomFilterEnabledFor("id"))
+		assert.False(t, wp.BloomFilterEnabledFor("name"))
+		assert.False(t, wp.BloomFilterEnabledFor("unmentioned_col"), "columns absent from properties must default to no bloom filter")
+	})
+}
+
+func TestParquetRowGroupTargetSizeBytes(t *testing.T) {
+	tests := []struct {
+		name      string
+		props     iceberg.Properties
+		expected  int64
+		errString string
+	}{
+		{
+			name:     "default",
+			props:    iceberg.Properties{},
+			expected: internal.ParquetRowGroupSizeBytesDefault,
+		},
+		{
+			name: "configured",
+			props: iceberg.Properties{
+				internal.ParquetRowGroupSizeBytesKey: "4096",
+			},
+			expected: 4096,
+		},
+		{
+			name: "not an integer",
+			props: iceberg.Properties{
+				internal.ParquetRowGroupSizeBytesKey: "large",
+			},
+			errString: "invalid write.parquet.row-group-size-bytes value",
+		},
+		{
+			name: "zero",
+			props: iceberg.Properties{
+				internal.ParquetRowGroupSizeBytesKey: "0",
+			},
+			errString: "must be greater than 0",
+		},
+		{
+			name: "negative",
+			props: iceberg.Properties{
+				internal.ParquetRowGroupSizeBytesKey: "-1",
+			},
+			errString: "must be greater than 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual, err := internal.ParquetRowGroupTargetSizeBytes(tt.props)
+			if tt.errString != "" {
+				require.ErrorContains(t, err, tt.errString)
+				require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, actual)
+		})
+	}
+}
+
+func TestParquetRowGroupTargetRotatesBeforeNextBatch(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	icebergSchema := iceberg.NewSchema(0, iceberg.NestedField{
+		ID: 1, Name: "value", Type: iceberg.PrimitiveTypes.String, Required: false,
+	})
+	arrowSchema, err := table.SchemaToArrowSchema(icebergSchema, nil, true, false)
+	require.NoError(t, err)
+
+	buildBatch := func(value string) arrow.RecordBatch {
+		bldr := array.NewRecordBuilder(mem, arrowSchema)
+		defer bldr.Release()
+		bldr.Field(0).(*array.StringBuilder).Append(value)
+
+		return bldr.NewRecordBatch()
+	}
+
+	first := buildBatch(strings.Repeat("a", 1024))
+	defer first.Release()
+	second := buildBatch(strings.Repeat("b", 1024))
+	defer second.Release()
+
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+	// Keep the page size below the batch size so Arrow flushes the first batch
+	// and RowGroupTotalBytesWritten can observe it before the second write.
+	writeProps := format.GetWriteProperties(iceberg.Properties{
+		internal.ParquetPageSizeBytesKey: "1",
+	})
+	for _, tt := range []struct {
+		name          string
+		targetBytes   int64
+		wantRowGroups int
+	}{
+		{name: "target reached", targetBytes: 1, wantRowGroups: 2},
+		{name: "target not reached", targetBytes: math.MaxInt64, wantRowGroups: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fsys := iceio.NewMemFS()
+			_, err = format.WriteDataFile(context.Background(), fsys, nil, internal.WriteFileInfo{
+				FileSchema: icebergSchema,
+				Spec:       *iceberg.UnpartitionedSpec,
+				FileName:   "row-groups.parquet",
+				StatsCols: map[int]internal.StatisticsCollector{
+					1: {
+						FieldID:    1,
+						Mode:       internal.MetricsMode{Typ: internal.MetricModeFull},
+						ColName:    "value",
+						IcebergTyp: iceberg.PrimitiveTypes.String,
+					},
+				},
+				WriteProps:    writeProps,
+				RowGroupBytes: tt.targetBytes,
+				Content:       iceberg.EntryContentData,
+			}, []arrow.RecordBatch{first, second})
+			require.NoError(t, err)
+
+			input, err := fsys.Open("row-groups.parquet")
+			require.NoError(t, err)
+			defer input.Close()
+
+			reader, err := file.NewParquetReader(input)
+			require.NoError(t, err)
+			defer reader.Close()
+
+			require.Equal(t, tt.wantRowGroups, reader.MetaData().NumRowGroups())
+			for rowGroup := range reader.MetaData().NumRowGroups() {
+				require.Positive(t, reader.MetaData().RowGroup(rowGroup).NumRows(),
+					"rotation must not create an empty trailing row group")
+			}
+		})
+	}
+}
+
+func TestParquetBatchSizeFromTableProperties(t *testing.T) {
+	t.Run("default batch size when no properties in context", func(t *testing.T) {
+		ctx := context.Background()
+		props := internal.TablePropertiesFromContext(ctx)
+		assert.Equal(t, internal.ParquetBatchSizeDefault, props.GetInt(internal.ParquetBatchSizeKey, internal.ParquetBatchSizeDefault))
+	})
+
+	t.Run("custom batch size from context properties", func(t *testing.T) {
+		customBatchSize := 1024
+		props := iceberg.Properties{internal.ParquetBatchSizeKey: "1024"}
+		ctx := internal.WithTableProperties(context.Background(), props)
+		got := internal.TablePropertiesFromContext(ctx)
+		assert.Equal(t, customBatchSize, got.GetInt(internal.ParquetBatchSizeKey, internal.ParquetBatchSizeDefault))
+	})
+
+	t.Run("invalid value falls back to default", func(t *testing.T) {
+		props := iceberg.Properties{internal.ParquetBatchSizeKey: "not-a-number"}
+		ctx := internal.WithTableProperties(context.Background(), props)
+		got := internal.TablePropertiesFromContext(ctx)
+		assert.Equal(t, internal.ParquetBatchSizeDefault, got.GetInt(internal.ParquetBatchSizeKey, internal.ParquetBatchSizeDefault))
+	})
+}
+
+// buildBloomTestParquet writes a Parquet file with two row groups into buf.
+// The single required INT32 column "id" has Iceberg field_id=1 and bloom
+// filters enabled. RG0 holds values [1..rgSize], RG1 holds [rgSize+1..2*rgSize].
+func buildBloomTestParquet(t testing.TB, rgSize int) []byte {
+	t.Helper()
+
+	idNode := schema.NewInt32Node("id", parquet.Repetitions.Required, 1)
+
+	rootNode, err := schema.NewGroupNode("schema", parquet.Repetitions.Required,
+		schema.FieldList{idNode}, -1)
+	require.NoError(t, err)
+
+	writerProps := parquet.NewWriterProperties(
+		parquet.WithStats(true),
+		parquet.WithBloomFilterEnabledFor("id", true),
+	)
+
+	var buf bytes.Buffer
+	pw := file.NewParquetWriter(&buf, rootNode, file.WithWriterProps(writerProps))
+
+	writeRG := func(start, end int) {
+		rgw, werr := pw.AppendRowGroupChecked()
+		require.NoError(t, werr)
+		cw, werr := rgw.NextColumn()
+		require.NoError(t, werr)
+
+		vals := make([]int32, end-start+1)
+		for i := range vals {
+			vals[i] = int32(start + i)
+		}
+
+		_, werr = cw.(*file.Int32ColumnChunkWriter).WriteBatch(vals, nil, nil)
+		require.NoError(t, werr)
+		require.NoError(t, cw.Close())
+		require.NoError(t, rgw.Close())
+	}
+
+	writeRG(1, rgSize)          // RG0
+	writeRG(rgSize+1, 2*rgSize) // RG1
+
+	require.NoError(t, pw.Close())
+
+	return buf.Bytes()
+}
+
+// openBloomTestReader creates a fresh FileReader from raw Parquet bytes for
+// each subtest call, so row-group state is not shared between subtests.
+func openBloomTestReader(t testing.TB, data []byte) internal.FileReader {
+	t.Helper()
+
+	source := bytes.NewReader(data)
+	pqRdr, err := file.NewParquetReader(source)
+	require.NoError(t, err)
+
+	arrRdr, err := pqarrow.NewFileReader(pqRdr, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	require.NoError(t, err)
+
+	return internal.WrapParquetFileReaderWithDictionarySource(arrRdr, source)
+}
+
+func openTestReaderWithoutDictionarySource(t testing.TB, data []byte) internal.FileReader {
+	t.Helper()
+
+	pqRdr, err := file.NewParquetReader(bytes.NewReader(data))
+	require.NoError(t, err)
+
+	arrRdr, err := pqarrow.NewFileReader(pqRdr, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	require.NoError(t, err)
+
+	return internal.WrapParquetFileReader(arrRdr)
+}
+
+func int32PhysBytes(v int32) []byte {
+	b := make([]byte, 4)
+	binary.LittleEndian.PutUint32(b, uint32(v))
+
+	return b
+}
+
+func countRecords(t testing.TB, rr array.RecordReader) int64 {
+	t.Helper()
+	defer rr.Release()
+
+	var n int64
+	for rr.Next() {
+		n += rr.RecordBatch().NumRows()
+	}
+
+	return n
+}
+
+// TestBloomFilterRowGroupPruning verifies that ParquetRowGroupTester's bloom
+// filter pass correctly skips row groups that definitively do not contain a
+// queried value, while keeping row groups where the value is present.
+func TestBloomFilterRowGroupPruning(t *testing.T) {
+	const rgSize = 100 // 100 rows per row group
+
+	data := buildBloomTestParquet(t, rgSize)
+
+	// Stats function that always keeps the row group (isolates bloom logic).
+	alwaysKeep := func(_ *metadata.RowGroupMetaData, _ []int) (bool, error) {
+		return true, nil
+	}
+
+	ctx := context.Background()
+	cols := []int{0}
+
+	t.Run("value in RG0 prunes RG1", func(t *testing.T) {
+		rdr := openBloomTestReader(t, data)
+		var survivors []internal.RowGroupSpan
+		tester := &internal.ParquetRowGroupTester{
+			StatsFn: alwaysKeep,
+			BloomPreds: []internal.RowGroupBloomPred{
+				{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(50)}}, // 50 is in RG0
+			},
+			Survivors: &survivors,
+		}
+		rr, err := rdr.GetRecords(ctx, cols, tester)
+		require.NoError(t, err)
+
+		assert.Equal(t, int64(rgSize), countRecords(t, rr), "only RG0 rows expected")
+		assert.Equal(t, []internal.RowGroupSpan{{FirstRowPos: 0, NumRows: rgSize}}, survivors,
+			"surviving RG0 keeps file position 0")
+	})
+
+	t.Run("value in RG1 prunes RG0", func(t *testing.T) {
+		rdr := openBloomTestReader(t, data)
+		var survivors []internal.RowGroupSpan
+		tester := &internal.ParquetRowGroupTester{
+			StatsFn: alwaysKeep,
+			BloomPreds: []internal.RowGroupBloomPred{
+				{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(150)}}, // 150 is in RG1
+			},
+			Survivors: &survivors,
+		}
+		rr, err := rdr.GetRecords(ctx, cols, tester)
+		require.NoError(t, err)
+
+		assert.Equal(t, int64(rgSize), countRecords(t, rr), "only RG1 rows expected")
+		assert.Equal(t, []internal.RowGroupSpan{{FirstRowPos: rgSize, NumRows: rgSize}}, survivors,
+			"surviving RG1 keeps its file position past the bloom-pruned RG0")
+	})
+
+	t.Run("value absent from all row groups skips all", func(t *testing.T) {
+		rdr := openBloomTestReader(t, data)
+		var survivors []internal.RowGroupSpan
+		tester := &internal.ParquetRowGroupTester{
+			StatsFn: alwaysKeep,
+			BloomPreds: []internal.RowGroupBloomPred{
+				{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(999)}}, // 999 not in either RG
+			},
+			Survivors: &survivors,
+		}
+		rr, err := rdr.GetRecords(ctx, cols, tester)
+		require.NoError(t, err)
+
+		assert.Equal(t, int64(0), countRecords(t, rr), "no rows expected when value absent")
+		assert.Empty(t, survivors, "no surviving row groups when value is absent everywhere")
+	})
+
+	t.Run("In predicate with a value in each RG keeps both", func(t *testing.T) {
+		rdr := openBloomTestReader(t, data)
+		tester := &internal.ParquetRowGroupTester{
+			StatsFn: alwaysKeep,
+			BloomPreds: []internal.RowGroupBloomPred{
+				{
+					FieldID: 1,
+					PhysBytes: [][]byte{
+						int32PhysBytes(50),  // in RG0
+						int32PhysBytes(150), // in RG1
+					},
+				},
+			},
+		}
+		rr, err := rdr.GetRecords(ctx, cols, tester)
+		require.NoError(t, err)
+
+		assert.Equal(t, int64(2*rgSize), countRecords(t, rr), "both row groups expected")
+	})
+
+	t.Run("nil bloom preds reads all row groups", func(t *testing.T) {
+		rdr := openBloomTestReader(t, data)
+		tester := &internal.ParquetRowGroupTester{
+			StatsFn:    alwaysKeep,
+			BloomPreds: nil,
+		}
+		rr, err := rdr.GetRecords(ctx, cols, tester)
+		require.NoError(t, err)
+
+		assert.Equal(t, int64(2*rgSize), countRecords(t, rr), "all rows expected without bloom preds")
+	})
+
+	t.Run("unknown field ID is ignored and row group kept", func(t *testing.T) {
+		rdr := openBloomTestReader(t, data)
+		tester := &internal.ParquetRowGroupTester{
+			StatsFn: alwaysKeep,
+			BloomPreds: []internal.RowGroupBloomPred{
+				{FieldID: 999, PhysBytes: [][]byte{int32PhysBytes(50)}}, // field 999 does not exist
+			},
+		}
+		rr, err := rdr.GetRecords(ctx, cols, tester)
+		require.NoError(t, err)
+
+		assert.Equal(t, int64(2*rgSize), countRecords(t, rr), "all rows expected when field ID unknown")
+	})
+}
+
+// buildDictionaryTestParquet writes a Parquet file with two low-cardinality
+// dictionary-encoded row groups. The single required INT32 column "id" has
+// Iceberg field_id=1.
+func buildDictionaryTestParquet(t testing.TB, rowGroups ...[]int32) []byte {
+	t.Helper()
+
+	idNode := schema.NewInt32Node("id", parquet.Repetitions.Required, 1)
+	rootNode, err := schema.NewGroupNode("schema", parquet.Repetitions.Required,
+		schema.FieldList{idNode}, -1)
+	require.NoError(t, err)
+
+	writerProps := parquet.NewWriterProperties(
+		parquet.WithStats(true),
+		parquet.WithDictionaryDefault(true),
+	)
+
+	var buf bytes.Buffer
+	pw := file.NewParquetWriter(&buf, rootNode, file.WithWriterProps(writerProps))
+	for _, values := range rowGroups {
+		rgw, werr := pw.AppendRowGroupChecked()
+		require.NoError(t, werr)
+		cw, werr := rgw.NextColumn()
+		require.NoError(t, werr)
+		_, werr = cw.(*file.Int32ColumnChunkWriter).WriteBatch(values, nil, nil)
+		require.NoError(t, werr)
+		require.NoError(t, cw.Close())
+		require.NoError(t, rgw.Close())
+	}
+	require.NoError(t, pw.Close())
+
+	return buf.Bytes()
+}
+
+type multiColumnDictionaryTestRowGroup struct {
+	ids        []int32
+	categories []string
+}
+
+func buildMultiColumnDictionaryTestParquet(
+	t testing.TB, rowGroups ...multiColumnDictionaryTestRowGroup,
+) []byte {
+	t.Helper()
+
+	idNode := schema.NewInt32Node("id", parquet.Repetitions.Required, 1)
+	categoryNode := schema.NewByteArrayNode("category", parquet.Repetitions.Required, 2)
+	rootNode, err := schema.NewGroupNode("schema", parquet.Repetitions.Required,
+		schema.FieldList{idNode, categoryNode}, -1)
+	require.NoError(t, err)
+
+	writerProps := parquet.NewWriterProperties(
+		parquet.WithStats(true),
+		parquet.WithDictionaryDefault(true),
+	)
+
+	var buf bytes.Buffer
+	pw := file.NewParquetWriter(&buf, rootNode, file.WithWriterProps(writerProps))
+	for _, values := range rowGroups {
+		require.Len(t, values.categories, len(values.ids))
+
+		rgw, werr := pw.AppendRowGroupChecked()
+		require.NoError(t, werr)
+
+		idColumn, werr := rgw.NextColumn()
+		require.NoError(t, werr)
+		_, werr = idColumn.(*file.Int32ColumnChunkWriter).WriteBatch(values.ids, nil, nil)
+		require.NoError(t, werr)
+		require.NoError(t, idColumn.Close())
+
+		categoryColumn, werr := rgw.NextColumn()
+		require.NoError(t, werr)
+		categories := make([]parquet.ByteArray, len(values.categories))
+		for i, category := range values.categories {
+			categories[i] = parquet.ByteArray(category)
+		}
+		_, werr = categoryColumn.(*file.ByteArrayColumnChunkWriter).WriteBatch(categories, nil, nil)
+		require.NoError(t, werr)
+		require.NoError(t, categoryColumn.Close())
+		require.NoError(t, rgw.Close())
+	}
+	require.NoError(t, pw.Close())
+
+	return buf.Bytes()
+}
+
+// TestDictionaryRowGroupPruning verifies that dictionary-only row groups are
+// skipped when an EqualTo/In predicate has no value in the complete dictionary.
+func TestDictionaryRowGroupPruning(t *testing.T) {
+	const rgSize = 1024
+	rg0 := make([]int32, rgSize)
+	rg1 := make([]int32, rgSize)
+	for i := range rg0 {
+		rg0[i] = 1 + int32(i%2)*2
+		rg1[i] = 5 + int32(i%2)*2
+	}
+
+	data := buildDictionaryTestParquet(t, rg0, rg1)
+	alwaysKeep := func(_ *metadata.RowGroupMetaData, _ []int) (bool, error) {
+		return true, nil
+	}
+
+	ctx := context.Background()
+	cols := []int{0}
+
+	t.Run("EqualTo absent from both dictionaries", func(t *testing.T) {
+		rdr := openBloomTestReader(t, data)
+		var survivors []internal.RowGroupSpan
+		tester := &internal.ParquetRowGroupTester{
+			DictionaryPreds: []internal.RowGroupDictionaryPred{
+				{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(2)}},
+			},
+			Survivors: &survivors,
+		}
+		rr, err := rdr.GetRecords(ctx, cols, tester)
+		require.NoError(t, err)
+
+		assert.Equal(t, int64(0), countRecords(t, rr))
+		assert.Empty(t, survivors)
+		require.NoError(t, rdr.Close())
+	})
+
+	t.Run("EqualTo keeps the matching dictionary", func(t *testing.T) {
+		rdr := openBloomTestReader(t, data)
+		var survivors []internal.RowGroupSpan
+		tester := &internal.ParquetRowGroupTester{
+			DictionaryPreds: []internal.RowGroupDictionaryPred{
+				{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(7)}},
+			},
+			StatsFn:   alwaysKeep,
+			Survivors: &survivors,
+		}
+		rr, err := rdr.GetRecords(ctx, cols, tester)
+		require.NoError(t, err)
+
+		assert.Equal(t, int64(rgSize), countRecords(t, rr))
+		assert.Equal(t, []internal.RowGroupSpan{{FirstRowPos: rgSize, NumRows: rgSize}}, survivors)
+		require.NoError(t, rdr.Close())
+	})
+
+	t.Run("In keeps a row group when any value is present", func(t *testing.T) {
+		rdr := openBloomTestReader(t, data)
+		var survivors []internal.RowGroupSpan
+		tester := &internal.ParquetRowGroupTester{
+			DictionaryPreds: []internal.RowGroupDictionaryPred{
+				{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(2), int32PhysBytes(5)}},
+			},
+			StatsFn:   alwaysKeep,
+			Survivors: &survivors,
+		}
+		rr, err := rdr.GetRecords(ctx, cols, tester)
+		require.NoError(t, err)
+
+		assert.Equal(t, int64(rgSize), countRecords(t, rr))
+		assert.Equal(t, []internal.RowGroupSpan{{FirstRowPos: rgSize, NumRows: rgSize}}, survivors)
+		require.NoError(t, rdr.Close())
+	})
+}
+
+func TestDictionaryRowGroupPruningMultiColumnAnd(t *testing.T) {
+	const rgSize = 1024
+
+	alwaysKeep := func(_ *metadata.RowGroupMetaData, _ []int) (bool, error) {
+		return true, nil
+	}
+	repeatedIDs := func(first, second int32) []int32 {
+		values := make([]int32, rgSize)
+		for i := range values {
+			if i%2 == 0 {
+				values[i] = first
+			} else {
+				values[i] = second
+			}
+		}
+
+		return values
+	}
+	repeatedCategory := func(category string) []string {
+		values := make([]string, rgSize)
+		for i := range values {
+			values[i] = category
+		}
+
+		return values
+	}
+
+	tests := []struct {
+		name      string
+		rowGroups []multiColumnDictionaryTestRowGroup
+		preds     []internal.RowGroupDictionaryPred
+		wantRows  int64
+		survivors []internal.RowGroupSpan
+	}{
+		{
+			name: "id predicate prunes a group while category matches",
+			rowGroups: []multiColumnDictionaryTestRowGroup{
+				{ids: repeatedIDs(1, 3), categories: repeatedCategory("a")},
+				{ids: repeatedIDs(5, 7), categories: repeatedCategory("a")},
+			},
+			preds: []internal.RowGroupDictionaryPred{
+				{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(5)}},
+				{FieldID: 2, PhysBytes: [][]byte{[]byte("a")}},
+			},
+			wantRows:  rgSize,
+			survivors: []internal.RowGroupSpan{{FirstRowPos: rgSize, NumRows: rgSize}},
+		},
+		{
+			name: "category predicate prunes a group while id matches",
+			rowGroups: []multiColumnDictionaryTestRowGroup{
+				{ids: repeatedIDs(1, 3), categories: repeatedCategory("a")},
+				{ids: repeatedIDs(1, 3), categories: repeatedCategory("b")},
+			},
+			preds: []internal.RowGroupDictionaryPred{
+				{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(1)}},
+				{FieldID: 2, PhysBytes: [][]byte{[]byte("a")}},
+			},
+			wantRows:  rgSize,
+			survivors: []internal.RowGroupSpan{{FirstRowPos: 0, NumRows: rgSize}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data := buildMultiColumnDictionaryTestParquet(t, test.rowGroups...)
+			rdr := openBloomTestReader(t, data)
+			defer rdr.Close()
+
+			var survivors []internal.RowGroupSpan
+			tester := &internal.ParquetRowGroupTester{
+				StatsFn:         alwaysKeep,
+				DictionaryPreds: test.preds,
+				Survivors:       &survivors,
+			}
+			rr, err := rdr.GetRecords(context.Background(), []int{0, 1}, tester)
+			require.NoError(t, err)
+
+			assert.Equal(t, test.wantRows, countRecords(t, rr))
+			assert.Equal(t, test.survivors, survivors)
+		})
+	}
+}
+
+func TestDictionaryRowGroupPruningChecksTailAfterMatchingPrefix(t *testing.T) {
+	const (
+		rgSize         = 1024
+		matchingGroups = 16
+	)
+
+	present := make([]int32, rgSize)
+	absent := make([]int32, rgSize)
+	for i := range present {
+		present[i] = 7
+		absent[i] = 1
+	}
+
+	rowGroups := make([][]int32, 0, matchingGroups+2)
+	for range matchingGroups {
+		rowGroups = append(rowGroups, present)
+	}
+	rowGroups = append(rowGroups, absent, absent)
+
+	data := buildDictionaryTestParquet(t, rowGroups...)
+	rdr := openBloomTestReader(t, data)
+	defer rdr.Close()
+
+	var survivors []internal.RowGroupSpan
+	tester := &internal.ParquetRowGroupTester{
+		StatsFn: func(_ *metadata.RowGroupMetaData, _ []int) (bool, error) {
+			return true, nil
+		},
+		DictionaryPreds: []internal.RowGroupDictionaryPred{
+			{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(7)}},
+		},
+		Survivors: &survivors,
+	}
+	rr, err := rdr.GetRecords(context.Background(), []int{0}, tester)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(matchingGroups*rgSize), countRecords(t, rr))
+	expected := make([]internal.RowGroupSpan, matchingGroups)
+	for i := range matchingGroups {
+		expected[i] = internal.RowGroupSpan{
+			FirstRowPos: int64(i * rgSize),
+			NumRows:     rgSize,
+		}
+	}
+	assert.Equal(t, expected, survivors)
+}
+
+func TestDictionaryRowGroupPruningFallbackUsesMainReader(t *testing.T) {
+	const rgSize = 1024
+	rg0 := make([]int32, rgSize)
+	rg1 := make([]int32, rgSize)
+	for i := range rg0 {
+		rg0[i] = 1
+		rg1[i] = 7
+	}
+
+	rdr := openTestReaderWithoutDictionarySource(t, buildDictionaryTestParquet(t, rg0, rg1))
+	defer rdr.Close()
+
+	tester := &internal.ParquetRowGroupTester{
+		StatsFn: func(_ *metadata.RowGroupMetaData, _ []int) (bool, error) {
+			return true, nil
+		},
+		DictionaryPreds: []internal.RowGroupDictionaryPred{
+			{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(7)}},
+		},
+	}
+	rr, err := rdr.GetRecords(context.Background(), []int{0}, tester)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(rgSize), countRecords(t, rr))
+}
+
+func TestDictionaryRowGroupPruningClosesTemporaryReaderWithoutClosingSource(t *testing.T) {
+	const rgSize = 1024
+	rg0 := make([]int32, rgSize)
+	rg1 := make([]int32, rgSize)
+	for i := range rg0 {
+		rg0[i] = 1
+		rg1[i] = 7
+	}
+	data := buildDictionaryTestParquet(t, rg0, rg1)
+
+	source := &trackingOpenFile{Reader: bytes.NewReader(data)}
+	pqRdr, err := file.NewParquetReader(source)
+	require.NoError(t, err)
+	arrRdr, err := pqarrow.NewFileReader(pqRdr, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	require.NoError(t, err)
+	rdr := internal.WrapParquetFileReaderWithDictionarySource(arrRdr, source)
+
+	tester := &internal.ParquetRowGroupTester{
+		StatsFn: func(_ *metadata.RowGroupMetaData, _ []int) (bool, error) {
+			return true, nil
+		},
+		DictionaryPreds: []internal.RowGroupDictionaryPred{
+			{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(7)}},
+		},
+	}
+	rr, err := rdr.GetRecords(context.Background(), []int{0}, tester)
+	require.NoError(t, err)
+	assert.Equal(t, int64(rgSize), countRecords(t, rr))
+	assert.False(t, source.closed, "temporary dictionary reader must not close the shared source")
+
+	require.NoError(t, rdr.Close())
+	assert.True(t, source.closed)
+}
+
+func BenchmarkDictionaryRowGroupPruning(b *testing.B) {
+	const (
+		numRowGroups = 16
+		rowsPerGroup = 4096
+	)
+
+	const commonValue int32 = 1 << 30
+	rowGroups := make([][]int32, numRowGroups)
+	for group := range rowGroups {
+		values := make([]int32, rowsPerGroup)
+		for i := range values {
+			if i == 0 {
+				values[i] = commonValue
+			} else {
+				values[i] = int32(group*2 + i%2)
+			}
+		}
+		rowGroups[group] = values
+	}
+
+	data := buildDictionaryTestParquet(b, rowGroups...)
+	alwaysKeep := func(_ *metadata.RowGroupMetaData, _ []int) (bool, error) {
+		return true, nil
+	}
+	cols := []int{0}
+	benchmarks := []struct {
+		name      string
+		physBytes [][]byte
+		wantRows  int64
+	}{
+		{name: "without dictionary", wantRows: int64(numRowGroups * rowsPerGroup)},
+		{name: "dictionary target absent", physBytes: [][]byte{int32PhysBytes(-1)}},
+		{
+			name:      "dictionary target in one group",
+			physBytes: [][]byte{int32PhysBytes(0)},
+			wantRows:  int64(rowsPerGroup),
+		},
+		{
+			name:      "dictionary target in every group",
+			physBytes: [][]byte{int32PhysBytes(commonValue)},
+			wantRows:  int64(numRowGroups * rowsPerGroup),
+		},
+	}
+
+	for _, benchmark := range benchmarks {
+		b.Run(benchmark.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(data)))
+			b.ResetTimer()
+
+			for range b.N {
+				rdr := openBloomTestReader(b, data)
+				tester := &internal.ParquetRowGroupTester{StatsFn: alwaysKeep}
+				if len(benchmark.physBytes) > 0 {
+					tester.DictionaryPreds = []internal.RowGroupDictionaryPred{
+						{FieldID: 1, PhysBytes: benchmark.physBytes},
+					}
+				}
+
+				rr, err := rdr.GetRecords(context.Background(), cols, tester)
+				if err != nil {
+					b.Fatal(err)
+				}
+				rows := countRecords(b, rr)
+				if rows != benchmark.wantRows {
+					b.Fatalf("returned %d rows, want %d", rows, benchmark.wantRows)
+				}
+				if err := rdr.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// buildDictionaryFallbackTestParquet writes one row group with dictionary
+// pages followed by plain data pages. The returned target exists only in the
+// plain portion of the column.
+func buildDictionaryFallbackTestParquet(t *testing.T) ([]byte, int) {
+	t.Helper()
+
+	valueWidth := 32
+	lowCardinality := make([]parquet.ByteArray, 2048)
+	for i := range lowCardinality {
+		value := make([]byte, valueWidth)
+		copy(value, fmt.Sprintf("category-%02d", i%16))
+		lowCardinality[i] = parquet.ByteArray(value)
+	}
+
+	target := "plain-only-target"
+	plainValues := make([]parquet.ByteArray, 16)
+	for i := range plainValues {
+		value := fmt.Sprintf("plain-value-%02d", i)
+		if i == len(plainValues)-1 {
+			value = target
+		}
+		plainValues[i] = parquet.ByteArray(value)
+	}
+
+	valueNode := schema.NewByteArrayNode("value", parquet.Repetitions.Required, 1)
+	rootNode, err := schema.NewGroupNode("schema", parquet.Repetitions.Required,
+		schema.FieldList{valueNode}, -1)
+	require.NoError(t, err)
+
+	writerProps := parquet.NewWriterProperties(
+		parquet.WithStats(true),
+		parquet.WithDictionaryDefault(true),
+		parquet.WithDataPageSize(1024),
+	)
+
+	var buf bytes.Buffer
+	pw := file.NewParquetWriter(&buf, rootNode, file.WithWriterProps(writerProps))
+	rgw, err := pw.AppendRowGroupChecked()
+	require.NoError(t, err)
+	cw, err := rgw.NextColumn()
+	require.NoError(t, err)
+	byteWriter := cw.(*file.ByteArrayColumnChunkWriter)
+	_, err = byteWriter.WriteBatch(lowCardinality, nil, nil)
+	require.NoError(t, err)
+	byteWriter.FallbackToPlain()
+	_, err = byteWriter.WriteBatch(plainValues, nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, byteWriter.Close())
+	require.NoError(t, rgw.Close())
+	require.NoError(t, pw.Close())
+
+	return buf.Bytes(), len(lowCardinality) + len(plainValues)
+}
+
+func TestDictionaryRowGroupPruningKeepsFallbackColumns(t *testing.T) {
+	data, numRows := buildDictionaryFallbackTestParquet(t)
+
+	pqReader, err := file.NewParquetReader(bytes.NewReader(data))
+	require.NoError(t, err)
+	defer pqReader.Close()
+	chunk, err := pqReader.MetaData().RowGroup(0).ColumnChunk(0)
+	require.NoError(t, err)
+	assert.True(t, chunk.HasDictionaryPage())
+	assert.Contains(t, chunk.Encodings(), parquet.Encodings.RLEDict)
+	assert.Contains(t, chunk.Encodings(), parquet.Encodings.Plain)
+	var hasPlainData bool
+	for _, stat := range chunk.EncodingStats() {
+		if stat.PageType == file.PageTypeDataPage && stat.Encoding == parquet.Encodings.Plain {
+			hasPlainData = true
+		}
+	}
+	require.True(t, hasPlainData, "expected a plain fallback data page")
+
+	rdr := openBloomTestReader(t, data)
+	defer rdr.Close()
+	tester := &internal.ParquetRowGroupTester{
+		DictionaryPreds: []internal.RowGroupDictionaryPred{
+			{FieldID: 1, PhysBytes: [][]byte{[]byte("plain-only-target")}},
+		},
+		StatsFn: func(_ *metadata.RowGroupMetaData, _ []int) (bool, error) {
+			return true, nil
+		},
+	}
+	rr, err := rdr.GetRecords(context.Background(), []int{0}, tester)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(numRows), countRecords(t, rr),
+		"fallback data pages must keep the row group even when the target is absent from the dictionary")
+}
+
+func TestParquetRowGroupRangeSelection(t *testing.T) {
+	const rgSize = 100
+
+	data := buildBloomTestParquet(t, rgSize)
+	pqReader, err := file.NewParquetReader(bytes.NewReader(data))
+	require.NoError(t, err)
+	defer pqReader.Close()
+
+	meta := pqReader.MetaData()
+	offsets := []int64{meta.RowGroup(0).FileOffset(), meta.RowGroup(1).FileOffset()}
+	require.Less(t, offsets[0], offsets[1])
+
+	alwaysKeep := func(_ *metadata.RowGroupMetaData, _ []int) (bool, error) {
+		return true, nil
+	}
+
+	tests := []struct {
+		name          string
+		start         int64
+		length        int64
+		rangeSet      bool
+		bloomPreds    []internal.RowGroupBloomPred
+		wantRows      int64
+		wantSurvivors []internal.RowGroupSpan
+	}{
+		{
+			name:          "first row group",
+			start:         offsets[0],
+			length:        offsets[1] - offsets[0],
+			rangeSet:      true,
+			wantRows:      rgSize,
+			wantSurvivors: []internal.RowGroupSpan{{FirstRowPos: 0, NumRows: rgSize}},
+		},
+		{
+			name:          "second row group",
+			start:         offsets[1],
+			length:        int64(len(data)) - offsets[1],
+			rangeSet:      true,
+			wantRows:      rgSize,
+			wantSurvivors: []internal.RowGroupSpan{{FirstRowPos: rgSize, NumRows: rgSize}},
+		},
+		{
+			name:     "range and bloom pruning combine",
+			start:    offsets[0],
+			length:   offsets[1] - offsets[0],
+			rangeSet: true,
+			bloomPreds: []internal.RowGroupBloomPred{{
+				FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(150)},
+			}},
+			wantRows: 0,
+		},
+		{
+			name:          "whole file range",
+			start:         offsets[0],
+			length:        int64(len(data)) - offsets[0],
+			rangeSet:      true,
+			wantRows:      2 * rgSize,
+			wantSurvivors: nil,
+		},
+		{
+			name:          "nonzero range fields without explicit range keep legacy behavior",
+			start:         offsets[0],
+			length:        offsets[1] - offsets[0],
+			wantRows:      2 * rgSize,
+			wantSurvivors: nil,
+		},
+		{
+			name:     "unset range keeps legacy whole file behavior",
+			start:    0,
+			length:   0,
+			wantRows: 2 * rgSize,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rdr := openBloomTestReader(t, data)
+			defer rdr.Close()
+
+			var survivors []internal.RowGroupSpan
+			tester := &internal.ParquetRowGroupTester{
+				StatsFn:    alwaysKeep,
+				BloomPreds: tt.bloomPreds,
+				RangeSet:   tt.rangeSet,
+				Start:      tt.start,
+				Length:     tt.length,
+				Survivors:  &survivors,
+			}
+			rr, err := rdr.GetRecords(context.Background(), []int{0}, tester)
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.wantRows, countRecords(t, rr))
+			assert.Equal(t, tt.wantSurvivors, survivors)
+		})
+	}
+}
+
+func TestParquetRowGroupRangeSelectionRejectsInvalidRanges(t *testing.T) {
+	const rgSize = 100
+
+	data := buildBloomTestParquet(t, rgSize)
+	pqReader, err := file.NewParquetReader(bytes.NewReader(data))
+	require.NoError(t, err)
+	meta := pqReader.MetaData()
+	firstOffset := meta.RowGroup(0).FileOffset()
+	fileSize := int64(len(data))
+	require.NoError(t, pqReader.Close())
+
+	alwaysKeep := func(_ *metadata.RowGroupMetaData, _ []int) (bool, error) {
+		return true, nil
+	}
+	tests := []struct {
+		name   string
+		start  int64
+		length int64
+	}{
+		{name: "negative start", start: -1, length: 1},
+		{name: "zero length", start: firstOffset, length: 0},
+		{name: "zero length at file start", start: 0, length: 0},
+		{name: "negative length", start: 0, length: -1},
+		{name: "start beyond file", start: fileSize + 1, length: 1},
+		{name: "length beyond file", start: firstOffset, length: fileSize - firstOffset + 1},
+		{name: "range end overflows", start: math.MaxInt64, length: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rdr := openBloomTestReader(t, data)
+			defer rdr.Close()
+
+			tester := &internal.ParquetRowGroupTester{
+				StatsFn:  alwaysKeep,
+				RangeSet: true,
+				Start:    tt.start,
+				Length:   tt.length,
+			}
+			rr, err := rdr.GetRecords(context.Background(), []int{0}, tester)
+			assert.Nil(t, rr)
+			require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+		})
+	}
+}
+
+func TestParquetRowGroupRangeSelectionUsesPlanningOffsets(t *testing.T) {
+	const rgSize = 100
+	alwaysKeep := func(_ *metadata.RowGroupMetaData, _ []int) (bool, error) {
+		return true, nil
+	}
+
+	data := buildBloomTestParquet(t, rgSize)
+	pqReader, err := file.NewParquetReader(bytes.NewReader(data))
+	require.NoError(t, err)
+	meta := pqReader.MetaData()
+	actualOffsets := make([]int64, meta.NumRowGroups())
+	for i := range actualOffsets {
+		rg := meta.RowGroup(i)
+		column, columnErr := rg.ColumnChunk(0)
+		require.NoError(t, columnErr)
+		actualOffsets[i] = column.DataPageOffset()
+		if column.HasDictionaryPage() && column.DictionaryPageOffset() < actualOffsets[i] {
+			actualOffsets[i] = column.DictionaryPageOffset()
+		}
+	}
+	require.Less(t, actualOffsets[1]+1, int64(len(data)))
+	require.NoError(t, pqReader.Close())
+
+	// A writer may record a row-group split offset that differs from the
+	// first data page offset used by the reader. The planning offsets must win
+	// when they are complete, otherwise a boundary can move a row group into
+	// the wrong split.
+	planningOffsets := append([]int64(nil), actualOffsets...)
+	planningOffsets[1]++
+
+	splitReader, err := file.NewParquetReader(bytes.NewReader(data))
+	require.NoError(t, err)
+	arrReader, err := pqarrow.NewFileReader(
+		splitReader, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	require.NoError(t, err)
+	rdr := internal.WrapParquetFileReader(arrReader)
+	defer rdr.Close()
+
+	tests := []struct {
+		name      string
+		start     int64
+		length    int64
+		wantRows  int64
+		wantSpans []internal.RowGroupSpan
+	}{
+		{
+			name:      "first planned range",
+			start:     0,
+			length:    planningOffsets[1],
+			wantRows:  rgSize,
+			wantSpans: []internal.RowGroupSpan{{FirstRowPos: 0, NumRows: rgSize}},
+		},
+		{
+			name:      "second planned range",
+			start:     planningOffsets[1],
+			length:    int64(len(data)) - planningOffsets[1],
+			wantRows:  rgSize,
+			wantSpans: []internal.RowGroupSpan{{FirstRowPos: rgSize, NumRows: rgSize}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var survivors []internal.RowGroupSpan
+			tester := &internal.ParquetRowGroupTester{
+				StatsFn:              alwaysKeep,
+				RangeSet:             true,
+				Start:                tt.start,
+				Length:               tt.length,
+				PlanningSplitOffsets: planningOffsets,
+				Survivors:            &survivors,
+			}
+			rr, err := rdr.GetRecords(context.Background(), []int{0}, tester)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantRows, countRecords(t, rr))
+			assert.Equal(t, tt.wantSpans, survivors)
+		})
+	}
+}
+
+func TestParquetRowGroupRangeSelectionFallsBackToFirstColumnOffset(t *testing.T) {
+	const rgSize = 100
+
+	data := buildBloomTestParquet(t, rgSize)
+	pqReader, err := file.NewParquetReader(bytes.NewReader(data))
+	require.NoError(t, err)
+	defer pqReader.Close()
+
+	meta := pqReader.MetaData()
+	offsets := make([]int64, meta.NumRowGroups())
+	for i := range offsets {
+		rg := meta.RowGroup(i)
+		column, columnErr := rg.ColumnChunk(0)
+		require.NoError(t, columnErr)
+		offsets[i] = column.DataPageOffset()
+		if column.HasDictionaryPage() && column.DictionaryPageOffset() < offsets[i] {
+			offsets[i] = column.DictionaryPageOffset()
+		}
+	}
+
+	// RowGroup.file_offset is optional. Removing it reproduces a valid file
+	// where the old range check saw offset zero instead of the planned split
+	// offset for the second group.
+	meta.RowGroups[1].FileOffset = nil
+
+	arrReader, err := pqarrow.NewFileReader(pqReader, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	require.NoError(t, err)
+	rdr := internal.WrapParquetFileReader(arrReader)
+	defer rdr.Close()
+
+	tester := &internal.ParquetRowGroupTester{
+		StatsFn:  func(_ *metadata.RowGroupMetaData, _ []int) (bool, error) { return true, nil },
+		RangeSet: true,
+		Start:    offsets[1],
+		Length:   int64(len(data)) - offsets[1],
+	}
+	rr, err := rdr.GetRecords(context.Background(), []int{0}, tester)
+	require.NoError(t, err)
+	assert.Equal(t, int64(rgSize), countRecords(t, rr))
+}
+
+func TestShreddedVariantStatsDoesNotPanic(t *testing.T) {
+	mem := memory.DefaultAllocator
+
+	shreddedType := extensions.NewShreddedVariantType(arrow.StructOf(
+		arrow.Field{Name: "latitude", Type: arrow.PrimitiveTypes.Float64},
+	))
+
+	bldr := extensions.NewVariantBuilder(mem, shreddedType)
+	defer bldr.Release()
+
+	var b variant.Builder
+	require.NoError(t, b.Append(map[string]any{"latitude": float64(40.7), "city": "NYC"}))
+	v1, err := b.Build()
+	require.NoError(t, err)
+	bldr.Append(v1)
+
+	b = variant.Builder{}
+	require.NoError(t, b.Append(map[string]any{"latitude": float64(51.5), "city": "London"}))
+	v2, err := b.Build()
+	require.NoError(t, err)
+	bldr.Append(v2)
+
+	arr := bldr.NewArray()
+	defer arr.Release()
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{{
+		Name: "payload", Type: shreddedType, Nullable: true,
+		Metadata: arrow.NewMetadata([]string{"PARQUET:field_id"}, []string{"1"}),
+	}}, nil)
+
+	rec := array.NewRecordBatch(arrowSchema, []arrow.Array{arr}, 2)
+	defer rec.Release()
+
+	var buf bytes.Buffer
+	wr, err := pqarrow.NewFileWriter(arrowSchema, &buf,
+		parquet.NewWriterProperties(parquet.WithStats(true)),
+		pqarrow.DefaultWriterProps())
+	require.NoError(t, err)
+	require.NoError(t, wr.Write(rec))
+	require.NoError(t, wr.Close())
+
+	rdr, err := file.NewParquetReader(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+	defer rdr.Close()
+
+	meta := rdr.MetaData()
+
+	// colMapping: only the parent variant field has an Iceberg field ID.
+	// Shredded sub-columns (metadata, value, typed_value.latitude.*) do NOT.
+	colMapping := map[string]int{
+		"payload": 1,
+	}
+
+	// Empty stats collector: nil arrow schema skips variant bounds anyway.
+	statsCols := map[int]internal.StatisticsCollector{}
+
+	variantFieldIDs := map[int]struct{}{1: {}}
+
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+	assert.NotPanics(t, func() {
+		format.DataFileStatsFromMeta(internal.Metadata(meta), statsCols, colMapping, variantFieldIDs, nil)
+	})
+}
+
+func TestShreddedVariantReadRoundTrip(t *testing.T) {
+	mem := memory.DefaultAllocator
+
+	// Build a shredded variant column in-memory: typed_value {a:int64} with a
+	// residual "city" field in the value column.
+	shreddedType := extensions.NewShreddedVariantType(arrow.StructOf(
+		arrow.Field{Name: "a", Type: arrow.PrimitiveTypes.Int64},
+	))
+	bldr := extensions.NewVariantBuilder(mem, shreddedType)
+	defer bldr.Release()
+
+	const nRows = 5
+	for i := range nRows {
+		var b variant.Builder
+		require.NoError(t, b.Append(map[string]any{"a": int64(i), "city": "NYC"}))
+		v, err := b.Build()
+		require.NoError(t, err)
+		bldr.Append(v)
+	}
+	arr := bldr.NewArray()
+	defer arr.Release()
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{{
+		Name: "payload", Type: shreddedType, Nullable: true,
+		Metadata: arrow.NewMetadata([]string{"PARQUET:field_id"}, []string{"1"}),
+	}}, nil)
+	rec := array.NewRecordBatch(arrowSchema, []arrow.Array{arr}, int64(nRows))
+	defer rec.Release()
+
+	var buf bytes.Buffer
+	wr, err := pqarrow.NewFileWriter(arrowSchema, &buf,
+		parquet.NewWriterProperties(parquet.WithStats(true)), pqarrow.DefaultWriterProps())
+	require.NoError(t, err)
+	require.NoError(t, wr.Write(rec))
+	require.NoError(t, wr.Close())
+
+	pqRdr, err := file.NewParquetReader(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+	defer pqRdr.Close()
+
+	arrRdr, err := pqarrow.NewFileReader(pqRdr, pqarrow.ArrowReadProperties{}, mem)
+	require.NoError(t, err)
+
+	arrowSc, err := arrRdr.Schema()
+	require.NoError(t, err)
+	assert.Equal(t, 1, arrowSc.NumFields())
+
+	ext, ok := arrowSc.Field(0).Type.(arrow.ExtensionType)
+	require.True(t, ok, "expected extension type, got %T", arrowSc.Field(0).Type)
+	assert.Equal(t, extensions.VariantExtensionName, ext.ExtensionName())
+
+	// The shredded layout collapses back to a plain VariantType in Iceberg.
+	iceSc, err := table.ArrowSchemaToIceberg(arrowSc, false, nil)
+	require.NoError(t, err)
+	assert.True(t, iceSc.Field(0).Type.Equals(iceberg.VariantType{}))
+
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+	mapping, err := format.PathToIDMapping(iceSc)
+	require.NoError(t, err)
+	assert.Contains(t, mapping, "payload")
+
+	statsCols := map[int]internal.StatisticsCollector{}
+	variantFieldIDs := internal.VariantFieldIDsFromSchema(iceSc)
+	assert.NotPanics(t, func() {
+		format.DataFileStatsFromMeta(internal.Metadata(pqRdr.MetaData()), statsCols, mapping, variantFieldIDs, nil)
+	})
+
+	tbl, err := arrRdr.ReadTable(context.Background())
+	require.NoError(t, err)
+	defer tbl.Release()
+
+	assert.Equal(t, int64(nRows), tbl.NumRows())
+	assert.Equal(t, 1, int(tbl.NumCols()))
+
+	chunk := tbl.Column(0).Data().Chunk(0)
+	varArr, ok := chunk.(*extensions.VariantArray)
+	require.True(t, ok, "expected VariantArray, got %T", chunk)
+	for i := range varArr.Len() {
+		val, err := varArr.Value(i)
+		require.NoError(t, err, "row %d", i)
+		obj, ok := val.Value().(variant.ObjectValue)
+		require.True(t, ok, "row %d: expected ObjectValue, got %T", i, val.Value())
+		assert.EqualValues(t, 2, obj.NumElements(), "row %d should have a + city", i)
+	}
+}
+
+// TestWriteDataFileGeoBounds writes geometry and geography columns through the
+// full ParquetFileWriter path and asserts that the resulting DataFile carries
+// geometry single-point bounds (Iceberg geospatial single-value serialization)
+// in the manifest entry, while geography bounds are omitted as unsafe.
+//
+// Running MetricModeFull end-to-end also guards a regression: geometry/geography
+// have no generic Parquet stats aggregator, so before the isGeoType guard in
+// DataFileStatsFromMeta a full-mode geo column panicked in createStatsAgg
+// ("unsupported iceberg type"). This test fails if that guard is removed.
+func TestWriteDataFileGeoBounds(t *testing.T) {
+	geomType, err := iceberg.GeometryTypeOf("srid:4326")
+	require.NoError(t, err)
+	geogType, err := iceberg.GeographyTypeOf("srid:4326", "vincenty")
+	require.NoError(t, err)
+
+	iceSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+		iceberg.NestedField{ID: 2, Name: "geom", Type: geomType, Required: false},
+		iceberg.NestedField{ID: 3, Name: "geog", Type: geogType, Required: false},
+	)
+
+	arrowSchema, err := table.SchemaToArrowSchema(iceSchema, nil, true, false)
+	require.NoError(t, err)
+
+	wkbStr := func(s string) string {
+		b, err := wktToWKB(s)
+		require.NoError(t, err)
+
+		return b.String()
+	}
+
+	rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrowSchema, strings.NewReader(`[
+		{"id": 1, "geom": "`+wkbStr("POINT (30 10)")+`", "geog": "`+wkbStr("POINT (20 5)")+`"},
+		{"id": 2, "geom": "`+wkbStr("POINT (5 40)")+`", "geog": null}
+	]`))
+	require.NoError(t, err)
+	defer rec.Release()
+
+	fm := internal.GetFileFormat(iceberg.ParquetFile)
+
+	// writeWithGeomMode runs the full writer path with the geometry column set to
+	// the given metrics mode and returns the resulting DataFile.
+	writeWithGeomMode := func(t *testing.T, geomMode internal.MetricsMode) iceberg.DataFile {
+		t.Helper()
+
+		statsCols := map[int]internal.StatisticsCollector{
+			1: {FieldID: 1, IcebergTyp: iceberg.PrimitiveTypes.Int32, ColName: "id", Mode: internal.MetricsMode{Typ: internal.MetricModeFull}},
+			2: {FieldID: 2, IcebergTyp: geomType, ColName: "geom", Mode: geomMode},
+			3: {FieldID: 3, IcebergTyp: geogType, ColName: "geog", Mode: internal.MetricsMode{Typ: internal.MetricModeFull}},
+		}
+
+		df, err := fm.WriteDataFile(context.Background(), iceio.NewMemFS(), nil, internal.WriteFileInfo{
+			FileSchema: iceSchema,
+			Spec:       *iceberg.UnpartitionedSpec,
+			FileName:   "geo.parquet",
+			StatsCols:  statsCols,
+			WriteProps: fm.GetWriteProperties(iceberg.Properties{}),
+			Content:    iceberg.EntryContentData,
+		}, []arrow.RecordBatch{rec})
+		require.NoError(t, err)
+
+		return df
+	}
+
+	t.Run("full mode emits geometry bounds, omits geography", func(t *testing.T) {
+		df := writeWithGeomMode(t, internal.MetricsMode{Typ: internal.MetricModeFull})
+		lower, upper := df.LowerBoundValues(), df.UpperBoundValues()
+
+		// Geometry bounds span both rows: lower (5, 10), upper (30, 40), encoded as
+		// two little-endian float64 coordinates (16 bytes), not WKB.
+		require.Len(t, lower[2], 16)
+		require.Len(t, upper[2], 16)
+		assert.Equal(t, geoBoundBytes(5, 10), lower[2])
+		assert.Equal(t, geoBoundBytes(30, 40), upper[2])
+
+		// Geography bounds are unsafe to compute from vertices, so they are omitted.
+		assert.NotContains(t, lower, 3, "geography lower bound must be omitted")
+		assert.NotContains(t, upper, 3, "geography upper bound must be omitted")
+
+		// Bounds round-trip back to a GeoLiteral (not a comparable binary
+		// literal) through LiteralFromBytes.
+		lit, err := iceberg.LiteralFromBytes(geomType, lower[2])
+		require.NoError(t, err)
+		assert.True(t, geomType.Equals(lit.Type()), "want geo type, got %s", lit.Type())
+		assert.Equal(t, geoBoundBytes(5, 10), lit.(iceberg.GeoLiteral).Value())
+
+		// Null counts are still recorded for geo columns.
+		assert.Equal(t, int64(1), df.NullValueCounts()[3])
+	})
+
+	// The counts/none modes must gate geo bounds exactly like any other column:
+	// the geo field ID must not appear in lower/upper. This pins the presence +
+	// mode check in applyGeoBounds (a missing/zero-value mode must not fall
+	// through and write bounds the caller asked to skip).
+	for _, tt := range []struct {
+		name string
+		mode internal.MetricsMode
+	}{
+		{"none mode omits geometry bounds", internal.MetricsMode{Typ: internal.MetricModeNone}},
+		{"counts mode omits geometry bounds", internal.MetricsMode{Typ: internal.MetricModeCounts}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			df := writeWithGeomMode(t, tt.mode)
+			assert.NotContains(t, df.LowerBoundValues(), 2, "geometry lower bound must be omitted for %s", tt.mode.Typ)
+			assert.NotContains(t, df.UpperBoundValues(), 2, "geometry upper bound must be omitted for %s", tt.mode.Typ)
+		})
+	}
+}
+
+// geoBoundBytes builds the Iceberg geospatial single-value serialization of a
+// bound point: little-endian float64 coordinates in X, Y[, Z][, M] order.
+func geoBoundBytes(coords ...float64) []byte {
+	buf := make([]byte, len(coords)*8)
+	for i, c := range coords {
+		binary.LittleEndian.PutUint64(buf[i*8:], math.Float64bits(c))
+	}
+
+	return buf
+}

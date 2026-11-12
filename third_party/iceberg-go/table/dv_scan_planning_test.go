@@ -1,0 +1,494 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package table
+
+import (
+	"sync"
+	"testing"
+
+	"github.com/apache/iceberg-go"
+	"github.com/stretchr/testify/assert"
+)
+
+// dvMockDataFile extends mockDataFile with the DV-specific fields
+// (referenced data file, content offset/size) needed by scan planning tests.
+type dvMockDataFile struct {
+	mockDataFile
+	referencedDataFile *string
+	contentOffset      *int64
+	contentSizeInBytes *int64
+}
+
+func (d *dvMockDataFile) ReferencedDataFile() *string { return d.referencedDataFile }
+func (d *dvMockDataFile) ContentOffset() *int64       { return d.contentOffset }
+func (d *dvMockDataFile) ContentSizeInBytes() *int64  { return d.contentSizeInBytes }
+
+func strPtr(s string) *string { return &s }
+func int64Ptr(v int64) *int64 { return &v }
+
+func TestIsDeletionVector(t *testing.T) {
+	tests := []struct {
+		name     string
+		df       iceberg.DataFile
+		expected bool
+	}{
+		{
+			name: "regular data file",
+			df: &mockDataFile{
+				path:        "s3://bucket/data/file.parquet",
+				contentType: iceberg.EntryContentData,
+			},
+			expected: false,
+		},
+		{
+			name: "regular position delete file",
+			df: &mockDataFile{
+				path:        "s3://bucket/data/pos-del.parquet",
+				contentType: iceberg.EntryContentPosDeletes,
+			},
+			expected: false,
+		},
+		{
+			name: "deletion vector",
+			df: &dvMockDataFile{
+				mockDataFile: mockDataFile{
+					path:        "s3://bucket/data/dv.puffin",
+					contentType: iceberg.EntryContentPosDeletes,
+					format:      iceberg.PuffinFile,
+				},
+				referencedDataFile: strPtr("s3://bucket/data/file.parquet"),
+				contentOffset:      int64Ptr(100),
+				contentSizeInBytes: int64Ptr(256),
+			},
+			expected: true,
+		},
+		{
+			name: "equality delete file (never a DV)",
+			df: &mockDataFile{
+				path:        "s3://bucket/data/eq-del.parquet",
+				contentType: iceberg.EntryContentEqDeletes,
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, IsDeletionVector(tt.df))
+		})
+	}
+}
+
+func TestManifestEntries_DVClassification(t *testing.T) {
+	snapshotID := int64(1)
+
+	// Data entry
+	dataFile := &mockDataFile{
+		path:        "s3://bucket/data/data-001.parquet",
+		contentType: iceberg.EntryContentData,
+	}
+
+	// Regular position delete entry
+	posDelFile := &mockDataFile{
+		path:        "s3://bucket/data/pos-del-001.parquet",
+		contentType: iceberg.EntryContentPosDeletes,
+	}
+
+	// DV entry
+	dvFile := &dvMockDataFile{
+		mockDataFile: mockDataFile{
+			path:        "s3://bucket/data/dv-001.puffin",
+			contentType: iceberg.EntryContentPosDeletes,
+			format:      iceberg.PuffinFile,
+		},
+		referencedDataFile: strPtr("s3://bucket/data/data-001.parquet"),
+		contentOffset:      int64Ptr(0),
+		contentSizeInBytes: int64Ptr(128),
+	}
+
+	// Equality delete entry
+	eqDelFile := &mockDataFile{
+		path:        "s3://bucket/data/eq-del-001.parquet",
+		contentType: iceberg.EntryContentEqDeletes,
+	}
+
+	entries := newManifestEntries()
+	assert.NoError(t, entries.merge([]iceberg.ManifestEntry{
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, dataFile),
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, posDelFile),
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, dvFile),
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, eqDelFile),
+	}))
+
+	assert.Len(t, entries.dataEntries, 1)
+	assert.Len(t, entries.positionalDeleteEntries, 1)
+	assert.Len(t, entries.dvEntries, 1)
+	assert.Len(t, entries.equalityDeleteEntries, 1)
+}
+
+func TestManifestEntries_MergeRejectsUnknownContent(t *testing.T) {
+	snapshotID := int64(1)
+	validEntry := iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, &mockDataFile{
+		path:        "s3://bucket/data/data-001.parquet",
+		contentType: iceberg.EntryContentData,
+	})
+	invalidEntry := iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, &mockDataFile{
+		path:        "s3://bucket/data/unknown.bin",
+		contentType: iceberg.ManifestEntryContent(99),
+	})
+	entryAfterInvalid := iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, &mockDataFile{
+		path:        "s3://bucket/data/data-002.parquet",
+		contentType: iceberg.EntryContentData,
+	})
+
+	entries := newManifestEntries()
+	err := entries.merge([]iceberg.ManifestEntry{validEntry, invalidEntry, entryAfterInvalid})
+
+	assert.ErrorIs(t, err, ErrInvalidMetadata)
+	assert.ErrorContains(t, err, "unknown DataFileContent type")
+	assert.Equal(t, []iceberg.ManifestEntry{validEntry}, entries.dataEntries)
+}
+
+func TestManifestEntries_MergeRejectsUnknownContentAfterMixedEntries(t *testing.T) {
+	snapshotID := int64(1)
+	dataEntry := iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, &mockDataFile{
+		path:        "s3://bucket/data/data-001.parquet",
+		contentType: iceberg.EntryContentData,
+	})
+	positionalDeleteEntry := iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, &mockDataFile{
+		path:        "s3://bucket/data/pos-delete-001.parquet",
+		contentType: iceberg.EntryContentPosDeletes,
+	})
+	invalidEntry := iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, &mockDataFile{
+		path:        "s3://bucket/data/unknown.bin",
+		contentType: iceberg.ManifestEntryContent(99),
+	})
+	entryAfterInvalid := iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, &mockDataFile{
+		path:        "s3://bucket/data/data-002.parquet",
+		contentType: iceberg.EntryContentData,
+	})
+
+	entries := newManifestEntries()
+	err := entries.merge([]iceberg.ManifestEntry{
+		dataEntry,
+		positionalDeleteEntry,
+		invalidEntry,
+		entryAfterInvalid,
+	})
+
+	assert.ErrorIs(t, err, ErrInvalidMetadata)
+	assert.ErrorContains(t, err, "unknown DataFileContent type")
+	assert.Equal(t, []iceberg.ManifestEntry{dataEntry}, entries.dataEntries)
+	assert.Equal(t, []iceberg.ManifestEntry{positionalDeleteEntry}, entries.positionalDeleteEntries)
+	assert.Empty(t, entries.equalityDeleteEntries)
+	assert.Empty(t, entries.dvEntries)
+}
+
+func TestManifestEntries_ConcurrentMerge(t *testing.T) {
+	snapshotID := int64(1)
+	batch := []iceberg.ManifestEntry{
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, &mockDataFile{
+			path:        "s3://bucket/data/data-001.parquet",
+			contentType: iceberg.EntryContentData,
+		}),
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, &mockDataFile{
+			path:        "s3://bucket/data/pos-del-001.parquet",
+			contentType: iceberg.EntryContentPosDeletes,
+		}),
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, &mockDataFile{
+			path:        "s3://bucket/data/eq-del-001.parquet",
+			contentType: iceberg.EntryContentEqDeletes,
+		}),
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, nil, nil, &dvMockDataFile{
+			mockDataFile: mockDataFile{
+				path:        "s3://bucket/data/dv-001.puffin",
+				contentType: iceberg.EntryContentPosDeletes,
+				format:      iceberg.PuffinFile,
+			},
+			referencedDataFile: strPtr("s3://bucket/data/data-001.parquet"),
+			contentOffset:      int64Ptr(0),
+			contentSizeInBytes: int64Ptr(128),
+		}),
+	}
+
+	const manifestCount = 64
+	entries := newManifestEntries()
+	var wg sync.WaitGroup
+	for range manifestCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			assert.NoError(t, entries.merge(batch))
+		}()
+	}
+	wg.Wait()
+
+	assert.Len(t, entries.dataEntries, manifestCount)
+	assert.Len(t, entries.positionalDeleteEntries, manifestCount)
+	assert.Len(t, entries.equalityDeleteEntries, manifestCount)
+	assert.Len(t, entries.dvEntries, manifestCount)
+}
+
+func TestDVMatchingToDataFiles(t *testing.T) {
+	dataFilePath := "s3://bucket/data/data-001.parquet"
+	otherDataFilePath := "s3://bucket/data/data-002.parquet"
+
+	dvForData1 := &dvMockDataFile{
+		mockDataFile: mockDataFile{
+			path:        "s3://bucket/data/dv-001.puffin",
+			contentType: iceberg.EntryContentPosDeletes,
+		},
+		referencedDataFile: strPtr(dataFilePath),
+		contentOffset:      int64Ptr(0),
+		contentSizeInBytes: int64Ptr(128),
+	}
+
+	dvForData2 := &dvMockDataFile{
+		mockDataFile: mockDataFile{
+			path:        "s3://bucket/data/dv-002.puffin",
+			contentType: iceberg.EntryContentPosDeletes,
+		},
+		referencedDataFile: strPtr(otherDataFilePath),
+		contentOffset:      int64Ptr(0),
+		contentSizeInBytes: int64Ptr(64),
+	}
+
+	snapshotID := int64(1)
+	seqNum := int64(1)
+	dvEntries := []iceberg.ManifestEntry{
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &seqNum, nil, dvForData1),
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &seqNum, nil, dvForData2),
+	}
+
+	dvIndex, err := buildDVIndex(dvEntries)
+	assert.NoError(t, err)
+	assert.Len(t, dvIndex, 2)
+
+	// Match DVs against data-001 — should only get dv-001
+	dataEntry1 := iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &seqNum, nil,
+		&mockDataFile{path: dataFilePath, contentType: iceberg.EntryContentData})
+	matched := matchDVToData(dataEntry1, dvIndex)
+	assert.Len(t, matched, 1)
+	assert.Equal(t, dvForData1.path, matched[0].FilePath())
+
+	// Match DVs against data-002 — should only get dv-002
+	dataEntry2 := iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &seqNum, nil,
+		&mockDataFile{path: otherDataFilePath, contentType: iceberg.EntryContentData})
+	matched2 := matchDVToData(dataEntry2, dvIndex)
+	assert.Len(t, matched2, 1)
+	assert.Equal(t, dvForData2.path, matched2[0].FilePath())
+}
+
+func TestDVMatchingNoMatch(t *testing.T) {
+	snapshotID := int64(1)
+	seqNum := int64(1)
+
+	dvFile := &dvMockDataFile{
+		mockDataFile: mockDataFile{
+			path:        "s3://bucket/data/dv-001.puffin",
+			contentType: iceberg.EntryContentPosDeletes,
+		},
+		referencedDataFile: strPtr("s3://bucket/data/data-999.parquet"),
+		contentOffset:      int64Ptr(0),
+		contentSizeInBytes: int64Ptr(128),
+	}
+
+	dvEntries := []iceberg.ManifestEntry{
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &seqNum, nil, dvFile),
+	}
+
+	dvIndex, err := buildDVIndex(dvEntries)
+	assert.NoError(t, err)
+
+	dataEntry := iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &seqNum, nil,
+		&mockDataFile{path: "s3://bucket/data/data-001.parquet", contentType: iceberg.EntryContentData})
+	matched := matchDVToData(dataEntry, dvIndex)
+	assert.Empty(t, matched)
+}
+
+func TestBuildDVIndex_RejectsMultipleDVsPerDataFile(t *testing.T) {
+	dataFilePath := "s3://bucket/data/data-001.parquet"
+	snapshotID := int64(1)
+	seqNum := int64(1)
+
+	dv1 := &dvMockDataFile{
+		mockDataFile: mockDataFile{
+			path:        "s3://bucket/data/dv-001.puffin",
+			contentType: iceberg.EntryContentPosDeletes,
+		},
+		referencedDataFile: strPtr(dataFilePath),
+		contentOffset:      int64Ptr(0),
+		contentSizeInBytes: int64Ptr(128),
+	}
+
+	dv2 := &dvMockDataFile{
+		mockDataFile: mockDataFile{
+			path:        "s3://bucket/data/dv-002.puffin",
+			contentType: iceberg.EntryContentPosDeletes,
+		},
+		referencedDataFile: strPtr(dataFilePath),
+		contentOffset:      int64Ptr(256),
+		contentSizeInBytes: int64Ptr(64),
+	}
+
+	dvEntries := []iceberg.ManifestEntry{
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &seqNum, nil, dv1),
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &seqNum, nil, dv2),
+	}
+
+	_, err := buildDVIndex(dvEntries)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "can't index multiple deletion vectors")
+	assert.Contains(t, err.Error(), dataFilePath)
+}
+
+func TestMatchDVToData_SequenceNumberGuard(t *testing.T) {
+	dataFilePath := "s3://bucket/data/data-001.parquet"
+	snapshotID := int64(1)
+
+	dvFile := &dvMockDataFile{
+		mockDataFile: mockDataFile{
+			path:        "s3://bucket/data/dv-001.puffin",
+			contentType: iceberg.EntryContentPosDeletes,
+		},
+		referencedDataFile: strPtr(dataFilePath),
+		contentOffset:      int64Ptr(0),
+		contentSizeInBytes: int64Ptr(128),
+	}
+
+	dvSeqNum := int64(5)
+	dvEntries := []iceberg.ManifestEntry{
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &dvSeqNum, nil, dvFile),
+	}
+
+	dvIndex, err := buildDVIndex(dvEntries)
+	assert.NoError(t, err)
+
+	tests := []struct {
+		name       string
+		dataSeqNum int64
+		expectDV   bool
+	}{
+		{"data seq < DV seq — DV applies", 3, true},
+		{"data seq == DV seq — DV applies", 5, true},
+		{"data seq > DV seq — DV skipped", 7, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			seqNum := tt.dataSeqNum
+			dataEntry := iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &seqNum, nil,
+				&mockDataFile{path: dataFilePath, contentType: iceberg.EntryContentData})
+			matched := matchDVToData(dataEntry, dvIndex)
+			if tt.expectDV {
+				assert.Len(t, matched, 1)
+				assert.Equal(t, dvFile.path, matched[0].FilePath())
+			} else {
+				assert.Empty(t, matched)
+			}
+		})
+	}
+}
+
+// TestMatchDVToData_NilDVSequenceNumber covers indeterminate sequence
+// numbers, for which ManifestEntry.SequenceNum reports the -1 sentinel. An
+// unset sequence number on either side must be treated as "applies": before
+// the guard, a real (>= 0) data sequence number compared against an unset
+// DV sequence (-1) was always false, silently dropping the DV and
+// resurfacing deleted rows. A known sequence of 0 is a real value, not
+// "unset", so the < 0 guard must stay tight.
+func TestMatchDVToData_NilDVSequenceNumber(t *testing.T) {
+	dataFilePath := "s3://bucket/data/data-001.parquet"
+	snapshotID := int64(1)
+
+	tests := []struct {
+		name     string
+		dvSeq    *int64 // nil → unset, SequenceNum reports -1
+		dataSeq  *int64 // nil → unset
+		expectDV bool
+	}{
+		{"unset DV seq, real data seq — applies (regression)", nil, int64Ptr(7), true},
+		{"unset DV seq and unset data seq — applies", nil, nil, true},
+		{"known DV seq 0, newer data — skipped (guard stays tight)", int64Ptr(0), int64Ptr(5), false},
+		{"known DV seq 0, same data seq 0 — applies", int64Ptr(0), int64Ptr(0), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dvFile := &dvMockDataFile{
+				mockDataFile: mockDataFile{
+					path:        "s3://bucket/data/dv-001.puffin",
+					contentType: iceberg.EntryContentPosDeletes,
+				},
+				referencedDataFile: strPtr(dataFilePath),
+				contentOffset:      int64Ptr(0),
+				contentSizeInBytes: int64Ptr(128),
+			}
+			dvEntries := []iceberg.ManifestEntry{
+				iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, tt.dvSeq, nil, dvFile),
+			}
+			dvIndex, err := buildDVIndex(dvEntries)
+			assert.NoError(t, err)
+
+			dataEntry := iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, tt.dataSeq, nil,
+				&mockDataFile{path: dataFilePath, contentType: iceberg.EntryContentData})
+
+			matched := matchDVToData(dataEntry, dvIndex)
+			if tt.expectDV {
+				assert.Len(t, matched, 1)
+				assert.Equal(t, dvFile.path, matched[0].FilePath())
+			} else {
+				assert.Empty(t, matched)
+			}
+		})
+	}
+}
+
+func TestFileScanTask_DeletionVectorFilesField(t *testing.T) {
+	dataFile := &mockDataFile{
+		path:        "s3://bucket/data/data-001.parquet",
+		contentType: iceberg.EntryContentData,
+		filesize:    1024,
+	}
+
+	dvFile := &dvMockDataFile{
+		mockDataFile: mockDataFile{
+			path:        "s3://bucket/data/dv-001.puffin",
+			contentType: iceberg.EntryContentPosDeletes,
+			format:      iceberg.PuffinFile,
+		},
+		referencedDataFile: strPtr("s3://bucket/data/data-001.parquet"),
+		contentOffset:      int64Ptr(0),
+		contentSizeInBytes: int64Ptr(128),
+	}
+
+	task := FileScanTask{
+		File:                dataFile,
+		DeletionVectorFiles: []iceberg.DataFile{dvFile},
+		Start:               0,
+		Length:              1024,
+	}
+
+	assert.Equal(t, dataFile, task.File)
+	assert.Len(t, task.DeletionVectorFiles, 1)
+	assert.Equal(t, dvFile, task.DeletionVectorFiles[0])
+	assert.NotNil(t, task.DeletionVectorFiles[0].ReferencedDataFile())
+	assert.Equal(t, "s3://bucket/data/data-001.parquet", *task.DeletionVectorFiles[0].ReferencedDataFile())
+	assert.Empty(t, task.DeleteFiles)
+	assert.Empty(t, task.EqualityDeleteFiles)
+}

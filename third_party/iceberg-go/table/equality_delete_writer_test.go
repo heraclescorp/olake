@@ -1,0 +1,555 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package table_test
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/file"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+	"github.com/apache/iceberg-go"
+	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/table"
+	"github.com/geoarrow/geoarrow-go"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func newEqDeleteTestTable(t *testing.T, formatVersion string) *table.Table {
+	t.Helper()
+
+	location := filepath.ToSlash(t.TempDir())
+
+	iceSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+
+	meta, err := table.NewMetadata(iceSchema, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, location,
+		iceberg.Properties{table.PropertyFormatVersion: formatVersion})
+	require.NoError(t, err)
+
+	return table.New(
+		table.Identifier{"db", "eq_del_test"},
+		meta, location+"/metadata/v1.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) {
+			return iceio.LocalFS{}, nil
+		},
+		&rowDeltaCatalog{metadata: meta},
+	)
+}
+
+func makeEqDeleteRecords(t *testing.T, arrowSc *arrow.Schema, jsonData string) (func(yield func(arrow.RecordBatch, error) bool), func()) {
+	t.Helper()
+
+	rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrowSc, strings.NewReader(jsonData))
+	require.NoError(t, err)
+
+	records := func(yield func(arrow.RecordBatch, error) bool) {
+		yield(rec, nil)
+	}
+
+	return records, rec.Release
+}
+
+func TestWriteEqualityDeleteFiles(t *testing.T) {
+	tbl := newEqDeleteTestTable(t, "2")
+
+	// Build Arrow schema with just the delete key column
+	delArrowSc, err := table.SchemaToArrowSchema(
+		iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true}),
+		nil, true, false)
+	require.NoError(t, err)
+
+	records, release := makeEqDeleteRecords(t, delArrowSc, `[{"id": 2}, {"id": 4}]`)
+	defer release()
+
+	tx := tbl.NewTransaction()
+	deleteFiles, err := tx.WriteEqualityDeletes(t.Context(), []int{1}, records)
+	require.NoError(t, err)
+	require.Len(t, deleteFiles, 1)
+
+	df := deleteFiles[0]
+	assert.Equal(t, iceberg.EntryContentEqDeletes, df.ContentType())
+	assert.Equal(t, []int{1}, df.EqualityFieldIDs())
+	assert.EqualValues(t, 2, df.Count())
+
+	// Verify the file was actually written to disk
+	fs := iceio.LocalFS{}
+	f, err := fs.Open(df.FilePath())
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+}
+
+func TestWriteEqualityDeleteFilesParquetContent(t *testing.T) {
+	tbl := newEqDeleteTestTable(t, "2")
+
+	delArrowSc, err := table.SchemaToArrowSchema(
+		iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true}),
+		nil, true, false)
+	require.NoError(t, err)
+
+	records, release := makeEqDeleteRecords(t, delArrowSc, `[{"id": 10}, {"id": 20}, {"id": 30}]`)
+	defer release()
+
+	tx := tbl.NewTransaction()
+	deleteFiles, err := tx.WriteEqualityDeletes(t.Context(), []int{1}, records)
+	require.NoError(t, err)
+	require.Len(t, deleteFiles, 1)
+
+	// Read the Parquet file back and verify its content
+	rdr, err := file.OpenParquetFile(deleteFiles[0].FilePath(), false)
+	require.NoError(t, err)
+	defer rdr.Close()
+
+	arrowRdr, err := pqarrow.NewFileReader(rdr, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	require.NoError(t, err)
+
+	tblReader, err := arrowRdr.ReadTable(t.Context())
+	require.NoError(t, err)
+	defer tblReader.Release()
+
+	// Should have exactly 1 column (the delete key) and 3 rows
+	assert.Equal(t, int64(1), tblReader.NumCols())
+	assert.Equal(t, int64(3), tblReader.NumRows())
+
+	col := tblReader.Column(0)
+	assert.Equal(t, "id", col.Name())
+
+	// Verify actual values by collecting all chunks
+	chunked := col.Data()
+	var vals []int64
+	for i := range chunked.Chunks() {
+		arr := chunked.Chunks()[i].(*array.Int64)
+		for j := range arr.Len() {
+			vals = append(vals, arr.Value(j))
+		}
+	}
+	assert.Equal(t, []int64{10, 20, 30}, vals)
+}
+
+func TestWriteEqualityDeleteFilesResolvesProjJSONCRSFromTableProperties(t *testing.T) {
+	const projjson = `{"type":"GeographicCRS","name":"Custom WGS 84"}`
+
+	// Exercise the public equality-delete writer path to ensure it threads
+	// table properties into Arrow schema conversion for projjson CRS fields.
+	location := filepath.ToSlash(t.TempDir())
+	geom, err := iceberg.GeometryTypeOf("projjson:geo.crs")
+	require.NoError(t, err)
+
+	iceSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "geom", Type: geom, Required: false},
+	)
+	meta, err := table.NewMetadata(iceSchema, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, location,
+		iceberg.Properties{
+			table.PropertyFormatVersion: "3",
+			"geo.crs":                   projjson,
+		})
+	require.NoError(t, err)
+
+	tbl := table.New(
+		table.Identifier{"db", "eq_del_projjson_test"},
+		meta,
+		location+"/metadata/v1.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) {
+			return iceio.LocalFS{}, nil
+		},
+		&rowDeltaCatalog{metadata: meta},
+	)
+
+	delArrowSc, err := table.SchemaToArrowSchemaWithOptions(iceSchema, table.ArrowSchemaOptions{
+		IncludeFieldIDs: true,
+		TableProperties: meta.Properties(),
+	})
+	require.NoError(t, err)
+
+	records, release := makeEqDeleteRecords(t, delArrowSc, `[
+		{"geom": "01010000000000000000003e400000000000002440"}
+	]`)
+	defer release()
+
+	tx := tbl.NewTransaction()
+	deleteFiles, err := tx.WriteEqualityDeletes(t.Context(), []int{1}, records)
+	require.NoError(t, err)
+	require.Len(t, deleteFiles, 1)
+
+	df := deleteFiles[0]
+	assert.Equal(t, iceberg.EntryContentEqDeletes, df.ContentType())
+	assert.Equal(t, []int{1}, df.EqualityFieldIDs())
+	assert.EqualValues(t, 1, df.Count())
+
+	rdr, err := file.OpenParquetFile(df.FilePath(), false)
+	require.NoError(t, err)
+	defer rdr.Close()
+
+	arrowRdr, err := pqarrow.NewFileReader(rdr, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	require.NoError(t, err)
+
+	tblReader, err := arrowRdr.ReadTable(t.Context())
+	require.NoError(t, err)
+	defer tblReader.Release()
+
+	require.Equal(t, int64(1), tblReader.NumCols())
+	wkb, ok := tblReader.Schema().Field(0).Type.(*geoarrow.WKBType)
+	require.True(t, ok)
+
+	geoMeta := wkb.Metadata()
+	assert.Equal(t, geoarrow.CRSTypePROJJSON, geoMeta.CRSType)
+	assert.JSONEq(t, projjson, string(geoMeta.CRS))
+}
+
+func TestWriteEqualityDeleteFilesMultiColumnKey(t *testing.T) {
+	location := filepath.ToSlash(t.TempDir())
+
+	iceSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: true},
+		iceberg.NestedField{ID: 3, Name: "value", Type: iceberg.PrimitiveTypes.Float64, Required: false},
+	)
+
+	meta, err := table.NewMetadata(iceSchema, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, location,
+		iceberg.Properties{table.PropertyFormatVersion: "2"})
+	require.NoError(t, err)
+
+	tbl := table.New(
+		table.Identifier{"db", "multi_key_test"},
+		meta, location+"/metadata/v1.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) {
+			return iceio.LocalFS{}, nil
+		},
+		&rowDeltaCatalog{metadata: meta},
+	)
+
+	delArrowSc, err := table.SchemaToArrowSchema(
+		iceberg.NewSchema(0,
+			iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+			iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: true},
+		), nil, true, false)
+	require.NoError(t, err)
+
+	records, release := makeEqDeleteRecords(t, delArrowSc,
+		`[{"id": 1, "name": "alice"}, {"id": 2, "name": "bob"}]`)
+	defer release()
+
+	tx := tbl.NewTransaction()
+	deleteFiles, err := tx.WriteEqualityDeletes(t.Context(), []int{1, 2}, records)
+	require.NoError(t, err)
+	require.Len(t, deleteFiles, 1)
+
+	df := deleteFiles[0]
+	assert.Equal(t, iceberg.EntryContentEqDeletes, df.ContentType())
+	assert.Equal(t, []int{1, 2}, df.EqualityFieldIDs())
+	assert.EqualValues(t, 2, df.Count())
+}
+
+func TestWriteEqualityDeleteFilesRejectsV1Table(t *testing.T) {
+	tbl := newEqDeleteTestTable(t, "1")
+
+	records := func(yield func(arrow.RecordBatch, error) bool) {}
+
+	tx := tbl.NewTransaction()
+	_, err := tx.WriteEqualityDeletes(t.Context(), []int{1}, records)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "format version >= 2")
+}
+
+func TestWriteEqualityDeleteFilesRejectsEmptyFieldIDs(t *testing.T) {
+	tbl := newEqDeleteTestTable(t, "2")
+
+	records := func(yield func(arrow.RecordBatch, error) bool) {}
+
+	tx := tbl.NewTransaction()
+	_, err := tx.WriteEqualityDeletes(t.Context(), nil, records)
+	require.ErrorIs(t, err, table.ErrEmptyEqualityFieldIDs)
+}
+
+func TestWriteEqualityDeleteFilesRejectsInvalidFieldID(t *testing.T) {
+	tbl := newEqDeleteTestTable(t, "2")
+
+	records := func(yield func(arrow.RecordBatch, error) bool) {}
+
+	tx := tbl.NewTransaction()
+	_, err := tx.WriteEqualityDeletes(t.Context(), []int{999}, records)
+	require.ErrorIs(t, err, iceberg.ErrInvalidSchema)
+}
+
+func TestWriteEqualityDeleteFilesRejectsFloatAndDoubleFieldIDs(t *testing.T) {
+	location := filepath.ToSlash(t.TempDir())
+
+	iceSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "score", Type: iceberg.PrimitiveTypes.Float32, Required: false},
+		iceberg.NestedField{ID: 3, Name: "ratio", Type: iceberg.PrimitiveTypes.Float64, Required: false},
+	)
+
+	meta, err := table.NewMetadata(iceSchema, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, location,
+		iceberg.Properties{table.PropertyFormatVersion: "2"})
+	require.NoError(t, err)
+
+	tbl := table.New(
+		table.Identifier{"db", "floating_key_test"},
+		meta, location+"/metadata/v1.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) {
+			return iceio.LocalFS{}, nil
+		},
+		&rowDeltaCatalog{metadata: meta},
+	)
+
+	records := func(yield func(arrow.RecordBatch, error) bool) {}
+
+	tests := []struct {
+		name      string
+		fieldID   int
+		fieldName string
+		fieldType string
+	}{
+		{name: "float", fieldID: 2, fieldName: "score", fieldType: "float"},
+		{name: "double", fieldID: 3, fieldName: "ratio", fieldType: "double"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tx := tbl.NewTransaction()
+			_, err := tx.WriteEqualityDeletes(t.Context(), []int{tt.fieldID}, records)
+			require.ErrorIs(t, err, iceberg.ErrInvalidSchema)
+			assert.ErrorContains(t, err, "equality field ID")
+			assert.ErrorContains(t, err, tt.fieldName)
+			assert.ErrorContains(t, err, tt.fieldType)
+		})
+	}
+}
+
+func newPartitionedEqDeleteTestTable(t *testing.T) *table.Table {
+	t.Helper()
+
+	location := filepath.ToSlash(t.TempDir())
+
+	iceSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "category", Type: iceberg.PrimitiveTypes.String, Required: true},
+		iceberg.NestedField{ID: 3, Name: "score", Type: iceberg.PrimitiveTypes.Float32, Required: false},
+		iceberg.NestedField{ID: 4, Name: "price", Type: iceberg.DecimalTypeOf(10, 2), Required: false},
+	)
+
+	partSpec := iceberg.NewPartitionSpec(
+		iceberg.PartitionField{SourceIDs: []int{2}, FieldID: 1000, Name: "category", Transform: iceberg.IdentityTransform{}},
+	)
+
+	meta, err := table.NewMetadata(iceSchema, &partSpec,
+		table.UnsortedSortOrder, location,
+		iceberg.Properties{table.PropertyFormatVersion: "2"})
+	require.NoError(t, err)
+
+	return table.New(
+		table.Identifier{"db", "partitioned_eq_del_test"},
+		meta, location+"/metadata/v1.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) {
+			return iceio.LocalFS{}, nil
+		},
+		&rowDeltaCatalog{metadata: meta},
+	)
+}
+
+func TestWriteEqualityDeleteFilesPartitionedTable(t *testing.T) {
+	tbl := newPartitionedEqDeleteTestTable(t)
+
+	// Delete records must include both the equality key (id) and partition source (category)
+	delSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "category", Type: iceberg.PrimitiveTypes.String, Required: true},
+	)
+	delArrowSc, err := table.SchemaToArrowSchema(delSchema, nil, true, false)
+	require.NoError(t, err)
+
+	// 2 books + 1 music = should produce 2 partitioned files
+	records, release := makeEqDeleteRecords(t, delArrowSc,
+		`[{"id": 10, "category": "books"}, {"id": 20, "category": "music"}, {"id": 30, "category": "books"}]`)
+	defer release()
+
+	tx := tbl.NewTransaction()
+	files, err := tx.WriteEqualityDeletes(t.Context(), []int{1}, records)
+	require.NoError(t, err)
+	require.Len(t, files, 2, "should produce one file per partition")
+
+	for _, df := range files {
+		assert.Equal(t, iceberg.EntryContentEqDeletes, df.ContentType())
+		assert.Equal(t, []int{1}, df.EqualityFieldIDs())
+		assert.True(t, df.Count() > 0)
+	}
+
+	// Verify Parquet file content: files should contain only the equality key column (id), not category
+	for _, df := range files {
+		func() {
+			f, err := os.Open(df.FilePath())
+			require.NoError(t, err)
+			defer f.Close()
+
+			rdr, err := file.NewParquetReader(f)
+			require.NoError(t, err)
+			defer rdr.Close()
+
+			pqSchema := rdr.MetaData().Schema
+			assert.Equal(t, 1, pqSchema.NumColumns(), "parquet file should contain only the equality key column")
+			assert.Equal(t, "id", pqSchema.Column(0).Name())
+		}()
+	}
+}
+
+func TestWriteEqualityDeleteFilesPartitionedTableRejectsFloatFieldID(t *testing.T) {
+	tbl := newPartitionedEqDeleteTestTable(t)
+
+	delSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 3, Name: "score", Type: iceberg.PrimitiveTypes.Float32, Required: false},
+		iceberg.NestedField{ID: 2, Name: "category", Type: iceberg.PrimitiveTypes.String, Required: true},
+	)
+	delArrowSc, err := table.SchemaToArrowSchema(delSchema, nil, true, false)
+	require.NoError(t, err)
+
+	records, release := makeEqDeleteRecords(t, delArrowSc,
+		`[{"score": 1.5, "category": "books"}]`)
+	defer release()
+
+	tx := tbl.NewTransaction()
+	_, err = tx.WriteEqualityDeletes(t.Context(), []int{3}, records)
+	require.ErrorIs(t, err, iceberg.ErrInvalidSchema)
+	assert.ErrorContains(t, err, "score")
+	assert.ErrorContains(t, err, "float")
+	assert.ErrorContains(t, err, "floating-point columns cannot be used as equality delete keys")
+}
+
+func TestWriteEqualityDeleteFilesPartitionedTableAcceptsDecimalFieldID(t *testing.T) {
+	tbl := newPartitionedEqDeleteTestTable(t)
+
+	delSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 4, Name: "price", Type: iceberg.DecimalTypeOf(10, 2), Required: false},
+		iceberg.NestedField{ID: 2, Name: "category", Type: iceberg.PrimitiveTypes.String, Required: true},
+	)
+	delArrowSc, err := table.SchemaToArrowSchema(delSchema, nil, true, false)
+	require.NoError(t, err)
+
+	records, release := makeEqDeleteRecords(t, delArrowSc,
+		`[{"price": "12.34", "category": "books"}, {"price": "56.78", "category": "music"}]`)
+	defer release()
+
+	tx := tbl.NewTransaction()
+	files, err := tx.WriteEqualityDeletes(t.Context(), []int{4}, records)
+	require.NoError(t, err)
+	require.Len(t, files, 2, "should produce one file per partition")
+
+	for _, df := range files {
+		assert.Equal(t, iceberg.EntryContentEqDeletes, df.ContentType())
+		assert.Equal(t, []int{4}, df.EqualityFieldIDs())
+
+		func() {
+			f, err := os.Open(df.FilePath())
+			require.NoError(t, err)
+			defer f.Close()
+
+			rdr, err := file.NewParquetReader(f)
+			require.NoError(t, err)
+			defer rdr.Close()
+
+			pqSchema := rdr.MetaData().Schema
+			assert.Equal(t, 1, pqSchema.NumColumns(), "parquet file should contain only the equality key column")
+			assert.Equal(t, "price", pqSchema.Column(0).Name())
+		}()
+	}
+}
+
+func TestWriteEqualityDeleteFilesPartitionedKeyOverlapsPartition(t *testing.T) {
+	tbl := newPartitionedEqDeleteTestTable(t)
+
+	// When the equality key IS the partition column, no extra columns needed
+	delSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 2, Name: "category", Type: iceberg.PrimitiveTypes.String, Required: true},
+	)
+	delArrowSc, err := table.SchemaToArrowSchema(delSchema, nil, true, false)
+	require.NoError(t, err)
+
+	records, release := makeEqDeleteRecords(t, delArrowSc,
+		`[{"category": "books"}, {"category": "music"}]`)
+	defer release()
+
+	tx := tbl.NewTransaction()
+	files, err := tx.WriteEqualityDeletes(t.Context(), []int{2}, records)
+	require.NoError(t, err)
+	require.NotEmpty(t, files)
+
+	for _, df := range files {
+		assert.Equal(t, iceberg.EntryContentEqDeletes, df.ContentType())
+		assert.Equal(t, []int{2}, df.EqualityFieldIDs())
+	}
+}
+
+func TestWriteEqualityDeleteFilesCommitViaRowDelta(t *testing.T) {
+	tbl := newEqDeleteTestTable(t, "2")
+
+	// Step 1: Append data
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Metadata().CurrentSchema(), nil, false, false)
+	require.NoError(t, err)
+
+	dataPath := tbl.Location() + "/data/data-001.parquet"
+	writeParquetFile(t, dataPath, arrowSc, `[
+		{"id": 1, "data": "alpha"},
+		{"id": 2, "data": "beta"},
+		{"id": 3, "data": "gamma"}
+	]`)
+
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	tbl, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+	assertRowCount(t, tbl, 3)
+
+	// Step 2: Write equality delete files and commit via RowDelta
+	delArrowSc, err := table.SchemaToArrowSchema(
+		iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true}),
+		nil, true, false)
+	require.NoError(t, err)
+
+	records, release := makeEqDeleteRecords(t, delArrowSc, `[{"id": 2}]`)
+	defer release()
+
+	tx2 := tbl.NewTransaction()
+	deleteFiles, err := tx2.WriteEqualityDeletes(t.Context(), []int{1}, records)
+	require.NoError(t, err)
+	require.Len(t, deleteFiles, 1)
+
+	rd := tx2.NewRowDelta(nil)
+	rd.AddDeletes(deleteFiles...)
+	require.NoError(t, rd.Commit(t.Context()))
+
+	tbl, err = tx2.Commit(t.Context())
+	require.NoError(t, err)
+
+	snap := tbl.CurrentSnapshot()
+	require.NotNil(t, snap)
+	assert.Equal(t, table.OpDelete, snap.Summary.Operation)
+	assert.Equal(t, "1", snap.Summary.Properties["added-equality-delete-files"])
+}

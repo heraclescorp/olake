@@ -105,6 +105,42 @@ func newUnavailableValuesResolver(threadID string, stream types.StreamInterface,
 	}
 }
 
+// InvalidateColumns forgets cached source values whose destination columns were
+// added or dropped. Keep other values and deletion tombstones: neither may be
+// reconstructed safely from an older indexed row during this thread.
+func (r *unavailableValuesResolver) InvalidateColumns(columns []string) {
+	if r == nil || len(columns) == 0 {
+		return
+	}
+	changed := make(map[string]struct{}, len(columns))
+	for _, column := range columns {
+		changed[column] = struct{}{}
+	}
+	var sources []string
+	for column := range r.tracked {
+		if _, invalidated := changed[r.stream.ResolveColumnName(column)]; invalidated {
+			sources = append(sources, column)
+			delete(r.tracked, column)
+		}
+	}
+	if len(sources) == 0 {
+		return
+	}
+	for olakeID, row := range r.carry {
+		if row.deleted {
+			continue
+		}
+		for _, column := range sources {
+			r.account(-valueSize(row.values[column]))
+			delete(row.values, column)
+		}
+		if len(row.values) == 0 {
+			r.account(-row.size(olakeID))
+			delete(r.carry, olakeID)
+		}
+	}
+}
+
 // Resolve fills every unavailable value in the batch it can recover. The rest keep
 // constants.UnavailableValue, as before this feature.
 func (r *unavailableValuesResolver) Resolve(ctx context.Context, records []types.RawRecord) error {

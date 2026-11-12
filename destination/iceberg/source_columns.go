@@ -6,13 +6,18 @@ import (
 	"maps"
 	"slices"
 
+	apacheiceberg "github.com/apache/iceberg-go"
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/destination"
-	legacywriter "github.com/datazip-inc/olake/destination/iceberg/legacy-writer"
-	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils/logger"
 )
+
+type nativeSourceColumn struct {
+	Key            string
+	IceType        string
+	InitialDefault apacheiceberg.Literal
+}
 
 // ApplySourceColumns adds selected source columns missing from the table and, when the stream
 // enables drop_removed_columns, deletes table columns the source no longer has.
@@ -29,29 +34,18 @@ func (i *Iceberg) ApplySourceColumns(ctx context.Context, globalSchema any, chan
 		return globalSchema, nil
 	}
 
-	request := proto.IcebergPayload{
-		Type: proto.IcebergPayload_ALTER_COLUMNS,
-		Metadata: &proto.IcebergPayload_Metadata{
-			ThreadId:       i.options.ThreadID,
-			AddedColumns:   added,
-			DroppedColumns: dropped,
-		},
+	if err := i.writer.AlterSourceColumns(ctx, added, dropped); err != nil {
+		return nil, destination.WriteFailure(fmt.Errorf("failed to alter source columns: %w", err))
 	}
-	resp, err := i.server.SendClientRequest(ctx, &request)
-	if err != nil {
-		return nil, fmt.Errorf("failed to %s: %w", request.Type.String(), err)
+	if i.unavailableValues != nil {
+		changed := dropped
+		for _, column := range added {
+			changed = append(changed, column.Key)
+		}
+		i.unavailableValues.InvalidateColumns(changed)
 	}
-
-	result := resp.(*proto.RecordIngestResponse).GetResult()
-	schemaAfterAlter, err := parseSchema(result)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse schema from resp[%s]: %w", result, err)
-	}
-
+	schemaAfterAlter := i.writer.schemaMap()
 	i.schema = copySchema(schemaAfterAlter)
-	if err := i.writer.EvolveSchema(ctx, schemaAfterAlter); err != nil {
-		return nil, destination.WriteFailure(fmt.Errorf("failed to evolve writer schema: %w", err))
-	}
 	return schemaAfterAlter, nil
 }
 
@@ -61,14 +55,14 @@ func (i *Iceberg) ApplySourceColumns(ctx context.Context, globalSchema any, chan
 // add with a default, or values of a column dropped since. syncStartColumns tracks the columns a
 // sync-start change added: the change stream may still describe the table from before they
 // existed, so they are not dropped until a change-stream change lists them.
-func planSourceColumns(stream types.StreamInterface, schema map[string]string, change types.SourceColumnsChange, syncStartColumns map[string]struct{}) ([]*proto.IcebergPayload_AddedColumn, []string) {
+func planSourceColumns(stream types.StreamInterface, schema map[string]string, change types.SourceColumnsChange, syncStartColumns map[string]struct{}) ([]*nativeSourceColumn, []string) {
 	isSelected := stream.IsSelectedColumn()
 	sourceColumns := types.NewSet[string]()
 	for _, name := range change.KeepColumns {
 		sourceColumns.Insert(stream.ResolveColumnName(name))
 	}
 
-	var added []*proto.IcebergPayload_AddedColumn
+	var added []*nativeSourceColumn
 	for _, column := range change.Columns {
 		key := stream.ResolveColumnName(column.Name)
 		sourceColumns.Insert(key)
@@ -83,21 +77,21 @@ func planSourceColumns(stream types.StreamInterface, schema map[string]string, c
 		switch {
 		case column.ExistingRowValueUnknown:
 			logger.Warnf("stream[%s]: adding column[%s] type[%s] with NULL for existing rows: the source's value for rows stored before the column was added is unknown (volatile default, table rewritten, or column no longer exists)", stream.ID(), key, iceType)
-			added = append(added, &proto.IcebergPayload_AddedColumn{Key: key, IceType: iceType})
+			added = append(added, &nativeSourceColumn{Key: key, IceType: iceType})
 		case column.ExistingRowValue == nil:
 			logger.Infof("stream[%s]: adding column[%s] type[%s], existing rows read NULL", stream.ID(), key, iceType)
-			added = append(added, &proto.IcebergPayload_AddedColumn{Key: key, IceType: iceType})
+			added = append(added, &nativeSourceColumn{Key: key, IceType: iceType})
 		case change.SyncStart:
 			logger.Infof("stream[%s]: column[%s] type[%s] with existing-row value[%v] will be added when its change arrives in the change stream", stream.ID(), key, iceType, column.ExistingRowValue)
 		default:
-			initialDefault, err := legacywriter.ToProtoFieldValue(iceType, column.ExistingRowValue)
+			initialDefault, err := nativeSourceColumnDefault(iceType, column.ExistingRowValue)
 			if err != nil {
 				logger.Warnf("stream[%s]: adding column[%s] type[%s] with NULL for existing rows: failed to encode existing-row value[%v]: %s", stream.ID(), key, iceType, column.ExistingRowValue, err)
-				added = append(added, &proto.IcebergPayload_AddedColumn{Key: key, IceType: iceType})
+				added = append(added, &nativeSourceColumn{Key: key, IceType: iceType})
 				continue
 			}
 			logger.Infof("stream[%s]: adding column[%s] type[%s], existing rows read [%v]", stream.ID(), key, iceType, column.ExistingRowValue)
-			added = append(added, &proto.IcebergPayload_AddedColumn{Key: key, IceType: iceType, InitialDefault: initialDefault})
+			added = append(added, &nativeSourceColumn{Key: key, IceType: iceType, InitialDefault: initialDefault})
 		}
 	}
 

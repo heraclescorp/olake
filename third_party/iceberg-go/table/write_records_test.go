@@ -1,0 +1,526 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package table_test
+
+import (
+	"context"
+	"errors"
+	"iter"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/file"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+	"github.com/apache/iceberg-go"
+	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/table"
+	"github.com/geoarrow/geoarrow-go"
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/suite"
+)
+
+type WriteRecordsTestSuite struct {
+	suite.Suite
+
+	mem *memory.CheckedAllocator
+	ctx context.Context
+}
+
+func TestWriteRecords(t *testing.T) {
+	suite.Run(t, new(WriteRecordsTestSuite))
+}
+
+func (s *WriteRecordsTestSuite) SetupTest() {
+	s.mem = memory.NewCheckedAllocator(memory.DefaultAllocator)
+	s.ctx = compute.WithAllocator(context.Background(), s.mem)
+}
+
+func (s *WriteRecordsTestSuite) TearDownTest() {
+	s.mem.AssertSize(s.T(), 0)
+}
+
+func (s *WriteRecordsTestSuite) newTable(loc string) *table.Table {
+	iceSch := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+		iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+	spec := iceberg.NewPartitionSpec()
+	meta, err := table.NewMetadata(iceSch, &spec, table.UnsortedSortOrder, loc, iceberg.Properties{})
+	s.Require().NoError(err)
+
+	return table.New(
+		table.Identifier{"test", "write_records"},
+		meta,
+		filepath.Join(loc, "metadata", "v1.metadata.json"),
+		func(ctx context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil },
+		nil,
+	)
+}
+
+func (s *WriteRecordsTestSuite) arrowSchema() *arrow.Schema {
+	return arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+}
+
+func (s *WriteRecordsTestSuite) buildRecords(schema *arrow.Schema, numRows int) arrow.RecordBatch {
+	bldr := array.NewRecordBuilder(s.mem, schema)
+	defer bldr.Release()
+
+	for i := range numRows {
+		bldr.Field(0).(*array.Int32Builder).Append(int32(i))
+		bldr.Field(1).(*array.StringBuilder).Append("value")
+	}
+
+	return bldr.NewRecordBatch()
+}
+
+func (s *WriteRecordsTestSuite) TestBasicWrite() {
+	loc := filepath.ToSlash(s.T().TempDir())
+	tbl := s.newTable(loc)
+	schema := s.arrowSchema()
+
+	records := func(yield func(arrow.RecordBatch, error) bool) {
+		rec := s.buildRecords(schema, 10)
+		yield(rec, nil)
+	}
+
+	var dataFiles []iceberg.DataFile
+	for df, err := range table.WriteRecords(s.ctx, tbl, schema, records) {
+		s.Require().NoError(err)
+		dataFiles = append(dataFiles, df)
+	}
+
+	s.Require().Len(dataFiles, 1)
+	s.Equal(int64(10), dataFiles[0].Count())
+	s.Equal(iceberg.ParquetFile, dataFiles[0].FileFormat())
+	s.Greater(dataFiles[0].FileSizeBytes(), int64(0))
+	s.Contains(dataFiles[0].FilePath(), loc)
+}
+
+func (s *WriteRecordsTestSuite) TestWriteRecordsResolvesProjJSONCRSFromTableProperties() {
+	const projjson = `{"type":"GeographicCRS","name":"Custom WGS 84"}`
+	loc := filepath.ToSlash(s.T().TempDir())
+	geom, err := iceberg.GeometryTypeOf("projjson:geo.crs")
+	s.Require().NoError(err)
+
+	iceSch := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "geom", Type: geom, Required: false},
+	)
+	spec := iceberg.NewPartitionSpec()
+	meta, err := table.NewMetadata(iceSch, &spec, table.UnsortedSortOrder, loc, iceberg.Properties{
+		table.PropertyFormatVersion: "3",
+		"geo.crs":                   projjson,
+	})
+	s.Require().NoError(err)
+
+	tbl := table.New(
+		table.Identifier{"test", "write_records_projjson"},
+		meta,
+		filepath.Join(loc, "metadata", "v1.metadata.json"),
+		func(ctx context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil },
+		nil,
+	)
+
+	arrowSchema, err := table.SchemaToArrowSchemaWithOptions(iceSch, table.ArrowSchemaOptions{
+		IncludeFieldIDs: true,
+		TableProperties: meta.Properties(),
+	})
+	s.Require().NoError(err)
+
+	records := func(yield func(arrow.RecordBatch, error) bool) {
+		rec, _, err := array.RecordFromJSON(s.mem, arrowSchema, strings.NewReader(`[
+			{"geom": "01010000000000000000003e400000000000002440"}
+		]`))
+		s.Require().NoError(err)
+		yield(rec, nil)
+	}
+
+	var dataFiles []iceberg.DataFile
+	for df, err := range table.WriteRecords(s.ctx, tbl, arrowSchema, records) {
+		s.Require().NoError(err)
+		dataFiles = append(dataFiles, df)
+	}
+	s.Require().Len(dataFiles, 1)
+
+	rdr, err := file.OpenParquetFile(dataFiles[0].FilePath(), false)
+	s.Require().NoError(err)
+	defer rdr.Close()
+
+	arrowRdr, err := pqarrow.NewFileReader(rdr, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	s.Require().NoError(err)
+
+	written, err := arrowRdr.ReadTable(s.ctx)
+	s.Require().NoError(err)
+	defer written.Release()
+
+	wkb, ok := written.Schema().Field(0).Type.(*geoarrow.WKBType)
+	s.Require().True(ok)
+	geoMeta := wkb.Metadata()
+	s.Equal(geoarrow.CRSTypePROJJSON, geoMeta.CRSType)
+	s.JSONEq(projjson, string(geoMeta.CRS))
+
+	// Read the written file through the table-aware scan path. This verifies
+	// that embedded GeoArrow PROJJSON metadata remains usable when the reader
+	// projects records using the table schema and properties.
+	scan := tbl.Scan()
+	readSchema, readRecords, err := scan.ReadTasks(s.ctx, []table.FileScanTask{{File: dataFiles[0]}})
+	s.Require().NoError(err)
+	readWKB, ok := readSchema.Field(0).Type.(*geoarrow.WKBType)
+	s.Require().True(ok)
+	readMeta := readWKB.Metadata()
+	s.Equal(geoarrow.CRSTypePROJJSON, readMeta.CRSType)
+	s.JSONEq(projjson, string(readMeta.CRS))
+
+	next, stop := iter.Pull2(readRecords)
+	defer stop()
+
+	readRecord, err, ok := next()
+	s.Require().True(ok)
+	s.Require().NoError(err)
+	defer readRecord.Release()
+	s.Equal(int64(1), readRecord.NumRows())
+
+	readGeom, ok := tbl.Schema().Field(0).Type.(iceberg.GeometryType)
+	s.Require().True(ok)
+	s.Equal("projjson:geo.crs", readGeom.CRS())
+}
+
+func (s *WriteRecordsTestSuite) TestUnknownPartitionTransformRejected() {
+	loc := filepath.ToSlash(s.T().TempDir())
+
+	unknown, err := iceberg.ParseTransform("custom_transform[42]")
+	s.Require().NoError(err)
+
+	iceSch := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+		iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+	spec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{1}, FieldID: iceberg.PartitionDataIDStart,
+		Name: "id_custom", Transform: unknown,
+	})
+	meta, err := table.NewMetadata(iceSch, &spec, table.UnsortedSortOrder, loc, iceberg.Properties{})
+	s.Require().NoError(err)
+	tbl := table.New(
+		table.Identifier{"test", "unknown_spec"}, meta,
+		filepath.Join(loc, "metadata", "v1.metadata.json"),
+		func(ctx context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil },
+		nil,
+	)
+
+	schema := s.arrowSchema()
+	records := func(yield func(arrow.RecordBatch, error) bool) {
+		rec := s.buildRecords(schema, 10)
+		defer rec.Release()
+		yield(rec, nil)
+	}
+
+	var got error
+	for _, err := range table.WriteRecords(s.ctx, tbl, schema, records) {
+		got = err
+	}
+	s.Require().ErrorIs(got, iceberg.ErrInvalidTransform)
+	s.ErrorContains(got, "custom_transform[42]")
+}
+
+func (s *WriteRecordsTestSuite) TestSmallTargetFileSizeProducesMultipleFiles() {
+	loc := filepath.ToSlash(s.T().TempDir())
+	tbl := s.newTable(loc)
+	schema := s.arrowSchema()
+
+	records := func(yield func(arrow.RecordBatch, error) bool) {
+		for range 10 {
+			rec := s.buildRecords(schema, 100)
+			if !yield(rec, nil) {
+				return
+			}
+		}
+	}
+
+	var totalRows int64
+	var dataFiles []iceberg.DataFile
+	for df, err := range table.WriteRecords(s.ctx, tbl, schema, records, table.WithTargetFileSize(1)) {
+		s.Require().NoError(err)
+		dataFiles = append(dataFiles, df)
+		totalRows += df.Count()
+	}
+
+	s.Greater(len(dataFiles), 1)
+	s.Equal(int64(1000), totalRows)
+}
+
+func (s *WriteRecordsTestSuite) TestEarlyStopCancelsRecordProduction() {
+	tests := []struct {
+		name        string
+		partitioned bool
+	}{
+		{name: "unpartitioned"},
+		{name: "partitioned", partitioned: true},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			loc := filepath.ToSlash(s.T().TempDir())
+			iceSch := iceberg.NewSchema(1,
+				iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32},
+				iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String},
+			)
+			spec := iceberg.NewPartitionSpec()
+			if tt.partitioned {
+				spec = iceberg.NewPartitionSpec(iceberg.PartitionField{
+					SourceIDs: []int{1}, FieldID: 1000, Name: "id", Transform: iceberg.IdentityTransform{},
+				})
+			}
+			meta, err := table.NewMetadata(iceSch, &spec, table.UnsortedSortOrder, loc, iceberg.Properties{})
+			s.Require().NoError(err)
+			tbl := table.New(
+				table.Identifier{"test", tt.name}, meta, filepath.Join(loc, "metadata", "v1.metadata.json"),
+				func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }, nil,
+			)
+
+			schema := s.arrowSchema()
+			var produced atomic.Int32
+			records := func(yield func(arrow.RecordBatch, error) bool) {
+				for range 1000 {
+					produced.Add(1)
+					record := s.buildRecords(schema, 100)
+					accepted := yield(record, nil)
+					if !accepted {
+						return
+					}
+				}
+			}
+
+			for df, writeErr := range table.WriteRecords(
+				s.ctx, tbl, schema, records, table.WithTargetFileSize(1), table.WithMaxWriteWorkers(1),
+			) {
+				s.Require().NoError(writeErr)
+				s.Require().NotNil(df)
+
+				break
+			}
+
+			s.Positive(produced.Load())
+			s.Less(produced.Load(), int32(100))
+		})
+	}
+}
+
+func (s *WriteRecordsTestSuite) TestWithWriteUUID() {
+	loc := filepath.ToSlash(s.T().TempDir())
+	tbl := s.newTable(loc)
+	schema := s.arrowSchema()
+
+	writeID := uuid.New()
+	records := func(yield func(arrow.RecordBatch, error) bool) {
+		rec := s.buildRecords(schema, 5)
+		yield(rec, nil)
+	}
+
+	for df, err := range table.WriteRecords(s.ctx, tbl, schema, records, table.WithWriteUUID(writeID)) {
+		s.Require().NoError(err)
+		s.Contains(df.FilePath(), writeID.String())
+	}
+}
+
+func (s *WriteRecordsTestSuite) TestClusteredWithMaxWriteWorkersIsRejected() {
+	loc := filepath.ToSlash(s.T().TempDir())
+	tbl := s.newTable(loc)
+	schema := s.arrowSchema()
+
+	records := func(yield func(arrow.RecordBatch, error) bool) {}
+
+	var (
+		dataFiles []iceberg.DataFile
+		writeErr  error
+	)
+	for df, err := range table.WriteRecords(s.ctx, tbl, schema, records,
+		table.WithClusteredWrite(), table.WithMaxWriteWorkers(4)) {
+		if err != nil {
+			writeErr = err
+
+			break
+		}
+		dataFiles = append(dataFiles, df)
+	}
+
+	s.Require().Error(writeErr)
+	s.Contains(writeErr.Error(), "WithClusteredWrite")
+	s.Contains(writeErr.Error(), "WithMaxWriteWorkers")
+	s.Empty(dataFiles)
+}
+
+func (s *WriteRecordsTestSuite) TestFSNotWritable() {
+	iceSch := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+	)
+	spec := iceberg.NewPartitionSpec()
+	meta, err := table.NewMetadata(iceSch, &spec, table.UnsortedSortOrder, "/tmp/noop", iceberg.Properties{})
+	s.Require().NoError(err)
+
+	tbl := table.New(
+		table.Identifier{"test", "readonly"},
+		meta,
+		"/tmp/noop/metadata/v1.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) { return readOnlyFS{}, nil },
+		nil,
+	)
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+	}, nil)
+	records := func(yield func(arrow.RecordBatch, error) bool) {}
+
+	for _, err := range table.WriteRecords(s.ctx, tbl, schema, records) {
+		s.Require().ErrorIs(err, table.ErrWriteIORequired)
+		s.Require().ErrorIs(err, iceberg.ErrNotImplemented)
+	}
+}
+
+func (s *WriteRecordsTestSuite) TestFSError() {
+	iceSch := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+	)
+	spec := iceberg.NewPartitionSpec()
+	meta, err := table.NewMetadata(iceSch, &spec, table.UnsortedSortOrder, "/tmp/noop", iceberg.Properties{})
+	s.Require().NoError(err)
+
+	fsErr := errors.New("connection refused")
+	tbl := table.New(
+		table.Identifier{"test", "fs_error"},
+		meta,
+		"/tmp/noop/metadata/v1.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) { return nil, fsErr },
+		nil,
+	)
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+	}, nil)
+	records := func(yield func(arrow.RecordBatch, error) bool) {}
+
+	for _, err := range table.WriteRecords(s.ctx, tbl, schema, records) {
+		s.Require().ErrorIs(err, fsErr)
+	}
+}
+
+func (s *WriteRecordsTestSuite) TestEmptyInput() {
+	loc := filepath.ToSlash(s.T().TempDir())
+	tbl := s.newTable(loc)
+	schema := s.arrowSchema()
+
+	records := func(yield func(arrow.RecordBatch, error) bool) {}
+
+	count := 0
+	for _, err := range table.WriteRecords(s.ctx, tbl, schema, records) {
+		s.Require().NoError(err)
+		count++
+	}
+
+	s.Equal(0, count)
+}
+
+func (s *WriteRecordsTestSuite) TestTimestampNanosecondsShouldFloorNegativeValuesIfTableUsesMicroseconds() {
+	loc := filepath.ToSlash(s.T().TempDir())
+	iceSch := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+		iceberg.NestedField{ID: 2, Name: "created_ts", Type: iceberg.PrimitiveTypes.Timestamp, Required: false},
+	)
+	spec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{2},
+		FieldID:   1000,
+		Transform: iceberg.IdentityTransform{},
+		Name:      "created_ts",
+	})
+	meta, err := table.NewMetadata(iceSch, &spec, table.UnsortedSortOrder, loc, iceberg.Properties{})
+	s.Require().NoError(err)
+
+	tbl := table.New(
+		table.Identifier{"test", "write_records_timestamps"},
+		meta,
+		filepath.Join(loc, "metadata", "v1.metadata.json"),
+		func(ctx context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil },
+		nil,
+	)
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "created_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond}, Nullable: true},
+	}, nil)
+
+	records := func(yield func(arrow.RecordBatch, error) bool) {
+		bldr := array.NewRecordBuilder(s.mem, arrowSchema)
+		defer bldr.Release()
+
+		bldr.Field(0).(*array.Int32Builder).Append(1)
+		bldr.Field(1).(*array.TimestampBuilder).Append(arrow.Timestamp(-1_500))
+
+		yield(bldr.NewRecordBatch(), nil)
+	}
+
+	var dataFiles []iceberg.DataFile
+	for df, err := range table.WriteRecords(s.ctx, tbl, arrowSchema, records) {
+		s.Require().NoError(err)
+		dataFiles = append(dataFiles, df)
+	}
+
+	s.Require().Len(dataFiles, 1)
+
+	partitionRec := table.GetPartitionRecord(dataFiles[0], spec.PartitionType(iceSch))
+	s.Equal("created_ts=1969-12-31T23%3A59%3A59.999998", spec.PartitionToPath(partitionRec, iceSch))
+
+	rdr, err := file.OpenParquetFile(dataFiles[0].FilePath(), false)
+	s.Require().NoError(err)
+	defer rdr.Close()
+
+	arrowRdr, err := pqarrow.NewFileReader(rdr, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	s.Require().NoError(err)
+
+	written, err := arrowRdr.ReadTable(s.ctx)
+	s.Require().NoError(err)
+	defer written.Release()
+
+	s.Equal(int64(1), written.NumRows())
+	chunks := written.Column(1).Data().Chunks()
+	s.Require().Len(chunks, 1)
+
+	timestamps := chunks[0].(*array.Timestamp)
+	s.Equal(arrow.Timestamp(-2), timestamps.Value(0))
+
+	writtenType := timestamps.DataType().(*arrow.TimestampType)
+	s.Equal(arrow.Microsecond, writtenType.Unit)
+	s.Empty(writtenType.TimeZone)
+}
+
+type readOnlyFS struct{}
+
+func (readOnlyFS) Open(name string) (iceio.File, error) {
+	return nil, errors.New("not supported")
+}
+
+func (readOnlyFS) Remove(name string) error {
+	return errors.New("not supported")
+}

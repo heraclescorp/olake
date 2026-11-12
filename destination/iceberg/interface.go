@@ -9,6 +9,8 @@ import (
 type Writer interface {
 	Write(ctx context.Context, records []types.RawRecord) error
 	EvolveSchema(ctx context.Context, newSchema map[string]string) error
+	AlterSourceColumns(ctx context.Context, added []*nativeSourceColumn, dropped []string) error
+	schemaMap() map[string]string
 	Close(ctx context.Context, finalMetadataState any) error
 	// Abort discards whatever the writer staged outside Iceberg, for the paths
 	// that give up before Close can commit.

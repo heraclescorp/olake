@@ -85,9 +85,7 @@ func (i *Iceberg) Setup(ctx context.Context, stream types.StreamInterface, _ any
 	return i.schema, state, nil
 }
 
-// Write sends records in order, split into chunks of at most MaxDestinationBatchBytes when values
-// recovered from the destination (unchanged TOAST) grew the batch past what the buffer measured,
-// so no single write exceeds the 2 GB message limit.
+// Write bounds batches after TOAST recovery expands their in-memory size.
 func (i *Iceberg) Write(ctx context.Context, records []types.RawRecord) error {
 	if i.unavailableValues == nil || i.unavailableValues.filledBytes == 0 {
 		return i.writer.Write(ctx, records)

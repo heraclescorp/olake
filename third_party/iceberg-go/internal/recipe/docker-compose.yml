@@ -1,0 +1,215 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+services:
+  spark-iceberg:
+    image: ${SPARK_IMAGE:-pyiceberg-spark}
+    container_name: spark-iceberg
+    build:
+      context: .
+      dockerfile: ${SPARK_DOCKERFILE:-Dockerfile}
+    networks:
+      iceberg_net:
+    depends_on:
+      - rest
+      - object-store
+    volumes:
+      - ./warehouse:/home/iceberg/warehouse
+      - ./notebooks:/home/iceberg/notebooks/notebooks
+      - /tmp/iceberg-hadoop-warehouse:/tmp/iceberg-hadoop-warehouse
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    ports:
+      - 8888:8888
+      - 8080:8080
+      - 10000:10000
+      - 10001:10001
+    healthcheck:
+      test: ["CMD-SHELL", "ls $$SPARK_HOME/jars/iceberg-spark-runtime*.jar > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+  rest:
+    depends_on:
+      create-bucket:
+        condition: service_completed_successfully
+    image: apache/iceberg-rest-fixture:1.10.1
+    container_name: iceberg-rest
+    networks:
+      iceberg_net:
+    ports:
+      - 8181:8181
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://object-store:9000
+  rest-scan-planning:
+    depends_on:
+      create-bucket:
+        condition: service_completed_successfully
+    # 1.10.1 predates the fixture's scan-planning implementation. Pin the
+    # multi-platform image built from apache/iceberg@b0df3ca so the Java wire
+    # compatibility tests are reproducible.
+    # TODO(#1880): Replace the digest with a stable release tag once a
+    # scan-planning-capable fixture tag is published.
+    # The image declares a /v1/config healthcheck that compose up --wait uses.
+    image: apache/iceberg-rest-fixture:latest@sha256:db8de90b5b7693d4ac334c336f91d9bbe320d7b19f4f514d26de84cdfbcbfe8d
+    container_name: iceberg-rest-scan-planning
+    networks:
+      iceberg_net:
+    ports:
+      - 8182:8181
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://object-store:9000
+      - CATALOG_INCLUDE__CREDENTIALS=true
+      # Use a non-S3 credential so vending can be asserted without changing the
+      # static S3 credentials used by the fixture's backing FileIO.
+      - CATALOG_GCS_OAUTH2_TOKEN=scan-planning-integration-token
+  object-store:
+    image: rustfs/rustfs:1.0.0
+    container_name: object-store
+    environment:
+      - RUSTFS_ACCESS_KEY=admin
+      - RUSTFS_SECRET_KEY=password
+      - RUSTFS_SERVER_DOMAINS=object-store
+      - RUSTFS_OBS_LOG_STDOUT_ENABLED=true
+    networks:
+      iceberg_net:
+        aliases:
+          - warehouse.object-store
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: ["/data"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:9000/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    container_name: azurite
+    hostname: azurite
+    ports:
+      - 11000:11000
+    command: ["azurite-blob", "--loose", "--blobHost", "0.0.0.0" ,"--blobPort", "11000", "--skipApiVersionCheck"]
+  create-bucket:
+    depends_on:
+      object-store:
+        condition: service_healthy
+    image: amazon/aws-cli:2.36.44
+    networks:
+      iceberg_net:
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ENDPOINT_URL=http://object-store:9000
+    entrypoint: /bin/sh
+    command:
+      - -ec
+      - |
+        for attempt in 1 2 3 4 5; do
+          if { aws s3api head-bucket --bucket warehouse >/dev/null 2>&1 || aws s3api create-bucket --bucket warehouse; } \
+            && aws s3 rm s3://warehouse --recursive --quiet; then
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "Failed to create warehouse bucket." >&2
+        exit 1
+  clickhouse:
+    image: clickhouse/clickhouse-server
+    container_name: clickhouse
+    networks:
+      iceberg_net:
+    ports:
+      - 8123:8123
+      - 9002:9000
+  trino:
+    image: trinodb/trino
+    container_name: trino
+    networks:
+      iceberg_net:
+    environment:
+      - CATALOG_MANAGEMENT=dynamic
+    ports:
+      - 8088:8080
+    healthcheck:
+      # Trino can take ~30s to finish booting in GitHub Actions; without a
+      # startup grace period, docker compose up --wait can mark it unhealthy
+      # just before the server reaches READY.
+      start_period: 45s
+
+  fake-gcs-server:
+    image: fsouza/fake-gcs-server
+    container_name: fake-gcs-server
+    networks:
+      iceberg_net:
+    ports:
+      - 4443:4443
+    command: ["-scheme", "http", "-port", "4443", "-backend", "memory", "-public-host", "fake-gcs-server:4443"]
+
+  hive-metastore:
+    image: apache/hive:4.0.0
+    container_name: hive-metastore
+    user: root
+    networks:
+      iceberg_net:
+    ports:
+      - 9083:9083
+    environment:
+      - SERVICE_NAME=metastore
+      - DB_DRIVER=derby
+    volumes:
+      - hive-metastore-data:/opt/hive/data
+      - /tmp/iceberg-warehouse:/tmp/iceberg-warehouse
+
+  hiveserver2:
+    image: apache/hive:4.0.0
+    container_name: hiveserver2
+    user: root
+    networks:
+      iceberg_net:
+    depends_on:
+      - hive-metastore
+    ports:
+      - "10003:10000"  # Adjusted to avoid conflict with spark-iceberg
+      - "10002:10002"  # Web UI
+    environment:
+      - SERVICE_NAME=hiveserver2
+      - SERVICE_OPTS=-Dhive.metastore.uris=thrift://hive-metastore:9083
+      - IS_RESUME=true
+    volumes:
+      - hive-metastore-data:/opt/hive/data
+      - /tmp/iceberg-warehouse:/tmp/iceberg-warehouse
+
+networks:
+  iceberg_net:
+
+volumes:
+  hive-metastore-data:

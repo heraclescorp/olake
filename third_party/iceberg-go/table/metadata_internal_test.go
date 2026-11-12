@@ -1,0 +1,3086 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package table
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"maps"
+	"math"
+	"os"
+	"path"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/apache/iceberg-go"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSnapshotIDFromUUIDClearsSignBit(t *testing.T) {
+	for _, id := range []uuid.UUID{
+		{7: 0x80},
+		{15: 0x80},
+	} {
+		require.Zero(t, snapshotIDFromUUID(id))
+	}
+
+	require.Equal(t, int64(math.MaxInt64), snapshotIDFromUUID(uuid.UUID{
+		0: 0xff, 1: 0xff, 2: 0xff, 3: 0xff, 4: 0xff, 5: 0xff, 6: 0xff, 7: 0xff,
+	}))
+}
+
+const ExampleTableMetadataV2 = `{
+    "format-version": 2,
+    "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+    "location": "s3://bucket/test/location",
+    "last-sequence-number": 34,
+    "last-updated-ms": 1602638573590,
+    "last-column-id": 3,
+    "current-schema-id": 1,
+    "schemas": [
+        {"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "x", "required": true, "type": "long"}]},
+        {
+            "type": "struct",
+            "schema-id": 1,
+            "identifier-field-ids": [1, 2],
+            "fields": [
+                {"id": 1, "name": "x", "required": true, "type": "long"},
+                {"id": 2, "name": "y", "required": true, "type": "long", "doc": "comment"},
+                {"id": 3, "name": "z", "required": true, "type": "long"}
+            ]
+        }
+    ],
+    "default-spec-id": 0,
+    "partition-specs": [{"spec-id": 0, "fields": [{"name": "x", "transform": "identity", "source-id": 1, "field-id": 1000}]}],
+    "last-partition-id": 1000,
+    "default-sort-order-id": 3,
+    "sort-orders": [
+        {
+            "order-id": 3,
+            "fields": [
+                {"transform": "identity", "source-id": 2, "direction": "asc", "null-order": "nulls-first"},
+                {"transform": "bucket[4]", "source-id": 3, "direction": "desc", "null-order": "nulls-last"}
+            ]
+        }
+    ],
+    "properties": {"read.split.target.size": "134217728"},
+    "current-snapshot-id": 3055729675574597004,
+    "snapshots": [
+        {
+            "snapshot-id": 3051729675574597004,
+            "timestamp-ms": 1515100955770,
+            "sequence-number": 0,
+            "summary": {"operation": "append"},
+            "manifest-list": "s3://a/b/1.avro"
+        },
+        {
+            "snapshot-id": 3055729675574597004,
+            "parent-snapshot-id": 3051729675574597004,
+            "timestamp-ms": 1555100955770,
+            "sequence-number": 1,
+            "summary": {"operation": "append"},
+            "manifest-list": "s3://a/b/2.avro",
+            "schema-id": 1
+        }
+    ],
+    "snapshot-log": [
+        {"snapshot-id": 3051729675574597004, "timestamp-ms": 1515100955770},
+        {"snapshot-id": 3055729675574597004, "timestamp-ms": 1555100955770}
+    ],
+    "metadata-log": [{"metadata-file": "s3://bucket/.../v1.json", "timestamp-ms": 1515100}],
+    "refs": {"test": {"snapshot-id": 3051729675574597004, "type": "tag", "max-ref-age-ms": 10000000}}
+}`
+
+const ExampleTableMetadataV3 = `{
+    "format-version": 3,
+    "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+    "location": "s3://bucket/test/location",
+    "last-sequence-number": 34,
+    "last-updated-ms": 1602638573590,
+    "last-column-id": 3,
+    "next-row-id": 1000,
+    "current-schema-id": 1,
+    "schemas": [
+        {"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "x", "required": true, "type": "long"}]},
+        {
+            "type": "struct",
+            "schema-id": 1,
+            "identifier-field-ids": [1, 2],
+            "fields": [
+                {"id": 1, "name": "x", "required": true, "type": "long"},
+                {"id": 2, "name": "y", "required": true, "type": "long", "doc": "comment"},
+                {"id": 3, "name": "z", "required": true, "type": "long"}
+            ]
+        }
+    ],
+    "default-spec-id": 0,
+    "partition-specs": [{"spec-id": 0, "fields": [{"name": "x", "transform": "identity", "source-id": 1, "field-id": 1000}]}],
+    "last-partition-id": 1000,
+    "default-sort-order-id": 3,
+    "sort-orders": [
+        {
+            "order-id": 3,
+            "fields": [
+                {"transform": "identity", "source-id": 2, "direction": "asc", "null-order": "nulls-first"},
+                {"transform": "bucket[4]", "source-id": 3, "direction": "desc", "null-order": "nulls-last"}
+            ]
+        }
+    ],
+    "properties": {"read.split.target.size": "134217728"},
+    "current-snapshot-id": 3055729675574597004,
+    "snapshots": [
+        {
+            "snapshot-id": 3051729675574597004,
+            "timestamp-ms": 1515100955770,
+            "sequence-number": 0,
+            "summary": {"operation": "append"},
+            "manifest-list": "s3://a/b/1.avro",
+            "first-row-id": 1000
+        },
+        {
+            "snapshot-id": 3055729675574597004,
+            "parent-snapshot-id": 3051729675574597004,
+            "timestamp-ms": 1555100955770,
+            "sequence-number": 1,
+            "summary": {"operation": "append"},
+            "manifest-list": "s3://a/b/2.avro",
+            "schema-id": 1,
+            "first-row-id": 2000
+        }
+    ],
+    "snapshot-log": [
+        {"snapshot-id": 3051729675574597004, "timestamp-ms": 1515100955770},
+        {"snapshot-id": 3055729675574597004, "timestamp-ms": 1555100955770}
+    ],
+    "metadata-log": [{"metadata-file": "s3://bucket/.../v1.json", "timestamp-ms": 1515100}],
+    "refs": {"test": {"snapshot-id": 3051729675574597004, "type": "tag", "max-ref-age-ms": 10000000}}
+}`
+
+const ExampleTableMetadataV1 = `{
+	"format-version": 1,
+	"table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+	"location": "s3://bucket/test/location",
+	"last-updated-ms": 1602638573874,
+	"last-column-id": 3,
+	"schema": {
+		"type": "struct",
+		"fields": [
+			{"id": 1, "name": "x", "required": true, "type": "long"},
+			{"id": 2, "name": "y", "required": true, "type": "long", "doc": "comment"},
+			{"id": 3, "name": "z", "required": true, "type": "long"}
+		]
+	},
+	"partition-spec": [{"name": "x", "transform": "identity", "source-id": 1, "field-id": 1000}],
+	"properties": {},
+	"current-snapshot-id": -1,
+	"snapshots": [{"snapshot-id": 1925, "timestamp-ms": 1602638573822}]
+}`
+
+func TestMetadataV1Parsing(t *testing.T) {
+	meta, err := ParseMetadataBytes([]byte(ExampleTableMetadataV1))
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+
+	assert.IsType(t, (*metadataV1)(nil), meta)
+	assert.Equal(t, 1, meta.Version())
+
+	data := meta.(*metadataV1)
+	assert.Equal(t, uuid.MustParse("d20125c8-7284-442c-9aea-15fee620737c"), meta.TableUUID())
+	assert.Equal(t, "s3://bucket/test/location", meta.Location())
+	assert.Equal(t, int64(1602638573874), meta.LastUpdatedMillis())
+	assert.Equal(t, 3, meta.LastColumnID())
+
+	expected := iceberg.NewSchema(
+		0,
+		iceberg.NestedField{ID: 1, Name: "x", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "y", Type: iceberg.PrimitiveTypes.Int64, Required: true, Doc: "comment"},
+		iceberg.NestedField{ID: 3, Name: "z", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+	)
+
+	assert.True(t, slices.EqualFunc([]*iceberg.Schema{expected}, meta.Schemas(), func(s1, s2 *iceberg.Schema) bool {
+		return s1.Equals(s2)
+	}))
+	assert.Zero(t, data.SchemaList[0].ID)
+	assert.True(t, meta.CurrentSchema().Equals(expected))
+	assert.Equal(t, []iceberg.PartitionSpec{
+		iceberg.NewPartitionSpec(iceberg.PartitionField{
+			SourceIDs: []int{1}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "x",
+		}),
+	}, meta.PartitionSpecs())
+
+	assert.Equal(t, iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{1}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "x",
+	}), meta.PartitionSpec())
+
+	assert.Equal(t, 0, meta.DefaultPartitionSpec())
+	assert.Equal(t, 1000, *meta.LastPartitionSpecID())
+	assert.Nil(t, data.CurrentSnapshotID)
+	assert.Nil(t, meta.CurrentSnapshot())
+	assert.Len(t, meta.Snapshots(), 1)
+	assert.NotNil(t, meta.SnapshotByID(1925))
+	assert.Nil(t, meta.SnapshotByID(0))
+	assert.Nil(t, meta.SnapshotByName("foo"))
+	assert.Zero(t, data.DefaultSortOrderID)
+	assert.Equal(t, UnsortedSortOrder, meta.SortOrder())
+}
+
+func TestMetadataV2Parsing(t *testing.T) {
+	meta, err := ParseMetadataBytes([]byte(ExampleTableMetadataV2))
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+
+	assert.IsType(t, (*metadataV2)(nil), meta)
+	assert.Equal(t, 2, meta.Version())
+
+	data := meta.(*metadataV2)
+	assert.Equal(t, uuid.MustParse("9c12d441-03fe-4693-9a96-a0705ddf69c1"), data.UUID)
+	assert.Equal(t, "s3://bucket/test/location", data.Location())
+	assert.Equal(t, int64(34), data.LastSeqNum)
+	assert.Equal(t, int64(1602638573590), data.LastUpdatedMS)
+	assert.Equal(t, 3, data.LastColumnId)
+	assert.Equal(t, 0, data.SchemaList[0].ID)
+	assert.Equal(t, 1, data.CurrentSchemaID)
+	assert.Equal(t, 0, data.Specs[0].ID())
+	assert.Equal(t, 0, data.DefaultSpecID)
+	assert.Equal(t, 1000, *data.LastPartitionID)
+	assert.EqualValues(t, "134217728", data.Props["read.split.target.size"])
+	assert.EqualValues(t, 3055729675574597004, *data.CurrentSnapshotID)
+	assert.EqualValues(t, 3051729675574597004, data.SnapshotList[0].SnapshotID)
+	assert.Equal(t, int64(1515100955770), data.SnapshotLog[0].TimestampMs)
+	assert.Equal(t, 3, data.SortOrderList[0].OrderID())
+	assert.Equal(t, 3, data.DefaultSortOrderID)
+
+	assert.Len(t, meta.Snapshots(), 2)
+	assert.Equal(t, data.SnapshotList[1], *meta.CurrentSnapshot())
+	assert.Equal(t, data.SnapshotList[0], *meta.SnapshotByName("test"))
+	assert.EqualValues(t, "134217728", meta.Properties()["read.split.target.size"])
+}
+
+func TestMetadataV3Parsing(t *testing.T) {
+	meta, err := ParseMetadataBytes([]byte(ExampleTableMetadataV3))
+	require.NoError(t, err)
+	require.NotNil(t, meta)
+
+	assert.IsType(t, (*metadataV3)(nil), meta)
+	assert.Equal(t, 3, meta.Version())
+
+	data := meta.(*metadataV3)
+	assert.Equal(t, uuid.MustParse("9c12d441-03fe-4693-9a96-a0705ddf69c1"), data.UUID)
+	assert.Equal(t, "s3://bucket/test/location", data.Location())
+	assert.Equal(t, int64(34), data.LastSeqNum)
+	assert.Equal(t, int64(1000), data.NextRowIDValue)
+	assert.Equal(t, int64(1602638573590), data.LastUpdatedMS)
+	assert.Equal(t, 3, data.LastColumnId)
+	assert.Equal(t, 0, data.SchemaList[0].ID)
+	assert.Equal(t, 1, data.CurrentSchemaID)
+	assert.Equal(t, 0, data.Specs[0].ID())
+	assert.Equal(t, 0, data.DefaultSpecID)
+	assert.Equal(t, 1000, *data.LastPartitionID)
+	assert.EqualValues(t, "134217728", data.Props["read.split.target.size"])
+	assert.EqualValues(t, 3055729675574597004, *data.CurrentSnapshotID)
+	assert.EqualValues(t, 3051729675574597004, data.SnapshotList[0].SnapshotID)
+	assert.Equal(t, int64(1515100955770), data.SnapshotLog[0].TimestampMs)
+	assert.Equal(t, 3, data.SortOrderList[0].OrderID())
+	assert.Equal(t, 3, data.DefaultSortOrderID)
+
+	// Test v3 specific fields
+	assert.Equal(t, int64(1000), meta.NextRowID())
+	assert.Equal(t, int64(34), meta.LastSequenceNumber())
+
+	// Test snapshot first-row-id
+	assert.Len(t, meta.Snapshots(), 2)
+	assert.Equal(t, data.SnapshotList[1], *meta.CurrentSnapshot())
+	assert.Equal(t, data.SnapshotList[0], *meta.SnapshotByName("test"))
+	assert.EqualValues(t, "134217728", meta.Properties()["read.split.target.size"])
+
+	firstSnapshot := data.SnapshotList[0]
+	assert.NotNil(t, firstSnapshot.FirstRowID)
+	assert.Equal(t, int64(1000), *firstSnapshot.FirstRowID)
+
+	secondSnapshot := data.SnapshotList[1]
+	assert.NotNil(t, secondSnapshot.FirstRowID)
+	assert.Equal(t, int64(2000), *secondSnapshot.FirstRowID)
+}
+
+func TestMetadataUnmarshalReplacesReceiverState(t *testing.T) {
+	tests := []struct {
+		name   string
+		data   string
+		target any
+	}{
+		{name: "v1", data: ExampleTableMetadataV1, target: &metadataV1{}},
+		{name: "v2", data: ExampleTableMetadataV2, target: &metadataV2{}},
+		{name: "v3", data: ExampleTableMetadataV3, target: &metadataV3{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			initialData := []byte(tt.data)
+			var initial map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(initialData, &initial))
+			setJSON := func(key string, value any) {
+				encoded, err := json.Marshal(value)
+				require.NoError(t, err)
+				initial[key] = encoded
+			}
+			var snapshots []struct {
+				SnapshotID int64 `json:"snapshot-id"`
+			}
+			require.NoError(t, json.Unmarshal(initial["snapshots"], &snapshots))
+			require.NotEmpty(t, snapshots)
+			snapshotID := snapshots[len(snapshots)-1].SnapshotID
+			setJSON("properties", map[string]any{"seed": "value"})
+			setJSON("current-snapshot-id", snapshotID)
+			setJSON("snapshot-log", []any{map[string]any{"snapshot-id": snapshotID, "timestamp-ms": int64(1)}})
+			setJSON("metadata-log", []any{map[string]any{"metadata-file": "s3://bucket/old.json", "timestamp-ms": int64(1)}})
+			setJSON("refs", map[string]any{"main": map[string]any{"snapshot-id": snapshotID, "type": "branch"}})
+			setJSON("last-partition-id", int64(1000))
+			setJSON("statistics", []any{map[string]any{
+				"snapshot-id": snapshotID, "statistics-path": "s3://bucket/stats.puffin",
+				"file-size-in-bytes": int64(1), "file-footer-size-in-bytes": int64(1), "blob-metadata": []any{},
+			}})
+			setJSON("partition-statistics", []any{map[string]any{
+				"snapshot-id": snapshotID, "statistics-path": "s3://bucket/partition-stats.parquet", "file-size-in-bytes": int64(1),
+			}})
+			if tt.name == "v2" || tt.name == "v3" {
+				setJSON("last-sequence-number", int64(34))
+			}
+			if tt.name == "v3" {
+				setJSON("encryption-keys", []any{map[string]any{
+					"key-id": "key-1", "encrypted-key-metadata": "YWJj",
+				}})
+			}
+			var err error
+			initialData, err = json.Marshal(initial)
+			require.NoError(t, err)
+
+			require.NoError(t, json.Unmarshal(initialData, tt.target))
+
+			common := metadataCommon(tt.target)
+			require.NotEmpty(t, common.Props)
+			require.NotEmpty(t, common.SnapshotList)
+			require.NotEmpty(t, common.SnapshotLog)
+			require.NotEmpty(t, common.MetadataLog)
+			require.NotEmpty(t, common.SnapshotRefs)
+			require.NotNil(t, common.CurrentSnapshotID)
+			require.NotNil(t, common.LastPartitionID)
+			require.NotEmpty(t, common.StatisticsList)
+			require.NotEmpty(t, common.PartitionStatsList)
+			switch metadata := tt.target.(type) {
+			case *metadataV1:
+				require.Equal(t, int64(0), metadata.LastSequenceNumber())
+			case *metadataV2:
+				require.Equal(t, int64(34), metadata.LastSeqNum)
+			case *metadataV3:
+				require.Equal(t, int64(34), metadata.LastSeqNum)
+			}
+			if tt.name == "v3" {
+				require.NotEmpty(t, common.EncryptionKeyList)
+			}
+
+			var reduced map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal([]byte(tt.data), &reduced))
+			for _, key := range []string{
+				"properties", "current-snapshot-id", "snapshots", "snapshot-log", "metadata-log", "refs",
+				"statistics", "partition-statistics", "encryption-keys", "last-sequence-number",
+			} {
+				delete(reduced, key)
+			}
+			reduced["last-partition-id"] = json.RawMessage("1001")
+			reducedData, err := json.Marshal(reduced)
+			require.NoError(t, err)
+
+			if tt.name != "v1" {
+				before, err := json.Marshal(tt.target)
+				require.NoError(t, err)
+
+				err = json.Unmarshal(reducedData, tt.target)
+				require.ErrorContains(t, err, "last-sequence-number is required")
+
+				after, err := json.Marshal(tt.target)
+				require.NoError(t, err)
+				assert.Equal(t, before, after)
+
+				return
+			}
+
+			require.NoError(t, json.Unmarshal(reducedData, tt.target))
+
+			common = metadataCommon(tt.target)
+			assert.Empty(t, common.Props)
+			assert.Empty(t, common.SnapshotList)
+			assert.Empty(t, common.SnapshotLog)
+			assert.Empty(t, common.MetadataLog)
+			assert.Empty(t, common.SnapshotRefs)
+			assert.Nil(t, common.CurrentSnapshotID)
+			assert.Equal(t, 1001, *common.LastPartitionID)
+			assert.Empty(t, common.StatisticsList)
+			assert.Empty(t, common.PartitionStatsList)
+			assert.Empty(t, common.EncryptionKeyList)
+			assert.Equal(t, int64(0), tt.target.(*metadataV1).LastSequenceNumber())
+		})
+	}
+}
+
+func metadataCommon(target any) *commonMetadata {
+	switch metadata := target.(type) {
+	case *metadataV1:
+		return &metadata.commonMetadata
+	case *metadataV2:
+		return &metadata.commonMetadata
+	case *metadataV3:
+		return &metadata.commonMetadata
+	default:
+		panic("unsupported metadata type")
+	}
+}
+
+func TestMetadataUnmarshalPreservesStateOnError(t *testing.T) {
+	tests := []struct {
+		name      string
+		data      string
+		invalid   string
+		malformed string
+		target    any
+	}{
+		{
+			name:      "v1",
+			data:      ExampleTableMetadataV1,
+			invalid:   strings.Replace(ExampleTableMetadataV1, `"current-snapshot-id": -1`, `"current-snapshot-id": 999`, 1),
+			malformed: "not json {",
+			target:    &metadataV1{},
+		},
+		{
+			name:      "v2",
+			data:      ExampleTableMetadataV2,
+			invalid:   strings.Replace(ExampleTableMetadataV2, `"current-schema-id": 1`, `"current-schema-id": 99`, 1),
+			malformed: "not json {",
+			target:    &metadataV2{},
+		},
+		{
+			name:      "v3",
+			data:      ExampleTableMetadataV3,
+			invalid:   strings.Replace(ExampleTableMetadataV3, `"current-schema-id": 1`, `"current-schema-id": 99`, 1),
+			malformed: "not json {",
+			target:    &metadataV3{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, invalid := range []struct {
+				name string
+				data string
+			}{
+				{name: "validation", data: tt.invalid},
+				{name: "json", data: tt.malformed},
+			} {
+				t.Run(invalid.name, func(t *testing.T) {
+					require.NoError(t, json.Unmarshal([]byte(tt.data), tt.target))
+					before, err := json.Marshal(tt.target)
+					require.NoError(t, err)
+
+					require.Error(t, json.Unmarshal([]byte(invalid.data), tt.target))
+
+					after, err := json.Marshal(tt.target)
+					require.NoError(t, err)
+					assert.Equal(t, before, after)
+				})
+			}
+		})
+	}
+}
+
+func TestMetadataV2UnmarshalRejectsMissingRequiredStateOnReuse(t *testing.T) {
+	seedData := strings.Replace(ExampleTableMetadataV2, `"spec-id": 0`, `"spec-id": 7`, 1)
+	seedData = strings.Replace(seedData, `"default-spec-id": 0`, `"default-spec-id": 7`, 1)
+
+	var metadata metadataV2
+	require.NoError(t, json.Unmarshal([]byte(seedData), &metadata))
+
+	var reduced map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(seedData), &reduced))
+	delete(reduced, "default-spec-id")
+	reducedData, err := json.Marshal(reduced)
+	require.NoError(t, err)
+
+	require.Error(t, json.Unmarshal(reducedData, &metadata))
+	assert.Equal(t, 7, metadata.DefaultSpecID)
+	assert.Equal(t, 1, metadata.CurrentSchemaID)
+	assert.Len(t, metadata.SnapshotList, 2)
+}
+
+func TestLastUpdatedMSPresence(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "v1", data: ExampleTableMetadataV1},
+		{name: "v2", data: ExampleTableMetadataV2},
+		{name: "v3", data: ExampleTableMetadataV3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var metadata map[string]any
+			require.NoError(t, json.Unmarshal([]byte(tt.data), &metadata))
+
+			for _, key := range []string{
+				"snapshots", "snapshot-log", "metadata-log", "current-snapshot-id",
+				"refs", "statistics", "partition-statistics",
+			} {
+				delete(metadata, key)
+			}
+
+			t.Run("missing", func(t *testing.T) {
+				metadata := maps.Clone(metadata)
+				delete(metadata, "last-updated-ms")
+				assertMissingLastUpdatedMS(t, metadata)
+			})
+
+			t.Run("null", func(t *testing.T) {
+				metadata := maps.Clone(metadata)
+				metadata["last-updated-ms"] = nil
+				assertMissingLastUpdatedMS(t, metadata)
+			})
+
+			t.Run("epoch", func(t *testing.T) {
+				metadata := maps.Clone(metadata)
+				metadata["last-updated-ms"] = float64(0)
+				raw, err := json.Marshal(metadata)
+				require.NoError(t, err)
+				parsed, err := ParseMetadataBytes(raw)
+				require.NoError(t, err)
+				assert.Zero(t, parsed.LastUpdatedMillis())
+			})
+
+			t.Run("negative", func(t *testing.T) {
+				metadata := maps.Clone(metadata)
+				metadata["last-updated-ms"] = float64(-1)
+				raw, err := json.Marshal(metadata)
+				require.NoError(t, err)
+				parsed, err := ParseMetadataBytes(raw)
+				require.NoError(t, err)
+				assert.Equal(t, int64(-1), parsed.LastUpdatedMillis())
+			})
+
+			t.Run("wrong type", func(t *testing.T) {
+				metadata := maps.Clone(metadata)
+				metadata["last-updated-ms"] = "2024-01-01"
+				raw, err := json.Marshal(metadata)
+				require.NoError(t, err)
+				_, err = ParseMetadataBytes(raw)
+				require.ErrorIs(t, err, ErrInvalidMetadata)
+			})
+		})
+	}
+}
+
+func assertMissingLastUpdatedMS(t *testing.T, metadata map[string]any) {
+	t.Helper()
+
+	raw, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	_, err = ParseMetadataBytes(raw)
+	require.ErrorIs(t, err, ErrInvalidMetadata)
+	assert.ErrorContains(t, err, "last-updated-ms is absent or null")
+}
+
+func TestMetadataRequiredFields(t *testing.T) {
+	versions := []struct {
+		name          string
+		formatVersion int
+		data          string
+	}{
+		{name: "v1", formatVersion: 1, data: ExampleTableMetadataV1},
+		{name: "v2", formatVersion: 2, data: ExampleTableMetadataV2},
+		{name: "v3", formatVersion: 3, data: ExampleTableMetadataV3},
+	}
+	mutations := []struct {
+		name       string
+		key        string
+		value      any
+		remove     bool
+		errorMatch string
+	}{
+		{name: "missing-location", key: "location", remove: true, errorMatch: "location is required"},
+		{name: "null-location", key: "location", value: nil, errorMatch: "location is required"},
+		{name: "empty-location", key: "location", value: "", errorMatch: "location is required"},
+		{name: "missing-table-uuid", key: "table-uuid", remove: true, errorMatch: "table-uuid is required"},
+		{name: "null-table-uuid", key: "table-uuid", value: nil, errorMatch: "table-uuid is required"},
+		{name: "zero-table-uuid", key: "table-uuid", value: uuid.Nil.String(), errorMatch: "table-uuid is required"},
+	}
+
+	for _, version := range versions {
+		var metadata map[string]any
+		decoder := json.NewDecoder(strings.NewReader(version.data))
+		decoder.UseNumber() // Preserve snapshot IDs larger than float64 can represent exactly.
+		require.NoError(t, decoder.Decode(&metadata))
+
+		for _, mutation := range mutations {
+			t.Run(version.name+"/"+mutation.name, func(t *testing.T) {
+				mutated := maps.Clone(metadata)
+				if mutation.remove {
+					delete(mutated, mutation.key)
+				} else {
+					mutated[mutation.key] = mutation.value
+				}
+
+				raw, err := json.Marshal(mutated)
+				require.NoError(t, err)
+
+				parsed, err := ParseMetadataBytes(raw)
+				required := mutation.key == "location" || version.formatVersion > 1
+				if required {
+					require.ErrorIs(t, err, ErrInvalidMetadata)
+					assert.ErrorContains(t, err, mutation.errorMatch)
+
+					return
+				}
+
+				require.NoError(t, err)
+				assert.Equal(t, uuid.Nil, parsed.TableUUID())
+			})
+		}
+	}
+}
+
+// A full v3 metadata document must load when its partition spec and sort order
+// use unknown transforms — nothing on the metadata path may trip a guard.
+func TestMetadataV3ParsesUnknownTransforms(t *testing.T) {
+	j := strings.NewReplacer(
+		`{"name": "x", "transform": "identity", "source-id": 1, "field-id": 1000}`,
+		`{"name": "x", "transform": "custom_transform[42]", "source-id": 1, "field-id": 1000}`,
+		`{"transform": "bucket[4]", "source-id": 3, "direction": "desc", "null-order": "nulls-last"}`,
+		`{"transform": "custom_sort[7]", "source-id": 3, "direction": "desc", "null-order": "nulls-last"}`,
+	).Replace(ExampleTableMetadataV3)
+
+	meta, err := ParseMetadataBytes([]byte(j))
+	require.NoError(t, err)
+
+	spec := meta.PartitionSpec()
+	pf := spec.Field(0)
+	_, ok := pf.Transform.(iceberg.UnknownTransform)
+	assert.True(t, ok, "unknown partition transform should load")
+	assert.Equal(t, "custom_transform[42]", pf.Transform.String())
+
+	sf := meta.SortOrder().Field(1)
+	_, ok = sf.Transform.(iceberg.UnknownTransform)
+	assert.True(t, ok, "unknown sort transform should load")
+	assert.Equal(t, "custom_sort[7]", sf.Transform.String())
+
+	// Marshalling back must preserve the unknown transforms verbatim, proving
+	// no write-path guard strips or rewrites them.
+	out, err := json.Marshal(meta)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), "custom_transform[42]")
+	assert.Contains(t, string(out), "custom_sort[7]")
+}
+
+func TestMetadataEqualsIncludesStatistics(t *testing.T) {
+	builder := builderWithoutChanges(2)
+	base, err := builder.Build()
+	require.NoError(t, err)
+
+	baseV2 := base.(*metadataV2)
+
+	clone := *baseV2
+	assert.True(t, base.Equals(&clone))
+
+	clone.StatisticsList = append(slices.Clone(clone.StatisticsList), StatisticsFile{
+		SnapshotID:     1,
+		StatisticsPath: "s3://bucket/stats.puffin",
+		BlobMetadata:   []BlobMetadata{},
+	})
+	assert.False(t, base.Equals(&clone))
+
+	clone = *baseV2
+	clone.PartitionStatsList = append(slices.Clone(clone.PartitionStatsList), PartitionStatisticsFile{
+		SnapshotID:     1,
+		StatisticsPath: "s3://bucket/partition-stats.parquet",
+	})
+	assert.False(t, base.Equals(&clone))
+}
+
+func TestMetadataV3Builder(t *testing.T) {
+	// Test creating v3 metadata with builder
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+	)
+
+	builder, err := NewMetadataBuilder(3)
+	require.NoError(t, err)
+	builder.SetUUID(uuid.New())
+	builder.SetLoc("s3://test/location")
+	builder.SetLastUpdatedMS()
+
+	require.NoError(t, builder.AddSchema(schema))
+	require.NoError(t, builder.SetCurrentSchemaID(0))
+
+	spec := iceberg.NewPartitionSpec()
+	require.NoError(t, builder.AddPartitionSpec(&spec, true))
+	require.NoError(t, builder.SetDefaultSpecID(0))
+
+	sortOrder := UnsortedSortOrder
+	require.NoError(t, builder.AddSortOrder(&sortOrder))
+	require.NoError(t, builder.SetDefaultSortOrderID(0))
+
+	metadata, err := builder.Build()
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, metadata.Version())
+	assert.Equal(t, int64(0), metadata.NextRowID())
+}
+
+func TestSnapshotV3FirstRowID(t *testing.T) {
+	// Test snapshot with first-row-id
+	firstRowID := int64(1000)
+	snapshot := Snapshot{
+		SnapshotID:     12345,
+		SequenceNumber: 1,
+		TimestampMs:    1602638573590,
+		ManifestList:   "s3://test/manifest-list.avro",
+		FirstRowID:     &firstRowID,
+	}
+
+	// Test equals with first-row-id
+	otherSnapshot := Snapshot{
+		SnapshotID:     12345,
+		SequenceNumber: 1,
+		TimestampMs:    1602638573590,
+		ManifestList:   "s3://test/manifest-list.avro",
+		FirstRowID:     &firstRowID,
+	}
+
+	assert.True(t, snapshot.Equals(otherSnapshot), "Snapshots with same first-row-id should be equal")
+
+	// Test with different first-row-id
+	differentFirstRowID := int64(2000)
+	otherSnapshot.FirstRowID = &differentFirstRowID
+
+	assert.False(t, snapshot.Equals(otherSnapshot), "Snapshots with different first-row-id should not be equal")
+}
+
+func TestParsingCorrectTypes(t *testing.T) {
+	var meta metadataV2
+	require.NoError(t, json.Unmarshal([]byte(ExampleTableMetadataV2), &meta))
+
+	assert.IsType(t, &iceberg.Schema{}, meta.SchemaList[0])
+	assert.IsType(t, iceberg.NestedField{}, meta.SchemaList[0].Field(0))
+	assert.IsType(t, iceberg.PrimitiveTypes.Int64, meta.SchemaList[0].Field(0).Type)
+}
+
+func TestSerializeMetadataV1(t *testing.T) {
+	var meta metadataV1
+	require.NoError(t, json.Unmarshal([]byte(ExampleTableMetadataV1), &meta))
+
+	data, err := json.Marshal(&meta)
+	require.NoError(t, err)
+
+	assert.JSONEq(t, `{
+		"location": "s3://bucket/test/location", 
+		"table-uuid": "d20125c8-7284-442c-9aea-15fee620737c", 
+		"last-updated-ms": 1602638573874, 
+		"last-column-id": 3, 
+		"schemas": [
+			{
+				"type": "struct", 
+				"fields": [
+					{"id": 1, "name": "x", "type": "long", "required": true}, 
+					{"id": 2, "name": "y", "type": "long", "required": true, "doc": "comment"}, 
+					{"id": 3, "name": "z", "type": "long", "required": true}
+				], 
+				"schema-id": 0, 
+				"identifier-field-ids": []
+			}
+		], 
+		"current-schema-id": 0, 
+		"partition-specs": [
+			{
+				"spec-id": 0, 
+				"fields": [
+					{"source-id": 1, "field-id": 1000, "transform": "identity", "name": "x"}
+				]
+			}
+		], 
+		"default-spec-id": 0, 
+		"last-partition-id": 1000, 
+		"snapshots": [
+			{"snapshot-id": 1925, "sequence-number": 0, "timestamp-ms": 1602638573822}
+		], 
+		"sort-orders": [{"order-id": 0, "fields": []}], 
+		"default-sort-order-id": 0,
+		"format-version": 1, 
+		"schema": {
+			"type": "struct", 
+			"fields": [
+				{"id": 1, "name": "x", "type": "long", "required": true}, 
+				{"id": 2, "name": "y", "type": "long", "required": true, "doc": "comment"}, 
+				{"id": 3, "name": "z", "type": "long", "required": true}
+			], 
+			"schema-id": 0, 
+			"identifier-field-ids": []
+		}, 
+		"partition-spec": [
+			{"name": "x", "transform": "identity", "source-id": 1, "field-id": 1000}
+		]
+	}`, string(data))
+}
+
+func TestSerializeMetadataV2(t *testing.T) {
+	var meta metadataV2
+	require.NoError(t, json.Unmarshal([]byte(ExampleTableMetadataV2), &meta))
+
+	data, err := json.Marshal(&meta)
+	require.NoError(t, err)
+
+	assert.JSONEq(t, `{"location": "s3://bucket/test/location", "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1", "last-updated-ms": 1602638573590, "last-column-id": 3, "schemas": [{"type": "struct", "fields": [{"id": 1, "name": "x", "type": "long", "required": true}], "schema-id": 0, "identifier-field-ids": []}, {"type": "struct", "fields": [{"id": 1, "name": "x", "type": "long", "required": true}, {"id": 2, "name": "y", "type": "long", "required": true, "doc": "comment"}, {"id": 3, "name": "z", "type": "long", "required": true}], "schema-id": 1, "identifier-field-ids": [1, 2]}], "current-schema-id": 1, "partition-specs": [{"spec-id": 0, "fields": [{"source-id": 1, "field-id": 1000, "transform": "identity", "name": "x"}]}], "default-spec-id": 0, "last-partition-id": 1000, "properties": {"read.split.target.size": "134217728"}, "current-snapshot-id": 3055729675574597004, "snapshots": [{"snapshot-id": 3051729675574597004, "sequence-number": 0, "timestamp-ms": 1515100955770, "manifest-list": "s3://a/b/1.avro", "summary": {"operation": "append"}}, {"snapshot-id": 3055729675574597004, "parent-snapshot-id": 3051729675574597004, "sequence-number": 1, "timestamp-ms": 1555100955770, "manifest-list": "s3://a/b/2.avro", "summary": {"operation": "append"}, "schema-id": 1}], "snapshot-log": [{"snapshot-id": 3051729675574597004, "timestamp-ms": 1515100955770}, {"snapshot-id": 3055729675574597004, "timestamp-ms": 1555100955770}], "metadata-log": [{"metadata-file": "s3://bucket/.../v1.json", "timestamp-ms": 1515100}], "sort-orders": [{"order-id": 3, "fields": [{"source-id": 2, "transform": "identity", "direction": "asc", "null-order": "nulls-first"}, {"source-id": 3, "transform": "bucket[4]", "direction": "desc", "null-order": "nulls-last"}]}], "default-sort-order-id": 3, "refs": {"test": {"snapshot-id": 3051729675574597004, "type": "tag", "max-ref-age-ms": 10000000}, "main": {"snapshot-id": 3055729675574597004, "type": "branch"}}, "format-version": 2, "last-sequence-number": 34}`,
+		string(data))
+}
+
+func TestInvalidFormatVersion(t *testing.T) {
+	metadataInvalidFormat := `{
+        "format-version": -1,
+        "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+        "location": "s3://bucket/test/location",
+        "last-updated-ms": 1602638573874,
+        "last-column-id": 3,
+        "schema": {
+            "type": "struct",
+            "fields": [
+                {"id": 1, "name": "x", "required": true, "type": "long"},
+                {"id": 2, "name": "y", "required": true, "type": "long", "doc": "comment"},
+                {"id": 3, "name": "z", "required": true, "type": "long"}
+            ]
+        },
+        "partition-spec": [{"name": "x", "transform": "identity", "source-id": 1, "field-id": 1000}],
+        "properties": {},
+        "current-snapshot-id": -1,
+        "snapshots": []
+    }`
+
+	_, err := ParseMetadataBytes([]byte(metadataInvalidFormat))
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrInvalidMetadataFormatVersion)
+}
+
+func TestCurrentSchemaNotFound(t *testing.T) {
+	schemaNotFound := `{
+        "format-version": 2,
+        "last-sequence-number": 34,
+        "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+        "location": "s3://bucket/test/location",
+        "last-updated-ms": 1602638573874,
+        "last-column-id": 3,
+        "schemas": [
+            {"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "x", "required": true, "type": "long"}]},
+            {
+                "type": "struct",
+                "schema-id": 1,
+                "identifier-field-ids": [1, 2],
+                "fields": [
+                    {"id": 1, "name": "x", "required": true, "type": "long"},
+                    {"id": 2, "name": "y", "required": true, "type": "long", "doc": "comment"},
+                    {"id": 3, "name": "z", "required": true, "type": "long"}
+                ]
+            }
+        ],
+        "current-schema-id": 2,
+        "default-spec-id": 0,
+        "partition-specs": [{"spec-id": 0, "fields": [{"name": "x", "transform": "identity", "source-id": 1, "field-id": 1000}]}],
+        "last-partition-id": 1000,
+        "default-sort-order-id": 0,
+		"sort-orders": [{"order-id": 0, "fields": []}],
+        "properties": {},
+        "current-snapshot-id": -1,
+        "snapshots": []
+    }`
+
+	_, err := ParseMetadataBytes([]byte(schemaNotFound))
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrInvalidMetadata)
+	assert.ErrorContains(t, err, "current-schema-id 2 can't be found in any schema")
+}
+
+func TestRejectInvalidSchemaEntries(t *testing.T) {
+	var metadata map[string]any
+	require.NoError(t, json.Unmarshal([]byte(ExampleTableMetadataV2), &metadata))
+
+	t.Run("null schema", func(t *testing.T) {
+		invalid := maps.Clone(metadata)
+		invalid["schemas"] = []any{nil}
+		data, err := json.Marshal(invalid)
+		require.NoError(t, err)
+
+		assert.NotPanics(t, func() {
+			_, err = ParseMetadataBytes(data)
+		})
+		require.ErrorIs(t, err, ErrInvalidMetadata)
+		assert.ErrorContains(t, err, "schema at index 0 is null")
+	})
+
+	t.Run("duplicate schema ID", func(t *testing.T) {
+		invalid := maps.Clone(metadata)
+		schemas := invalid["schemas"].([]any)
+		invalid["schemas"] = append(slices.Clone(schemas), schemas[0])
+		data, err := json.Marshal(invalid)
+		require.NoError(t, err)
+
+		_, err = ParseMetadataBytes(data)
+		require.ErrorIs(t, err, ErrInvalidMetadata)
+		assert.ErrorContains(t, err, "duplicate schema ID 0")
+	})
+}
+
+func TestRejectDuplicateSnapshotIDs(t *testing.T) {
+	var metadata map[string]any
+	decoder := json.NewDecoder(strings.NewReader(ExampleTableMetadataV2))
+	decoder.UseNumber()
+	require.NoError(t, decoder.Decode(&metadata))
+	snapshots := metadata["snapshots"].([]any)
+	current := snapshots[len(snapshots)-1].(map[string]any)
+
+	tests := []struct {
+		name      string
+		duplicate map[string]any
+	}{
+		{name: "identical snapshot", duplicate: maps.Clone(current)},
+		{
+			name: "different manifest list",
+			duplicate: func() map[string]any {
+				duplicate := maps.Clone(current)
+				duplicate["manifest-list"] = "s3://bucket/metadata/different.avro"
+
+				return duplicate
+			}(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			invalid := maps.Clone(metadata)
+			invalid["snapshots"] = append(slices.Clone(snapshots), tt.duplicate)
+			data, err := json.Marshal(invalid)
+			require.NoError(t, err)
+
+			_, err = ParseMetadataBytes(data)
+			require.ErrorIs(t, err, ErrInvalidMetadata)
+			assert.ErrorContains(t, err, "duplicate snapshot ID 3055729675574597004")
+		})
+	}
+}
+
+func TestRejectStructurallyInvalidHistoricalPartitionSpec(t *testing.T) {
+	var metadata map[string]any
+	decoder := json.NewDecoder(strings.NewReader(ExampleTableMetadataV2))
+	decoder.UseNumber()
+	require.NoError(t, decoder.Decode(&metadata))
+
+	specs := metadata["partition-specs"].([]any)
+	metadata["partition-specs"] = append(slices.Clone(specs), map[string]any{
+		"spec-id": json.Number("-1"),
+		"fields":  []any{},
+	})
+	data, err := json.Marshal(metadata)
+	require.NoError(t, err)
+
+	_, err = ParseMetadataBytes(data)
+	require.ErrorIs(t, err, iceberg.ErrInvalidPartitionSpec)
+	assert.ErrorContains(t, err, "spec ID must be non-negative")
+}
+
+// A create-table request carries unbound placeholder IDs rather than final
+// field IDs. Spark numbers the root struct's fields by ordinal, so the first
+// column is field-id 0 and partitioning by it yields source-id 0. NewMetadata
+// must accept an unbound spec and order and remap every source ID by name,
+// matching Java's TableMetadata.newTableMetadata.
+//
+// The schema and specs below are the bodies Spark 3.5 with
+// iceberg-spark-runtime posts to /v1/namespaces/{ns}/tables for
+// CREATE TABLE t (ints INT, floats DOUBLE, strings STRING) USING iceberg
+// PARTITIONED BY (...).
+func TestNewMetadataFromOrdinalNumberedRequest(t *testing.T) {
+	const requestSchema = `{
+		"type": "struct", "schema-id": 0,
+		"fields": [
+			{"id": 0, "name": "ints", "required": false, "type": "int"},
+			{"id": 1, "name": "floats", "required": false, "type": "double"},
+			{"id": 2, "name": "strings", "required": false, "type": "string"}
+		]
+	}`
+
+	// A client is free to number its request schema however it likes; the remap
+	// resolves each placeholder through that schema's own IDs, not through the
+	// ordinal positions of its columns.
+	const nonOrdinalSchema = `{
+		"type": "struct", "schema-id": 0,
+		"fields": [
+			{"id": 5, "name": "ints", "required": false, "type": "int"},
+			{"id": 7, "name": "floats", "required": false, "type": "double"},
+			{"id": 9, "name": "strings", "required": false, "type": "string"}
+		]
+	}`
+
+	for _, tt := range []struct {
+		name string
+		// schema and order default to requestSchema and a sort by the first
+		// column when empty.
+		schema        string
+		spec          string
+		order         string
+		wantSourceIDs []int
+		wantNames     []string
+		wantSortID    int
+		wantErr       string
+	}{
+		{
+			// PARTITIONED BY (ints)
+			name:          "identity on first column",
+			spec:          `{"spec-id":0,"fields":[{"name":"ints","transform":"identity","source-id":0,"field-id":1000}]}`,
+			wantSourceIDs: []int{1},
+			wantNames:     []string{"ints"},
+		},
+		{
+			// PARTITIONED BY (bucket(16, ints))
+			name:          "bucket on first column",
+			spec:          `{"spec-id":0,"fields":[{"name":"ints_bucket","transform":"bucket[16]","source-id":0,"field-id":1000}]}`,
+			wantSourceIDs: []int{1},
+			wantNames:     []string{"ints_bucket"},
+		},
+		{
+			// PARTITIONED BY (strings)
+			name:          "identity on last column",
+			spec:          `{"spec-id":0,"fields":[{"name":"strings","transform":"identity","source-id":2,"field-id":1000}]}`,
+			wantSourceIDs: []int{3},
+			wantNames:     []string{"strings"},
+		},
+		{
+			// PARTITIONED BY (strings, ints): each placeholder maps to the column
+			// that carries it, not to the position of the field referencing it.
+			name: "columns out of schema order",
+			spec: `{"spec-id":0,"fields":[
+				{"name":"strings","transform":"identity","source-id":2,"field-id":1000},
+				{"name":"ints","transform":"identity","source-id":0,"field-id":1001}
+			]}`,
+			wantSourceIDs: []int{3, 1},
+			wantNames:     []string{"strings", "ints"},
+		},
+		{
+			// PARTITIONED BY (ints, bucket(16, ints)): partition fields with
+			// different transforms share one source column, so 0 repeats.
+			name: "repeated placeholder",
+			spec: `{"spec-id":0,"fields":[
+				{"name":"ints","transform":"identity","source-id":0,"field-id":1000},
+				{"name":"ints_bucket","transform":"bucket[16]","source-id":0,"field-id":1001}
+			]}`,
+			wantSourceIDs: []int{1, 1},
+			wantNames:     []string{"ints", "ints_bucket"},
+		},
+		{
+			// The remap goes through the request schema by ID, so it is not tied
+			// to the Spark ordinal wire format: the same request numbered 5,7,9
+			// remaps to the same fresh IDs.
+			name:          "non-ordinal request schema",
+			schema:        nonOrdinalSchema,
+			spec:          `{"spec-id":0,"fields":[{"name":"strings","transform":"identity","source-id":9,"field-id":1000}]}`,
+			order:         `{"order-id":1,"fields":[{"transform":"identity","source-id":5,"direction":"asc","null-order":"nulls-first"}]}`,
+			wantSourceIDs: []int{3},
+			wantNames:     []string{"strings"},
+			wantSortID:    1,
+		},
+		{
+			// A placeholder naming no column in the request schema cannot be
+			// resolved, so it must fail rather than produce invalid metadata.
+			name:    "placeholder outside request schema",
+			spec:    `{"spec-id":0,"fields":[{"name":"missing","transform":"identity","source-id":5,"field-id":1000}]}`,
+			wantErr: "partition source field 5 not found in schema",
+		},
+		{
+			name:    "sort placeholder outside request schema",
+			spec:    `{"spec-id":0,"fields":[{"name":"ints","transform":"identity","source-id":0,"field-id":1000}]}`,
+			order:   `{"order-id":1,"fields":[{"transform":"identity","source-id":5,"direction":"asc","null-order":"nulls-first"}]}`,
+			wantErr: "cannot find source column id",
+		},
+		{
+			// Ordinal placeholders against a schema that does not use ordinals
+			// resolve to nothing; an ID-based remap that happened to hit a valid
+			// field would silently bind the wrong column.
+			name:    "ordinal placeholder against non-ordinal schema",
+			schema:  nonOrdinalSchema,
+			spec:    `{"spec-id":0,"fields":[{"name":"ints","transform":"identity","source-id":0,"field-id":1000}]}`,
+			order:   `{"order-id":1,"fields":[{"transform":"identity","source-id":5,"direction":"asc","null-order":"nulls-first"}]}`,
+			wantErr: "partition source field 0 not found in schema",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			schemaJSON := requestSchema
+			if tt.schema != "" {
+				schemaJSON = tt.schema
+			}
+			orderJSON := `{"order-id":1,"fields":[{"transform":"identity","source-id":0,"direction":"asc","null-order":"nulls-first"}]}`
+			if tt.order != "" {
+				orderJSON = tt.order
+			}
+			wantSortID := tt.wantSortID
+			if wantSortID == 0 {
+				wantSortID = 1
+			}
+
+			var sc iceberg.Schema
+			require.NoError(t, json.Unmarshal([]byte(schemaJSON), &sc))
+
+			var spec iceberg.UnboundPartitionSpec
+			require.NoError(t, json.Unmarshal([]byte(tt.spec), &spec))
+
+			var order UnboundSortOrder
+			require.NoError(t, json.Unmarshal([]byte(orderJSON), &order))
+
+			meta, err := NewMetadata(&sc, &spec.PartitionSpec, order.SortOrder, "s3://bucket/tbl", nil)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+
+				return
+			}
+			require.NoError(t, err)
+
+			gotSpec := meta.PartitionSpec()
+			require.Equal(t, len(tt.wantSourceIDs), gotSpec.NumFields())
+			for i, wantSourceID := range tt.wantSourceIDs {
+				assert.Equal(t, wantSourceID, gotSpec.Field(i).SourceID())
+				assert.Equal(t, tt.wantNames[i], gotSpec.Field(i).Name)
+			}
+
+			// The sort order references the first column, so it remaps to 1.
+			require.Equal(t, 1, meta.SortOrder().Len())
+			for _, field := range meta.SortOrder().Fields() {
+				assert.Equal(t, wantSortID, field.SourceID())
+			}
+
+			// Written metadata carries bound IDs only, so it parses back as
+			// persisted metadata, which rejects placeholders.
+			data, err := json.Marshal(meta)
+			require.NoError(t, err)
+			reparsed, err := ParseMetadataBytes(data)
+			require.NoError(t, err)
+			reparsedSpec := reparsed.PartitionSpec()
+			for i, wantSourceID := range tt.wantSourceIDs {
+				assert.Equal(t, wantSourceID, reparsedSpec.Field(i).SourceID())
+			}
+		})
+	}
+}
+
+// Persisted metadata is bound to a schema, so its source IDs are field IDs and
+// placeholders are invalid — in historical specs and orders as much as in the
+// default ones, which are the only ones metadata validation binds.
+func TestRejectZeroSourceIDInPersistedMetadata(t *testing.T) {
+	zeroSpecField := map[string]any{
+		"name": "zero", "transform": "identity",
+		"source-id": json.Number("0"), "field-id": json.Number("1001"),
+	}
+	boundSpecField := map[string]any{
+		"name": "x", "transform": "identity",
+		"source-id": json.Number("1"), "field-id": json.Number("1000"),
+	}
+	zeroOrderField := map[string]any{
+		"transform": "identity", "source-id": json.Number("0"),
+		"direction": "asc", "null-order": "nulls-first",
+	}
+	boundOrderField := map[string]any{
+		"transform": "identity", "source-id": json.Number("1"),
+		"direction": "asc", "null-order": "nulls-first",
+	}
+
+	for _, version := range []struct {
+		name     string
+		metadata string
+	}{
+		{name: "v1", metadata: ExampleTableMetadataV1},
+		{name: "v2", metadata: ExampleTableMetadataV2},
+		{name: "v3", metadata: ExampleTableMetadataV3},
+	} {
+		for _, tt := range []struct {
+			name    string
+			mutate  func(map[string]any)
+			wantErr error
+			message string
+		}{
+			{
+				name: "default partition spec",
+				mutate: func(m map[string]any) {
+					m["default-spec-id"] = json.Number("0")
+					m["partition-specs"] = []any{
+						map[string]any{"spec-id": json.Number("0"), "fields": []any{zeroSpecField}},
+					}
+				},
+				wantErr: iceberg.ErrInvalidPartitionSpec,
+				message: "partition source ID must be positive: 0",
+			},
+			{
+				name: "historical partition spec",
+				mutate: func(m map[string]any) {
+					m["default-spec-id"] = json.Number("0")
+					m["partition-specs"] = []any{
+						map[string]any{"spec-id": json.Number("0"), "fields": []any{boundSpecField}},
+						map[string]any{"spec-id": json.Number("1"), "fields": []any{zeroSpecField}},
+					}
+				},
+				wantErr: iceberg.ErrInvalidPartitionSpec,
+				message: "partition source ID must be positive: 0",
+			},
+			{
+				name: "default sort order",
+				mutate: func(m map[string]any) {
+					m["default-sort-order-id"] = json.Number("1")
+					m["sort-orders"] = []any{
+						map[string]any{"order-id": json.Number("1"), "fields": []any{zeroOrderField}},
+					}
+				},
+				wantErr: ErrInvalidSortSourceID,
+				message: "source ID must be positive: 0",
+			},
+			{
+				name: "historical sort order",
+				mutate: func(m map[string]any) {
+					m["default-sort-order-id"] = json.Number("1")
+					m["sort-orders"] = []any{
+						map[string]any{"order-id": json.Number("1"), "fields": []any{boundOrderField}},
+						map[string]any{"order-id": json.Number("2"), "fields": []any{zeroOrderField}},
+					}
+				},
+				wantErr: ErrInvalidSortSourceID,
+				message: "source ID must be positive: 0",
+			},
+		} {
+			t.Run(version.name+"/"+tt.name, func(t *testing.T) {
+				var metadata map[string]any
+				decoder := json.NewDecoder(strings.NewReader(version.metadata))
+				decoder.UseNumber()
+				require.NoError(t, decoder.Decode(&metadata))
+				// V1 also accepts the legacy bare field list, which the
+				// partition-specs the mutations install would shadow.
+				delete(metadata, "partition-spec")
+				tt.mutate(metadata)
+
+				data, err := json.Marshal(metadata)
+				require.NoError(t, err)
+
+				_, err = ParseMetadataBytes(data)
+				require.ErrorIs(t, err, tt.wantErr)
+				assert.ErrorContains(t, err, tt.message)
+			})
+		}
+	}
+}
+
+// V1 metadata may carry the default spec as a bare field list.
+func TestRejectZeroSourceIDInV1LegacyPartitionSpec(t *testing.T) {
+	var metadata map[string]any
+	decoder := json.NewDecoder(strings.NewReader(ExampleTableMetadataV1))
+	decoder.UseNumber()
+	require.NoError(t, decoder.Decode(&metadata))
+
+	metadata["partition-spec"] = []any{map[string]any{
+		"name": "zero", "transform": "identity",
+		"source-id": json.Number("0"), "field-id": json.Number("1000"),
+	}}
+	data, err := json.Marshal(metadata)
+	require.NoError(t, err)
+
+	_, err = ParseMetadataBytes(data)
+	require.ErrorIs(t, err, iceberg.ErrInvalidPartitionSpec)
+	assert.ErrorContains(t, err, "partition source ID must be positive: 0")
+}
+
+func TestRejectsStoredPartitionSpecWithoutID(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{
+			name: "missing",
+			mutate: func(spec map[string]any) {
+				delete(spec, "spec-id")
+			},
+		},
+		{
+			name: "null",
+			mutate: func(spec map[string]any) {
+				spec["spec-id"] = nil
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var metadata map[string]any
+			decoder := json.NewDecoder(strings.NewReader(ExampleTableMetadataV2))
+			decoder.UseNumber()
+			require.NoError(t, decoder.Decode(&metadata))
+			specs := metadata["partition-specs"].([]any)
+			tt.mutate(specs[0].(map[string]any))
+
+			data, err := json.Marshal(metadata)
+			require.NoError(t, err)
+
+			_, err = ParseMetadataBytes(data)
+			require.ErrorIs(t, err, ErrInvalidMetadata)
+			assert.ErrorContains(t, err, "missing required spec-id")
+		})
+	}
+}
+
+func TestSortOrderNotFound(t *testing.T) {
+	metadataSortOrderNotFound := `{
+        "format-version": 2,
+        "last-sequence-number": 34,
+        "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+        "location": "s3://bucket/test/location",
+        "last-updated-ms": 1602638573874,
+        "last-column-id": 3,
+        "schemas": [
+            {
+                "type": "struct",
+                "schema-id": 0,
+                "identifier-field-ids": [1, 2],
+                "fields": [
+                    {"id": 1, "name": "x", "required": true, "type": "long"},
+                    {"id": 2, "name": "y", "required": true, "type": "long", "doc": "comment"},
+                    {"id": 3, "name": "z", "required": true, "type": "long"}
+                ]
+            }
+        ],
+        "default-sort-order-id": 4,
+        "sort-orders": [
+            {
+                "order-id": 3,
+                "fields": [
+                    {"transform": "identity", "source-id": 2, "direction": "asc", "null-order": "nulls-first"},
+                    {"transform": "bucket[4]", "source-id": 3, "direction": "desc", "null-order": "nulls-last"}
+                ]
+            }
+        ],
+        "current-schema-id": 0,
+        "default-spec-id": 0,
+        "partition-specs": [{"spec-id": 0, "fields": [{"name": "x", "transform": "identity", "source-id": 1, "field-id": 1000}]}],
+        "last-partition-id": 1000,
+        "properties": {},
+        "current-snapshot-id": -1,
+        "snapshots": []
+    }`
+
+	_, err := ParseMetadataBytes([]byte(metadataSortOrderNotFound))
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrInvalidMetadata)
+	assert.ErrorContains(t, err, "default-sort-order-id 4 can't be found in [3: [\n2 asc nulls-first\nbucket[4](3) desc nulls-last\n]]")
+}
+
+func TestSortOrderUnsorted(t *testing.T) {
+	sortOrderUnsorted := `{
+        "format-version": 2,
+        "last-sequence-number": 34,
+        "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+        "location": "s3://bucket/test/location",
+        "last-updated-ms": 1602638573874,
+        "last-column-id": 3,
+        "schemas": [
+            {
+                "type": "struct",
+                "schema-id": 0,
+                "identifier-field-ids": [1, 2],
+                "fields": [
+                    {"id": 1, "name": "x", "required": true, "type": "long"},
+                    {"id": 2, "name": "y", "required": true, "type": "long", "doc": "comment"},
+                    {"id": 3, "name": "z", "required": true, "type": "long"}
+                ]
+            }
+        ],
+        "default-sort-order-id": 0,
+        "sort-orders": [],
+        "current-schema-id": 0,
+        "default-spec-id": 0,
+        "partition-specs": [{"spec-id": 0, "fields": [{"name": "x", "transform": "identity", "source-id": 1, "field-id": 1000}]}],
+        "last-partition-id": 1000,
+        "properties": {},
+        "current-snapshot-id": -1,
+        "snapshots": []
+    }`
+
+	var meta metadataV2
+	require.NoError(t, json.Unmarshal([]byte(sortOrderUnsorted), &meta))
+
+	assert.Equal(t, UnsortedSortOrderID, meta.DefaultSortOrderID)
+	assert.Len(t, meta.SortOrderList, 0)
+}
+
+func TestInvalidPartitionSpecID(t *testing.T) {
+	invalidSpecID := `{
+        "format-version": 2,
+        "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+        "location": "s3://bucket/test/location",
+        "last-sequence-number": 34,
+        "last-updated-ms": 1602638573590,
+        "last-column-id": 3,
+        "current-schema-id": 1,
+        "schemas": [
+            {"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "x", "required": true, "type": "long"}]},
+            {
+                "type": "struct",
+                "schema-id": 1,
+                "identifier-field-ids": [1, 2],
+                "fields": [
+                    {"id": 1, "name": "x", "required": true, "type": "long"},
+                    {"id": 2, "name": "y", "required": true, "type": "long", "doc": "comment"},
+                    {"id": 3, "name": "z", "required": true, "type": "long"}
+                ]
+            }
+        ],
+        "sort-orders": [],
+        "default-sort-order-id": 0,
+        "default-spec-id": 1,
+        "partition-specs": [{"spec-id": 0, "fields": [{"name": "x", "transform": "identity", "source-id": 1, "field-id": 1000}]}],
+        "last-partition-id": 1000
+    }`
+
+	var meta metadataV2
+	err := json.Unmarshal([]byte(invalidSpecID), &meta)
+	assert.ErrorIs(t, err, ErrInvalidMetadata)
+	assert.ErrorContains(t, err, "default-spec-id 1 can't be found")
+}
+
+func TestV2RefCreation(t *testing.T) {
+	var meta metadataV2
+	require.NoError(t, json.Unmarshal([]byte(ExampleTableMetadataV2), &meta))
+
+	maxRefAge := int64(10000000)
+	assert.Equal(t, map[string]SnapshotRef{
+		"main": {
+			SnapshotID:      3055729675574597004,
+			SnapshotRefType: BranchRef,
+		},
+		"test": {
+			SnapshotID:      3051729675574597004,
+			SnapshotRefType: TagRef,
+			MaxRefAgeMs:     &maxRefAge,
+		},
+	}, meta.SnapshotRefs)
+}
+
+func TestV1WriteMetadataToV2(t *testing.T) {
+	// https://iceberg.apache.org/spec/#version-2
+	//
+	// Table metadata JSON:
+	//     - last-sequence-number was added and is required; default to 0 when reading v1 metadata
+	//     - table-uuid is now required
+	//     - current-schema-id is now required
+	//     - schemas is now required
+	//     - partition-specs is now required
+	//     - default-spec-id is now required
+	//     - last-partition-id is now required
+	//     - sort-orders is now required
+	//     - default-sort-order-id is now required
+	//     - schema is no longer required and should be omitted; use schemas and current-schema-id instead
+	//     - partition-spec is no longer required and should be omitted; use partition-specs and default-spec-id instead
+
+	minimalV1Example := `{
+		"format-version": 1,
+		"location": "s3://bucket/test/location",
+		"last-updated-ms": 1062638573874,
+		"last-column-id": 3,
+		"schema": {
+			"type": "struct",
+			"fields": [
+				{"id": 1, "name": "x", "required": true, "type": "long"},
+				{"id": 2, "name": "y", "required": true, "type": "long", "doc": "comment"},
+				{"id": 3, "name": "z", "required": true, "type": "long"}
+			]
+		},
+		"partition-spec": [{"name": "x", "transform": "identity", "source-id": 1, "field-id": 1000}],
+		"properties": {},
+		"current-snapshot-id": -1,
+		"snapshots": [{"snapshot-id": 1925, "timestamp-ms": 1602638573822}]
+	}`
+
+	meta, err := ParseMetadataString(minimalV1Example)
+	require.NoError(t, err)
+	assert.IsType(t, (*metadataV1)(nil), meta)
+
+	metaV2 := meta.(*metadataV1).ToV2()
+	metaV2Json, err := json.Marshal(metaV2)
+	require.NoError(t, err)
+	_, err = ParseMetadataBytes(metaV2Json)
+	require.NoError(t, err)
+
+	rawData := make(map[string]any)
+	require.NoError(t, json.Unmarshal(metaV2Json, &rawData))
+
+	assert.EqualValues(t, 0, rawData["last-sequence-number"])
+	assert.NotEqual(t, uuid.Nil.String(), rawData["table-uuid"])
+	assert.EqualValues(t, 0, rawData["current-schema-id"])
+	assert.Equal(t, []any{map[string]any{
+		"fields": []any{
+			map[string]any{"id": float64(1), "name": "x", "required": true, "type": "long"},
+			map[string]any{"id": float64(2), "name": "y", "required": true, "type": "long", "doc": "comment"},
+			map[string]any{"id": float64(3), "name": "z", "required": true, "type": "long"},
+		},
+		"identifier-field-ids": []any{},
+		"schema-id":            float64(0),
+		"type":                 "struct",
+	}}, rawData["schemas"])
+	assert.Equal(t, []any{map[string]any{
+		"spec-id": float64(0),
+		"fields": []any{map[string]any{
+			"name": "x", "transform": "identity",
+			"source-id": float64(1), "field-id": float64(1000),
+		}},
+	}}, rawData["partition-specs"])
+
+	assert.Zero(t, rawData["default-spec-id"])
+	assert.EqualValues(t, 1000, rawData["last-partition-id"])
+	assert.Zero(t, rawData["default-sort-order-id"])
+	assert.Equal(t, []any{map[string]any{"order-id": float64(0), "fields": []any{}}}, rawData["sort-orders"])
+	assert.NotContains(t, rawData, "schema")
+	assert.NotContains(t, rawData, "partition-spec")
+}
+
+func TestNewMetadataWithExplicitV1Format(t *testing.T) {
+	schema := iceberg.NewSchemaWithIdentifiers(10,
+		[]int{22},
+		iceberg.NestedField{ID: 10, Name: "foo", Type: iceberg.PrimitiveTypes.String, Required: false},
+		iceberg.NestedField{ID: 22, Name: "bar", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 33, Name: "baz", Type: iceberg.PrimitiveTypes.Bool, Required: false},
+	)
+
+	partitionSpec := iceberg.NewPartitionSpecID(10,
+		iceberg.PartitionField{SourceIDs: []int{22}, FieldID: 1022, Transform: iceberg.IdentityTransform{}, Name: "bar"})
+
+	sortOrder, err := NewSortOrder(10, []SortField{{
+		SourceIDs: []int{10},
+		Transform: iceberg.IdentityTransform{},
+		Direction: SortASC, NullOrder: NullsLast,
+	}})
+	require.NoError(t, err)
+
+	actual, err := NewMetadata(schema, &partitionSpec, sortOrder, "s3://some_v1_location/", iceberg.Properties{PropertyFormatVersion: "1"})
+	require.NoError(t, err)
+
+	expectedSchema := iceberg.NewSchemaWithIdentifiers(0, []int{2},
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 2, Name: "bar", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool})
+
+	expectedSpec := iceberg.NewPartitionSpec(
+		iceberg.PartitionField{SourceIDs: []int{2}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "bar"})
+
+	expectedSortOrder, err := NewSortOrder(1, []SortField{{
+		SourceIDs: []int{1}, Transform: iceberg.IdentityTransform{},
+		Direction: SortASC, NullOrder: NullsLast,
+	}})
+	require.NoError(t, err)
+
+	lastPartitionID := 1000
+	partitionFields := make([]iceberg.PartitionField, 0)
+	for _, field := range expectedSpec.Fields() {
+		partitionFields = append(partitionFields, field)
+	}
+
+	expected := &metadataV1{
+		commonMetadata: commonMetadata{
+			Loc:                "s3://some_v1_location/",
+			UUID:               actual.TableUUID(),
+			LastUpdatedMS:      actual.LastUpdatedMillis(),
+			LastColumnId:       3,
+			SchemaList:         []*iceberg.Schema{expectedSchema},
+			CurrentSchemaID:    0,
+			Specs:              []iceberg.PartitionSpec{expectedSpec},
+			DefaultSpecID:      0,
+			LastPartitionID:    &lastPartitionID,
+			SortOrderList:      []SortOrder{expectedSortOrder},
+			DefaultSortOrderID: 1,
+			FormatVersion:      1,
+		},
+		Schema:    expectedSchema,
+		Partition: partitionFields,
+	}
+
+	assert.Truef(t, expected.Equals(actual), "expected: %s\ngot: %s", expected, actual)
+}
+
+func TestNewMetadataRejectInvalidFormatVersion(t *testing.T) {
+	props := iceberg.Properties{
+		"format-version": "banana",
+		"foo":            "bar",
+	}
+	schema := iceberg.NewSchema(1, iceberg.NestedField{ID: 1, Name: "x", Type: iceberg.PrimitiveTypes.Int64})
+
+	metadata, err := NewMetadata(schema, iceberg.UnpartitionedSpec, UnsortedSortOrder, "s3://bucket/path", props)
+	require.Error(t, err)
+	require.ErrorIs(t, err, iceberg.ErrInvalidFormatVersion)
+	assert.Nil(t, metadata)
+	assert.Equal(t, "banana", props["format-version"])
+	assert.Equal(t, "bar", props["foo"])
+	assert.Len(t, props, 2)
+}
+
+func TestNewMetadataV2Format(t *testing.T) {
+	schema := iceberg.NewSchemaWithIdentifiers(10,
+		[]int{22},
+		iceberg.NestedField{ID: 10, Name: "foo", Type: iceberg.PrimitiveTypes.String, Required: false},
+		iceberg.NestedField{ID: 22, Name: "bar", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 33, Name: "baz", Type: iceberg.PrimitiveTypes.Bool, Required: false},
+	)
+
+	partitionSpec := iceberg.NewPartitionSpecID(10,
+		iceberg.PartitionField{SourceIDs: []int{22}, FieldID: 1022, Transform: iceberg.IdentityTransform{}, Name: "bar"})
+
+	sortOrder, err := NewSortOrder(10, []SortField{{
+		SourceIDs: []int{10},
+		Transform: iceberg.IdentityTransform{},
+		Direction: SortASC, NullOrder: NullsLast,
+	}})
+	require.NoError(t, err)
+
+	tableUUID := uuid.New()
+
+	actual, err := NewMetadataWithUUID(schema, &partitionSpec, sortOrder, "s3://some_v1_location/", nil, tableUUID)
+	require.NoError(t, err)
+
+	expectedSchema := iceberg.NewSchemaWithIdentifiers(0, []int{2},
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 2, Name: "bar", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool})
+
+	expectedSpec := iceberg.NewPartitionSpec(
+		iceberg.PartitionField{SourceIDs: []int{2}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "bar"})
+
+	expectedSortOrder, err := NewSortOrder(1, []SortField{{
+		SourceIDs: []int{1}, Transform: iceberg.IdentityTransform{},
+		Direction: SortASC, NullOrder: NullsLast,
+	}})
+	require.NoError(t, err)
+
+	lastPartitionID := 1000
+	expected := &metadataV2{
+		commonMetadata: commonMetadata{
+			Loc:                "s3://some_v1_location/",
+			UUID:               tableUUID,
+			LastUpdatedMS:      actual.LastUpdatedMillis(),
+			LastColumnId:       3,
+			SchemaList:         []*iceberg.Schema{expectedSchema},
+			CurrentSchemaID:    0,
+			Specs:              []iceberg.PartitionSpec{expectedSpec},
+			DefaultSpecID:      0,
+			LastPartitionID:    &lastPartitionID,
+			SortOrderList:      []SortOrder{expectedSortOrder},
+			DefaultSortOrderID: 1,
+			FormatVersion:      2,
+		},
+	}
+
+	assert.Truef(t, expected.Equals(actual), "expected: %s\ngot: %s", expected, actual)
+}
+
+func TestMetadataV1Serialize(t *testing.T) {
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "int", Type: iceberg.PrimitiveTypes.Int32})
+	toserialize := &metadataV1{
+		commonMetadata: commonMetadata{
+			FormatVersion:      1,
+			UUID:               uuid.MustParse("dd93fa46-a1a7-43bb-8748-6cc7eff107a3"),
+			Loc:                "s3a://warehouse/iceberg/iceberg-test-2.db/test-table-2",
+			LastUpdatedMS:      1742412491193,
+			LastColumnId:       1,
+			SchemaList:         []*iceberg.Schema{sc},
+			CurrentSchemaID:    0,
+			Specs:              []iceberg.PartitionSpec{*iceberg.UnpartitionedSpec},
+			DefaultSpecID:      0,
+			SortOrderList:      []SortOrder{UnsortedSortOrder},
+			DefaultSortOrderID: 0,
+			StatisticsList: []StatisticsFile{
+				{
+					SnapshotID:            1234567890,
+					StatisticsPath:        "s3://bucket/statistics/stats1.puffin",
+					FileSizeInBytes:       1024000,
+					FileFooterSizeInBytes: 512,
+					KeyMetadata:           nil,
+					BlobMetadata: []BlobMetadata{
+						{
+							Type:           BlobTypeApacheDatasketchesThetaV1,
+							SnapshotID:     1234567890,
+							SequenceNumber: 1,
+							Fields:         []int32{1, 2},
+							Properties:     map[string]string{"ndv": "1000"},
+						},
+					},
+				},
+			},
+			PartitionStatsList: []PartitionStatisticsFile{
+				{
+					SnapshotID:      1234567890,
+					StatisticsPath:  "s3://bucket/partition-stats/part1.parquet",
+					FileSizeInBytes: 512000,
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(toserialize)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"format-version":1,
+		"table-uuid":"dd93fa46-a1a7-43bb-8748-6cc7eff107a3",
+		"location":"s3a://warehouse/iceberg/iceberg-test-2.db/test-table-2",
+		"last-updated-ms":1742412491193,
+		"last-column-id":1,
+		"schemas": [
+			{
+				"type":"struct",
+				"fields":[{"type":"int","id":1,"name":"int","required":false}],
+				"schema-id":0,
+				"identifier-field-ids":[]
+			}
+		],
+		"current-schema-id":0,
+		"partition-specs":[{"spec-id":0,"fields":[]}],
+		"default-spec-id":0,
+		"sort-orders":[{"order-id":0,"fields":[]}],
+		"default-sort-order-id":0,
+		"statistics": [
+			{
+				"snapshot-id": 1234567890,
+				"statistics-path": "s3://bucket/statistics/stats1.puffin",
+				"file-size-in-bytes": 1024000,
+				"file-footer-size-in-bytes": 512,
+				"blob-metadata": [
+					{
+						"type": "apache-datasketches-theta-v1",
+						"snapshot-id": 1234567890,
+						"sequence-number": 1,
+						"fields": [1, 2],
+						"properties": {"ndv": "1000"}
+					}
+				]
+			}
+		],
+		"partition-statistics": [
+			{
+				"snapshot-id": 1234567890,
+				"statistics-path": "s3://bucket/partition-stats/part1.parquet",
+				"file-size-in-bytes": 512000
+			}
+		]
+	}`, string(data))
+}
+
+func TestMetadataV2Serialize(t *testing.T) {
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "int", Type: iceberg.PrimitiveTypes.Int32})
+	toserialize := &metadataV2{
+		LastSeqNum: 1,
+		commonMetadata: commonMetadata{
+			FormatVersion:      2,
+			UUID:               uuid.MustParse("dd93fa46-a1a7-43bb-8748-6cc7eff107a3"),
+			Loc:                "s3a://warehouse/iceberg/iceberg-test-2.db/test-table-2",
+			LastUpdatedMS:      1742412491193,
+			LastColumnId:       1,
+			SchemaList:         []*iceberg.Schema{sc},
+			CurrentSchemaID:    0,
+			Specs:              []iceberg.PartitionSpec{*iceberg.UnpartitionedSpec},
+			DefaultSpecID:      0,
+			SortOrderList:      []SortOrder{UnsortedSortOrder},
+			DefaultSortOrderID: 0,
+			StatisticsList: []StatisticsFile{
+				{
+					SnapshotID:            9876543210,
+					StatisticsPath:        "s3://bucket/v2/statistics/stats2.puffin",
+					FileSizeInBytes:       2048000,
+					FileFooterSizeInBytes: 1024,
+					BlobMetadata: []BlobMetadata{
+						{
+							Type:           BlobTypeDeletionVectorV1,
+							SnapshotID:     9876543210,
+							SequenceNumber: 5,
+							Fields:         []int32{1},
+							Properties:     map[string]string{"deletion-vector-size": "500"},
+						},
+					},
+				},
+			},
+			PartitionStatsList: []PartitionStatisticsFile{
+				{
+					SnapshotID:      9876543210,
+					StatisticsPath:  "s3://bucket/v2/partition-stats/part2.parquet",
+					FileSizeInBytes: 768000,
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(toserialize)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"last-sequence-number": 1,
+		"format-version": 2,
+		"table-uuid":"dd93fa46-a1a7-43bb-8748-6cc7eff107a3",
+		"location":"s3a://warehouse/iceberg/iceberg-test-2.db/test-table-2",
+		"last-updated-ms":1742412491193,
+		"last-column-id":1,
+		"schemas": [
+			{
+				"type":"struct",
+				"fields":[{"type":"int","id":1,"name":"int","required":false}],
+				"schema-id":0,
+				"identifier-field-ids":[]
+			}
+		],
+		"current-schema-id":0,
+		"partition-specs":[{"spec-id":0,"fields":[]}],
+		"default-spec-id":0,
+		"sort-orders":[{"order-id":0,"fields":[]}],
+		"default-sort-order-id":0,
+		"statistics": [
+			{
+				"snapshot-id": 9876543210,
+				"statistics-path": "s3://bucket/v2/statistics/stats2.puffin",
+				"file-size-in-bytes": 2048000,
+				"file-footer-size-in-bytes": 1024,
+				"blob-metadata": [
+					{
+						"type": "deletion-vector-v1",
+						"snapshot-id": 9876543210,
+						"sequence-number": 5,
+						"fields": [1],
+						"properties": {"deletion-vector-size": "500"}
+					}
+				]
+			}
+		],
+		"partition-statistics": [
+			{
+				"snapshot-id": 9876543210,
+				"statistics-path": "s3://bucket/v2/partition-stats/part2.parquet",
+				"file-size-in-bytes": 768000
+			}
+		]
+	}`, string(data))
+}
+
+func TestMetadataBuilderSetDefaultSpecIDLastPartition(t *testing.T) {
+	builder, err := NewMetadataBuilder(2)
+	assert.NoError(t, err)
+	schema := schema()
+	assert.NoError(t, builder.AddSchema(&schema))
+	assert.NoError(t, builder.SetCurrentSchemaID(-1))
+	partitionSpec := iceberg.NewPartitionSpecID(0)
+	assert.NoError(t, builder.AddPartitionSpec(&partitionSpec, false))
+
+	assert.NoError(t, builder.SetDefaultSpecID(-1))
+
+	assert.Equal(t, 0, builder.defaultSpecID)
+}
+
+func TestMetadataBuilderSetLastAddedSchema(t *testing.T) {
+	builder, err := NewMetadataBuilder(2)
+	assert.NoError(t, err)
+	schema := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.StringType{}, Required: true},
+	)
+	assert.NoError(t, builder.AddSchema(schema))
+	assert.NoError(t, builder.SetCurrentSchemaID(-1))
+
+	partitionSpec := iceberg.NewPartitionSpecID(0)
+	assert.NoError(t, builder.AddPartitionSpec(&partitionSpec, false))
+
+	assert.NoError(t, builder.SetDefaultSpecID(-1))
+
+	unsorted := UnsortedSortOrder
+	require.NoError(t, builder.AddSortOrder(&unsorted))
+	require.NoError(t, builder.SetDefaultSortOrderID(-1))
+
+	meta, err := builder.Build()
+	assert.NoError(t, err)
+	assert.Equal(t, schema.ID, meta.CurrentSchema().ID)
+	assert.True(t, schema.Equals(meta.CurrentSchema()))
+}
+
+func TestMetadataBuilderSchemaIncreasingNumbering(t *testing.T) {
+	builder, err := NewMetadataBuilder(2)
+	assert.NoError(t, err)
+	assert.NoError(t, builder.SetFormatVersion(2))
+	schema := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.StringType{}, Required: true},
+	)
+	assert.NoError(t, builder.AddSchema(schema))
+
+	schema = iceberg.NewSchema(3,
+		iceberg.NestedField{ID: 3, Name: "foo", Type: iceberg.StringType{}, Required: true},
+	)
+	assert.NoError(t, builder.AddSchema(schema))
+
+	schema = iceberg.NewSchema(2,
+		iceberg.NestedField{ID: 4, Name: "foo", Type: iceberg.StringType{}, Required: true},
+	)
+	assert.NoError(t, builder.AddSchema(schema))
+
+	assert.Equal(t, 1, builder.schemaList[0].ID)
+	assert.Equal(t, 3, builder.schemaList[1].ID)
+	assert.Equal(t, 4, builder.schemaList[2].ID)
+}
+
+func TestMetadataBuilderReuseSchema(t *testing.T) {
+	builder, err := NewMetadataBuilder(2)
+	assert.NoError(t, err)
+	schema := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.StringType{}, Required: true},
+	)
+	assert.NoError(t, builder.AddSchema(schema))
+	schema2 := iceberg.NewSchema(15,
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.StringType{}, Required: true},
+	)
+	assert.NoError(t, builder.AddSchema(schema2))
+	assert.Equal(t, len(builder.schemaList), 1)
+	assert.Equal(t, *builder.lastAddedSchemaID, 1)
+}
+
+func TestMetadataV1Validation(t *testing.T) {
+	// Test case 1: JSON with no last-column-id field
+	noColumnID := `{
+		"format-version": 1,
+		"table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+		"location": "s3://bucket/test/location",
+		"last-updated-ms": 1602638573874,
+		"schema": {"type": "struct", "fields": []},
+		"partition-spec": [],
+		"properties": {},
+		"current-snapshot-id": -1,
+		"snapshots": []
+	}`
+
+	// Test case 2: JSON with explicit last-column-id field
+	withColumnID := `{
+		"format-version": 1,
+		"table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+		"location": "s3://bucket/test/location",
+		"last-updated-ms": 1602638573874,
+		"last-column-id": 5,
+		"schema": {"type": "struct", "fields": []},
+		"partition-spec": [],
+		"properties": {},
+		"current-snapshot-id": -1,
+		"snapshots": []
+	}`
+
+	// Test case 3: JSON with last-column-id explicitly set to 0
+	zeroColumnID := `{
+		"format-version": 1,
+		"table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+		"location": "s3://bucket/test/location",
+		"last-updated-ms": 1602638573874,
+		"last-column-id": 0,
+		"schema": {"type": "struct", "fields": []},
+		"partition-spec": [],
+		"properties": {},
+		"current-snapshot-id": -1,
+		"snapshots": []
+	}`
+
+	// Parse each test case
+	meta1 := initMetadataV1Deser()
+	meta2 := initMetadataV1Deser()
+	meta3 := initMetadataV1Deser()
+
+	// Test case 1: Verify LastColumnId is -1 when not specified
+	require.Error(t, meta1.UnmarshalJSON([]byte(noColumnID)))
+	assert.Equal(t, -1, meta1.LastColumnId, "LastColumnId should be -1 when not specified in JSON")
+
+	// Test case 2: Verify LastColumnId maintains the specified value
+	require.NoError(t, meta2.UnmarshalJSON([]byte(withColumnID)))
+
+	// Test case 3: Verify LastColumnId maintains 0 when explicitly set
+	require.NoError(t, meta3.UnmarshalJSON([]byte(zeroColumnID)))
+}
+
+func TestMetadataV2Validation(t *testing.T) {
+	// Test case 1: JSON with no last-column-id field
+	noColumnID := `{
+		"format-version": 2,
+		"table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+		"location": "s3://bucket/test/location",
+		"last-sequence-number": 34,
+		"current-schema-id": 0,
+		"last-updated-ms": 1602638573590,
+		"last-partition-id": 1000,
+		"schemas": [{"type":"struct","schema-id":0,"fields":[]}],
+		"default-spec-id": 0,
+		"partition-specs": [{"spec-id": 0, "fields": []}],
+		"sort-orders": [{"order-id": 0, "fields": []}],
+		"default-sort-order-id": 0
+	}`
+
+	// Test case 2: JSON with explicit last-column-id field
+	withColumnID := `{
+		"format-version": 2,
+		"last-sequence-number": 34,
+		"table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+		"location": "s3://bucket/test/location",
+		"last-updated-ms": 1602638573874,
+		"last-column-id": 5,
+		"current-schema-id": 0,
+		"last-partition-id": 1000,
+		"schemas": [{"type":"struct","schema-id":0,"fields":[]}],
+		"default-spec-id": 0,
+		"partition-specs": [{"spec-id": 0, "fields": []}],
+		"properties": {},
+        "default-sort-order-id": 0,
+		"sort-orders": [{"order-id": 0, "fields": []}],
+		"current-snapshot-id": -1,
+		"snapshots": []
+	}`
+
+	// Test case 3: JSON with last-column-id explicitly set to 0
+	zeroColumnID := `{
+		"format-version": 2,
+		"table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+		"location": "s3://bucket/test/location",
+		"last-sequence-number": 34,
+		"current-schema-id": 0,
+		"last-updated-ms": 1602638573590,
+		"last-column-id": 0,
+		"last-partition-id": 1000,
+		"schemas": [{"type":"struct","schema-id":0,"fields":[]}],
+		"default-spec-id": 0,
+		"partition-specs": [{"spec-id": 0, "fields": []}],
+		"sort-orders": [],
+		"default-sort-order-id": 0
+	}`
+
+	// Parse each test case
+	meta1 := initMetadataV2Deser()
+	meta2 := initMetadataV2Deser()
+	meta3 := initMetadataV2Deser()
+
+	// Test case 1: Verify LastColumnId is -1 when not specified
+	require.Error(t, meta1.UnmarshalJSON([]byte(noColumnID)))
+	assert.Equal(t, -1, meta1.LastColumnId, "LastColumnId should be -1 when not specified in JSON")
+	// Test case 2: Verify LastColumnId maintains the specified value
+	require.NoError(t, meta2.UnmarshalJSON([]byte(withColumnID)))
+
+	// Test case 3: Verify LastColumnId maintains 0 when explicitly set
+	require.NoError(t, meta3.UnmarshalJSON([]byte(zeroColumnID)))
+}
+
+func TestTableMetadataV1PartitionSpecsWithoutDefaultId(t *testing.T) {
+	// Deserialize the JSON - this should succeed by inferring default_spec_id as the max spec ID
+	meta, err := getTestTableMetadata("TableMetadataV1PartitionSpecsWithoutDefaultId.json")
+	require.NoError(t, err)
+	require.Equal(t, meta.Version(), 1)
+	require.Equal(t, meta.TableUUID(), uuid.MustParse("d20125c8-7284-442c-9aea-15fee620737c"))
+	require.Equal(t, meta.DefaultPartitionSpec(), 2)
+	require.Equal(t, len(meta.PartitionSpecs()), 2)
+	spec := meta.PartitionSpec()
+	require.Equal(t, spec.ID(), 2)
+	require.Equal(t, spec.NumFields(), 1)
+	require.Equal(t, spec.Field(0).Name, "y")
+	require.Equal(t, spec.Field(0).Transform, iceberg.IdentityTransform{})
+	require.Equal(t, spec.Field(0).SourceID(), 2)
+}
+
+func TestTableMetadataV2MissingPartitionSpecs(t *testing.T) {
+	meta, err := getTestTableMetadata("TableMetadataV2MissingPartitionSpecs.json")
+	require.ErrorContains(t, err, "invalid metadata: missing partition-specs")
+	require.Nil(t, meta)
+}
+
+func TestTableMetadataV2MissingLastPartitionId(t *testing.T) {
+	meta, err := getTestTableMetadata("TableMetadataV2MissingLastPartitionId.json")
+	require.ErrorContains(t, err, "invalid metadata: last-partition-id must be set for FormatVersion > 1")
+	require.Nil(t, meta)
+}
+
+func TestDefaultPartitionSpec(t *testing.T) {
+	defaultSpecID := 1234
+	meta, err := getTestTableMetadata("TableMetadataV2Valid.json")
+	require.NoError(t, err)
+	spec := iceberg.NewPartitionSpecID(1234)
+
+	meta.(*metadataV2).DefaultSpecID = spec.ID()
+	meta.(*metadataV2).Specs = append(meta.(*metadataV2).Specs, spec)
+	partitionSpec := meta.PartitionSpec()
+	require.Equal(t, partitionSpec.ID(), defaultSpecID)
+}
+
+func TestTableMetadataV1SchemasWithoutCurrentId(t *testing.T) {
+	meta, err := getTestTableMetadata("TableMetadataV1SchemasWithoutCurrentId.json")
+	require.NoError(t, err)
+	require.Equal(t, meta.(*metadataV1).Version(), 1)
+	require.Equal(t, meta.TableUUID(), uuid.MustParse("d20125c8-7284-442c-9aea-15fee620737c"))
+	schema := meta.CurrentSchema()
+	require.Equal(t, len(schema.Fields()), 3)
+	require.Equal(t, schema.Fields()[0].Name, "x")
+	require.Equal(t, schema.Fields()[1].Name, "y")
+	require.Equal(t, schema.Fields()[2].Name, "z")
+}
+
+func TestTableMetadataV1NoValidSchema(t *testing.T) {
+	meta, err := getTestTableMetadata("TableMetadataV1NoValidSchema.json")
+	require.ErrorContains(t, err, "invalid metadata: no valid schema configuration found in table metadata")
+	require.Nil(t, meta)
+}
+
+func TestTableMetadataV2SchemaNotFound(t *testing.T) {
+	meta, err := getTestTableMetadata("TableMetadataV2CurrentSchemaNotFound.json")
+	require.ErrorContains(t, err, "invalid metadata: current-schema-id 2 can't be found in any schema")
+	require.Nil(t, meta)
+}
+
+func TestTableMetadataV2MissingSchemas(t *testing.T) {
+	meta, err := getTestTableMetadata("TableMetadataV2MissingSchemas.json")
+	require.ErrorContains(t, err, "invalid metadata: no valid schema configuration found in table metadata")
+	require.Nil(t, meta)
+}
+
+func TestAssignMissingPartitionFieldIDsAcrossSpecs(t *testing.T) {
+	input := []byte(`{
+		"format-version": 2,
+		"last-updated-ms": 0,
+		"last-partition-id": 1003,
+		"partition-specs": [
+			{
+				"spec-id": 0,
+				"fields": [
+					{"source-id": 1, "field-id": 1000, "transform": "identity", "name": "id"},
+					{"source-id": 2, "transform": "identity", "name": "data"}
+				]
+			},
+			{
+				"spec-id": 1,
+				"fields": [
+					{"source-id": 3, "transform": "bucket[16]", "name": "category_bucket"}
+				]
+			}
+		]
+	}`)
+
+	normalized, err := assignMissingPartitionFieldIDs(input)
+	require.NoError(t, err)
+
+	var parsed struct {
+		LastPartitionID int `json:"last-partition-id"`
+		Specs           []struct {
+			ID     int `json:"spec-id"`
+			Fields []struct {
+				FieldID int `json:"field-id"`
+			} `json:"fields"`
+		} `json:"partition-specs"`
+	}
+	require.NoError(t, json.Unmarshal(normalized, &parsed))
+	require.Equal(t, 1005, parsed.LastPartitionID)
+	require.Equal(t, 0, parsed.Specs[0].ID)
+	require.Equal(t, 1, parsed.Specs[1].ID)
+	require.Equal(t, 1000, parsed.Specs[0].Fields[0].FieldID)
+	require.Equal(t, 1004, parsed.Specs[0].Fields[1].FieldID)
+	require.Equal(t, 1005, parsed.Specs[1].Fields[0].FieldID)
+}
+
+func TestTableDataV2NoSnapshots(t *testing.T) {
+	data := `{
+            "format-version" : 2,
+            "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+            "location": "s3://b/wh/data.db/table",
+            "last-sequence-number" : 1,
+            "last-updated-ms": 1515100955770,
+            "last-column-id": 1,
+            "schemas": [
+                {
+                    "schema-id" : 1,
+                    "type" : "struct",
+                    "fields" :[
+                        {
+                            "id": 1,
+                            "name": "struct_name",
+                            "required": true,
+                            "type": "fixed[1]"
+                        }
+                    ]
+                }
+            ],
+            "current-schema-id" : 1,
+            "partition-specs": [
+                {
+                    "spec-id": 0,
+                    "fields": []
+                }
+            ],
+            "refs": {},
+            "default-spec-id": 0,
+            "last-partition-id": 1000,
+            "metadata-log": [
+                {
+                    "metadata-file": "s3://bucket/.../v1.json",
+                    "timestamp-ms": 1515100
+                }
+            ],
+            "sort-orders": [
+                {
+                "order-id": 0,
+                "fields": []
+                }
+            ],
+            "default-sort-order-id": 0
+        }`
+	schema := iceberg.NewSchema(1, iceberg.NestedField{
+		Type:     iceberg.FixedTypeOf(1),
+		ID:       1,
+		Name:     "struct_name",
+		Required: true,
+	})
+
+	partitionSpec := iceberg.NewPartitionSpecID(0)
+
+	i := 1000
+	expected := metadataV2{
+		LastSeqNum: 1,
+		commonMetadata: commonMetadata{
+			FormatVersion:     2,
+			UUID:              uuid.MustParse("fb072c92-a02b-11e9-ae9c-1bb7bc9eca94"),
+			Loc:               "s3://b/wh/data.db/table",
+			LastUpdatedMS:     1515100955770,
+			LastColumnId:      1,
+			SchemaList:        []*iceberg.Schema{schema},
+			CurrentSchemaID:   1,
+			Specs:             []iceberg.PartitionSpec{partitionSpec},
+			DefaultSpecID:     0,
+			LastPartitionID:   &i,
+			Props:             map[string]string{},
+			SnapshotList:      []Snapshot{},
+			CurrentSnapshotID: nil,
+			SnapshotLog:       []SnapshotLogEntry{},
+			MetadataLog: []MetadataLogEntry{
+				{
+					MetadataFile: "s3://bucket/.../v1.json",
+					TimestampMs:  1515100,
+				},
+			},
+
+			SortOrderList:      []SortOrder{UnsortedSortOrder},
+			DefaultSortOrderID: 0,
+			SnapshotRefs:       nil,
+		},
+	}
+
+	parsed, err := ParseMetadataString(data)
+	require.NoError(t, err)
+	require.Truef(t, expected.Equals(parsed), "%s", cmp.Diff(spew.Sdump(expected), spew.Sdump(parsed)))
+}
+
+func TestCurrentSnapshotIDMustMatchMainBranch(t *testing.T) {
+	data := `{
+            "format-version" : 2,
+            "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+            "location": "s3://b/wh/data.db/table",
+            "last-sequence-number" : 1,
+            "last-updated-ms": 1515100955770,
+            "last-column-id": 1,
+            "schemas": [
+                {
+                    "schema-id" : 1,
+                    "type" : "struct",
+                    "fields" :[
+                        {
+                            "id": 1,
+                            "name": "struct_name",
+                            "required": true,
+                            "type": "fixed[1]"
+                        },
+                        {
+                            "id": 4,
+                            "name": "ts",
+                            "required": true,
+                            "type": "timestamp"
+                        }
+                    ]
+                }
+            ],
+            "current-schema-id" : 1,
+            "partition-specs": [
+                {
+                    "spec-id": 0,
+                    "fields": [
+                        {
+                            "source-id": 4,
+                            "field-id": 1000,
+                            "name": "ts_day",
+                            "transform": "day"
+                        }
+                    ]
+                }
+            ],
+            "default-spec-id": 0,
+            "last-partition-id": 1000,
+            "properties": {
+                "commit.retry.num-retries": "1"
+            },
+            "metadata-log": [
+                {
+                    "metadata-file": "s3://bucket/.../v1.json",
+                    "timestamp-ms": 1515100
+                }
+            ],
+            "sort-orders": [
+                {
+                "order-id": 0,
+                "fields": []
+                }
+            ],
+            "default-sort-order-id": 0,
+            "current-snapshot-id" : 1,
+            "refs" : {
+              "main" : {
+                "snapshot-id" : 2,
+                "type" : "branch"
+              }
+            },
+            "snapshots" : [ {
+              "snapshot-id" : 1,
+              "timestamp-ms" : 1662532818843,
+              "sequence-number" : 0,
+              "summary" : {
+                "operation" : "append",
+                "spark.app.id" : "local-1662532784305",
+                "added-data-files" : "4",
+                "added-records" : "4",
+                "added-files-size" : "6001"
+              },
+              "manifest-list" : "/home/iceberg/warehouse/nyc/taxis/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro",
+              "schema-id" : 0
+            },
+            {
+              "snapshot-id" : 2,
+              "timestamp-ms" : 1662532818844,
+              "sequence-number" : 0,
+              "summary" : {
+                "operation" : "append",
+                "spark.app.id" : "local-1662532784305",
+                "added-data-files" : "4",
+                "added-records" : "4",
+                "added-files-size" : "6001"
+              },
+              "manifest-list" : "/home/iceberg/warehouse/nyc/taxis/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro",
+              "schema-id" : 0
+            } ]
+        }`
+	_, err := ParseMetadataString(data)
+	require.Error(t, err, "")
+}
+
+func TestMainWithoutCurrent(t *testing.T) {
+	data := `{
+            "format-version" : 2,
+            "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+            "location": "s3://b/wh/data.db/table",
+            "last-sequence-number" : 1,
+            "last-updated-ms": 1515100955770,
+            "last-column-id": 1,
+            "schemas": [
+                {
+                    "schema-id" : 1,
+                    "type" : "struct",
+                    "fields" :[
+                        {
+                            "id": 1,
+                            "name": "struct_name",
+                            "required": true,
+                            "type": "fixed[1]"
+                        },
+                        {
+                            "id": 4,
+                            "name": "ts",
+                            "required": true,
+                            "type": "timestamp"
+                        }
+                    ]
+                }
+            ],
+            "current-schema-id" : 1,
+            "partition-specs": [
+                {
+                    "spec-id": 0,
+                    "fields": [
+                        {
+                            "source-id": 4,
+                            "field-id": 1000,
+                            "name": "ts_day",
+                            "transform": "day"
+                        }
+                    ]
+                }
+            ],
+            "default-spec-id": 0,
+            "last-partition-id": 1000,
+            "properties": {
+                "commit.retry.num-retries": "1"
+            },
+            "metadata-log": [
+                {
+                    "metadata-file": "s3://bucket/.../v1.json",
+                    "timestamp-ms": 1515100
+                }
+            ],
+            "sort-orders": [
+                {
+                "order-id": 0,
+                "fields": []
+                }
+            ],
+            "default-sort-order-id": 0,
+            "refs" : {
+              "main" : {
+                "snapshot-id" : 1,
+                "type" : "branch"
+              }
+            },
+            "snapshots" : [ {
+              "snapshot-id" : 1,
+              "timestamp-ms" : 1662532818843,
+              "sequence-number" : 0,
+              "summary" : {
+                "operation" : "append",
+                "spark.app.id" : "local-1662532784305",
+                "added-data-files" : "4",
+                "added-records" : "4",
+                "added-files-size" : "6001"
+              },
+              "manifest-list" : "/home/iceberg/warehouse/nyc/taxis/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro",
+              "schema-id" : 0
+            } ]
+        }`
+	_, err := ParseMetadataString(data)
+	require.Error(t, err, "")
+}
+
+func TestBranchSnapshotMissing(t *testing.T) {
+	data := `{
+            "format-version" : 2,
+            "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+            "location": "s3://b/wh/data.db/table",
+            "last-sequence-number" : 1,
+            "last-updated-ms": 1515100955770,
+            "last-column-id": 1,
+            "schemas": [
+                {
+                    "schema-id" : 1,
+                    "type" : "struct",
+                    "fields" :[
+                        {
+                            "id": 1,
+                            "name": "struct_name",
+                            "required": true,
+                            "type": "fixed[1]"
+                        },
+                        {
+                            "id": 4,
+                            "name": "ts",
+                            "required": true,
+                            "type": "timestamp"
+                        }
+                    ]
+                }
+            ],
+            "current-schema-id" : 1,
+            "partition-specs": [
+                {
+                    "spec-id": 0,
+                    "fields": [
+                        {
+                            "source-id": 4,
+                            "field-id": 1000,
+                            "name": "ts_day",
+                            "transform": "day"
+                        }
+                    ]
+                }
+            ],
+            "default-spec-id": 0,
+            "last-partition-id": 1000,
+            "properties": {
+                "commit.retry.num-retries": "1"
+            },
+            "metadata-log": [
+                {
+                    "metadata-file": "s3://bucket/.../v1.json",
+                    "timestamp-ms": 1515100
+                }
+            ],
+            "sort-orders": [
+                {
+                "order-id": 0,
+                "fields": []
+                }
+            ],
+            "default-sort-order-id": 0,
+            "refs" : {
+              "main" : {
+                "snapshot-id" : 1,
+                "type" : "branch"
+              },
+              "foo" : {
+                "snapshot-id" : 2,
+                "type" : "branch"
+              }
+            },
+			"current-snapshot-id" : 1,
+            "snapshots" : [ {
+              "snapshot-id" : 1,
+              "timestamp-ms" : 1662532818843,
+              "sequence-number" : 0,
+              "summary" : {
+                "operation" : "append",
+                "spark.app.id" : "local-1662532784305",
+                "added-data-files" : "4",
+                "added-records" : "4",
+                "added-files-size" : "6001"
+              },
+              "manifest-list" : "/home/iceberg/warehouse/nyc/taxis/metadata/snap-638933773299822130-1-7e6760f0-4f6c-4b23-b907-0a5a174e3863.avro",
+              "schema-id" : 0
+            }]
+        }`
+	_, err := ParseMetadataString(data)
+	require.ErrorContains(t, err, "invalid metadata: snapshot ref foo with ID 2 does not exist in snapshot list")
+}
+
+func TestV2WrongMaxSnapshotSequenceNumber(t *testing.T) {
+	data := `{"format-version": 2,
+            "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+            "location": "s3://bucket/test/location",
+            "last-sequence-number": 1,
+            "last-updated-ms": 1602638573590,
+            "last-column-id": 3,
+            "current-schema-id": 0,
+            "schemas": [
+                {
+                    "type": "struct",
+                    "schema-id": 0,
+                    "fields": [
+                        {
+                            "id": 1,
+                            "name": "x",
+                            "required": true,
+                            "type": "long"
+                        }
+                    ]
+                }
+            ],
+            "default-spec-id": 0,
+            "partition-specs": [
+                {
+                    "spec-id": 0,
+                    "fields": []
+                }
+            ],
+            "last-partition-id": 1000,
+            "default-sort-order-id": 0,
+            "sort-orders": [
+                {
+                    "order-id": 0,
+                    "fields": []
+                }
+            ],
+            "properties": {},
+            "current-snapshot-id": 3055729675574597004,
+            "snapshots": [
+                {
+                    "snapshot-id": 3055729675574597004,
+                    "timestamp-ms": 1555100955770,
+                    "sequence-number": 4,
+                    "summary": { "operation": "append" },
+                    "manifest-list": "s3://a/b/2.avro",
+                    "schema-id": 0
+                }
+            ],
+            "statistics": [],
+            "snapshot-log": [],
+            "metadata-log": []}`
+	_, err := ParseMetadataString(data)
+	require.Error(t, err, "")
+	s := strings.ReplaceAll(data, `"last-sequence-number": 1,`, `"last-sequence-number": 4,`)
+
+	meta, err := ParseMetadataString(s)
+	require.NoError(t, err)
+	require.Equal(t, meta.LastSequenceNumber(), int64(4))
+
+	s = strings.ReplaceAll(data, `"last-sequence-number": 1,`, `"last-sequence-number": 5,`)
+	meta, err = ParseMetadataString(s)
+	require.NoError(t, err)
+	require.Equal(t, meta.LastSequenceNumber(), int64(5))
+}
+
+func TestTableMetadataV2MissingSortOrder(t *testing.T) {
+	meta, err := getTestTableMetadata("TableMetadataV2MissingSortOrder.json")
+	require.ErrorContains(t, err, "invalid metadata: missing sort-orders")
+	require.Nil(t, meta)
+}
+
+func TestDefaultSortOrder(t *testing.T) {
+	orderID := 1234
+	meta, err := getTestTableMetadata("TableMetadataV2Valid.json")
+	require.NoError(t, err)
+	meta.(*metadataV2).DefaultSortOrderID = orderID
+	sortOrder, err := NewSortOrder(orderID, []SortField{{
+		SourceIDs: []int{2},
+		Transform: iceberg.IdentityTransform{},
+		Direction: SortASC,
+		NullOrder: NullsFirst,
+	}})
+	require.NoError(t, err)
+
+	meta.(*metadataV2).SortOrderList = append(meta.(*metadataV2).SortOrderList, sortOrder)
+	require.Equal(t, meta.SortOrder().OrderID(), orderID)
+}
+
+// Java: TestTableMetadata.testParseSchemaIdentifierFields
+func TestParseSchemaIdentifierFields(t *testing.T) {
+	meta, err := getTestTableMetadata("TableMetadataV2Valid.json")
+	require.NoError(t, err)
+	// Verify identifier fields
+	schemas := meta.Schemas()
+	require.Len(t, schemas, 2)
+
+	require.Empty(t, schemas[0].IdentifierFieldIDs)
+	require.Equal(t, []int{1, 2}, schemas[1].IdentifierFieldIDs)
+}
+
+func TestInvalidSnapshotLogOrder(t *testing.T) {
+	meta, err := getTestTableMetadata("TableMetadataV2Valid.json")
+	require.NoError(t, err)
+
+	// we reject snapshot logs where latest timestamp is at least 1 minute older than the previous one
+	meta.(*metadataV2).SnapshotLog[0].TimestampMs = 61000
+	meta.(*metadataV2).SnapshotLog[1].TimestampMs = 0
+
+	ser, err := json.Marshal(meta)
+	require.NoError(t, err)
+	_, err = ParseMetadataBytes(ser)
+	require.ErrorContains(t, err, "invalid metadata: expected sorted snapshot log entries")
+}
+
+func TestInvalidMetadataLogOrder(t *testing.T) {
+	meta, err := getTestTableMetadata("TableMetadataV2Valid.json")
+	require.NoError(t, err)
+
+	// we reject snapshot logs where latest timestamp is at least 1 minute older than the previous one
+	meta.(*metadataV2).MetadataLog = []MetadataLogEntry{
+		{
+			MetadataFile: "f1",
+			TimestampMs:  61000,
+		},
+		{
+			MetadataFile: "f2",
+			TimestampMs:  0,
+		},
+	}
+
+	ser, err := json.Marshal(meta)
+	require.NoError(t, err)
+	_, err = ParseMetadataBytes(ser)
+	require.ErrorContains(t, err, "invalid metadata: expected sorted metadata log entries")
+}
+
+func getTestTableMetadata(fileName string) (Metadata, error) {
+	fCont, err := os.ReadFile(path.Join("testdata", fileName))
+	if err != nil {
+		return nil, err
+	}
+	meta, err := ParseMetadataBytes(fCont)
+	if err != nil {
+		return nil, err
+	}
+
+	return meta, nil
+}
+
+func TestV3PartitionStatisticsRoundTrip(t *testing.T) {
+	const testFile = "TableMetadataV3WithPartitionStatistics.json"
+
+	raw, err := os.ReadFile(path.Join("testdata", testFile))
+	require.NoError(t, err)
+
+	meta, err := ParseMetadataBytes(raw)
+	require.NoError(t, err)
+	require.Equal(t, 3, meta.Version())
+
+	partStats := slices.Collect(meta.PartitionStatistics())
+	require.Len(t, partStats, 2)
+
+	assert.Equal(t, int64(3051729675574597004), partStats[0].SnapshotID)
+	assert.Equal(t, "s3://bucket/test/location/metadata/partition-stats/snap-3051729675574597004.parquet", partStats[0].StatisticsPath)
+	assert.Equal(t, int64(42330), partStats[0].FileSizeInBytes)
+
+	assert.Equal(t, int64(3055729675574597004), partStats[1].SnapshotID)
+	assert.Equal(t, "s3://bucket/test/location/metadata/partition-stats/snap-3055729675574597004.parquet", partStats[1].StatisticsPath)
+	assert.Equal(t, int64(65871), partStats[1].FileSizeInBytes)
+
+	serialized, err := json.Marshal(meta)
+	require.NoError(t, err)
+
+	reparsed, err := ParseMetadataBytes(serialized)
+	require.NoError(t, err)
+
+	roundTripStats := slices.Collect(reparsed.PartitionStatistics())
+	require.Len(t, roundTripStats, 2)
+	assert.Equal(t, partStats, roundTripStats)
+
+	assert.JSONEq(t, string(raw), string(serialized))
+}
+
+func TestZstdGoldenFixture(t *testing.T) {
+	compressed, err := os.ReadFile(path.Join("testdata", "TableMetadataV2Valid.zstd.metadata.json"))
+	require.NoError(t, err)
+
+	dec, err := zstd.NewReader(bytes.NewReader(compressed))
+	require.NoError(t, err)
+	defer dec.Close()
+
+	data, err := io.ReadAll(dec)
+	require.NoError(t, err)
+
+	meta, err := ParseMetadataBytes(data)
+	require.NoError(t, err)
+
+	expected, err := getTestTableMetadata("TableMetadataV2ValidMinimal.json")
+	require.NoError(t, err)
+
+	assert.True(t, expected.Equals(meta))
+}
+
+func TestRejectFieldsBeyondVersion(t *testing.T) {
+	v1Base := `{
+		"format-version": 1,
+		"table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+		"location": "s3://bucket/test/location",
+		"last-updated-ms": 1602638573874,
+		"last-column-id": 3,
+		"schemas": [{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}],
+		"current-schema-id": 0,
+		"partition-specs": [{"spec-id": 0, "fields": []}],
+		"default-spec-id": 0,
+		"sort-orders": [{"order-id": 0, "fields": []}],
+		"default-sort-order-id": 0`
+
+	v2Base := `{
+		"format-version": 2,
+		"table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+		"location": "s3://bucket/test/location",
+		"last-updated-ms": 1602638573874,
+		"last-column-id": 3,
+		"last-sequence-number": 0,
+		"schemas": [{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}],
+		"current-schema-id": 0,
+		"partition-specs": [{"spec-id": 0, "fields": []}],
+		"default-spec-id": 0,
+		"last-partition-id": 1000,
+		"sort-orders": [{"order-id": 0, "fields": []}],
+		"default-sort-order-id": 0`
+
+	tests := []struct {
+		name      string
+		json      string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:      "v1 rejects next-row-id",
+			json:      v1Base + `, "next-row-id": 42}`,
+			wantErr:   true,
+			errSubstr: "v3-only field 'next-row-id' present in v1 metadata",
+		},
+		{
+			name:      "v1 rejects encryption-keys",
+			json:      v1Base + `, "encryption-keys": [{"key-id": "k1", "encrypted-key-metadata": "abc123"}]}`,
+			wantErr:   true,
+			errSubstr: "v3-only field 'encryption-keys' present in v1 metadata",
+		},
+		{
+			name:    "v1 accepts empty encryption-keys",
+			json:    v1Base + `, "encryption-keys": []}`,
+			wantErr: false,
+		},
+		{
+			name:      "v1 rejects last-sequence-number",
+			json:      v1Base + `, "last-sequence-number": 7}`,
+			wantErr:   true,
+			errSubstr: "v2-only field 'last-sequence-number' present in v1 metadata",
+		},
+		{
+			name:      "v2 rejects next-row-id",
+			json:      v2Base + `, "next-row-id": 42}`,
+			wantErr:   true,
+			errSubstr: "v3-only field 'next-row-id' present in v2 metadata",
+		},
+		{
+			name:      "v2 rejects encryption-keys",
+			json:      v2Base + `, "encryption-keys": [{"key-id": "k1", "encrypted-key-metadata": "abc123"}]}`,
+			wantErr:   true,
+			errSubstr: "v3-only field 'encryption-keys' present in v2 metadata",
+		},
+		{
+			name:    "v2 accepts empty encryption-keys",
+			json:    v2Base + `, "encryption-keys": []}`,
+			wantErr: false,
+		},
+		{
+			name:    "v2 accepts last-sequence-number",
+			json:    v2Base + `, "last-sequence-number": 7}`,
+			wantErr: false,
+		},
+		{
+			name:      "v2 rejects multiple v3 fields at once",
+			json:      v2Base + `, "next-row-id": 42, "encryption-keys": [{"key-id": "k1", "encrypted-key-metadata": "abc123"}]}`,
+			wantErr:   true,
+			errSubstr: "next-row-id",
+		},
+		{
+			name: "v3 accepts encryption-keys",
+			json: `{
+				"format-version": 3,
+				"table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+				"location": "s3://bucket/test/location",
+				"last-updated-ms": 1602638573874,
+				"last-column-id": 3,
+				"last-sequence-number": 0,
+				"next-row-id": 1,
+				"schemas": [{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}],
+				"current-schema-id": 0,
+				"partition-specs": [{"spec-id": 0, "fields": []}],
+				"default-spec-id": 0,
+				"last-partition-id": 1000,
+				"sort-orders": [{"order-id": 0, "fields": []}],
+				"default-sort-order-id": 0,
+				"encryption-keys": [{"key-id": "k1", "encrypted-key-metadata": "abc123"}]
+			}`,
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseMetadataBytes([]byte(tt.json))
+			if tt.wantErr {
+				require.ErrorIs(t, err, ErrInvalidMetadataFormatVersion)
+				assert.ErrorContains(t, err, tt.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+
+	// Verify multiple v3 fields are all reported in a single error.
+	t.Run("reports all rejected fields", func(t *testing.T) {
+		input := v2Base + `, "next-row-id": 42, "encryption-keys": [{"key-id": "k1", "encrypted-key-metadata": "abc123"}]}`
+		_, err := ParseMetadataBytes([]byte(input))
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "next-row-id")
+		assert.ErrorContains(t, err, "encryption-keys")
+	})
+
+	// Verify mixed v2-only and v3-only fields in v1 metadata are all reported.
+	t.Run("v1 reports fields from both v2 and v3", func(t *testing.T) {
+		input := v1Base + `, "last-sequence-number": 7, "next-row-id": 42}`
+		_, err := ParseMetadataBytes([]byte(input))
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "last-sequence-number")
+		assert.ErrorContains(t, err, "next-row-id")
+	})
+}
+
+// TestMetadataV3EmitsNullCurrentSnapshotID pins the spec-mandated emission of
+// `current-snapshot-id: null` for empty v3 metadata (Java reference
+// apache/iceberg#12335). The pointer-typed field has an `omitempty` tag that
+// would otherwise drop the key entirely; v3's custom MarshalJSON injects an
+// explicit null and positions it after `snapshots` to match Java's field
+// ordering. v1/v2 are intentionally unaffected — they keep emitting -1
+// sentinels rather than null.
+func TestMetadataV3EmitsNullCurrentSnapshotID(t *testing.T) {
+	// Shared helper: v2+ requires last-partition-id, so every direct
+	// metadataV3 fixture below sets it. validateV3Marshal already covers
+	// the rejection path below.
+	v3LastPartitionID := 999
+
+	t.Run("empty v3 metadata emits explicit null", func(t *testing.T) {
+		m := &metadataV3{
+			LastSeqNum:     0,
+			NextRowIDValue: 0,
+			commonMetadata: commonMetadata{
+				FormatVersion:   3,
+				UUID:            uuid.MustParse("9c12d441-03fe-4693-9a96-a0705ddf69c1"),
+				Loc:             "s3://bucket/test/location",
+				LastUpdatedMS:   1,
+				LastColumnId:    0,
+				CurrentSchemaID: 0,
+				DefaultSpecID:   0,
+				LastPartitionID: &v3LastPartitionID,
+				// CurrentSnapshotID intentionally nil
+			},
+		}
+
+		raw, err := json.Marshal(m)
+		require.NoError(t, err)
+		// Semantic check: key is present with null value.
+		var obj map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(raw, &obj))
+		got, ok := obj["current-snapshot-id"]
+		require.True(t, ok, "current-snapshot-id key must be present even when nil")
+		assert.JSONEq(t, "null", string(got))
+	})
+
+	t.Run("v3 metadata with snapshot emits the id, not null", func(t *testing.T) {
+		id := int64(42)
+		m := &metadataV3{
+			LastSeqNum:     0,
+			NextRowIDValue: 0,
+			commonMetadata: commonMetadata{
+				FormatVersion:     3,
+				UUID:              uuid.MustParse("9c12d441-03fe-4693-9a96-a0705ddf69c1"),
+				Loc:               "s3://bucket/test/location",
+				LastUpdatedMS:     1,
+				LastColumnId:      0,
+				CurrentSchemaID:   0,
+				DefaultSpecID:     0,
+				LastPartitionID:   &v3LastPartitionID,
+				CurrentSnapshotID: &id,
+			},
+		}
+
+		raw, err := json.Marshal(m)
+		require.NoError(t, err)
+		var obj map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(raw, &obj))
+		got, ok := obj["current-snapshot-id"]
+		require.True(t, ok)
+		assert.JSONEq(t, "42", string(got))
+	})
+
+	// Field-ordering position subtests removed: the struct-embed override
+	// emits CurrentSnapshotID after the embedded metadataV3 fields rather
+	// than at its declaration-order position. Spec doesn't require ordering
+	// (JSON is order-independent) and consumers parse semantically, so the
+	// presence + value assertions in the other subtests cover what
+	// matters.
+
+	t.Run("v3 marshal rejects nil last-partition-id (symmetric with parse-time check)", func(t *testing.T) {
+		// last-partition-id is required for v2+ per spec. The existing
+		// parse-time validator (preValidate/validate) catches nil on
+		// read; this check is the symmetric guard on the write side, so
+		// direct struct construction that skips the builder can't
+		// silently emit a non-conformant file Java/PyIceberg would
+		// reject.
+		m := &metadataV3{
+			LastSeqNum:     0,
+			NextRowIDValue: 0,
+			commonMetadata: commonMetadata{
+				FormatVersion:   3,
+				UUID:            uuid.New(),
+				Loc:             "s3://bucket/test/location",
+				LastUpdatedMS:   1,
+				LastColumnId:    0,
+				CurrentSchemaID: 0,
+				DefaultSpecID:   0,
+				// LastPartitionID intentionally nil
+			},
+		}
+
+		_, err := json.Marshal(m)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "last-partition-id must be set")
+	})
+
+	t.Run("v2 metadata keeps omitempty (no regression)", func(t *testing.T) {
+		// v2 fixtures rely on the -1 sentinel rather than null. The PR
+		// scoped the change to v3 only; ensure v2 still drops the key.
+		m := &metadataV2{
+			LastSeqNum: 0,
+			commonMetadata: commonMetadata{
+				FormatVersion: 2,
+				UUID:          uuid.New(),
+				Loc:           "s3://bucket/test/location",
+				LastUpdatedMS: 1,
+				// CurrentSnapshotID intentionally nil
+			},
+		}
+
+		raw, err := json.Marshal(m)
+		require.NoError(t, err)
+		var obj map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(raw, &obj))
+		_, present := obj["current-snapshot-id"]
+		assert.False(t, present, "v2 must keep omitempty behavior, not emit null")
+	})
+
+	t.Run("round-trip: marshal empty v3, parse back, current snapshot id stays nil", func(t *testing.T) {
+		lastPartitionID := 999
+		original := &metadataV3{
+			LastSeqNum:     0,
+			NextRowIDValue: 0,
+			commonMetadata: commonMetadata{
+				FormatVersion:      3,
+				UUID:               uuid.MustParse("9c12d441-03fe-4693-9a96-a0705ddf69c1"),
+				Loc:                "s3://bucket/test/location",
+				LastUpdatedMS:      1602638573590,
+				LastColumnId:       0,
+				CurrentSchemaID:    0,
+				DefaultSpecID:      0,
+				DefaultSortOrderID: 0,
+				LastPartitionID:    &lastPartitionID,
+				SchemaList:         []*iceberg.Schema{iceberg.NewSchema(0)},
+				Specs:              []iceberg.PartitionSpec{*iceberg.UnpartitionedSpec},
+				SortOrderList:      []SortOrder{UnsortedSortOrder},
+			},
+		}
+
+		raw, err := json.Marshal(original)
+		require.NoError(t, err)
+		// The marshaled bytes must carry the explicit null key — that's
+		// what the round-trip is actually exercising.
+		assert.Contains(t, string(raw), `"current-snapshot-id":null`)
+
+		parsed, err := ParseMetadataBytes(raw)
+		require.NoError(t, err)
+		v3, ok := parsed.(*metadataV3)
+		require.True(t, ok)
+		assert.Nil(t, v3.CurrentSnapshotID, "explicit null must parse back to nil")
+	})
+}
+
+func TestPropertiesRoundTripToEmptyMap(t *testing.T) {
+	meta, err := NewMetadata(iceberg.NewSchema(0), iceberg.UnpartitionedSpec,
+		UnsortedSortOrder, "s3://bucket/test/location", nil)
+	require.NoError(t, err)
+	assert.NotNil(t, meta.Properties())
+
+	raw, err := json.Marshal(meta)
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), `"properties"`)
+
+	parsed, err := ParseMetadataBytes(raw)
+	require.NoError(t, err)
+	assert.NotNil(t, parsed.Properties(), "omitted properties must parse back to an empty map, not nil")
+}

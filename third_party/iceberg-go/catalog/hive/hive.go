@@ -1,0 +1,1067 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package hive
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"iter"
+	"log"
+	"maps"
+	"strings"
+	_ "unsafe"
+
+	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/catalog/internal"
+	"github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/metrics"
+	"github.com/apache/iceberg-go/table"
+	"github.com/apache/iceberg-go/view"
+	"github.com/beltran/gohive/hive_metastore"
+)
+
+const (
+	locationKey    = "location"
+	commentKey     = "comment"
+	descriptionKey = "description"
+)
+
+var _ catalog.Catalog = (*Catalog)(nil)
+
+func init() {
+	catalog.Register("hive", catalog.RegistrarFunc(func(ctx context.Context, _ string, props iceberg.Properties) (catalog.Catalog, error) {
+		return NewCatalog(props)
+	}))
+}
+
+var _ catalog.PurgeableTable = (*Catalog)(nil)
+
+type Catalog struct {
+	client HiveClient
+	opts   *HiveOptions
+	// reporter builds and caches the catalog's metrics reporter once, so it is
+	// constructed per-catalog rather than per table load. Released by Close.
+	reporter metrics.CachedReporter
+}
+
+func NewCatalog(props iceberg.Properties, opts ...Option) (*Catalog, error) {
+	o := NewHiveOptions()
+	o.ApplyProperties(props)
+
+	for _, opt := range opts {
+		opt(o)
+	}
+
+	if o.URI == "" {
+		return nil, errors.New("hive.uri is required")
+	}
+
+	client, err := newHiveClient(o.URI, o)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Hive client: %w", err)
+	}
+
+	return &Catalog{
+		client: client,
+		opts:   o,
+	}, nil
+}
+
+func NewCatalogWithClient(client HiveClient, props iceberg.Properties) *Catalog {
+	o := NewHiveOptions()
+	o.ApplyProperties(props)
+
+	return &Catalog{
+		client: client,
+		opts:   o,
+	}
+}
+
+func (c *Catalog) CatalogType() catalog.Type {
+	return catalog.Hive
+}
+
+// Close releases the Hive client and the catalog's metrics reporter. Each close
+// is isolated from the other so one failing does not skip the other and leak its
+// resource — not just when a close returns an error (errors.Join already keeps
+// both), but when it panics: a bare errors.Join(c.client.Close(), c.reporter.Close())
+// would let a panic in the first close abort the second. Recovered panics are
+// converted to errors and joined with any close errors. Callers holding a
+// [catalog.Catalog] can reach this via a [catalog.Closer] type assertion.
+func (c *Catalog) Close() error {
+	return errors.Join(
+		closeIsolated(c.client.Close),
+		closeIsolated(c.reporter.Close),
+	)
+}
+
+// closeIsolated runs a close function, converting a panic into an error so a
+// single misbehaving close cannot abort a sibling close in the same Close call.
+func closeIsolated(closeFn func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("hive catalog: panic during close: %v", r)
+		}
+	}()
+
+	return closeFn()
+}
+
+var _ catalog.Closer = (*Catalog)(nil)
+
+// ListTables returns a list of table identifiers in the given namespace.
+func (c *Catalog) ListTables(ctx context.Context, namespace table.Identifier) iter.Seq2[table.Identifier, error] {
+	return func(yield func(table.Identifier, error) bool) {
+		database, err := identifierToDatabase(namespace)
+		if err != nil {
+			yield(nil, err)
+
+			return
+		}
+
+		tableNames, err := c.client.GetTables(ctx, database, "*")
+		if err != nil {
+			yield(nil, fmt.Errorf("failed to list tables in %s: %w", database, err))
+
+			return
+		}
+
+		if len(tableNames) == 0 {
+			return
+		}
+
+		for _, tableName := range tableNames {
+			tbl, err := c.client.GetTable(ctx, database, tableName)
+			if err != nil {
+				if isNoSuchObjectError(err) {
+					continue
+				}
+
+				yield(table.Identifier{}, fmt.Errorf("failed to load table %s.%s while listing: %w", database, tableName, err))
+
+				return
+			}
+			if isIcebergTable(tbl) {
+				if !yield(TableIdentifier(database, tableName), nil) {
+					return
+				}
+			}
+		}
+	}
+}
+
+func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier) (*table.Table, error) {
+	database, tableName, err := identifierToTableName(identifier)
+	if err != nil {
+		return nil, err
+	}
+
+	hiveTbl, err := c.getIcebergTable(ctx, database, tableName)
+	if err != nil {
+		return nil, err
+	}
+
+	metadataLocation, err := getMetadataLocation(hiveTbl)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get metadata location: %w", err)
+	}
+
+	reporter, err := c.reporter.Get(c.opts.props)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize metrics reporter: %w", err)
+	}
+
+	return table.NewFromLocation(
+		ctx,
+		identifier,
+		metadataLocation,
+		io.LoadFSFunc(c.opts.props, metadataLocation),
+		c,
+		table.WithMetricsReporter(reporter),
+	)
+}
+
+func (c *Catalog) CreateTable(ctx context.Context, identifier table.Identifier, schema *iceberg.Schema, opts ...catalog.CreateTableOpt) (*table.Table, error) {
+	database, tableName, err := identifierToTableName(identifier)
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve the reporter before any mutation: this method ends in LoadTable,
+	// which is where the reporter is otherwise first built, so a bad
+	// metrics-reporter-impl would only surface after the metastore entry was
+	// created — turning a successful create into a reported failure whose retry
+	// hits ErrTableAlreadyExists. CachedReporter caches this for that LoadTable.
+	if _, err := c.reporter.Get(c.opts.props); err != nil {
+		return nil, fmt.Errorf("failed to initialize metrics reporter: %w", err)
+	}
+
+	// Ensure there is no view with the same identifier.
+	viewExists, err := c.CheckViewExists(ctx, identifier)
+	if err != nil {
+		return nil, err
+	}
+	if viewExists {
+		return nil, fmt.Errorf("%w: %s.%s", catalog.ErrViewAlreadyExists, database, tableName)
+	}
+
+	staged, err := internal.CreateStagedTable(ctx, c.opts.props, c.LoadNamespaceProperties, identifier, schema, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := internal.WriteMetadata(ctx, staged.Table); err != nil {
+		return nil, err
+	}
+
+	hiveTbl := constructHiveTable(database, tableName, staged.Location(), staged.MetadataLocation(), schema, staged.Properties())
+
+	if err := c.client.CreateTable(ctx, hiveTbl); err != nil {
+		if isAlreadyExistsError(err) {
+			return nil, fmt.Errorf("%w: %s.%s", catalog.ErrTableAlreadyExists, database, tableName)
+		}
+
+		return nil, fmt.Errorf("failed to create table %s.%s: %w", database, tableName, err)
+	}
+
+	return c.LoadTable(ctx, identifier)
+}
+
+// RegisterTable adds an existing Iceberg table to the Hive metastore
+func (c *Catalog) RegisterTable(ctx context.Context, identifier table.Identifier, metadataLocation string) (*table.Table, error) {
+	database, tableName, err := identifierToTableName(identifier)
+	if err != nil {
+		return nil, err
+	}
+
+	exists, err := c.CheckNamespaceExists(ctx, DatabaseIdentifier(database))
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchNamespace, database)
+	}
+
+	viewExists, err := c.CheckViewExists(ctx, identifier)
+	if err != nil {
+		return nil, err
+	}
+	if viewExists {
+		return nil, fmt.Errorf("%w: %s.%s", catalog.ErrViewAlreadyExists, database, tableName)
+	}
+
+	tableExists, err := c.CheckTableExists(ctx, identifier)
+	if err != nil {
+		return nil, err
+	}
+	if tableExists {
+		return nil, fmt.Errorf("%w: %s.%s", catalog.ErrTableAlreadyExists, database, tableName)
+	}
+
+	reporter, err := c.reporter.Get(c.opts.props)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize metrics reporter: %w", err)
+	}
+
+	tbl, err := table.NewFromLocation(
+		ctx,
+		identifier,
+		metadataLocation,
+		io.LoadFSFunc(c.opts.props, metadataLocation),
+		c,
+		table.WithMetricsReporter(reporter),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read table metadata from %s: %w", metadataLocation, err)
+	}
+
+	hiveTbl := constructHiveTable(database, tableName, tbl.Location(), metadataLocation, tbl.Metadata().CurrentSchema(), maps.Clone(tbl.Metadata().Properties()))
+
+	if err := c.client.CreateTable(ctx, hiveTbl); err != nil {
+		if isAlreadyExistsError(err) {
+			return nil, fmt.Errorf("%w: %s.%s", catalog.ErrTableAlreadyExists, database, tableName)
+		}
+
+		return nil, fmt.Errorf("failed to register table %s.%s: %w", database, tableName, err)
+	}
+
+	return c.LoadTable(ctx, identifier)
+}
+
+// CreateView creates a new view in the catalog. It uses the same signature as the REST catalog:
+// identifier, version (with SQL representations), schema, and optional CreateViewOpt for location and properties.
+// Returns the created *view.View, or an error if the namespace is missing, a view/table already exists, or creation fails.
+func (c *Catalog) CreateView(ctx context.Context, identifier table.Identifier, version *view.Version, schema *iceberg.Schema, opts ...catalog.CreateViewOpt) (*view.View, error) {
+	database, viewName, err := identifierToViewName(identifier)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := catalog.NewCreateViewCfg()
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	exists, err := c.CheckNamespaceExists(ctx, DatabaseIdentifier(database))
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchNamespace, database)
+	}
+
+	viewExists, err := c.CheckViewExists(ctx, identifier)
+	if err != nil {
+		return nil, err
+	}
+	if viewExists {
+		return nil, fmt.Errorf("%w: %s.%s", catalog.ErrViewAlreadyExists, database, viewName)
+	}
+
+	tableExists, err := c.CheckTableExists(ctx, identifier)
+	if err != nil {
+		return nil, err
+	}
+	if tableExists {
+		return nil, fmt.Errorf("%w: %s.%s", catalog.ErrTableAlreadyExists, database, viewName)
+	}
+
+	loc := strings.TrimSuffix(cfg.Location, "/")
+	if loc == "" {
+		var err error
+		loc, err = internal.ResolveTableLocation(ctx, "", database, viewName, c.opts.props, c.LoadNamespaceProperties)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	freshSchema, err := iceberg.AssignFreshSchemaIDs(schema, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	viewSQL, err := sqlFromVersion(version)
+	if err != nil {
+		return nil, err
+	}
+
+	defaultNS := catalog.NamespaceFromIdent(identifier)
+	catalogName := "hive"
+
+	ioProps := make(iceberg.Properties)
+	if c.opts.props != nil {
+		maps.Copy(ioProps, c.opts.props)
+	}
+	if cfg.Properties != nil {
+		maps.Copy(ioProps, cfg.Properties)
+	}
+
+	createdView, err := view.CreateViewWithIOProperties(
+		ctx, catalogName, identifier, freshSchema, viewSQL, defaultNS, loc, ioProps, cfg.Properties,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	viewProps := make(map[string]string)
+	if cfg.Properties != nil {
+		maps.Copy(viewProps, cfg.Properties)
+	}
+
+	hiveTbl := constructHiveViewTable(database, viewName, loc, createdView.MetadataLocation(), freshSchema, viewSQL, viewProps)
+	if err := c.client.CreateTable(ctx, hiveTbl); err != nil {
+		if isAlreadyExistsError(err) {
+			return nil, fmt.Errorf("%w: %s.%s", catalog.ErrViewAlreadyExists, database, viewName)
+		}
+
+		return nil, fmt.Errorf("failed to create view %s.%s: %w", database, viewName, err)
+	}
+
+	return createdView, nil
+}
+
+// sqlFromVersion returns the SQL from the first SQL representation in version, preferring dialect "hive".
+func sqlFromVersion(v *view.Version) (string, error) {
+	if v == nil || len(v.Representations) == 0 {
+		return "", errors.New("view version has no representations")
+	}
+	var fallback string
+	for _, r := range v.Representations {
+		if r.Type != "sql" {
+			continue
+		}
+		if strings.EqualFold(r.Dialect, "hive") {
+			return r.Sql, nil
+		}
+		if fallback == "" {
+			fallback = r.Sql
+		}
+	}
+	if fallback != "" {
+		return fallback, nil
+	}
+
+	return "", errors.New("view version has no SQL representation")
+}
+
+func (c *Catalog) DropTable(ctx context.Context, identifier table.Identifier) (err error) {
+	database, tableName, err := identifierToTableName(identifier)
+	if err != nil {
+		return err
+	}
+
+	lock, err := acquireLock(ctx, c.client, database, tableName, c.opts)
+	if err != nil {
+		return fmt.Errorf("%w: failed to acquire lock for %s.%s: %w", table.ErrCommitFailed, database, tableName, err)
+	}
+	defer func() {
+		if releaseErr := lock.releaseForCleanup(ctx); releaseErr != nil {
+			if err != nil {
+				err = errors.Join(err, releaseErr)
+			} else {
+				log.Printf("WARNING: failed to release Hive lock after dropping %s.%s: %v", database, tableName, releaseErr)
+			}
+		}
+	}()
+
+	// Re-read after acquiring the lock so drop cannot act on table state that a
+	// concurrent commit changed while lock acquisition was waiting.
+	if _, err := c.getIcebergTable(ctx, database, tableName); err != nil {
+		return err
+	}
+
+	if err := c.client.DropTable(ctx, database, tableName, false); err != nil {
+		return fmt.Errorf("failed to drop table %s.%s: %w", database, tableName, err)
+	}
+
+	return nil
+}
+
+func (c *Catalog) PurgeTable(ctx context.Context, identifier table.Identifier) error {
+	tbl, err := c.LoadTable(ctx, identifier)
+	if err != nil {
+		return err
+	}
+
+	// Drop the table entry from the catalog first
+	err = c.DropTable(ctx, identifier)
+	if err != nil {
+		return err
+	}
+
+	// Physically delete all table files on storage best-effort
+	if purgeErr := tbl.PurgeFiles(ctx); purgeErr != nil {
+		log.Printf("WARNING: dropped table %s but failed to purge files: %v", identifier, purgeErr)
+	}
+
+	return nil
+}
+
+func (c *Catalog) RenameTable(ctx context.Context, from, to table.Identifier) (_ *table.Table, err error) {
+	fromDB, fromTable, err := identifierToTableName(from)
+	if err != nil {
+		return nil, err
+	}
+
+	toDB, toTable, err := identifierToTableName(to)
+	if err != nil {
+		return nil, err
+	}
+
+	exists, err := c.CheckNamespaceExists(ctx, DatabaseIdentifier(toDB))
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchNamespace, toDB)
+	}
+
+	source, err := c.getIcebergTable(ctx, fromDB, fromTable)
+	if err != nil {
+		return nil, err
+	}
+	sourceMetadataLocation, err := getMetadataLocation(source)
+	if err != nil {
+		return nil, err
+	}
+
+	lockIdentifiers := []tableLockIdentifier{
+		{database: fromDB, table: fromTable},
+		{database: toDB, table: toTable},
+	}
+	lock, err := acquireLocks(ctx, c.client, lockIdentifiers, c.opts)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to acquire locks for rename %s.%s to %s.%s: %w",
+			table.ErrCommitFailed, fromDB, fromTable, toDB, toTable, err)
+	}
+	defer func() {
+		if releaseErr := lock.releaseForCleanup(ctx); releaseErr != nil {
+			if err != nil {
+				err = errors.Join(err, releaseErr)
+			} else {
+				log.Printf("WARNING: failed to release Hive lock after renaming %s.%s to %s.%s: %v", fromDB, fromTable, toDB, toTable, releaseErr)
+			}
+		}
+	}()
+
+	hiveTbl, err := c.getIcebergTable(ctx, fromDB, fromTable)
+	if err != nil {
+		if errors.Is(err, catalog.ErrNoSuchTable) {
+			return nil, fmt.Errorf("%w: source table %s.%s changed during rename: %w",
+				table.ErrCommitFailed, fromDB, fromTable, err)
+		}
+
+		return nil, err
+	}
+	lockedMetadataLocation, err := getMetadataLocation(hiveTbl)
+	if err != nil {
+		return nil, err
+	}
+	if lockedMetadataLocation != sourceMetadataLocation {
+		return nil, fmt.Errorf("%w: source table %s.%s metadata location changed from %s to %s",
+			table.ErrCommitFailed, fromDB, fromTable, sourceMetadataLocation, lockedMetadataLocation)
+	}
+
+	hiveTbl.TableName = toTable
+	hiveTbl.DbName = toDB
+
+	if err := c.client.AlterTable(ctx, fromDB, fromTable, hiveTbl); err != nil {
+		return nil, fmt.Errorf("failed to rename table %s.%s to %s.%s: %w", fromDB, fromTable, toDB, toTable, err)
+	}
+
+	return c.LoadTable(ctx, to)
+}
+
+func (c *Catalog) CommitTable(ctx context.Context, identifier table.Identifier, requirements []table.Requirement, updates []table.Update) (_ table.Metadata, _ string, err error) {
+	database, tableName, err := identifierToTableName(identifier)
+	if err != nil {
+		return nil, "", err
+	}
+
+	lock, err := acquireLock(ctx, c.client, database, tableName, c.opts)
+	if err != nil {
+		// Lock contention is Hive's primary concurrent-writer signal.
+		// Wrap with table.ErrCommitFailed so the retry loop in
+		// Table.doCommit treats it as a retryable conflict.
+		return nil, "", fmt.Errorf("%w: failed to acquire lock for %s.%s: %w",
+			table.ErrCommitFailed, database, tableName, err)
+	}
+	defer func() {
+		if releaseErr := lock.releaseForCleanup(ctx); releaseErr != nil {
+			if err != nil {
+				err = errors.Join(err, releaseErr)
+			} else {
+				log.Printf("WARNING: failed to release Hive lock after committing %s.%s: %v", database, tableName, releaseErr)
+			}
+		}
+	}()
+
+	currentHiveTbl, err := c.client.GetTable(ctx, database, tableName)
+	if err != nil && !isNoSuchObjectError(err) {
+		return nil, "", err
+	}
+
+	var current *table.Table
+	if currentHiveTbl != nil && isIcebergTable(currentHiveTbl) {
+		metadataLoc, err := getMetadataLocation(currentHiveTbl)
+		if err != nil {
+			return nil, "", err
+		}
+		current, err = table.NewFromLocation(ctx, identifier, metadataLoc, io.LoadFSFunc(c.opts.props, metadataLoc), c)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+
+	staged, err := internal.UpdateAndStageTable(ctx, c.opts.props, current, identifier, requirements, updates, c)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if current != nil && staged.Metadata().Equals(current.Metadata()) {
+		return current.Metadata(), current.MetadataLocation(), nil
+	}
+
+	if err := internal.WriteMetadata(ctx, staged.Table); err != nil {
+		return nil, "", err
+	}
+
+	if current != nil {
+		updatedHiveTbl := updateHiveTableForCommit(
+			currentHiveTbl,
+			current.Metadata(),
+			staged.Metadata(),
+			staged.MetadataLocation(),
+		)
+
+		if err := c.client.AlterTable(ctx, database, tableName, updatedHiveTbl); err != nil {
+			return nil, "", fmt.Errorf("failed to commit table %s.%s: %w", database, tableName, err)
+		}
+	} else {
+		hiveTbl := constructHiveTable(database, tableName, staged.Location(), staged.MetadataLocation(), staged.Metadata().CurrentSchema(), staged.Properties())
+		if err := c.client.CreateTable(ctx, hiveTbl); err != nil {
+			return nil, "", fmt.Errorf("failed to create table %s.%s: %w", database, tableName, err)
+		}
+	}
+
+	return staged.Metadata(), staged.MetadataLocation(), nil
+}
+
+// CheckTableExists checks if a table exists in the catalog.
+func (c *Catalog) CheckTableExists(ctx context.Context, identifier table.Identifier) (bool, error) {
+	database, tableName, err := identifierToTableName(identifier)
+	if err != nil {
+		return false, err
+	}
+
+	hiveTbl, err := c.client.GetTable(ctx, database, tableName)
+	if err != nil {
+		if isNoSuchObjectError(err) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	return isIcebergTable(hiveTbl), nil
+}
+
+// ListViews returns a list of view identifiers in the given namespace.
+func (c *Catalog) ListViews(ctx context.Context, namespace table.Identifier) iter.Seq2[table.Identifier, error] {
+	return func(yield func(table.Identifier, error) bool) {
+		database, err := identifierToDatabase(namespace)
+		if err != nil {
+			yield(nil, err)
+
+			return
+		}
+
+		exists, err := c.CheckNamespaceExists(ctx, DatabaseIdentifier(database))
+		if err != nil {
+			yield(nil, err)
+
+			return
+		}
+		if !exists {
+			yield(nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchNamespace, database))
+
+			return
+		}
+
+		viewNames, err := c.client.GetTables(ctx, database, "*")
+		if err != nil {
+			yield(nil, fmt.Errorf("failed to list views in %s: %w", database, err))
+
+			return
+		}
+
+		if len(viewNames) == 0 {
+			return
+		}
+
+		for _, viewName := range viewNames {
+			tbl, err := c.client.GetTable(ctx, database, viewName)
+			if err != nil {
+				if isNoSuchObjectError(err) {
+					continue
+				}
+
+				yield(table.Identifier{}, fmt.Errorf("failed to load view %s.%s while listing: %w", database, viewName, err))
+
+				return
+			}
+			if isIcebergView(tbl) {
+				if !yield(TableIdentifier(database, viewName), nil) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// LoadView loads a view from the catalog.
+func (c *Catalog) LoadView(ctx context.Context, identifier table.Identifier) (*view.View, error) {
+	database, viewName, err := identifierToViewName(identifier)
+	if err != nil {
+		return nil, err
+	}
+
+	hiveTbl, err := c.client.GetTable(ctx, database, viewName)
+	if err != nil {
+		if isNoSuchObjectError(err) {
+			return nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchView, identifier)
+		}
+
+		return nil, fmt.Errorf("failed to get view %s.%s: %w", database, viewName, err)
+	}
+
+	// If the object is an Iceberg table, do not treat it as a view.
+	if isIcebergTable(hiveTbl) || !isIcebergView(hiveTbl) {
+		return nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchView, identifier)
+	}
+
+	metadataLocation, err := getViewMetadataLocation(hiveTbl)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s, metadata location is missing", catalog.ErrNoSuchView, identifier)
+	}
+
+	return view.NewFromLocation(
+		ctx,
+		identifier,
+		metadataLocation,
+		io.LoadFSFunc(c.opts.props, metadataLocation),
+	)
+}
+
+// DropView drops a view from the catalog.
+func (c *Catalog) DropView(ctx context.Context, identifier table.Identifier) error {
+	database, viewName, err := identifierToViewName(identifier)
+	if err != nil {
+		return err
+	}
+
+	hiveTbl, err := c.client.GetTable(ctx, database, viewName)
+	if err != nil {
+		if isNoSuchObjectError(err) {
+			return fmt.Errorf("%w: %s", catalog.ErrNoSuchView, identifier)
+		}
+
+		return fmt.Errorf("failed to get view %s.%s: %w", database, viewName, err)
+	}
+
+	if !isIcebergView(hiveTbl) {
+		return fmt.Errorf("%w: %s", catalog.ErrNoSuchView, identifier)
+	}
+
+	metadataLocation, err := getViewMetadataLocation(hiveTbl)
+	if err != nil {
+		return err
+	}
+
+	if err := c.client.DropTable(ctx, database, viewName, false); err != nil {
+		return fmt.Errorf("failed to drop view %s.%s: %w", database, viewName, err)
+	}
+
+	fs, err := io.LoadFS(ctx, c.opts.props, metadataLocation)
+	if err != nil {
+		return fmt.Errorf("failed to load filesystem for view metadata: %w", err)
+	}
+
+	if err := fs.Remove(metadataLocation); err != nil {
+		return fmt.Errorf("failed to remove view metadata file at %s: %w", metadataLocation, err)
+	}
+
+	return nil
+}
+
+// CheckViewExists checks if a view exists in the catalog.
+func (c *Catalog) CheckViewExists(ctx context.Context, identifier table.Identifier) (bool, error) {
+	database, viewName, err := identifierToViewName(identifier)
+	if err != nil {
+		return false, err
+	}
+
+	hiveTbl, err := c.client.GetTable(ctx, database, viewName)
+	if err != nil {
+		if isNoSuchObjectError(err) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	return isIcebergView(hiveTbl), nil
+}
+
+func (c *Catalog) ListNamespaces(ctx context.Context, parent table.Identifier) ([]table.Identifier, error) {
+	if len(parent) > 0 {
+		return nil, errors.New("hierarchical namespace is not supported")
+	}
+
+	databases, err := c.client.GetAllDatabases(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list namespaces: %w", err)
+	}
+
+	namespaces := make([]table.Identifier, len(databases))
+	for i, db := range databases {
+		namespaces[i] = DatabaseIdentifier(db)
+	}
+
+	return namespaces, nil
+}
+
+// CreateNamespace creates a new namespace in the catalog.
+func (c *Catalog) CreateNamespace(ctx context.Context, namespace table.Identifier, props iceberg.Properties) error {
+	database, err := identifierToDatabase(namespace)
+	if err != nil {
+		return err
+	}
+
+	db := &hive_metastore.Database{
+		Name:       database,
+		Parameters: make(map[string]string),
+	}
+
+	for k, v := range props {
+		switch k {
+		case locationKey, "Location":
+			db.LocationUri = v
+		case commentKey, descriptionKey, "Description":
+			db.Description = v
+		default:
+			db.Parameters[k] = v
+		}
+	}
+
+	// Derive a location from the warehouse when none is given, so the metastore
+	// is not handed an empty path (which it rejects).
+	if db.LocationUri == "" {
+		db.LocationUri = defaultNamespaceLocation(c.opts.Warehouse, database)
+	}
+
+	if err := c.client.CreateDatabase(ctx, db); err != nil {
+		if isAlreadyExistsError(err) {
+			return fmt.Errorf("%w: %s", catalog.ErrNamespaceAlreadyExists, database)
+		}
+
+		return fmt.Errorf("failed to create namespace %s: %w", database, err)
+	}
+
+	return nil
+}
+
+// defaultNamespaceLocation derives <warehouse>/<db>.db, the metastore's
+// conventional database location, or "" when no warehouse is configured.
+func defaultNamespaceLocation(warehouse, database string) string {
+	if warehouse == "" {
+		return ""
+	}
+
+	return strings.TrimSuffix(warehouse, "/") + "/" + database + ".db"
+}
+
+// DropNamespace drops a namespace from the catalog.
+func (c *Catalog) DropNamespace(ctx context.Context, namespace table.Identifier) error {
+	database, err := identifierToDatabase(namespace)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.client.GetDatabase(ctx, database)
+	if err != nil {
+		if isNoSuchObjectError(err) {
+			return fmt.Errorf("%w: %s", catalog.ErrNoSuchNamespace, database)
+		}
+
+		return err
+	}
+
+	if err := c.client.DropDatabase(ctx, database, false, false); err != nil {
+		if isInvalidOperationError(err) {
+			return fmt.Errorf("%w: %s", catalog.ErrNamespaceNotEmpty, database)
+		}
+
+		return fmt.Errorf("failed to drop namespace %s: %w", database, err)
+	}
+
+	return nil
+}
+
+// CheckNamespaceExists checks if a namespace exists in the catalog.
+func (c *Catalog) CheckNamespaceExists(ctx context.Context, namespace table.Identifier) (bool, error) {
+	database, err := identifierToDatabase(namespace)
+	if err != nil {
+		return false, err
+	}
+
+	_, err = c.client.GetDatabase(ctx, database)
+	if err != nil {
+		if isNoSuchObjectError(err) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	return true, nil
+}
+
+// LoadNamespaceProperties loads the properties for a namespace.
+func (c *Catalog) LoadNamespaceProperties(ctx context.Context, namespace table.Identifier) (iceberg.Properties, error) {
+	database, err := identifierToDatabase(namespace)
+	if err != nil {
+		return nil, err
+	}
+
+	db, err := c.client.GetDatabase(ctx, database)
+	if err != nil {
+		if isNoSuchObjectError(err) {
+			return nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchNamespace, database)
+		}
+
+		return nil, fmt.Errorf("failed to get namespace %s: %w", database, err)
+	}
+
+	props := make(iceberg.Properties)
+	if db.Parameters != nil {
+		maps.Copy(props, db.Parameters)
+	}
+	if db.LocationUri != "" {
+		props[locationKey] = db.LocationUri
+	}
+	if db.Description != "" {
+		props[commentKey] = db.Description
+	}
+
+	return props, nil
+}
+
+//go:linkname getUpdatedPropsAndUpdateSummary github.com/apache/iceberg-go/catalog.getUpdatedPropsAndUpdateSummary
+func getUpdatedPropsAndUpdateSummary(currentProps iceberg.Properties, removals []string, updates iceberg.Properties) (iceberg.Properties, catalog.PropertiesUpdateSummary, error)
+
+// UpdateNamespaceProperties updates the properties for a namespace.
+func (c *Catalog) UpdateNamespaceProperties(ctx context.Context, namespace table.Identifier,
+	removals []string, updates iceberg.Properties,
+) (catalog.PropertiesUpdateSummary, error) {
+	currentProps, err := c.LoadNamespaceProperties(ctx, namespace)
+	if err != nil {
+		return catalog.PropertiesUpdateSummary{}, err
+	}
+
+	updatedProperties, propertiesUpdateSummary, err := getUpdatedPropsAndUpdateSummary(currentProps, removals, updates)
+	if err != nil {
+		return catalog.PropertiesUpdateSummary{}, err
+	}
+
+	database, _ := identifierToDatabase(namespace)
+
+	db := &hive_metastore.Database{
+		Name:       database,
+		Parameters: make(map[string]string),
+	}
+
+	for k, v := range updatedProperties {
+		switch k {
+		case locationKey, "Location":
+			db.LocationUri = v
+		case commentKey, descriptionKey, "Description":
+			db.Description = v
+		default:
+			db.Parameters[k] = v
+		}
+	}
+
+	if err := c.client.AlterDatabase(ctx, database, db); err != nil {
+		return catalog.PropertiesUpdateSummary{}, fmt.Errorf("failed to update namespace properties %s: %w", database, err)
+	}
+
+	return propertiesUpdateSummary, nil
+}
+
+// getIcebergTable retrieves a table and validates it's an Iceberg table.
+func (c *Catalog) getIcebergTable(ctx context.Context, database, tableName string) (*hive_metastore.Table, error) {
+	hiveTbl, err := c.client.GetTable(ctx, database, tableName)
+	if err != nil {
+		if isNoSuchObjectError(err) {
+			return nil, fmt.Errorf("%w: %s.%s", catalog.ErrNoSuchTable, database, tableName)
+		}
+
+		return nil, fmt.Errorf("failed to get table %s.%s: %w", database, tableName, err)
+	}
+
+	if !isIcebergTable(hiveTbl) {
+		return nil, fmt.Errorf("table %s.%s is not an Iceberg table", database, tableName)
+	}
+
+	return hiveTbl, nil
+}
+
+func identifierToTableName(identifier table.Identifier) (string, string, error) {
+	return identifierToObjectName(identifier, catalog.ValidateTableIdentifier, catalog.ErrNoSuchTable, "table")
+}
+
+func identifierToViewName(identifier table.Identifier) (string, string, error) {
+	return identifierToObjectName(identifier, catalog.ValidateViewIdentifier, catalog.ErrNoSuchView, "view")
+}
+
+func identifierToObjectName(identifier table.Identifier, validate func(table.Identifier) error, notFound error, objectType string) (string, string, error) {
+	if err := validate(identifier); err != nil {
+		return "", "", err
+	}
+	if len(identifier) != 2 {
+		return "", "", fmt.Errorf("%w: expected [database, %s], got %v", notFound, objectType, identifier)
+	}
+
+	return identifier[0], identifier[1], nil
+}
+
+func identifierToDatabase(identifier table.Identifier) (string, error) {
+	if len(identifier) != 1 {
+		return "", fmt.Errorf("invalid identifier, expected [database]: %v", identifier)
+	}
+
+	return identifier[0], nil
+}
+
+// TableIdentifier returns a table identifier for a Hive table.
+func TableIdentifier(database, tableName string) table.Identifier {
+	return []string{database, tableName}
+}
+
+// DatabaseIdentifier returns a database identifier for a Hive database.
+func DatabaseIdentifier(database string) table.Identifier {
+	return []string{database}
+}
+
+func isNoSuchObjectError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var noSuchObjectErr *hive_metastore.NoSuchObjectException
+	if errors.As(err, &noSuchObjectErr) {
+		return true
+	}
+
+	return strings.Contains(err.Error(), "NoSuchObjectException")
+}
+
+func isAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	return strings.Contains(errStr, "AlreadyExistsException") ||
+		strings.Contains(errStr, "already exists")
+}
+
+func isInvalidOperationError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	return strings.Contains(errStr, "InvalidOperationException") ||
+		strings.Contains(errStr, "is not empty")
+}

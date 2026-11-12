@@ -237,5 +237,6 @@ require (
 
 replace (
 	cloud.google.com/go/compute => cloud.google.com/go/compute v1.23.3
+	github.com/apache/iceberg-go => ./third_party/iceberg-go
 	google.golang.org/genproto => google.golang.org/genproto v0.0.0-20240123012728-ef4313101c80
 )

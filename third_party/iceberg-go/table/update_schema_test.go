@@ -1,0 +1,2623 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package table
+
+import (
+	"testing"
+
+	"github.com/apache/iceberg-go"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+var originalSchema = iceberg.NewSchema(1,
+	iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+	iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+	iceberg.NestedField{ID: 3, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: false, Doc: ""},
+	iceberg.NestedField{ID: 4, Name: "address", Type: &iceberg.StructType{
+		FieldList: []iceberg.NestedField{
+			{ID: 5, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			{ID: 6, Name: "zip", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+		},
+	}, Required: false, Doc: ""},
+	iceberg.NestedField{ID: 7, Name: "tags", Type: &iceberg.ListType{
+		ElementID:       8,
+		Element:         iceberg.PrimitiveTypes.String,
+		ElementRequired: false,
+	}, Required: false, Doc: ""},
+	iceberg.NestedField{ID: 9, Name: "properties", Type: &iceberg.MapType{
+		KeyID:         10,
+		KeyType:       iceberg.PrimitiveTypes.String,
+		ValueID:       11,
+		ValueType:     iceberg.PrimitiveTypes.String,
+		ValueRequired: false,
+	}, Required: false, Doc: ""},
+)
+
+var testMetadata, _ = NewMetadata(originalSchema, nil, UnsortedSortOrder, "", nil)
+
+func TestNewUpdateSchemaWithNilTransactionReturnsError(t *testing.T) {
+	err := NewUpdateSchema(nil, true, false).Commit()
+	require.ErrorIs(t, err, ErrInvalidMetadata)
+	assert.ErrorContains(t, err, "transaction is nil")
+}
+
+func TestAddColumn(t *testing.T) {
+	t.Run("test update schema with add primitive type on top level", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).AddColumn([]string{"gender"}, iceberg.PrimitiveTypes.String, "", false, iceberg.StringLiteral("male")).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		assert.Equal(t, []iceberg.NestedField{
+			{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+			{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			{ID: 3, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: false, Doc: ""},
+			{ID: 4, Name: "address", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 5, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+					{ID: 6, Name: "zip", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+				},
+			}, Required: false, Doc: ""},
+			{ID: 7, Name: "tags", Type: &iceberg.ListType{
+				ElementID:       8,
+				Element:         iceberg.PrimitiveTypes.String,
+				ElementRequired: false,
+			}, Required: false, Doc: ""},
+			{ID: 9, Name: "properties", Type: &iceberg.MapType{
+				KeyID:         10,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       11,
+				ValueType:     iceberg.PrimitiveTypes.String,
+				ValueRequired: false,
+			}, Required: false, Doc: ""},
+			{
+				ID:             12,
+				Name:           "gender",
+				Type:           iceberg.PrimitiveTypes.String,
+				Required:       false,
+				Doc:            "",
+				InitialDefault: "male",
+				WriteDefault:   "male",
+			},
+		}, newSchema.Fields())
+	})
+
+	t.Run("test update schema with add list of primitive type on top level", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).AddColumn([]string{"files"}, &iceberg.ListType{
+			Element:         iceberg.PrimitiveTypes.String,
+			ElementRequired: false,
+		}, "", false, nil).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		assert.Equal(t, []iceberg.NestedField{
+			{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+			{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			{ID: 3, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: false, Doc: ""},
+			{ID: 4, Name: "address", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 5, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+					{ID: 6, Name: "zip", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+				},
+			}, Required: false, Doc: ""},
+			{ID: 7, Name: "tags", Type: &iceberg.ListType{
+				ElementID:       8,
+				Element:         iceberg.PrimitiveTypes.String,
+				ElementRequired: false,
+			}, Required: false, Doc: ""},
+			{ID: 9, Name: "properties", Type: &iceberg.MapType{
+				KeyID:         10,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       11,
+				ValueType:     iceberg.PrimitiveTypes.String,
+				ValueRequired: false,
+			}, Required: false, Doc: ""},
+			{ID: 12, Name: "files", Type: &iceberg.ListType{
+				ElementID:       13,
+				Element:         iceberg.PrimitiveTypes.String,
+				ElementRequired: false,
+			}, Required: false, Doc: ""},
+		}, newSchema.Fields())
+	})
+
+	t.Run("test update schema with add map of primitive type on top level", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).AddColumn([]string{"files"}, &iceberg.MapType{
+			KeyType:       iceberg.PrimitiveTypes.String,
+			ValueType:     iceberg.PrimitiveTypes.String,
+			ValueRequired: false,
+		}, "", false, nil).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		assert.Equal(t, []iceberg.NestedField{
+			{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+			{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			{ID: 3, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: false, Doc: ""},
+			{ID: 4, Name: "address", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 5, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+					{ID: 6, Name: "zip", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+				},
+			}, Required: false, Doc: ""},
+			{ID: 7, Name: "tags", Type: &iceberg.ListType{
+				ElementID:       8,
+				Element:         iceberg.PrimitiveTypes.String,
+				ElementRequired: false,
+			}, Required: false, Doc: ""},
+			{ID: 9, Name: "properties", Type: &iceberg.MapType{
+				KeyID:         10,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       11,
+				ValueType:     iceberg.PrimitiveTypes.String,
+				ValueRequired: false,
+			}, Required: false, Doc: ""},
+			{ID: 12, Name: "files", Type: &iceberg.MapType{
+				KeyID:         13,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       14,
+				ValueType:     iceberg.PrimitiveTypes.String,
+				ValueRequired: false,
+			}, Required: false, Doc: ""},
+		}, newSchema.Fields())
+	})
+
+	t.Run("test update schema with add struct type on top level", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).AddColumn([]string{"files"}, &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 5, Name: "id", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+				{ID: 6, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			},
+		}, "", false, nil).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		assert.Equal(t, []iceberg.NestedField{
+			{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+			{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			{ID: 3, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: false, Doc: ""},
+			{ID: 4, Name: "address", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 5, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+					{ID: 6, Name: "zip", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+				},
+			}, Required: false, Doc: ""},
+			{ID: 7, Name: "tags", Type: &iceberg.ListType{
+				ElementID:       8,
+				Element:         iceberg.PrimitiveTypes.String,
+				ElementRequired: false,
+			}, Required: false, Doc: ""},
+			{ID: 9, Name: "properties", Type: &iceberg.MapType{
+				KeyID:         10,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       11,
+				ValueType:     iceberg.PrimitiveTypes.String,
+				ValueRequired: false,
+			}, Required: false, Doc: ""},
+			{ID: 12, Name: "files", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 13, Name: "id", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+					{ID: 14, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+				},
+			}, Required: false, Doc: ""},
+		}, newSchema.Fields())
+	})
+
+	t.Run("test update schema with add primitive in struct", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).AddColumn([]string{"address", "code"}, iceberg.PrimitiveTypes.String, "", false, nil).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		assert.Equal(t, []iceberg.NestedField{
+			{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+			{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			{ID: 3, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: false, Doc: ""},
+			{ID: 4, Name: "address", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 5, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+					{ID: 6, Name: "zip", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+					{ID: 12, Name: "code", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+				},
+			}, Required: false, Doc: ""},
+			{ID: 7, Name: "tags", Type: &iceberg.ListType{
+				ElementID:       8,
+				Element:         iceberg.PrimitiveTypes.String,
+				ElementRequired: false,
+			}, Required: false, Doc: ""},
+			{ID: 9, Name: "properties", Type: &iceberg.MapType{
+				KeyID:         10,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       11,
+				ValueType:     iceberg.PrimitiveTypes.String,
+				ValueRequired: false,
+			}, Required: false, Doc: ""},
+		}, newSchema.Fields())
+	})
+
+	t.Run("test update schema with add struct in struct", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).AddColumn([]string{"address", "code"}, &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 5, Name: "code-1", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+				{ID: 6, Name: "code-2", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			},
+		}, "", false, nil).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		assert.Equal(t, []iceberg.NestedField{
+			{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+			{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			{ID: 3, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: false, Doc: ""},
+			{ID: 4, Name: "address", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 5, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+					{ID: 6, Name: "zip", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+					{ID: 12, Name: "code", Type: &iceberg.StructType{
+						FieldList: []iceberg.NestedField{
+							{ID: 13, Name: "code-1", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+							{ID: 14, Name: "code-2", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+						},
+					}, Required: false, Doc: ""},
+				},
+			}},
+			{ID: 7, Name: "tags", Type: &iceberg.ListType{
+				ElementID:       8,
+				Element:         iceberg.PrimitiveTypes.String,
+				ElementRequired: false,
+			}, Required: false, Doc: ""},
+			{ID: 9, Name: "properties", Type: &iceberg.MapType{
+				KeyID:         10,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       11,
+				ValueType:     iceberg.PrimitiveTypes.String,
+				ValueRequired: false,
+			}, Required: false, Doc: ""},
+		}, newSchema.Fields())
+	})
+
+	t.Run("test update schema with multiple adds", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).AddColumn([]string{"address", "code"}, &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 5, Name: "code-1", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+				{ID: 6, Name: "code-2", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			},
+		}, "", false, nil).AddColumn([]string{"gender"}, iceberg.PrimitiveTypes.String, "", false, nil).AddColumn([]string{"files"}, &iceberg.ListType{
+			Element:         iceberg.PrimitiveTypes.String,
+			ElementRequired: false,
+		}, "", false, nil).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		assert.Equal(t, []iceberg.NestedField{
+			{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+			{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			{ID: 3, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: false, Doc: ""},
+			{ID: 4, Name: "address", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 5, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+					{ID: 6, Name: "zip", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+					{ID: 12, Name: "code", Type: &iceberg.StructType{
+						FieldList: []iceberg.NestedField{
+							{ID: 13, Name: "code-1", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+							{ID: 14, Name: "code-2", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+						},
+					}, Required: false, Doc: ""},
+				},
+			}, Required: false, Doc: ""},
+			{ID: 7, Name: "tags", Type: &iceberg.ListType{
+				ElementID:       8,
+				Element:         iceberg.PrimitiveTypes.String,
+				ElementRequired: false,
+			}, Required: false, Doc: ""},
+			{ID: 9, Name: "properties", Type: &iceberg.MapType{
+				KeyID:         10,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       11,
+				ValueType:     iceberg.PrimitiveTypes.String,
+				ValueRequired: false,
+			}, Required: false, Doc: ""},
+			{ID: 15, Name: "gender", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			{ID: 16, Name: "files", Type: &iceberg.ListType{
+				ElementID:       17,
+				Element:         iceberg.PrimitiveTypes.String,
+				ElementRequired: false,
+			}},
+		}, newSchema.Fields())
+	})
+
+	t.Run("test update schema with add geometry and geography columns", func(t *testing.T) {
+		metaV3, err := NewMetadata(originalSchema, nil, UnsortedSortOrder, "", iceberg.Properties{
+			PropertyFormatVersion: "3",
+		})
+		assert.NoError(t, err)
+
+		table := New([]string{"id"}, metaV3, "", nil, nil)
+		txn := table.NewTransaction()
+
+		geog, err := iceberg.GeographyTypeOf("srid:4269", "karney")
+		assert.NoError(t, err)
+
+		upd := NewUpdateSchema(txn, true, true).
+			AddColumn([]string{"geom"}, iceberg.GeometryType{}, "", false, nil).
+			AddColumn([]string{"geog"}, geog, "", false, nil)
+		err = upd.Commit()
+		assert.NoError(t, err)
+
+		newSchema := txn.meta.CurrentSchema()
+		assert.NotNil(t, newSchema)
+
+		geomField, ok := newSchema.FindFieldByName("geom")
+		assert.True(t, ok)
+		assert.Equal(t, 12, geomField.ID)
+		assert.Equal(t, iceberg.GeometryType{}, geomField.Type)
+
+		geogField, ok := newSchema.FindFieldByName("geog")
+		assert.True(t, ok)
+		assert.Equal(t, 13, geogField.ID)
+		assert.True(t, geogField.Type.Equals(geog))
+	})
+
+	t.Run("test update schema with add geometry and geography columns errors in v2", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		geog, err := iceberg.GeographyTypeOf("srid:4269", "karney")
+		assert.NoError(t, err)
+
+		upd := NewUpdateSchema(txn, true, true).
+			AddColumn([]string{"geom"}, iceberg.GeometryType{}, "", false, nil).
+			AddColumn([]string{"geog"}, geog, "", false, nil)
+		err = upd.Commit()
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, iceberg.ErrInvalidSchema)
+		assert.Contains(t, err.Error(), "is not supported until v3")
+	})
+}
+
+func TestApplyChanges(t *testing.T) {
+	t.Run("test apply changes on schema", func(t *testing.T) {
+		deletes := map[int]struct{}{
+			2: {},
+		}
+		updates := map[int]iceberg.NestedField{
+			3: {Name: "age", Type: iceberg.PrimitiveTypes.Int64, Required: true, Doc: ""},
+		}
+		adds := map[int][]iceberg.NestedField{
+			-1: {
+				{ID: 12, Name: "gender", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			},
+		}
+		moves := map[int][]move{
+			4: {
+				{FieldID: 6, RelativeTo: 5, Op: MoveOpBefore},
+			},
+		}
+
+		st, err := iceberg.Visit(originalSchema, &applyChanges{
+			deletes: deletes,
+			updates: updates,
+			adds:    adds,
+			moves:   moves,
+		})
+		assert.NoError(t, err)
+		assert.NotNil(t, st)
+
+		assert.Equal(t, []iceberg.NestedField{
+			{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+			{ID: 3, Name: "age", Type: iceberg.PrimitiveTypes.Int64, Required: true, Doc: ""},
+			{ID: 4, Name: "address", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 6, Name: "zip", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+					{ID: 5, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+				},
+			}, Required: false, Doc: ""},
+			{ID: 7, Name: "tags", Type: &iceberg.ListType{
+				ElementID:       8,
+				Element:         iceberg.PrimitiveTypes.String,
+				ElementRequired: false,
+			}, Required: false, Doc: ""},
+			{ID: 9, Name: "properties", Type: &iceberg.MapType{
+				KeyID:         10,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       11,
+				ValueType:     iceberg.PrimitiveTypes.String,
+				ValueRequired: false,
+			}, Required: false, Doc: ""},
+			{ID: 12, Name: "gender", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+		}, st.(*iceberg.StructType).Fields())
+	})
+
+	t.Run("test apply changes on add field that delete in same time", func(t *testing.T) {
+		originalSchema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+			iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			iceberg.NestedField{ID: 3, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: false, Doc: ""},
+		)
+		deletes := map[int]struct{}{
+			2: {},
+		}
+		adds := map[int][]iceberg.NestedField{
+			-1: {
+				{ID: 4, Name: "name", Type: iceberg.PrimitiveTypes.UUID, Required: false, Doc: ""},
+			},
+		}
+
+		st, err := iceberg.Visit(originalSchema, &applyChanges{
+			deletes: deletes,
+			adds:    adds,
+		})
+		assert.NoError(t, err)
+		assert.NotNil(t, st)
+
+		assert.Equal(t, []iceberg.NestedField{
+			{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+			{ID: 3, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: false, Doc: ""},
+			{ID: 4, Name: "name", Type: iceberg.PrimitiveTypes.UUID, Required: false, Doc: ""},
+		}, st.(*iceberg.StructType).Fields())
+	})
+
+	t.Run("test move with missing target fails", func(t *testing.T) {
+		_, err := iceberg.Visit(originalSchema, &applyChanges{
+			deletes: map[int]struct{}{2: {}},
+			moves: map[int][]move{
+				TableRootID: {{FieldID: 3, RelativeTo: 2, Op: MoveOpBefore}},
+			},
+		})
+		require.ErrorContains(t, err, "cannot move field 3: target field 2 not found")
+	})
+}
+
+func TestDeleteColumn(t *testing.T) {
+	t.Run("test delete top level column", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).DeleteColumn([]string{"name"}).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		fields := newSchema.Fields()
+		assert.Len(t, fields, 5)
+
+		fieldNames := make([]string, len(fields))
+		for i, field := range fields {
+			fieldNames[i] = field.Name
+		}
+		assert.Contains(t, fieldNames, "id")
+		assert.Contains(t, fieldNames, "age")
+		assert.Contains(t, fieldNames, "address")
+		assert.NotContains(t, fieldNames, "name")
+	})
+
+	t.Run("test delete nested column", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).DeleteColumn([]string{"address", "city"}).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		addressField, ok := newSchema.FindFieldByName("address")
+		assert.True(t, ok)
+
+		structType, ok := addressField.Type.(*iceberg.StructType)
+		assert.True(t, ok)
+		assert.Len(t, structType.Fields(), 1)
+		assert.Equal(t, "zip", structType.Fields()[0].Name)
+	})
+
+	t.Run("test delete non-existent column", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, true).DeleteColumn([]string{"non_existent"}).Apply()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "field not found")
+	})
+
+	t.Run("test delete top level column with own update fails", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, true).
+			UpdateColumn([]string{"age"}, ColumnUpdate{
+				Doc: iceberg.Optional[string]{Valid: true, Val: "the age"},
+			}).
+			DeleteColumn([]string{"age"}).
+			Apply()
+		require.ErrorContains(t, err, "field that has updates cannot be deleted: age")
+	})
+
+	t.Run("test delete nested column with own update fails", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, true).
+			UpdateColumn([]string{"address", "city"}, ColumnUpdate{
+				Doc: iceberg.Optional[string]{Valid: true, Val: "the city"},
+			}).
+			DeleteColumn([]string{"address", "city"}).
+			Apply()
+		require.ErrorContains(t, err, "field that has updates cannot be deleted: address.city")
+	})
+
+	t.Run("test delete parent struct with updated child succeeds", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).
+			UpdateColumn([]string{"address", "city"}, ColumnUpdate{
+				Doc: iceberg.Optional[string]{Valid: true, Val: "the city"},
+			}).
+			DeleteColumn([]string{"address"}).
+			Apply()
+		require.NoError(t, err)
+		require.NotNil(t, newSchema)
+
+		_, ok := newSchema.FindFieldByName("address")
+		assert.False(t, ok, "address struct should be deleted")
+
+		// The staged child update is discarded with its parent; every other
+		// top-level column must survive untouched.
+		for _, name := range []string{"id", "name", "age", "tags", "properties"} {
+			_, ok := newSchema.FindFieldByName(name)
+			assert.True(t, ok, "field %s should remain", name)
+		}
+	})
+
+	// deleting a column while an unrelated column has a pending update must still succeed,
+	// and that update must be applied to the surviving column.
+	t.Run("test delete column with unrelated pending update succeeds", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).
+			UpdateColumn([]string{"age"}, ColumnUpdate{
+				Doc: iceberg.Optional[string]{Valid: true, Val: "the age"},
+			}).
+			DeleteColumn([]string{"name"}).
+			Apply()
+		require.NoError(t, err)
+		require.NotNil(t, newSchema)
+
+		_, ok := newSchema.FindFieldByName("name")
+		assert.False(t, ok, "name column should be deleted")
+
+		ageField, ok := newSchema.FindFieldByName("age")
+		require.True(t, ok, "age column should remain")
+		assert.Equal(t, "the age", ageField.Doc, "unrelated update should still apply")
+	})
+}
+
+func TestUpdateColumn(t *testing.T) {
+	t.Run("test update column type", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).UpdateColumn([]string{"age"}, ColumnUpdate{
+			FieldType: iceberg.Optional[iceberg.Type]{Valid: true, Val: iceberg.PrimitiveTypes.Int64},
+		}).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		ageField, ok := newSchema.FindFieldByName("age")
+		assert.True(t, ok)
+		assert.Equal(t, iceberg.PrimitiveTypes.Int64, ageField.Type)
+	})
+
+	t.Run("test update column required", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).UpdateColumn([]string{"name"}, ColumnUpdate{
+			Required: iceberg.Optional[bool]{Valid: true, Val: true},
+		}).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		nameField, ok := newSchema.FindFieldByName("name")
+		assert.True(t, ok)
+		assert.True(t, nameField.Required)
+	})
+
+	t.Run("test update column doc", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).UpdateColumn([]string{"age"}, ColumnUpdate{
+			Doc: iceberg.Optional[string]{Valid: true, Val: "User's age in years"},
+		}).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		ageField, ok := newSchema.FindFieldByName("age")
+		assert.True(t, ok)
+		assert.Equal(t, "User's age in years", ageField.Doc)
+	})
+
+	t.Run("test write default on v2 table returns compatibility error", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		err := NewUpdateSchema(txn, true, true).UpdateColumn([]string{"age"}, ColumnUpdate{
+			WriteDefault: iceberg.Optional[iceberg.Literal]{
+				Valid: true,
+				Val:   iceberg.NewLiteral(int32(7)),
+			},
+		}).Commit()
+		require.ErrorContains(t, err, "invalid write default")
+		require.ErrorContains(t, err, "non-null default (7)")
+	})
+
+	t.Run("test valid write default is applied", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).UpdateColumn([]string{"age"}, ColumnUpdate{
+			WriteDefault: iceberg.Optional[iceberg.Literal]{Valid: true, Val: iceberg.NewLiteral(int32(7))},
+		}).Apply()
+		require.NoError(t, err)
+
+		ageField, ok := newSchema.FindFieldByName("age")
+		require.True(t, ok)
+		assert.Equal(t, int32(7), ageField.WriteDefault)
+	})
+
+	t.Run("test mistyped write default is rejected", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, true).UpdateColumn([]string{"age"}, ColumnUpdate{
+			WriteDefault: iceberg.Optional[iceberg.Literal]{Valid: true, Val: iceberg.NewLiteral("not-an-int")},
+		}).Apply()
+		require.ErrorContains(t, err, "invalid write-default for age")
+	})
+
+	t.Run("test write default validated against updated type", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		// Promote age to Int64 in the same update;
+		// the write-default must match the promoted type, so an int32 literal is rejected.
+		_, err := NewUpdateSchema(txn, true, true).UpdateColumn([]string{"age"}, ColumnUpdate{
+			FieldType:    iceberg.Optional[iceberg.Type]{Valid: true, Val: iceberg.PrimitiveTypes.Int64},
+			WriteDefault: iceberg.Optional[iceberg.Literal]{Valid: true, Val: iceberg.NewLiteral(int32(7))},
+		}).Apply()
+		require.ErrorContains(t, err, "invalid write-default for age")
+
+		// A default matching the promoted type is accepted.
+		txn = table.NewTransaction()
+		newSchema, err := NewUpdateSchema(txn, true, true).UpdateColumn([]string{"age"}, ColumnUpdate{
+			FieldType:    iceberg.Optional[iceberg.Type]{Valid: true, Val: iceberg.PrimitiveTypes.Int64},
+			WriteDefault: iceberg.Optional[iceberg.Literal]{Valid: true, Val: iceberg.NewLiteral(int64(7))},
+		}).Apply()
+		require.NoError(t, err)
+		ageField, ok := newSchema.FindFieldByName("age")
+		require.True(t, ok)
+		assert.Equal(t, int64(7), ageField.WriteDefault)
+	})
+
+	t.Run("test write default on non-primitive column is rejected", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, true).UpdateColumn([]string{"address"}, ColumnUpdate{
+			WriteDefault: iceberg.Optional[iceberg.Literal]{Valid: true, Val: iceberg.NewLiteral(int32(7))},
+		}).Apply()
+		require.ErrorContains(t, err, "invalid write-default for address")
+	})
+
+	t.Run("test clearing write default on optional column is allowed", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).UpdateColumn([]string{"age"}, ColumnUpdate{
+			WriteDefault: iceberg.Optional[iceberg.Literal]{Valid: true, Val: nil},
+		}).Apply()
+		require.NoError(t, err)
+
+		ageField, ok := newSchema.FindFieldByName("age")
+		require.True(t, ok)
+		assert.Nil(t, ageField.WriteDefault)
+	})
+
+	t.Run("test update non-existent column", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, true).UpdateColumn([]string{"non_existent"}, ColumnUpdate{
+			Doc: iceberg.Optional[string]{Valid: true, Val: "test"},
+		}).Apply()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "field not found")
+	})
+}
+
+func TestRenameColumn(t *testing.T) {
+	t.Run("test rename top level column", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).RenameColumn([]string{"name"}, "full_name").Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		_, ok := newSchema.FindFieldByName("name")
+		assert.False(t, ok)
+
+		field, ok := newSchema.FindFieldByName("full_name")
+		assert.True(t, ok)
+		assert.Equal(t, iceberg.PrimitiveTypes.String, field.Type)
+	})
+
+	t.Run("test rename nested column", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).RenameColumn([]string{"address", "city"}, "city_name").Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		addressField, ok := newSchema.FindFieldByName("address")
+		assert.True(t, ok)
+
+		structType, ok := addressField.Type.(*iceberg.StructType)
+		assert.True(t, ok)
+
+		fieldNames := make([]string, len(structType.Fields()))
+		for i, field := range structType.Fields() {
+			fieldNames[i] = field.Name
+		}
+		assert.Contains(t, fieldNames, "city_name")
+		assert.NotContains(t, fieldNames, "city")
+	})
+
+	t.Run("test rename to existing name", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, true).RenameColumn([]string{"name"}, "age").Apply()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "field already exists")
+	})
+}
+
+func TestMoveColumn(t *testing.T) {
+	t.Run("test move column to first", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).MoveFirst([]string{"age"}).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		fields := newSchema.Fields()
+		assert.Equal(t, "age", fields[0].Name)
+		assert.Equal(t, "id", fields[1].Name)
+	})
+
+	t.Run("test move column before", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).MoveBefore([]string{"age"}, []string{"name"}).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		fields := newSchema.Fields()
+		fieldNames := make([]string, len(fields))
+		for i, field := range fields {
+			fieldNames[i] = field.Name
+		}
+
+		ageIndex := -1
+		nameIndex := -1
+		for i, name := range fieldNames {
+			if name == "age" {
+				ageIndex = i
+			}
+			if name == "name" {
+				nameIndex = i
+			}
+		}
+
+		assert.True(t, ageIndex < nameIndex, "age should come before name")
+	})
+
+	t.Run("test move column after", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).MoveAfter([]string{"name"}, []string{"age"}).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		fields := newSchema.Fields()
+		fieldNames := make([]string, len(fields))
+		for i, field := range fields {
+			fieldNames[i] = field.Name
+		}
+
+		ageIndex := -1
+		nameIndex := -1
+		for i, name := range fieldNames {
+			if name == "age" {
+				ageIndex = i
+			}
+			if name == "name" {
+				nameIndex = i
+			}
+		}
+
+		assert.True(t, nameIndex > ageIndex, "name should come after age")
+	})
+
+	t.Run("test move non-existent column", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, true).MoveFirst([]string{"non_existent"}).Apply()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "field not found")
+	})
+}
+
+func TestMoveRelativeToDeletedColumnRejected(t *testing.T) {
+	tests := []struct {
+		name    string
+		build   func(*UpdateSchema) *UpdateSchema
+		wantErr string
+	}{
+		{
+			name: "delete then move before",
+			build: func(update *UpdateSchema) *UpdateSchema {
+				return update.DeleteColumn([]string{"name"}).MoveBefore([]string{"age"}, []string{"name"})
+			},
+			wantErr: "has been deleted",
+		},
+		{
+			name: "move before then delete",
+			build: func(update *UpdateSchema) *UpdateSchema {
+				return update.MoveBefore([]string{"age"}, []string{"name"}).DeleteColumn([]string{"name"})
+			},
+			wantErr: "cannot be deleted",
+		},
+		{
+			name: "delete then move after",
+			build: func(update *UpdateSchema) *UpdateSchema {
+				return update.DeleteColumn([]string{"name"}).MoveAfter([]string{"age"}, []string{"name"})
+			},
+			wantErr: "has been deleted",
+		},
+		{
+			name: "move after then delete",
+			build: func(update *UpdateSchema) *UpdateSchema {
+				return update.MoveAfter([]string{"age"}, []string{"name"}).DeleteColumn([]string{"name"})
+			},
+			wantErr: "cannot be deleted",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tbl := New([]string{"id"}, testMetadata, "", nil, nil)
+			_, err := tt.build(NewUpdateSchema(tbl.NewTransaction(), true, true)).Apply()
+			require.ErrorContains(t, err, tt.wantErr)
+			require.ErrorContains(t, err, "name")
+		})
+	}
+
+	t.Run("move then delete source", func(t *testing.T) {
+		tbl := New([]string{"id"}, testMetadata, "", nil, nil)
+		_, err := NewUpdateSchema(tbl.NewTransaction(), true, true).
+			MoveBefore([]string{"age"}, []string{"name"}).
+			DeleteColumn([]string{"age"}).
+			Apply()
+		require.ErrorContains(t, err, "cannot move field 3: field not found")
+	})
+
+	t.Run("delete with unrelated move", func(t *testing.T) {
+		tbl := New([]string{"id"}, testMetadata, "", nil, nil)
+		updated, err := NewUpdateSchema(tbl.NewTransaction(), true, true).
+			DeleteColumn([]string{"name"}).
+			MoveBefore([]string{"age"}, []string{"id"}).
+			Apply()
+		require.NoError(t, err)
+		fields := updated.Fields()
+		names := make([]string, len(fields))
+		for i, field := range fields {
+			names[i] = field.Name
+		}
+		require.Equal(t, []string{"age", "id", "address", "tags", "properties"}, names)
+	})
+
+	t.Run("nested move target cannot be deleted", func(t *testing.T) {
+		tbl := New([]string{"id"}, testMetadata, "", nil, nil)
+		_, err := NewUpdateSchema(tbl.NewTransaction(), true, true).
+			MoveBefore([]string{"address", "zip"}, []string{"address", "city"}).
+			DeleteColumn([]string{"address", "city"}).
+			Apply()
+		require.ErrorContains(t, err, "cannot be deleted: address.city")
+	})
+}
+
+func TestChainedOperations(t *testing.T) {
+	t.Run("test multiple operations in chain", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).
+			AddColumn([]string{"email"}, iceberg.PrimitiveTypes.String, "Email address", false, nil).
+			RenameColumn([]string{"name"}, "full_name").
+			UpdateColumn([]string{"age"}, ColumnUpdate{
+				Required: iceberg.Optional[bool]{Valid: true, Val: true},
+			}).
+			MoveFirst([]string{"email"}).
+			DeleteColumn([]string{"tags"}).
+			Apply()
+
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		fields := newSchema.Fields()
+		assert.Len(t, fields, 6)
+
+		assert.Equal(t, "email", fields[0].Name)
+
+		_, ok := newSchema.FindFieldByName("name")
+		assert.False(t, ok)
+		_, ok = newSchema.FindFieldByName("full_name")
+		assert.True(t, ok)
+
+		ageField, ok := newSchema.FindFieldByName("age")
+		assert.True(t, ok)
+		assert.True(t, ageField.Required)
+
+		_, ok = newSchema.FindFieldByName("tags")
+		assert.False(t, ok)
+	})
+}
+
+func TestSetIdentifierField(t *testing.T) {
+	t.Run("test set identifier field with single top-level field", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		// Test that SetIdentifierField returns the same UpdateSchema instance
+		updateSchema := NewUpdateSchema(txn, true, true)
+		updatedSchema := updateSchema.SetIdentifierField([][]string{{"id"}})
+		assert.Equal(t, updateSchema, updatedSchema) // Should return the same instance
+
+		newSchema, err := updatedSchema.Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		// Check that the schema has identifier field IDs set
+		assert.Len(t, newSchema.IdentifierFieldIDs, 1)
+		if len(newSchema.IdentifierFieldIDs) > 0 {
+			assert.Equal(t, 1, newSchema.IdentifierFieldIDs[0]) // id field has ID 1
+		}
+	})
+
+	t.Run("test set identifier field with multiple fields", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).SetIdentifierField([][]string{{"id"}, {"name"}}).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		// Check that the schema has identifier field IDs set
+		assert.Len(t, newSchema.IdentifierFieldIDs, 2)
+		assert.Contains(t, newSchema.IdentifierFieldIDs, 1) // id field
+		assert.Contains(t, newSchema.IdentifierFieldIDs, 2) // name field
+	})
+
+	t.Run("test set identifier field with case sensitive matching", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, true).SetIdentifierField([][]string{{"ID"}}).Apply()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "identifier field not found: ID")
+	})
+
+	t.Run("test set identifier field with case insensitive matching", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, false, true).SetIdentifierField([][]string{{"ID"}}).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		// Check that the schema has identifier field IDs set
+		assert.Len(t, newSchema.IdentifierFieldIDs, 1)
+		assert.Equal(t, 1, newSchema.IdentifierFieldIDs[0]) // id field (case insensitive match)
+	})
+
+	t.Run("test set identifier field with non-existent field", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, true).SetIdentifierField([][]string{{"non_existent"}}).Apply()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "identifier field not found: non_existent")
+	})
+
+	t.Run("test set identifier field with empty paths", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).SetIdentifierField([][]string{}).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		// Check that the schema has no identifier field IDs
+		assert.Len(t, newSchema.IdentifierFieldIDs, 0)
+	})
+
+	t.Run("test set identifier field chained with other operations", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).
+			AddColumn([]string{"email"}, iceberg.PrimitiveTypes.String, "", false, nil).
+			SetIdentifierField([][]string{{"id"}, {"email"}}).
+			Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		// Check that the schema has identifier field IDs set
+		assert.Len(t, newSchema.IdentifierFieldIDs, 2)
+		assert.Contains(t, newSchema.IdentifierFieldIDs, 1)  // id field
+		assert.Contains(t, newSchema.IdentifierFieldIDs, 12) // email field (newly added)
+	})
+
+	t.Run("test set identifier field with duplicate field paths", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).SetIdentifierField([][]string{{"id"}, {"id"}}).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		// Check that the schema has identifier field IDs set (duplicates should be deduplicated)
+		assert.Len(t, newSchema.IdentifierFieldIDs, 1)
+		assert.Equal(t, 1, newSchema.IdentifierFieldIDs[0]) // id field
+	})
+
+	t.Run("test set identifier field replaces existing identifier fields", func(t *testing.T) {
+		// Create a schema with existing identifier fields
+		schemaWithIdentifiers := iceberg.NewSchemaWithIdentifiers(1, []int{1}, // id is initially an identifier
+			iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+			iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+			iceberg.NestedField{ID: 3, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: false, Doc: ""},
+		)
+		metadata, _ := NewMetadata(schemaWithIdentifiers, nil, UnsortedSortOrder, "", nil)
+		table := New([]string{"id"}, metadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		// Set identifier fields to name instead of id
+		newSchema, err := NewUpdateSchema(txn, true, true).SetIdentifierField([][]string{{"name"}}).Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		// Check that only name is now an identifier field
+		assert.Len(t, newSchema.IdentifierFieldIDs, 1)
+		assert.Equal(t, 2, newSchema.IdentifierFieldIDs[0]) // name field has ID 2
+	})
+
+	t.Run("test set identifier field multiple times", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		// Set identifier fields multiple times - last one should win
+		newSchema, err := NewUpdateSchema(txn, true, true).
+			SetIdentifierField([][]string{{"id"}}).
+			SetIdentifierField([][]string{{"name"}}).
+			Apply()
+		assert.NoError(t, err)
+		assert.NotNil(t, newSchema)
+
+		// Check that only the last SetIdentifierField call is applied
+		assert.Len(t, newSchema.IdentifierFieldIDs, 1)
+		assert.Equal(t, 2, newSchema.IdentifierFieldIDs[0]) // name field has ID 2
+	})
+
+	t.Run("test rename then set identifier to old name fails", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, true).
+			RenameColumn([]string{"id"}, "new_id").
+			SetIdentifierField([][]string{{"id"}}).
+			Apply()
+		require.Error(t, err)
+		require.ErrorContains(t, err, "identifier field not found: id")
+	})
+
+	t.Run("test set identifier then rename tracks the new name", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		newSchema, err := NewUpdateSchema(txn, true, true).
+			SetIdentifierField([][]string{{"id"}}).
+			RenameColumn([]string{"id"}, "new_id").
+			Apply()
+		require.NoError(t, err)
+		require.NotNil(t, newSchema)
+
+		require.Len(t, newSchema.IdentifierFieldIDs, 1)
+		// Renamed field keeps ID 1
+		assert.Equal(t, 1, newSchema.IdentifierFieldIDs[0])
+		field, ok := newSchema.FindColumnName(1)
+		require.True(t, ok)
+		assert.Equal(t, "new_id", field)
+	})
+
+	t.Run("test delete then set identifier to deleted name fails", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, true).
+			DeleteColumn([]string{"name"}).
+			SetIdentifierField([][]string{{"name"}}).
+			Apply()
+		require.Error(t, err)
+		require.ErrorContains(t, err, "identifier field not found: name")
+	})
+}
+
+func TestSetIdentifierFieldDeterministicOrder(t *testing.T) {
+	t.Run("apply returns identifier field ids in sorted order", func(t *testing.T) {
+		const iterations = 50
+
+		var first *iceberg.Schema
+		for range iterations {
+			table := New([]string{"id"}, testMetadata, "", nil, nil)
+			txn := table.NewTransaction()
+
+			newSchema, err := NewUpdateSchema(txn, true, true).
+				SetIdentifierField([][]string{{"age"}, {"id"}, {"name"}}).
+				Apply()
+			require.NoError(t, err)
+			require.NotNil(t, newSchema)
+
+			assert.Equal(t, []int{1, 2, 3}, newSchema.IdentifierFieldIDs)
+
+			// Every independently-produced schema must compare equal, which is
+			// exactly the invariant the ordering bug breaks.
+			if first == nil {
+				first = newSchema
+			} else {
+				assert.True(t, first.Equals(newSchema),
+					"schemas produced by separate Apply() calls must be equal")
+			}
+		}
+	})
+}
+
+func TestErrorHandling(t *testing.T) {
+	t.Run("test incompatible changes without allowIncompatibleChanges", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, false).UpdateColumn([]string{"name"}, ColumnUpdate{
+			Required: iceberg.Optional[bool]{Valid: true, Val: true},
+		}).Apply()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot change column nullability from optional to required")
+	})
+
+	t.Run("test update geography CRS and edge algorithm without allowIncompatibleChanges", func(t *testing.T) {
+		currentGeog, err := iceberg.GeographyTypeOf("srid:4269", "karney")
+		assert.NoError(t, err)
+		targetGeog, err := iceberg.GeographyTypeOf("srid:4326", "spherical")
+		assert.NoError(t, err)
+
+		geoSchema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+			iceberg.NestedField{ID: 2, Name: "geog", Type: currentGeog, Required: false},
+		)
+		geoMeta, err := NewMetadata(geoSchema, nil, UnsortedSortOrder, "", iceberg.Properties{
+			PropertyFormatVersion: "3",
+		})
+		assert.NoError(t, err)
+
+		table := New([]string{"geo"}, geoMeta, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err = NewUpdateSchema(txn, true, false).UpdateColumn([]string{"geog"}, ColumnUpdate{
+			FieldType: iceberg.Optional[iceberg.Type]{Valid: true, Val: targetGeog},
+		}).Apply()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot promote geography(srid:4269, karney) to geography(srid:4326)")
+	})
+
+	t.Run("test add required field without default value", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, false).AddColumn([]string{"required_field"}, iceberg.PrimitiveTypes.String, "", true, nil).Apply()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "required field required_field has no default value")
+	})
+
+	t.Run("test add field with incompatible default value", func(t *testing.T) {
+		table := New([]string{"id"}, testMetadata, "", nil, nil)
+		txn := table.NewTransaction()
+
+		_, err := NewUpdateSchema(txn, true, true).AddColumn([]string{"age_field"}, iceberg.PrimitiveTypes.String, "", false, iceberg.Int32Literal(25)).Apply()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "default value type mismatch")
+	})
+}
+
+func TestBuildUpdates(t *testing.T) {
+	t.Run("test BuildUpdates sets correct schema ID when existing schema found", func(t *testing.T) {
+		previousSchema := iceberg.NewSchema(0,
+			iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+		)
+
+		currentSchema := iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+			iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false, Doc: ""},
+		)
+
+		metadata, _ := NewMetadata(previousSchema, iceberg.UnpartitionedSpec, UnsortedSortOrder, "", nil)
+		metadataBuilder, _ := MetadataBuilderFromBase(metadata, "")
+		_ = metadataBuilder.AddSchema(currentSchema)
+		_ = metadataBuilder.SetCurrentSchemaID(1)
+		metadata, _ = metadataBuilder.Build()
+
+		table := New([]string{"table"}, metadata, "", nil, nil)
+		txn := table.NewTransaction()
+		updateSchema := txn.UpdateSchema(true, false).DeleteColumn([]string{"name"})
+
+		updates, requirements, err := updateSchema.BuildUpdates()
+		assert.NoError(t, err)
+		assert.NotNil(t, requirements)
+		assert.Len(t, requirements, 1)
+		assert.IsType(t, &assertCurrentSchemaId{}, requirements[0])
+		assert.Equal(t, 1, requirements[0].(*assertCurrentSchemaId).CurrentSchemaID)
+		assert.NotNil(t, updates)
+		assert.Len(t, updates, 1)
+		assert.IsType(t, &setCurrentSchemaUpdate{}, updates[0])
+		assert.Equal(t, 0, updates[0].(*setCurrentSchemaUpdate).SchemaID)
+	})
+}
+
+// TestAddColumnMonotonicFieldIDs exercises the case where the table's
+// last-column-id is greater than the current schema's highest field id — for
+// example because a previous schema was added that introduced higher ids, or
+// because the highest-id columns were later dropped. The Iceberg spec requires
+// new field ids to be allocated above last-column-id (never to be reused), so
+// AddColumn must seed its id counter from metadata.LastColumnID() rather than
+// the current schema's HighestFieldID().
+func TestAddColumnMonotonicFieldIDs(t *testing.T) {
+	// Start from originalSchema (field ids 1..11, schema id 1).
+	baseMeta, err := NewMetadata(originalSchema, iceberg.UnpartitionedSpec, UnsortedSortOrder, "", nil)
+	assert.NoError(t, err)
+
+	// Add a second schema that introduces higher field ids. This bumps the
+	// metadata's last-column-id to 13 while the current schema is still the
+	// original (highest field id 11).
+	expanded := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 12, Name: "extra_a", Type: iceberg.PrimitiveTypes.String, Required: false},
+		iceberg.NestedField{ID: 13, Name: "extra_b", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+
+	builder, err := MetadataBuilderFromBase(baseMeta, "")
+	assert.NoError(t, err)
+	assert.NoError(t, builder.AddSchema(expanded))
+
+	meta, err := builder.Build()
+	assert.NoError(t, err)
+
+	assert.Equal(t, 11, meta.CurrentSchema().HighestFieldID(),
+		"precondition: current schema should still be the original with highest id 11")
+	assert.Equal(t, 13, meta.LastColumnID(),
+		"precondition: last-column-id should have been bumped by the expanded schema")
+
+	tbl := New([]string{"id"}, meta, "", nil, nil)
+	txn := tbl.NewTransaction()
+
+	newSchema, err := NewUpdateSchema(txn, true, true).
+		AddColumn([]string{"fresh"}, iceberg.PrimitiveTypes.String, "", false, nil).
+		Apply()
+	assert.NoError(t, err)
+	assert.NotNil(t, newSchema)
+
+	fresh, ok := newSchema.FindFieldByName("fresh")
+	assert.True(t, ok, "new field should be present in the resulting schema")
+	assert.Equal(t, 14, fresh.ID,
+		"new field id must be allocated above metadata.LastColumnID() (13), not reused from the current schema's highest id (11)")
+}
+
+func TestApplyChangesListElementOptionalityUpdates(t *testing.T) {
+	newListSchema := func(elementRequired bool, elementType iceberg.Type) *iceberg.Schema {
+		return iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+			iceberg.NestedField{ID: 2, Name: "tags", Type: &iceberg.ListType{
+				ElementID:       3,
+				Element:         elementType,
+				ElementRequired: elementRequired,
+			}, Required: false},
+		)
+	}
+
+	t.Run("required -> optional is applied", func(t *testing.T) {
+		meta, err := NewMetadata(newListSchema(true, iceberg.PrimitiveTypes.String), nil, UnsortedSortOrder, "", nil)
+		require.NoError(t, err)
+
+		table := New([]string{"id"}, meta, "", nil, nil)
+		newSchema, err := NewUpdateSchema(table.NewTransaction(), true, false).
+			UpdateColumn([]string{"tags", "element"}, ColumnUpdate{
+				Required: iceberg.Optional[bool]{Val: false, Valid: true},
+			}).Apply()
+		assert.NoError(t, err)
+
+		tags, ok := newSchema.FindFieldByName("tags")
+		require.True(t, ok, "tags field must be present in the applied schema")
+		listType, ok := tags.Type.(*iceberg.ListType)
+		require.True(t, ok, "tags must remain a ListType after apply")
+		assert.False(t, listType.ElementRequired,
+			"list element optionality update must be reflected in the applied schema")
+	})
+
+	t.Run("optional -> required is applied with allowIncompatibleChanges", func(t *testing.T) {
+		meta, err := NewMetadata(newListSchema(false, iceberg.PrimitiveTypes.String), nil, UnsortedSortOrder, "", nil)
+		require.NoError(t, err)
+
+		table := New([]string{"id"}, meta, "", nil, nil)
+		newSchema, err := NewUpdateSchema(table.NewTransaction(), true, true).
+			UpdateColumn([]string{"tags", "element"}, ColumnUpdate{
+				Required: iceberg.Optional[bool]{Val: true, Valid: true},
+			}).Apply()
+		assert.NoError(t, err)
+
+		tags, ok := newSchema.FindFieldByName("tags")
+		require.True(t, ok, "tags field must be present in the applied schema")
+		listType, ok := tags.Type.(*iceberg.ListType)
+		require.True(t, ok, "tags must remain a ListType after apply")
+		assert.True(t, listType.ElementRequired,
+			"list element optionality update must be reflected in the applied schema")
+	})
+
+	t.Run("optional -> required is rejected without allowIncompatibleChanges", func(t *testing.T) {
+		meta, err := NewMetadata(newListSchema(false, iceberg.PrimitiveTypes.String), nil, UnsortedSortOrder, "", nil)
+		require.NoError(t, err)
+
+		table := New([]string{"id"}, meta, "", nil, nil)
+		_, err = NewUpdateSchema(table.NewTransaction(), true, false).
+			UpdateColumn([]string{"tags", "element"}, ColumnUpdate{
+				Required: iceberg.Optional[bool]{Val: true, Valid: true},
+			}).Apply()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot change column nullability from optional to required")
+	})
+
+	t.Run("optionality change composes with type promotion", func(t *testing.T) {
+		meta, err := NewMetadata(newListSchema(true, iceberg.PrimitiveTypes.Int32), nil, UnsortedSortOrder, "", nil)
+		require.NoError(t, err)
+
+		table := New([]string{"id"}, meta, "", nil, nil)
+		newSchema, err := NewUpdateSchema(table.NewTransaction(), true, false).
+			UpdateColumn([]string{"tags", "element"}, ColumnUpdate{
+				FieldType: iceberg.Optional[iceberg.Type]{Val: iceberg.PrimitiveTypes.Int64, Valid: true},
+				Required:  iceberg.Optional[bool]{Val: false, Valid: true},
+			}).Apply()
+		assert.NoError(t, err)
+
+		tags, ok := newSchema.FindFieldByName("tags")
+		require.True(t, ok, "tags field must be present in the applied schema")
+		listType, ok := tags.Type.(*iceberg.ListType)
+		require.True(t, ok, "tags must remain a ListType after apply")
+		assert.True(t, iceberg.PrimitiveTypes.Int64.Equals(listType.Element),
+			"type promotion must still be applied alongside optionality change")
+		assert.False(t, listType.ElementRequired,
+			"optionality change must be applied alongside type promotion")
+	})
+
+	t.Run("type promotion alone preserves original ElementRequired", func(t *testing.T) {
+		meta, err := NewMetadata(newListSchema(true, iceberg.PrimitiveTypes.Int32), nil, UnsortedSortOrder, "", nil)
+		require.NoError(t, err)
+
+		table := New([]string{"id"}, meta, "", nil, nil)
+		newSchema, err := NewUpdateSchema(table.NewTransaction(), true, false).
+			UpdateColumn([]string{"tags", "element"}, ColumnUpdate{
+				FieldType: iceberg.Optional[iceberg.Type]{Val: iceberg.PrimitiveTypes.Int64, Valid: true},
+			}).Apply()
+		assert.NoError(t, err)
+
+		tags, ok := newSchema.FindFieldByName("tags")
+		require.True(t, ok, "tags field must be present in the applied schema")
+		listType, ok := tags.Type.(*iceberg.ListType)
+		require.True(t, ok, "tags must remain a ListType after apply")
+		assert.True(t, listType.ElementRequired,
+			"ElementRequired must be preserved from the original schema when no Required update is registered")
+	})
+
+	t.Run("doc-only update preserves original ElementRequired", func(t *testing.T) {
+		meta, err := NewMetadata(newListSchema(true, iceberg.PrimitiveTypes.String), nil, UnsortedSortOrder, "", nil)
+		require.NoError(t, err)
+
+		table := New([]string{"id"}, meta, "", nil, nil)
+		newSchema, err := NewUpdateSchema(table.NewTransaction(), true, false).
+			UpdateColumn([]string{"tags", "element"}, ColumnUpdate{
+				Doc: iceberg.Optional[string]{Val: "element doc", Valid: true},
+			}).Apply()
+		assert.NoError(t, err)
+
+		tags, ok := newSchema.FindFieldByName("tags")
+		require.True(t, ok, "tags field must be present in the applied schema")
+		listType, ok := tags.Type.(*iceberg.ListType)
+		require.True(t, ok, "tags must remain a ListType after apply")
+		assert.True(t, listType.ElementRequired,
+			"ElementRequired must be preserved when the registered update leaves Required unset")
+	})
+}
+
+func TestApplyChangesMapValueOptionalityUpdates(t *testing.T) {
+	newMapSchema := func(valueRequired bool, valueType iceberg.Type) *iceberg.Schema {
+		return iceberg.NewSchema(1,
+			iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+			iceberg.NestedField{ID: 2, Name: "properties", Type: &iceberg.MapType{
+				KeyID:         3,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       4,
+				ValueType:     valueType,
+				ValueRequired: valueRequired,
+			}, Required: false},
+		)
+	}
+
+	t.Run("required -> optional is applied", func(t *testing.T) {
+		meta, err := NewMetadata(newMapSchema(true, iceberg.PrimitiveTypes.String), nil, UnsortedSortOrder, "", nil)
+		require.NoError(t, err)
+
+		table := New([]string{"id"}, meta, "", nil, nil)
+		newSchema, err := NewUpdateSchema(table.NewTransaction(), true, false).
+			UpdateColumn([]string{"properties", "value"}, ColumnUpdate{
+				Required: iceberg.Optional[bool]{Val: false, Valid: true},
+			}).Apply()
+		assert.NoError(t, err)
+
+		props, ok := newSchema.FindFieldByName("properties")
+		require.True(t, ok, "properties field must be present in the applied schema")
+		mapType, ok := props.Type.(*iceberg.MapType)
+		require.True(t, ok, "properties must remain a MapType after apply")
+		assert.False(t, mapType.ValueRequired,
+			"map value optionality update must be reflected in the applied schema")
+	})
+
+	t.Run("optional -> required is applied with allowIncompatibleChanges", func(t *testing.T) {
+		meta, err := NewMetadata(newMapSchema(false, iceberg.PrimitiveTypes.String), nil, UnsortedSortOrder, "", nil)
+		require.NoError(t, err)
+
+		table := New([]string{"id"}, meta, "", nil, nil)
+		newSchema, err := NewUpdateSchema(table.NewTransaction(), true, true).
+			UpdateColumn([]string{"properties", "value"}, ColumnUpdate{
+				Required: iceberg.Optional[bool]{Val: true, Valid: true},
+			}).Apply()
+		assert.NoError(t, err)
+
+		props, ok := newSchema.FindFieldByName("properties")
+		require.True(t, ok, "properties field must be present in the applied schema")
+		mapType, ok := props.Type.(*iceberg.MapType)
+		require.True(t, ok, "properties must remain a MapType after apply")
+		assert.True(t, mapType.ValueRequired,
+			"map value optionality update must be reflected in the applied schema")
+	})
+
+	t.Run("optional -> required is rejected without allowIncompatibleChanges", func(t *testing.T) {
+		meta, err := NewMetadata(newMapSchema(false, iceberg.PrimitiveTypes.String), nil, UnsortedSortOrder, "", nil)
+		require.NoError(t, err)
+
+		table := New([]string{"id"}, meta, "", nil, nil)
+		_, err = NewUpdateSchema(table.NewTransaction(), true, false).
+			UpdateColumn([]string{"properties", "value"}, ColumnUpdate{
+				Required: iceberg.Optional[bool]{Val: true, Valid: true},
+			}).Apply()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot change column nullability from optional to required")
+	})
+
+	t.Run("optionality change composes with type promotion", func(t *testing.T) {
+		meta, err := NewMetadata(newMapSchema(true, iceberg.PrimitiveTypes.Int32), nil, UnsortedSortOrder, "", nil)
+		require.NoError(t, err)
+
+		table := New([]string{"id"}, meta, "", nil, nil)
+		newSchema, err := NewUpdateSchema(table.NewTransaction(), true, false).
+			UpdateColumn([]string{"properties", "value"}, ColumnUpdate{
+				FieldType: iceberg.Optional[iceberg.Type]{Val: iceberg.PrimitiveTypes.Int64, Valid: true},
+				Required:  iceberg.Optional[bool]{Val: false, Valid: true},
+			}).Apply()
+		assert.NoError(t, err)
+
+		props, ok := newSchema.FindFieldByName("properties")
+		require.True(t, ok, "properties field must be present in the applied schema")
+		mapType, ok := props.Type.(*iceberg.MapType)
+		require.True(t, ok, "properties must remain a MapType after apply")
+		assert.True(t, iceberg.PrimitiveTypes.Int64.Equals(mapType.ValueType),
+			"type promotion must still be applied alongside optionality change")
+		assert.False(t, mapType.ValueRequired,
+			"optionality change must be applied alongside type promotion")
+	})
+
+	t.Run("type promotion alone preserves original ValueRequired", func(t *testing.T) {
+		meta, err := NewMetadata(newMapSchema(true, iceberg.PrimitiveTypes.Int32), nil, UnsortedSortOrder, "", nil)
+		require.NoError(t, err)
+
+		table := New([]string{"id"}, meta, "", nil, nil)
+		newSchema, err := NewUpdateSchema(table.NewTransaction(), true, false).
+			UpdateColumn([]string{"properties", "value"}, ColumnUpdate{
+				FieldType: iceberg.Optional[iceberg.Type]{Val: iceberg.PrimitiveTypes.Int64, Valid: true},
+			}).Apply()
+		assert.NoError(t, err)
+
+		props, ok := newSchema.FindFieldByName("properties")
+		require.True(t, ok, "properties field must be present in the applied schema")
+		mapType, ok := props.Type.(*iceberg.MapType)
+		require.True(t, ok, "properties must remain a MapType after apply")
+		assert.True(t, mapType.ValueRequired,
+			"ValueRequired must be preserved from the original schema when no Required update is registered")
+	})
+
+	t.Run("doc-only update preserves original ValueRequired", func(t *testing.T) {
+		meta, err := NewMetadata(newMapSchema(true, iceberg.PrimitiveTypes.String), nil, UnsortedSortOrder, "", nil)
+		require.NoError(t, err)
+
+		table := New([]string{"id"}, meta, "", nil, nil)
+		newSchema, err := NewUpdateSchema(table.NewTransaction(), true, false).
+			UpdateColumn([]string{"properties", "value"}, ColumnUpdate{
+				Doc: iceberg.Optional[string]{Val: "value doc", Valid: true},
+			}).Apply()
+		assert.NoError(t, err)
+
+		props, ok := newSchema.FindFieldByName("properties")
+		require.True(t, ok, "properties field must be present in the applied schema")
+		mapType, ok := props.Type.(*iceberg.MapType)
+		require.True(t, ok, "properties must remain a MapType after apply")
+		assert.True(t, mapType.ValueRequired,
+			"ValueRequired must be preserved when the registered update leaves Required unset")
+	})
+}
+
+// TestAddColumnAfterDropHighestID is a regression test for #942.
+// It reproduces the exact scenario from the original bug: a column is added
+// (bumping last-column-id) then dropped (lowering the current schema's
+// HighestFieldID back down). A subsequent AddColumn must allocate an id above
+// last-column-id, not above HighestFieldID. Reverting #936 (i.e. seeding from
+// HighestFieldID instead of LastColumnID) causes the new column to reuse a
+// previously assigned id, which violates the Iceberg spec's monotonic id
+// invariant.
+func TestAddColumnAfterDropHighestID(t *testing.T) {
+	// originalSchema has field ids 1..11.
+	baseMeta, err := NewMetadata(originalSchema, iceberg.UnpartitionedSpec, UnsortedSortOrder, "", nil)
+	assert.NoError(t, err)
+	assert.Equal(t, 11, baseMeta.LastColumnID())
+
+	// Step 1: Add a column via UpdateSchema. This allocates id 12 and bumps
+	// last-column-id to 12.
+	tbl := New([]string{"id"}, baseMeta, "", nil, nil)
+	txn := tbl.NewTransaction()
+
+	withExtra, err := NewUpdateSchema(txn, true, true).
+		AddColumn([]string{"temp_col"}, iceberg.PrimitiveTypes.String, "", false, nil).
+		Apply()
+	assert.NoError(t, err)
+
+	tempCol, ok := withExtra.FindFieldByName("temp_col")
+	assert.True(t, ok)
+	assert.Equal(t, 12, tempCol.ID, "added column should get id 12")
+
+	// Persist the expanded schema into metadata so last-column-id is 12.
+	builder1, err := MetadataBuilderFromBase(baseMeta, "")
+	assert.NoError(t, err)
+	assert.NoError(t, builder1.AddSchema(withExtra))
+	assert.NoError(t, builder1.SetCurrentSchemaID(-1))
+
+	afterAdd, err := builder1.Build()
+	assert.NoError(t, err)
+	assert.Equal(t, 12, afterAdd.LastColumnID())
+	assert.Equal(t, 12, afterAdd.CurrentSchema().HighestFieldID())
+
+	// Step 2: Drop the highest-id column. The new current schema's
+	// HighestFieldID drops back to 11 while last-column-id stays at 12.
+	tbl2 := New([]string{"id"}, afterAdd, "", nil, nil)
+	txn2 := tbl2.NewTransaction()
+
+	afterDrop, err := NewUpdateSchema(txn2, true, true).
+		DeleteColumn([]string{"temp_col"}).
+		Apply()
+	assert.NoError(t, err)
+
+	_, found := afterDrop.FindFieldByName("temp_col")
+	assert.False(t, found, "temp_col should be gone after drop")
+
+	builder2, err := MetadataBuilderFromBase(afterAdd, "")
+	assert.NoError(t, err)
+	assert.NoError(t, builder2.AddSchema(afterDrop))
+	assert.NoError(t, builder2.SetCurrentSchemaID(-1))
+
+	afterDropMeta, err := builder2.Build()
+	assert.NoError(t, err)
+
+	assert.Equal(t, 11, afterDropMeta.CurrentSchema().HighestFieldID(),
+		"precondition: current schema's highest id should be 11 after dropping id-12 column")
+	assert.Equal(t, 12, afterDropMeta.LastColumnID(),
+		"precondition: last-column-id must still be 12 — ids are never reclaimed")
+
+	// Verify schema history still contains the dropped temp_col with id 12.
+	// A partial fix that strips dropped fields from historical schemas could
+	// still pass the id-monotonicity check above but break interop with
+	// Java/PyIceberg/Glue which expect historical schemas to be intact.
+	var foundInHistory bool
+	for _, s := range afterDropMeta.Schemas() {
+		if col, ok := s.FindFieldByID(12); ok {
+			assert.Equal(t, "temp_col", col.Name,
+				"historical schema must retain temp_col at id 12")
+			foundInHistory = true
+
+			break
+		}
+	}
+	assert.True(t, foundInHistory,
+		"dropped column (id 12) must still appear in at least one historical schema")
+
+	// Step 3: Add a new column. Its id must be 13 (last-column-id + 1), not
+	// 12 (HighestFieldID + 1). Using HighestFieldID would re-assign id 12,
+	// colliding with the dropped column still referenced by historical schemas.
+	tbl3 := New([]string{"id"}, afterDropMeta, "", nil, nil)
+	txn3 := tbl3.NewTransaction()
+
+	finalSchema, err := NewUpdateSchema(txn3, true, true).
+		AddColumn([]string{"new_col"}, iceberg.PrimitiveTypes.Int64, "", false, nil).
+		Apply()
+	assert.NoError(t, err)
+	assert.NotNil(t, finalSchema)
+
+	newCol, ok := finalSchema.FindFieldByName("new_col")
+	assert.True(t, ok, "new_col should be present in the final schema")
+	assert.Equal(t, 13, newCol.ID,
+		"new column id must be last-column-id+1 (13), not HighestFieldID+1 (12) — "+
+			"reusing 12 would collide with the dropped column still in historical schemas")
+}
+
+func unionTxn(t *testing.T, schema *iceberg.Schema) *Transaction {
+	t.Helper()
+	meta, err := NewMetadata(schema, nil, UnsortedSortOrder, "", nil)
+	require.NoError(t, err)
+
+	return New([]string{"tbl"}, meta, "", nil, nil).NewTransaction()
+}
+
+func TestUnionByNameAddTopLevelColumns(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false},
+		iceberg.NestedField{ID: 3, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	name, ok := applied.FindFieldByName("name")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.PrimitiveTypes.String, name.Type)
+	assert.False(t, name.Required)
+
+	age, ok := applied.FindFieldByName("age")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.PrimitiveTypes.Int32, age.Type)
+}
+
+func TestUnionByNameAddedColumnsAreOptional(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: true},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	data, ok := applied.FindFieldByName("data")
+	require.True(t, ok)
+	assert.False(t, data.Required)
+}
+
+func TestUnionByNameAddNestedStructField(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "address", Type: &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 3, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: false},
+			},
+		}, Required: false},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "address", Type: &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 3, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: false},
+				{ID: 4, Name: "zip", Type: iceberg.PrimitiveTypes.String, Required: false},
+			},
+		}, Required: false},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	zip, ok := applied.FindFieldByName("address.zip")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.PrimitiveTypes.String, zip.Type)
+
+	_, ok = applied.FindFieldByName("address.city")
+	assert.True(t, ok)
+}
+
+func TestUnionByNamePromoteType(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "amount", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "amount", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	amount, ok := applied.FindFieldByName("amount")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.PrimitiveTypes.Int64, amount.Type)
+}
+
+func TestUnionByNamePromoteFloatToDouble(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "amount", Type: iceberg.PrimitiveTypes.Float32, Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "amount", Type: iceberg.PrimitiveTypes.Float64, Required: true},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	amount, ok := applied.FindFieldByName("amount")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.PrimitiveTypes.Float64, amount.Type)
+}
+
+func TestUnionByNamePromoteDecimalPrecision(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "amount", Type: iceberg.DecimalTypeOf(9, 2), Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "amount", Type: iceberg.DecimalTypeOf(18, 2), Required: true},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	amount, ok := applied.FindFieldByName("amount")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.DecimalTypeOf(18, 2), amount.Type)
+}
+
+func TestUnionByNameIgnoreNarrowingType(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "amount", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "amount", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	amount, ok := applied.FindFieldByName("amount")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.PrimitiveTypes.Int64, amount.Type)
+}
+
+// An invalid (non-promotable) map value type change must error.
+func TestUnionByNameInvalidMapValueTypeChange(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+			KeyID: 2, KeyType: iceberg.PrimitiveTypes.String,
+			ValueID: 3, ValueType: iceberg.PrimitiveTypes.String, ValueRequired: false,
+		}, Required: false},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+			KeyID: 2, KeyType: iceberg.PrimitiveTypes.String,
+			ValueID: 3, ValueType: iceberg.PrimitiveTypes.Int64, ValueRequired: false,
+		}, Required: false},
+	)
+
+	_, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.Error(t, err, "map value string -> long is not a valid promotion")
+}
+
+func TestUnionByNamePromoteListElement(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "vals", Type: &iceberg.ListType{
+			ElementID: 2, Element: iceberg.PrimitiveTypes.Int32, ElementRequired: false,
+		}, Required: false},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "vals", Type: &iceberg.ListType{
+			ElementID: 2, Element: iceberg.PrimitiveTypes.Int64, ElementRequired: false,
+		}, Required: false},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	elem, ok := applied.FindFieldByName("vals.element")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.PrimitiveTypes.Int64, elem.Type)
+}
+
+func TestUnionByNameMakeColumnOptional(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	id, ok := applied.FindFieldByName("id")
+	require.True(t, ok)
+	assert.False(t, id.Required)
+}
+
+func TestUnionByNameUpdateDoc(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: "identifier"},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	id, ok := applied.FindFieldByName("id")
+	require.True(t, ok)
+	assert.Equal(t, "identifier", id.Doc)
+}
+
+func TestUnionByNameUpdateWriteDefaultOnly(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{
+			ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true,
+			InitialDefault: int32(34), WriteDefault: int32(35),
+		},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	id, ok := applied.FindFieldByName("id")
+	require.True(t, ok)
+	assert.Equal(t, int32(35), id.WriteDefault)
+	assert.Nil(t, id.InitialDefault)
+}
+
+func TestUnionByNameCaseSensitivity(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "ID", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+	)
+
+	t.Run("case sensitive adds a new column", func(t *testing.T) {
+		applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+		require.NoError(t, err)
+
+		_, ok := applied.FindFieldByName("id")
+		require.True(t, ok)
+		_, ok = applied.FindFieldByName("ID")
+		require.True(t, ok)
+	})
+
+	t.Run("case insensitive matches the existing column", func(t *testing.T) {
+		applied, err := NewUpdateSchema(unionTxn(t, current), false, false).UnionByNameWith(incoming).Apply()
+		require.NoError(t, err)
+
+		assert.Len(t, applied.Fields(), 1)
+		id, ok := applied.FindFieldByName("id")
+		require.True(t, ok)
+		assert.False(t, id.Required)
+	})
+}
+
+func TestUnionByNameIdenticalSchemaIsNoop(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(current).Apply()
+	require.NoError(t, err)
+	assert.Equal(t, current.AsStruct(), applied.AsStruct())
+}
+
+// Variant is not a primitive and has no nested children, so,
+// it must be recognized as an equal-type no-op.
+func TestUnionByNameUnchangedVariantIsNoop(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}, Required: false},
+	)
+	meta, err := NewMetadata(current, iceberg.UnpartitionedSpec, UnsortedSortOrder, "",
+		iceberg.Properties{PropertyFormatVersion: "3"})
+	require.NoError(t, err)
+	txn := New([]string{"tbl"}, meta, "", nil, nil).NewTransaction()
+
+	applied, err := NewUpdateSchema(txn, true, false).UnionByNameWith(current).Apply()
+	require.NoError(t, err)
+	assert.Equal(t, current.AsStruct(), applied.AsStruct())
+}
+
+func TestUnionByNameNilSchema(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+
+	_, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(nil).Apply()
+	assert.Error(t, err)
+}
+
+func TestUnionByNameRejectsMapKeyChange(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+			KeyID: 2, KeyType: iceberg.PrimitiveTypes.Int32,
+			ValueID: 3, ValueType: iceberg.PrimitiveTypes.String, ValueRequired: false,
+		}, Required: false},
+	)
+
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+			KeyID: 2, KeyType: iceberg.PrimitiveTypes.Int64,
+			ValueID: 3, ValueType: iceberg.PrimitiveTypes.String, ValueRequired: false,
+		}, Required: false},
+	)
+
+	_, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.Error(t, err, "widening map key promotion int -> long must be rejected")
+}
+
+func TestUnionByNameIgnoresNarrowingMapKey(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+			KeyID: 2, KeyType: iceberg.PrimitiveTypes.Int64,
+			ValueID: 3, ValueType: iceberg.PrimitiveTypes.String, ValueRequired: false,
+		}, Required: false},
+	)
+
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+			KeyID: 2, KeyType: iceberg.PrimitiveTypes.Int32,
+			ValueID: 3, ValueType: iceberg.PrimitiveTypes.String, ValueRequired: false,
+		}, Required: false},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	key, ok := applied.FindFieldByName("m.key")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.PrimitiveTypes.Int64, key.Type)
+}
+
+func TestUnionByNamePromoteMapValue(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+			KeyID: 2, KeyType: iceberg.PrimitiveTypes.String,
+			ValueID: 3, ValueType: iceberg.PrimitiveTypes.Int32, ValueRequired: false,
+		}, Required: false},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+			KeyID: 2, KeyType: iceberg.PrimitiveTypes.String,
+			ValueID: 3, ValueType: iceberg.PrimitiveTypes.Int64, ValueRequired: false,
+		}, Required: false},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	value, ok := applied.FindFieldByName("m.value")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.PrimitiveTypes.Int64, value.Type)
+}
+
+func TestUnionByNameAddNewNestedStructWithChildren(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "address", Type: &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 3, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: false},
+				{ID: 4, Name: "zip", Type: iceberg.PrimitiveTypes.String, Required: false},
+			},
+		}, Required: false},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	address, ok := applied.FindFieldByName("address")
+	require.True(t, ok)
+	assert.False(t, address.Required, "added struct must be optional")
+
+	city, ok := applied.FindFieldByName("address.city")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.PrimitiveTypes.String, city.Type)
+
+	zip, ok := applied.FindFieldByName("address.zip")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.PrimitiveTypes.String, zip.Type)
+}
+
+func TestUnionByNameAddFieldToListOfStruct(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "events", Type: &iceberg.ListType{
+			ElementID: 2, ElementRequired: false,
+			Element: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 3, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+				},
+			},
+		}, Required: false},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "events", Type: &iceberg.ListType{
+			ElementID: 2, ElementRequired: false,
+			Element: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 3, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+					{ID: 4, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false},
+				},
+			},
+		}, Required: false},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	name, ok := applied.FindFieldByName("events.element.name")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.PrimitiveTypes.String, name.Type)
+
+	_, ok = applied.FindFieldByName("events.element.id")
+	require.True(t, ok)
+}
+
+func TestUnionByNameAddFieldToMapValueStruct(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+			KeyID: 2, KeyType: iceberg.PrimitiveTypes.String,
+			ValueID: 3, ValueRequired: false,
+			ValueType: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 4, Name: "a", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+				},
+			},
+		}, Required: false},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "m", Type: &iceberg.MapType{
+			KeyID: 2, KeyType: iceberg.PrimitiveTypes.String,
+			ValueID: 3, ValueRequired: false,
+			ValueType: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 4, Name: "a", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+					{ID: 5, Name: "b", Type: iceberg.PrimitiveTypes.String, Required: false},
+				},
+			},
+		}, Required: false},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	b, ok := applied.FindFieldByName("m.value.b")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.PrimitiveTypes.String, b.Type)
+
+	_, ok = applied.FindFieldByName("m.value.a")
+	require.True(t, ok)
+}
+
+func TestUnionByNameEmptyDocDoesNotClearExisting(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: "original"},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true, Doc: ""},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	id, ok := applied.FindFieldByName("id")
+	require.True(t, ok)
+	assert.Equal(t, "original", id.Doc)
+}
+
+func TestUnionByNameAddedColumnPreservesInitialDefault(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{
+			ID: 2, Name: "count", Type: iceberg.PrimitiveTypes.Int32,
+			Required: false, InitialDefault: int32(42), WriteDefault: int32(42),
+		},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	count, ok := applied.FindFieldByName("count")
+	require.True(t, ok)
+	assert.Equal(t, int32(42), count.InitialDefault)
+	assert.Equal(t, int32(42), count.WriteDefault)
+}
+
+func TestUnionByNameRejectsInvalidAddedColumnDefault(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+
+	incomingInitial := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{
+			ID: 2, Name: "count", Type: iceberg.PrimitiveTypes.Int32,
+			Required: false, InitialDefault: "not-an-int",
+		},
+	)
+	_, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incomingInitial).Apply()
+	require.ErrorContains(t, err, "invalid initial-default for count")
+
+	incomingWrite := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{
+			ID: 2, Name: "when", Type: iceberg.PrimitiveTypes.Date,
+			Required: false, WriteDefault: "not-a-date",
+		},
+	)
+	_, err = NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incomingWrite).Apply()
+	require.ErrorContains(t, err, "invalid write-default for when")
+}
+
+func TestUnionByNameRejectsInvalidWriteDefaultUpdate(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{
+			ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true,
+			WriteDefault: "not-an-int",
+		},
+	)
+
+	_, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.ErrorContains(t, err, "invalid write-default for id")
+}
+
+func TestUnionByNameRejectsInvalidNestedAddedColumnDefault(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+
+	incomingStruct := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "addr", Required: false, Type: &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{
+					ID: 3, Name: "zip", Type: iceberg.PrimitiveTypes.Int32,
+					Required: false, InitialDefault: "not-an-int",
+				},
+			},
+		}},
+	)
+	_, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incomingStruct).Apply()
+	require.ErrorContains(t, err, "invalid initial-default for zip")
+
+	incomingMap := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "events", Required: false, Type: &iceberg.MapType{
+			KeyID: 3, KeyType: iceberg.PrimitiveTypes.String,
+			ValueID: 4, ValueRequired: false, ValueType: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{
+						ID: 5, Name: "when", Type: iceberg.PrimitiveTypes.Date,
+						Required: false, WriteDefault: "not-a-date",
+					},
+				},
+			},
+		}},
+	)
+	_, err = NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incomingMap).Apply()
+	require.ErrorContains(t, err, "invalid write-default for when")
+
+	incomingMapKey := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "lookup", Required: false, Type: &iceberg.MapType{
+			KeyID: 3, KeyType: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{
+						ID: 4, Name: "code", Type: iceberg.PrimitiveTypes.Int32,
+						Required: false, InitialDefault: "not-an-int",
+					},
+				},
+			},
+			ValueID: 5, ValueRequired: false, ValueType: iceberg.PrimitiveTypes.String,
+		}},
+	)
+	_, err = NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incomingMapKey).Apply()
+	require.ErrorContains(t, err, "invalid initial-default for code")
+}
+
+func TestUnionByNameRejectsMistypedNativeDefault(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{
+			ID: 2, Name: "count", Type: iceberg.PrimitiveTypes.Int32,
+			Required: false, InitialDefault: int64(5),
+		},
+	)
+
+	_, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.ErrorContains(t, err, "invalid initial-default for count")
+}
+
+func TestUnionByNamePromoteDecimalKeepsWiderWriteDefault(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "amount", Type: iceberg.DecimalTypeOf(9, 2), Required: true},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{
+			ID: 1, Name: "amount", Type: iceberg.DecimalTypeOf(18, 2), Required: true,
+			WriteDefault: "123456789.12",
+		},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	require.NoError(t, err)
+
+	amount, ok := applied.FindFieldByName("amount")
+	require.True(t, ok)
+	assert.Equal(t, iceberg.DecimalTypeOf(18, 2), amount.Type)
+	assert.Equal(t, "123456789.12", amount.WriteDefault)
+}
+
+func TestUnionByNameAddedComplexColumnDefault(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+
+	structType := func() *iceberg.StructType {
+		return &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 3, Name: "zip", Type: iceberg.PrimitiveTypes.String, Required: false},
+			},
+		}
+	}
+
+	valid := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{
+			ID: 2, Name: "addr", Required: false, Type: structType(),
+			InitialDefault: map[string]any{"zip": "00000"},
+		},
+	)
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(valid).Apply()
+	require.NoError(t, err)
+	addr, ok := applied.FindFieldByName("addr")
+	require.True(t, ok)
+	assert.Equal(t, map[string]any{"zip": "00000"}, addr.InitialDefault)
+
+	invalid := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{
+			ID: 2, Name: "addr", Required: false, Type: structType(),
+			InitialDefault: "not-json",
+		},
+	)
+	_, err = NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(invalid).Apply()
+	require.ErrorContains(t, err, "must have null or JSON object initial-default")
+}
+
+func TestUnionByNameCannotExtendStructAddedByPriorOp(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+
+	extend := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "addr", Required: false, Type: &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 3, Name: "zip", Type: iceberg.PrimitiveTypes.String, Required: false},
+			},
+		}},
+	)
+
+	_, err := NewUpdateSchema(unionTxn(t, current), true, true).
+		AddColumn([]string{"addr"}, &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 5, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: false},
+			},
+		}, "", false, nil).
+		UnionByNameWith(extend).
+		Apply()
+	require.ErrorContains(t, err, "field already exists in adds: addr")
+}
+
+func TestUnionByNameMirroredSchemas(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 9, Name: "s", Type: &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 8, Name: "inner", Type: iceberg.PrimitiveTypes.String, Required: false},
+			},
+		}, Required: false},
+		iceberg.NestedField{ID: 5, Name: "a", Type: iceberg.PrimitiveTypes.String, Required: false},
+		iceberg.NestedField{ID: 4, Name: "b", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+	mirrored := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "s", Type: &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 2, Name: "inner", Type: iceberg.PrimitiveTypes.String, Required: false},
+			},
+		}, Required: false},
+		iceberg.NestedField{ID: 3, Name: "a", Type: iceberg.PrimitiveTypes.String, Required: false},
+		iceberg.NestedField{ID: 4, Name: "b", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+
+	txn := unionTxn(t, current)
+	baseline := txn.meta.CurrentSchema().AsStruct()
+
+	applied, err := NewUpdateSchema(txn, true, false).UnionByNameWith(mirrored).Apply()
+	require.NoError(t, err)
+	assert.Equal(t, baseline, applied.AsStruct(),
+		"union operates by name; differing incoming field IDs must not cause changes")
+}
+
+func TestUnionByNameInvalidListElementTypeChange(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "vals", Type: &iceberg.ListType{
+			ElementID: 2, Element: iceberg.PrimitiveTypes.String, ElementRequired: false,
+		}, Required: false},
+	)
+	incoming := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "vals", Type: &iceberg.ListType{
+			ElementID: 2, Element: iceberg.PrimitiveTypes.Int64, ElementRequired: false,
+		}, Required: false},
+	)
+
+	_, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+	assert.Error(t, err, "list<string> -> list<long> is not a valid promotion")
+}
+
+// Cross-kind changes must be rejected outright
+func TestUnionByNameRejectsCrossKindChanges(t *testing.T) {
+	cases := []struct {
+		name        string
+		existing    iceberg.NestedField
+		incoming    iceberg.NestedField
+		errContains string
+	}{
+		{
+			name: "list -> map",
+			existing: iceberg.NestedField{ID: 1, Name: "c", Type: &iceberg.ListType{
+				ElementID: 2, Element: iceberg.PrimitiveTypes.Int32, ElementRequired: false,
+			}, Required: false},
+			incoming: iceberg.NestedField{ID: 1, Name: "c", Type: &iceberg.MapType{
+				KeyID: 2, KeyType: iceberg.PrimitiveTypes.String,
+				ValueID: 3, ValueType: iceberg.PrimitiveTypes.Int32, ValueRequired: false,
+			}, Required: false},
+			errContains: "cannot change column type",
+		},
+		{
+			name: "struct -> list",
+			existing: iceberg.NestedField{ID: 1, Name: "c", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 2, Name: "x", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+				},
+			}, Required: false},
+			incoming: iceberg.NestedField{ID: 1, Name: "c", Type: &iceberg.ListType{
+				ElementID: 2, Element: iceberg.PrimitiveTypes.Int32, ElementRequired: false,
+			}, Required: false},
+			errContains: "cannot change column type",
+		},
+		{
+			name: "map -> struct",
+			existing: iceberg.NestedField{ID: 1, Name: "c", Type: &iceberg.MapType{
+				KeyID: 2, KeyType: iceberg.PrimitiveTypes.String,
+				ValueID: 3, ValueType: iceberg.PrimitiveTypes.Int32, ValueRequired: false,
+			}, Required: false},
+			incoming: iceberg.NestedField{ID: 1, Name: "c", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 2, Name: "x", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+				},
+			}, Required: false},
+			errContains: "cannot change column type",
+		},
+		{
+			name:     "primitive -> struct",
+			existing: iceberg.NestedField{ID: 1, Name: "c", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+			incoming: iceberg.NestedField{ID: 1, Name: "c", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 2, Name: "x", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+				},
+			}, Required: false},
+			errContains: "cannot change column type",
+		},
+		{
+			name: "struct -> primitive",
+			existing: iceberg.NestedField{ID: 1, Name: "c", Type: &iceberg.StructType{
+				FieldList: []iceberg.NestedField{
+					{ID: 2, Name: "x", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+				},
+			}, Required: false},
+			incoming:    iceberg.NestedField{ID: 1, Name: "c", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+			errContains: "cannot change column type",
+		},
+		{
+			name: "list -> primitive",
+			existing: iceberg.NestedField{ID: 1, Name: "c", Type: &iceberg.ListType{
+				ElementID: 2, Element: iceberg.PrimitiveTypes.String, ElementRequired: false,
+			}, Required: false},
+			incoming:    iceberg.NestedField{ID: 1, Name: "c", Type: iceberg.PrimitiveTypes.String, Required: false},
+			errContains: "cannot change column type",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			current := iceberg.NewSchema(1, tc.existing)
+			incoming := iceberg.NewSchema(1, tc.incoming)
+
+			_, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.errContains)
+		})
+	}
+}
+
+func TestUnionByNameRejectsInvalidPromotions(t *testing.T) {
+	cases := []struct {
+		name     string
+		existing iceberg.Type
+		incoming iceberg.Type
+	}{
+		{"string -> binary", iceberg.PrimitiveTypes.String, iceberg.PrimitiveTypes.Binary},
+		{"binary -> string", iceberg.PrimitiveTypes.Binary, iceberg.PrimitiveTypes.String},
+		{"fixed[16] -> uuid", iceberg.FixedTypeOf(16), iceberg.PrimitiveTypes.UUID},
+		{"decimal scale widening", iceberg.DecimalTypeOf(10, 1), iceberg.DecimalTypeOf(10, 2)},
+		{"string -> int", iceberg.PrimitiveTypes.String, iceberg.PrimitiveTypes.Int32},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			current := iceberg.NewSchema(1,
+				iceberg.NestedField{ID: 1, Name: "c", Type: tc.existing, Required: false},
+			)
+			incoming := iceberg.NewSchema(1,
+				iceberg.NestedField{ID: 1, Name: "c", Type: tc.incoming, Required: false},
+			)
+
+			_, err := NewUpdateSchema(unionTxn(t, current), true, false).UnionByNameWith(incoming).Apply()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "cannot change column type")
+		})
+	}
+}
+
+// Two sequential UnionByNameWith calls on the same UpdateSchema must both
+// take effect when they contribute disjoint additions.
+func TestUnionByNameSequentialCalls(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	first := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+	// Note: second schema intentionally omits "name" so we don't retry an add
+	// that is already staged.
+	second := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "age", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+	)
+
+	applied, err := NewUpdateSchema(unionTxn(t, current), true, false).
+		UnionByNameWith(first).
+		UnionByNameWith(second).
+		Apply()
+	require.NoError(t, err)
+
+	_, ok := applied.FindFieldByName("name")
+	require.True(t, ok, "field added by first union must survive the second call")
+	_, ok = applied.FindFieldByName("age")
+	require.True(t, ok, "field added by second union must be present")
+}
+
+// A second UnionByNameWith that re-adds a field already staged by the first
+// must error rather than silently double-add.
+func TestUnionByNameRejectsOverlappingAdds(t *testing.T) {
+	current := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+	)
+	overlap := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+		iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+
+	_, err := NewUpdateSchema(unionTxn(t, current), true, false).
+		UnionByNameWith(overlap).
+		UnionByNameWith(overlap).
+		Apply()
+	require.Error(t, err, "re-adding a field already pending must be rejected")
+	assert.Contains(t, err.Error(), "name")
+}

@@ -1,0 +1,3740 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package table_test
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"io/fs"
+	"log"
+	"log/slog"
+	"maps"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/catalog/sql"
+	"github.com/apache/iceberg-go/internal"
+	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/table"
+	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+	"github.com/uptrace/bun/driver/sqliteshim"
+)
+
+type TableTestSuite struct {
+	suite.Suite
+
+	tbl *table.Table
+}
+
+func TestTable(t *testing.T) {
+	suite.Run(t, new(TableTestSuite))
+}
+
+func TestTableIdentifierIsolation(t *testing.T) {
+	meta, err := table.ParseMetadataBytes([]byte(table.ExampleTableMetadataV2))
+	require.NoError(t, err)
+
+	ident := table.Identifier{"db", "my_table"}
+	tbl := table.New(ident, meta, "s3://bucket/test/location/metadata.json", nil, nil)
+
+	ident[0] = "altered_ns"
+	require.Equal(t, table.Identifier{"db", "my_table"}, tbl.Identifier())
+
+	out := tbl.Identifier()
+	out[1] = "altered_table"
+	require.Equal(t, table.Identifier{"db", "my_table"}, tbl.Identifier())
+}
+
+func mustFS(t *testing.T, tbl *table.Table) iceio.IO {
+	r, err := tbl.FS(context.Background())
+	require.NoError(t, err)
+
+	return r
+}
+
+// mustFileSize returns the file size for a test path and fails the test on error.
+func mustFileSize(t *testing.T, path string) int64 {
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+
+	return info.Size()
+}
+
+// mustDataFile builds a test DataFile and fails the test if construction fails.
+// v3 requires the caller to supply first_row_id on files handed to
+// AddDataFiles, so stamp one when the suite is running against v3.
+func (t *TableWritingTestSuite) mustDataFile(spec iceberg.PartitionSpec, path string, partition map[int]any, count, size int64) iceberg.DataFile {
+	builder, err := iceberg.NewDataFileBuilder(spec, iceberg.EntryContentData, path, iceberg.ParquetFile, partition, nil, nil, count, size)
+	t.Require().NoError(err)
+
+	if t.formatVersion >= 3 {
+		builder = builder.FirstRowID(0)
+	}
+
+	return builder.Build()
+}
+
+func (t *TableTestSuite) SetupSuite() {
+	var mockfs internal.MockFS
+	mockfs.Test(t.T())
+	mockfs.On("Open", "s3://bucket/test/location/uuid.metadata.json").
+		Return(&internal.MockFile{Contents: bytes.NewReader([]byte(table.ExampleTableMetadataV2))}, nil)
+	defer mockfs.AssertExpectations(t.T())
+
+	tbl, err := table.NewFromLocation(
+		context.Background(),
+		[]string{"foo"},
+		"s3://bucket/test/location/uuid.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) {
+			return &mockfs, nil
+		},
+		nil,
+	)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl)
+
+	t.Equal([]string{"foo"}, tbl.Identifier())
+	t.Equal("s3://bucket/test/location/uuid.metadata.json", tbl.MetadataLocation())
+	t.Equal(&mockfs, mustFS(t.T(), tbl))
+
+	t.tbl = tbl
+}
+
+func (t *TableTestSuite) TestNewTableFromReadFile() {
+	var mockfsReadFile internal.MockFSReadFile
+	mockfsReadFile.Test(t.T())
+	mockfsReadFile.On("ReadFile", "s3://bucket/test/location/uuid.metadata.json").
+		Return([]byte(table.ExampleTableMetadataV2), nil)
+	defer mockfsReadFile.AssertExpectations(t.T())
+
+	tbl2, err := table.NewFromLocation(
+		t.T().Context(),
+		[]string{"foo"},
+		"s3://bucket/test/location/uuid.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) {
+			return &mockfsReadFile, nil
+		},
+		nil,
+	)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(t.tbl.Equals(*tbl2))
+}
+
+func (t *TableTestSuite) TestNewTableFromReadFileGzipped() {
+	var b bytes.Buffer
+	gzWriter := gzip.NewWriter(&b)
+
+	_, err := gzWriter.Write([]byte(table.ExampleTableMetadataV2))
+	if err != nil {
+		log.Fatalf("Error writing to gzip writer: %v", err)
+	}
+	err = gzWriter.Close()
+	if err != nil {
+		log.Fatalf("Error closing gzip writer: %v", err)
+	}
+
+	var mockfsReadFile internal.MockFSReadFile
+	mockfsReadFile.Test(t.T())
+	mockfsReadFile.On("ReadFile", "s3://bucket/test/location/uuid.gz.metadata.json").
+		Return(b.Bytes(), nil)
+	defer mockfsReadFile.AssertExpectations(t.T())
+
+	tbl2, err := table.NewFromLocation(
+		t.T().Context(),
+		[]string{"foo"},
+		"s3://bucket/test/location/uuid.gz.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) {
+			return &mockfsReadFile, nil
+		},
+		nil,
+	)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(t.tbl.Metadata().Equals(tbl2.Metadata()))
+}
+
+func (t *TableTestSuite) TestNewTableFromReadFileZstd() {
+	var b bytes.Buffer
+	enc, err := zstd.NewWriter(&b)
+	t.Require().NoError(err)
+
+	_, err = enc.Write([]byte(table.ExampleTableMetadataV2))
+	t.Require().NoError(err)
+	t.Require().NoError(enc.Close())
+
+	var mockfsReadFile internal.MockFSReadFile
+	mockfsReadFile.Test(t.T())
+	mockfsReadFile.On("ReadFile", "s3://bucket/test/location/uuid.zstd.metadata.json").
+		Return(b.Bytes(), nil)
+	defer mockfsReadFile.AssertExpectations(t.T())
+
+	tbl2, err := table.NewFromLocation(
+		t.T().Context(),
+		[]string{"foo"},
+		"s3://bucket/test/location/uuid.zstd.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) {
+			return &mockfsReadFile, nil
+		},
+		nil,
+	)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(t.tbl.Metadata().Equals(tbl2.Metadata()))
+}
+
+func (t *TableTestSuite) TestNewTableFromReadFileZstdAlternateSuffix() {
+	var b bytes.Buffer
+	enc, err := zstd.NewWriter(&b)
+	t.Require().NoError(err)
+
+	_, err = enc.Write([]byte(table.ExampleTableMetadataV2))
+	t.Require().NoError(err)
+	t.Require().NoError(enc.Close())
+
+	var mockfsReadFile internal.MockFSReadFile
+	mockfsReadFile.Test(t.T())
+	mockfsReadFile.On("ReadFile", "s3://bucket/test/location/uuid.metadata.json.zstd").
+		Return(b.Bytes(), nil)
+	defer mockfsReadFile.AssertExpectations(t.T())
+
+	tbl2, err := table.NewFromLocation(
+		t.T().Context(),
+		[]string{"foo"},
+		"s3://bucket/test/location/uuid.metadata.json.zstd",
+		func(ctx context.Context) (iceio.IO, error) {
+			return &mockfsReadFile, nil
+		},
+		nil,
+	)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(t.tbl.Metadata().Equals(tbl2.Metadata()))
+}
+
+func (t *TableTestSuite) TestNewTableFromOpenZstd() {
+	var b bytes.Buffer
+	enc, err := zstd.NewWriter(&b)
+	t.Require().NoError(err)
+
+	_, err = enc.Write([]byte(table.ExampleTableMetadataV2))
+	t.Require().NoError(err)
+	t.Require().NoError(enc.Close())
+
+	var mockfs internal.MockFS
+	mockfs.Test(t.T())
+	mockfs.On("Open", "s3://bucket/test/location/uuid.zstd.metadata.json").
+		Return(&internal.MockFile{Contents: bytes.NewReader(b.Bytes())}, nil)
+	defer mockfs.AssertExpectations(t.T())
+
+	tbl2, err := table.NewFromLocation(
+		t.T().Context(),
+		[]string{"foo"},
+		"s3://bucket/test/location/uuid.zstd.metadata.json",
+		func(ctx context.Context) (iceio.IO, error) {
+			return &mockfs, nil
+		},
+		nil,
+	)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(t.tbl.Metadata().Equals(tbl2.Metadata()))
+}
+
+func (t *TableTestSuite) TestNewTableFromOpenZstdAlternateSuffix() {
+	var b bytes.Buffer
+	enc, err := zstd.NewWriter(&b)
+	t.Require().NoError(err)
+
+	_, err = enc.Write([]byte(table.ExampleTableMetadataV2))
+	t.Require().NoError(err)
+	t.Require().NoError(enc.Close())
+
+	var mockfs internal.MockFS
+	mockfs.Test(t.T())
+	mockfs.On("Open", "s3://bucket/test/location/uuid.metadata.json.zstd").
+		Return(&internal.MockFile{Contents: bytes.NewReader(b.Bytes())}, nil)
+	defer mockfs.AssertExpectations(t.T())
+
+	tbl2, err := table.NewFromLocation(
+		t.T().Context(),
+		[]string{"foo"},
+		"s3://bucket/test/location/uuid.metadata.json.zstd",
+		func(ctx context.Context) (iceio.IO, error) {
+			return &mockfs, nil
+		},
+		nil,
+	)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(t.tbl.Metadata().Equals(tbl2.Metadata()))
+}
+
+func (t *TableTestSuite) TestSchema() {
+	t.True(t.tbl.Schema().Equals(iceberg.NewSchemaWithIdentifiers(1, []int{1, 2},
+		iceberg.NestedField{ID: 1, Name: "x", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "y", Type: iceberg.PrimitiveTypes.Int64, Required: true, Doc: "comment"},
+		iceberg.NestedField{ID: 3, Name: "z", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+	)))
+}
+
+func (t *TableTestSuite) TestPartitionSpec() {
+	t.Equal(iceberg.NewPartitionSpec(
+		iceberg.PartitionField{SourceIDs: []int{1}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "x"},
+	), t.tbl.Spec())
+}
+
+func (t *TableTestSuite) TestSortOrder() {
+	expected, err := table.NewSortOrder(
+		3,
+		[]table.SortField{
+			{SourceIDs: []int{2}, Transform: iceberg.IdentityTransform{}, Direction: table.SortASC, NullOrder: table.NullsFirst},
+			{SourceIDs: []int{3}, Transform: iceberg.BucketTransform{NumBuckets: 4}, Direction: table.SortDESC, NullOrder: table.NullsLast},
+		},
+	)
+	require.NoError(t.T(), err)
+	t.Equal(expected, t.tbl.SortOrder())
+}
+
+func (t *TableTestSuite) TestLocation() {
+	t.Equal("s3://bucket/test/location", t.tbl.Location())
+}
+
+func (t *TableTestSuite) TestSnapshot() {
+	var (
+		parentSnapshotID int64 = 3051729675574597004
+		one                    = 1
+		manifestList           = "s3://a/b/2.avro"
+	)
+
+	testSnapshot := table.Snapshot{
+		SnapshotID:       3055729675574597004,
+		ParentSnapshotID: &parentSnapshotID,
+		SequenceNumber:   1,
+		TimestampMs:      1555100955770,
+		ManifestList:     manifestList,
+		Summary:          &table.Summary{Operation: table.OpAppend, Properties: map[string]string{}},
+		SchemaID:         &one,
+	}
+	t.True(testSnapshot.Equals(*t.tbl.CurrentSnapshot()))
+
+	t.True(testSnapshot.Equals(*t.tbl.SnapshotByID(3055729675574597004)))
+}
+
+func (t *TableTestSuite) TestSnapshotByName() {
+	testSnapshot := table.Snapshot{
+		SnapshotID:   3051729675574597004,
+		TimestampMs:  1515100955770,
+		ManifestList: "s3://a/b/1.avro",
+		Summary:      &table.Summary{Operation: table.OpAppend},
+	}
+
+	t.True(testSnapshot.Equals(*t.tbl.SnapshotByName("test")))
+}
+
+type TableWritingTestSuite struct {
+	suite.Suite
+
+	ctx context.Context
+
+	tableSchema      *iceberg.Schema
+	arrSchema        *arrow.Schema
+	arrTbl           arrow.Table
+	arrSchemaWithIDs *arrow.Schema
+	arrTblWithIDs    arrow.Table
+	arrSchemaUpdated *arrow.Schema
+	arrTblUpdated    arrow.Table
+
+	tableSchemaPromotedTypes *iceberg.Schema
+	arrSchemaPromotedTypes   *arrow.Schema
+	arrTablePromotedTypes    arrow.Table
+
+	location      string
+	formatVersion int
+}
+
+func (t *TableWritingTestSuite) SetupSuite() {
+	t.ctx = context.Background()
+	mem := memory.DefaultAllocator
+
+	t.tableSchema = iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.Bool},
+		iceberg.NestedField{ID: 2, Name: "bar", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 4, Name: "baz", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 10, Name: "qux", Type: iceberg.PrimitiveTypes.Date})
+
+	t.arrSchema = arrow.NewSchema([]arrow.Field{
+		{Name: "foo", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
+		{Name: "bar", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "baz", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "qux", Type: arrow.PrimitiveTypes.Date32, Nullable: true},
+	}, nil)
+
+	var err error
+	t.arrTbl, err = array.TableFromJSON(mem, t.arrSchema, []string{
+		`[{"foo": true, "bar": "bar_string", "baz": 123, "qux": "2024-03-07"}]`,
+	})
+	t.Require().NoError(err)
+
+	t.arrSchemaWithIDs = arrow.NewSchema([]arrow.Field{
+		{
+			Name: "foo", Type: arrow.FixedWidthTypes.Boolean,
+			Metadata: arrow.MetadataFrom(map[string]string{"PARQUET:field_id": "1"}),
+		},
+		{
+			Name: "bar", Type: arrow.BinaryTypes.String,
+			Metadata: arrow.MetadataFrom(map[string]string{"PARQUET:field_id": "2"}),
+		},
+		{
+			Name: "baz", Type: arrow.PrimitiveTypes.Int32,
+			Metadata: arrow.MetadataFrom(map[string]string{"PARQUET:field_id": "3"}),
+		},
+		{
+			Name: "qux", Type: arrow.PrimitiveTypes.Date32,
+			Metadata: arrow.MetadataFrom(map[string]string{"PARQUET:field_id": "4"}),
+		},
+	}, nil)
+
+	t.arrTblWithIDs, err = array.TableFromJSON(mem, t.arrSchemaWithIDs, []string{
+		`[{"foo": true, "bar": "bar_string", "baz": 123, "qux": "2024-03-07"}]`,
+	})
+	t.Require().NoError(err)
+
+	t.arrSchemaUpdated = arrow.NewSchema([]arrow.Field{
+		{Name: "foo", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
+		{Name: "baz", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "qux", Type: arrow.PrimitiveTypes.Date32, Nullable: true},
+		{Name: "quux", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+	}, nil)
+
+	t.arrTblUpdated, err = array.TableFromJSON(mem, t.arrSchemaUpdated, []string{
+		`[{"foo": true, "baz": 123, "qux": "2024-03-07", "quux": 234}]`,
+	})
+	t.Require().NoError(err)
+
+	t.tableSchemaPromotedTypes = iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "long", Type: iceberg.PrimitiveTypes.Int64},
+		iceberg.NestedField{
+			ID: 2, Name: "list",
+			Type:     &iceberg.ListType{ElementID: 4, Element: iceberg.PrimitiveTypes.Int64},
+			Required: true,
+		},
+		iceberg.NestedField{
+			ID: 3, Name: "map",
+			Type: &iceberg.MapType{
+				KeyID:     5,
+				KeyType:   iceberg.PrimitiveTypes.String,
+				ValueID:   6,
+				ValueType: iceberg.PrimitiveTypes.Int64,
+			},
+			Required: true,
+		},
+		iceberg.NestedField{ID: 7, Name: "double", Type: iceberg.PrimitiveTypes.Float64})
+	// arrow-go needs to implement cast_extension for [16]byte -> uuid
+	// iceberg.NestedField{ID: 8, Name: "uuid", Type: iceberg.PrimitiveTypes.UUID})
+
+	t.arrSchemaPromotedTypes = arrow.NewSchema([]arrow.Field{
+		{Name: "long", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "list", Type: arrow.ListOf(arrow.PrimitiveTypes.Int32), Nullable: false},
+		{Name: "map", Type: arrow.MapOf(arrow.BinaryTypes.String, arrow.PrimitiveTypes.Int32), Nullable: false},
+		{Name: "double", Type: arrow.PrimitiveTypes.Float32, Nullable: true},
+	}, nil)
+	// arrow-go needs to implement cast_extension for [16]byte -> uuid
+	// {Name: "uuid", Type: &arrow.FixedSizeBinaryType{ByteWidth: 16}, Nullable: true}}, nil)
+
+	t.arrTablePromotedTypes, err = array.TableFromJSON(mem, t.arrSchemaPromotedTypes, []string{
+		`[
+			{"long": 1, "list": [1, 1], "map": [{"key": "a", "value": 1}], "double": 1.1, "uuid": "cVp4705TQImb+TrQ7pv1RQ=="},
+			{"long": 9, "list": [2, 2], "map": [{"key": "b", "value": 2}], "double": 9.2, "uuid": "l12HVF5KREqWl/R25AMM3g=="}
+		]`,
+	})
+	t.Require().NoError(err)
+}
+
+func (t *TableWritingTestSuite) SetupTest() {
+	t.location = filepath.ToSlash(strings.ReplaceAll(t.T().TempDir(), "#", ""))
+}
+
+func (t *TableWritingTestSuite) TearDownSuite() {
+	t.arrTbl.Release()
+	t.arrTblUpdated.Release()
+	t.arrTblWithIDs.Release()
+}
+
+func (t *TableWritingTestSuite) getMetadataLoc() string {
+	return fmt.Sprintf("%s/metadata/%05d-%s.metadata.json",
+		t.location, 1, uuid.New().String())
+}
+
+func (t *TableWritingTestSuite) writeParquet(fio iceio.WriteFileIO, filePath string, arrTbl arrow.Table) {
+	fo, err := fio.Create(filePath)
+	t.Require().NoError(err)
+
+	t.Require().NoError(pqarrow.WriteTable(arrTbl, fo, arrTbl.NumRows(),
+		nil, pqarrow.DefaultWriterProps()))
+}
+
+func (t *TableWritingTestSuite) writeParquetWithStoredSchema(fio iceio.WriteFileIO, filePath string, arrTbl arrow.Table) {
+	fo, err := fio.Create(filePath)
+	t.Require().NoError(err)
+
+	t.Require().NoError(pqarrow.WriteTable(arrTbl, fo, arrTbl.NumRows(),
+		nil, pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema())))
+}
+
+func (t *TableWritingTestSuite) createTable(identifier table.Identifier, formatVersion int, spec iceberg.PartitionSpec, sc *iceberg.Schema) *table.Table {
+	meta, err := table.NewMetadata(sc, &spec, table.UnsortedSortOrder,
+		t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(formatVersion)})
+	t.Require().NoError(err)
+
+	return table.New(
+		identifier,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return iceio.LocalFS{}, nil
+		},
+		&mockedCatalog{meta},
+	)
+}
+
+func (t *TableWritingTestSuite) TestAddFilesUnpartitioned() {
+	ident := table.Identifier{"default", "unpartitioned_table_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion,
+		*iceberg.UnpartitionedSpec, t.tableSchema)
+
+	t.NotNil(tbl)
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/unpartitioned/test-%d.parquet", t.location, i)
+		t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+		files = append(files, filePath)
+	}
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+
+	stagedTbl, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.NotNil(stagedTbl.NameMapping())
+
+	t.Equal(stagedTbl.CurrentSnapshot().Summary,
+		&table.Summary{
+			Operation: table.OpAppend,
+			Properties: iceberg.Properties{
+				"added-data-files":       "5",
+				"added-files-size":       "3080",
+				"added-records":          "5",
+				"iceberg-version":        "Apache Iceberg Go " + iceberg.Version(),
+				"total-data-files":       "5",
+				"total-delete-files":     "0",
+				"total-equality-deletes": "0",
+				"total-files-size":       "3080",
+				"total-position-deletes": "0",
+				"total-records":          "5",
+			},
+		})
+
+	scan, err := tx.Scan()
+	t.Require().NoError(err)
+
+	contents, err := scan.ToArrowTable(context.Background())
+	t.Require().NoError(err)
+	defer contents.Release()
+
+	t.EqualValues(5, contents.NumRows())
+}
+
+func (t *TableWritingTestSuite) TestAddFilesFileNotFound() {
+	ident := table.Identifier{"default", "unpartitioned_table_file_not_found_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion,
+		*iceberg.UnpartitionedSpec, t.tableSchema)
+
+	t.NotNil(tbl)
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/unpartitioned_file_not_found/test-%d.parquet", t.location, i)
+		t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+		files = append(files, filePath)
+	}
+
+	files = append(files, t.location+"/unpartitioned_file_not_found/unknown.parquet")
+	tx := tbl.NewTransaction()
+	err := tx.AddFiles(t.ctx, files, nil, false)
+	t.Error(err)
+	t.ErrorIs(err, fs.ErrNotExist)
+}
+
+func (t *TableWritingTestSuite) TestAddFilesUnpartitionedHasFieldIDs() {
+	ident := table.Identifier{"default", "unpartitioned_table_with_ids_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion,
+		*iceberg.UnpartitionedSpec, t.tableSchema)
+	t.Require().NotNil(tbl)
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/unpartitioned_with_ids/test-%d.parquet", t.location, i)
+		t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTblWithIDs)
+		files = append(files, filePath)
+	}
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+
+	stagedTbl, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.NotNil(stagedTbl.NameMapping())
+
+	scan, err := tx.Scan()
+	t.Require().NoError(err)
+
+	contents, err := scan.ToArrowTable(context.Background())
+	t.Require().NoError(err)
+	defer contents.Release()
+
+	t.EqualValues(5, contents.NumRows())
+}
+
+func (t *TableWritingTestSuite) TestAddFilesFieldIDsWithDifferentNames() {
+	ident := table.Identifier{"default", "unpartitioned_table_ids_diff_names_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion,
+		*iceberg.UnpartitionedSpec, t.tableSchema)
+	t.Require().NotNil(tbl)
+
+	renamedSchema := arrow.NewSchema([]arrow.Field{
+		{
+			Name: "alpha", Type: arrow.FixedWidthTypes.Boolean,
+			Metadata: arrow.MetadataFrom(map[string]string{"PARQUET:field_id": "1"}),
+		},
+		{
+			Name: "beta", Type: arrow.BinaryTypes.String,
+			Metadata: arrow.MetadataFrom(map[string]string{"PARQUET:field_id": "2"}),
+		},
+		{
+			Name: "gamma", Type: arrow.PrimitiveTypes.Int32,
+			Metadata: arrow.MetadataFrom(map[string]string{"PARQUET:field_id": "3"}),
+		},
+		{
+			Name: "delta", Type: arrow.PrimitiveTypes.Date32,
+			Metadata: arrow.MetadataFrom(map[string]string{"PARQUET:field_id": "4"}),
+		},
+	}, nil)
+
+	renamedTbl, err := array.TableFromJSON(memory.DefaultAllocator, renamedSchema, []string{
+		`[{"alpha": true, "beta": "bar_string", "gamma": 123, "delta": "2024-03-07"}]`,
+	})
+	t.Require().NoError(err)
+	defer renamedTbl.Release()
+
+	files := make([]string, 0, 5)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/unpartitioned_ids_diff_names/test-%d.parquet", t.location, i)
+		t.writeParquetWithStoredSchema(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, renamedTbl)
+		files = append(files, filePath)
+	}
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+
+	stagedTbl, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.NotNil(stagedTbl.NameMapping())
+
+	scan, err := tx.Scan()
+	t.Require().NoError(err)
+
+	contents, err := scan.ToArrowTable(context.Background())
+	t.Require().NoError(err)
+	defer contents.Release()
+
+	t.EqualValues(5, contents.NumRows())
+
+	expectedSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "foo", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
+		{Name: "bar", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "baz", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "qux", Type: arrow.PrimitiveTypes.Date32, Nullable: true},
+	}, nil)
+	t.Truef(expectedSchema.Equal(contents.Schema()),
+		"expected table schema names, got: %s", contents.Schema())
+
+	for i := range 5 {
+		t.Equal(true, contents.Column(0).Data().Chunk(i).(*array.Boolean).Value(0))
+		t.Equal("bar_string", contents.Column(1).Data().Chunk(i).(*array.String).Value(0))
+		t.Equal(int32(123), contents.Column(2).Data().Chunk(i).(*array.Int32).Value(0))
+		t.Equal(arrow.Date32(19789), contents.Column(3).Data().Chunk(i).(*array.Date32).Value(0))
+	}
+}
+
+func (t *TableWritingTestSuite) TestAddFilesFailsSchemaMismatch() {
+	ident := table.Identifier{"default", "unpartitioned_table_schema_mismatch_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion,
+		*iceberg.UnpartitionedSpec, t.tableSchema)
+	t.Require().NotNil(tbl)
+
+	wrongSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "foo", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
+		{Name: "bar", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "baz", Type: arrow.BinaryTypes.String, Nullable: true}, // should be int32
+		{Name: "qux", Type: arrow.PrimitiveTypes.Date32, Nullable: true},
+	}, nil)
+
+	filePath := fmt.Sprintf("%s/unpartitioned_schema_mismatch_v%d/test.parquet", t.location, t.formatVersion)
+	mismatchTable, err := array.TableFromJSON(memory.DefaultAllocator, wrongSchema, []string{
+		`[{"foo": true, "bar": "bar_string", "baz": "123", "qux": "2024-03-07"},
+		  {"foo": false, "bar": "bar_string", "baz": "456", "qux": "2024-03-07"}]`,
+	})
+	t.Require().NoError(err)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, mismatchTable)
+
+	files := []string{filePath}
+
+	tx := tbl.NewTransaction()
+	err = tx.AddFiles(t.ctx, files, nil, false)
+	t.Error(err)
+	t.EqualError(err, `error encountered during file conversion: invalid schema: mismatch in fields:
+   Table Field               Requested Field
+✅  1: foo: optional boolean  1: foo: optional boolean
+✅  2: bar: optional string   2: bar: optional string
+❌  3: baz: optional int      3: baz: optional string
+✅  4: qux: optional date     4: qux: optional date
+`)
+}
+
+func (t *TableWritingTestSuite) TestAddFilesPartitionedTable() {
+	ident := table.Identifier{"default", "partitioned_table_v" + strconv.Itoa(t.formatVersion)}
+	spec := iceberg.NewPartitionSpec(
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
+		iceberg.PartitionField{SourceIDs: []int{10}, FieldID: 1001, Transform: iceberg.MonthTransform{}, Name: "qux_month"})
+
+	tbl := t.createTable(ident, t.formatVersion,
+		spec, t.tableSchema)
+
+	t.NotNil(tbl)
+
+	dates := []string{
+		"2024-03-07", "2024-03-08", "2024-03-16", "2024-03-18", "2024-03-19",
+	}
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/partitioned_table/test-%d.parquet", t.location, i)
+		table, err := array.TableFromJSON(memory.DefaultAllocator, t.arrSchema, []string{
+			`[{"foo": true, "bar": "bar_string", "baz": 123, "qux": "` + dates[i] + `"}]`,
+		})
+		t.Require().NoError(err)
+		defer table.Release()
+
+		t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, table)
+		files = append(files, filePath)
+	}
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+
+	stagedTbl, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.NotNil(stagedTbl.NameMapping())
+
+	t.Equal(stagedTbl.CurrentSnapshot().Summary,
+		&table.Summary{
+			Operation: table.OpAppend,
+			Properties: iceberg.Properties{
+				"added-data-files":        "5",
+				"added-files-size":        "3080",
+				"added-records":           "5",
+				"changed-partition-count": "1",
+				"iceberg-version":         "Apache Iceberg Go " + iceberg.Version(),
+				"total-data-files":        "5",
+				"total-delete-files":      "0",
+				"total-equality-deletes":  "0",
+				"total-files-size":        "3080",
+				"total-position-deletes":  "0",
+				"total-records":           "5",
+			},
+		})
+
+	m, err := stagedTbl.CurrentSnapshot().Manifests(mustFS(t.T(), tbl))
+	t.Require().NoError(err)
+
+	for _, manifest := range m {
+		for e, err := range manifest.Entries(mustFS(t.T(), tbl), false) {
+			t.Require().NoError(err)
+			t.Equal(map[int]any{
+				1000: int32(123), 1001: int32(650),
+			}, e.DataFile().Partition())
+		}
+	}
+}
+
+func (t *TableWritingTestSuite) TestAddFilesToBucketPartitionedTableFails() {
+	ident := table.Identifier{"default", "partitioned_table_bucket_fails_v" + strconv.Itoa(t.formatVersion)}
+	spec := iceberg.NewPartitionSpec(
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.BucketTransform{NumBuckets: 3}, Name: "baz_bucket_3"})
+
+	tbl := t.createTable(ident, t.formatVersion, spec, t.tableSchema)
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/partitioned_table/test-%d.parquet", t.location, i)
+		table, err := array.TableFromJSON(memory.DefaultAllocator, t.arrSchema, []string{
+			`[{"foo": true, "bar": "bar_string", "baz": ` + strconv.Itoa(i) + `, "qux": "2024-03-07"}]`,
+		})
+		t.Require().NoError(err)
+		defer table.Release()
+
+		t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, table)
+		files = append(files, filePath)
+	}
+
+	tx := tbl.NewTransaction()
+	err := tx.AddFiles(t.ctx, files, nil, false)
+	t.Error(err)
+	t.ErrorContains(err, "cannot infer partition value from parquet metadata for a non-linear partition field: baz_bucket_3 with transform bucket[3]")
+}
+
+func (t *TableWritingTestSuite) TestAddFilesToPartitionedTableFailsLowerAndUpperMismatch() {
+	ident := table.Identifier{"default", "partitioned_table_bucket_fails_v" + strconv.Itoa(t.formatVersion)}
+	spec := iceberg.NewPartitionSpec(
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"})
+
+	tbl := t.createTable(ident, t.formatVersion, spec, t.tableSchema)
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/partitioned_table/test-%d.parquet", t.location, i)
+		table, err := array.TableFromJSON(memory.DefaultAllocator, t.arrSchema, []string{
+			`[
+				{"foo": true, "bar": "bar_string", "baz": 123, "qux": "2024-03-07"},
+				{"foo": true, "bar": "bar_string", "baz": 124, "qux": "2024-03-07"}
+			]`,
+		})
+		t.Require().NoError(err)
+		defer table.Release()
+
+		t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, table)
+		files = append(files, filePath)
+	}
+
+	tx := tbl.NewTransaction()
+	err := tx.AddFiles(t.ctx, files, nil, false)
+	t.Error(err)
+	t.ErrorContains(err, "cannot infer partition value from parquet metadata as there is more than one value for partition field: baz. (low: 123, high: 124)")
+}
+
+func (t *TableWritingTestSuite) TestAddFilesWithLargeAndRegular() {
+	ident := table.Identifier{"default", "unpartitioned_with_large_types_v" + strconv.Itoa(t.formatVersion)}
+	ice := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.String, Required: true})
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "foo", Type: arrow.BinaryTypes.String},
+	}, nil)
+	arrowSchemaLarge := arrow.NewSchema([]arrow.Field{
+		{Name: "foo", Type: arrow.BinaryTypes.LargeString},
+	}, nil)
+
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, ice)
+	t.Require().NotNil(tbl)
+
+	filePath := fmt.Sprintf("%s/unpartitioned_with_large_types/v%d/test-0.parquet", t.location, t.formatVersion)
+	filePathLarge := fmt.Sprintf("%s/unpartitioned_with_large_types/v%d/test-1.parquet", t.location, t.formatVersion)
+
+	arrTable, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+		`[{"foo": "bar"}]`,
+	})
+	t.Require().NoError(err)
+	defer arrTable.Release()
+
+	arrTableLarge, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchemaLarge,
+		[]string{`[{"foo": "bar"}]`})
+	t.Require().NoError(err)
+	defer arrTableLarge.Release()
+
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, arrTable)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePathLarge, arrTableLarge)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{filePath, filePathLarge}, nil, false))
+
+	scan, err := tx.Scan(table.WithOptions(iceberg.Properties{
+		table.ScanOptionArrowUseLargeTypes: "true",
+	}))
+	t.Require().NoError(err)
+
+	result, err := scan.ToArrowTable(context.Background())
+	t.Require().NoError(err)
+	defer result.Release()
+
+	t.EqualValues(2, result.NumRows())
+	t.Truef(arrowSchemaLarge.Equal(result.Schema()), "expected schema: %s, got: %s", arrowSchemaLarge, result.Schema())
+}
+
+func (t *TableWritingTestSuite) TestScanWithOptionsAliasing() {
+	ident := table.Identifier{"default", "test_scan_with_options_alias_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	filePath := fmt.Sprintf("%s/scan-with-options-alias-%d/test.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{filePath}, nil, false))
+
+	opts := iceberg.Properties{
+		table.ScanOptionArrowUseLargeTypes: "false",
+	}
+	scan, err := tx.Scan(table.WithOptions(opts))
+	t.Require().NoError(err)
+
+	opts[table.ScanOptionArrowUseLargeTypes] = "true"
+
+	result, err := scan.ToArrowTable(context.Background())
+	t.Require().NoError(err)
+	defer result.Release()
+
+	t.True(t.arrSchema.Equal(result.Schema()))
+}
+
+func (t *TableWritingTestSuite) TestAddFilesValidUpcast() {
+	ident := table.Identifier{"default", "test_table_with_valid_upcast_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchemaPromotedTypes)
+
+	filePath := fmt.Sprintf("%s/test_table_with_valid_upcast_v%d/test.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTablePromotedTypes)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{filePath}, nil, false))
+
+	scan, err := tx.Scan()
+	t.Require().NoError(err)
+
+	written, err := scan.ToArrowTable(context.Background())
+	t.Require().NoError(err)
+	defer written.Release()
+
+	t.EqualValues(2, written.NumRows())
+	expectedSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "long", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "list", Type: arrow.ListOf(arrow.PrimitiveTypes.Int64), Nullable: false},
+		{Name: "map", Type: arrow.MapOf(arrow.BinaryTypes.String, arrow.PrimitiveTypes.Int64), Nullable: false},
+		{Name: "double", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+	}, nil)
+	t.True(expectedSchema.Equal(written.Schema()))
+}
+
+func dropColFromTable(idx int, tbl arrow.Table) arrow.Table {
+	if idx < 0 || idx >= int(tbl.NumCols()) {
+		panic("invalid column to drop")
+	}
+
+	fields := tbl.Schema().Fields()
+	fields = append(fields[:idx], fields[idx+1:]...)
+
+	cols := make([]arrow.Column, 0, tbl.NumCols()-1)
+	for i := range int(tbl.NumCols()) {
+		if i == idx {
+			continue
+		}
+		cols = append(cols, *tbl.Column(i))
+	}
+
+	return array.NewTable(arrow.NewSchema(fields, nil), cols, tbl.NumRows())
+}
+
+func (t *TableWritingTestSuite) TestAddFilesSubsetOfSchema() {
+	ident := table.Identifier{"default", "test_table_with_subset_of_schema_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	filePath := fmt.Sprintf("%s/test_table_with_subset_of_schema_v%d/test.parquet", t.location, t.formatVersion)
+	withoutCol := dropColFromTable(0, t.arrTbl)
+	defer withoutCol.Release()
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, withoutCol)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{filePath}, nil, false))
+
+	scan, err := tx.Scan()
+	t.Require().NoError(err)
+
+	written, err := scan.ToArrowTable(context.Background())
+	t.Require().NoError(err)
+	defer written.Release()
+
+	t.EqualValues(1, written.NumRows())
+	expectedSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "foo", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
+		{Name: "bar", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "baz", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "qux", Type: arrow.PrimitiveTypes.Date32, Nullable: true},
+	}, nil)
+	t.True(expectedSchema.Equal(written.Schema()), expectedSchema.String(), written.Schema().String())
+
+	result, err := array.TableFromJSON(memory.DefaultAllocator, t.arrSchema, []string{
+		`[{"foo": null, "bar": "bar_string", "baz": 123, "qux": "2024-03-07"}]`,
+	})
+	t.Require().NoError(err)
+	defer result.Release()
+
+	t.True(array.TableEqual(result, written))
+}
+
+func (t *TableWritingTestSuite) TestAddFilesDuplicateFilesInFilePaths() {
+	ident := table.Identifier{"default", "test_table_with_duplicate_files_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	filePath := fmt.Sprintf("%s/test_table_with_duplicate_files_v%d/test.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	err := tx.AddFiles(t.ctx, []string{filePath, filePath}, nil, false)
+	t.Error(err)
+	t.ErrorContains(err, "file paths must be unique for AddFiles")
+}
+
+func (t *TableWritingTestSuite) TestAddFilesReferencedByCurrentSnapshot() {
+	ident := table.Identifier{"default", "add_files_referenced_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion,
+		*iceberg.UnpartitionedSpec, t.tableSchema)
+
+	t.NotNil(tbl)
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/add_files_referenced/test-%d.parquet", t.location, i)
+		t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+		files = append(files, filePath)
+	}
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+
+	err := tx.AddFiles(t.ctx, files[len(files)-1:], nil, false)
+	t.Error(err)
+	t.ErrorContains(err, "cannot add files that are already referenced by table, files:")
+}
+
+func (t *TableWritingTestSuite) TestAddFilesReferencedCurrentSnapshotIgnoreDuplicates() {
+	ident := table.Identifier{"default", "add_files_referenced_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion,
+		*iceberg.UnpartitionedSpec, t.tableSchema)
+
+	t.NotNil(tbl)
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/add_files_referenced/test-%d.parquet", t.location, i)
+		t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+		files = append(files, filePath)
+	}
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+
+	t.Require().NoError(tx.AddFiles(t.ctx, files[len(files)-1:], nil, true))
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+
+	added, existing, deleted := []int32{}, []int32{}, []int32{}
+	for m, err := range staged.AllManifests(t.T().Context()) {
+		t.Require().NoError(err)
+		added = append(added, m.AddedDataFiles())
+		existing = append(existing, m.ExistingDataFiles())
+		deleted = append(deleted, m.DeletedDataFiles())
+	}
+
+	t.Equal([]int32{5, 1, 5}, added)
+	t.Equal([]int32{0, 0, 0}, existing)
+	t.Equal([]int32{0, 0, 0}, deleted)
+}
+
+// mockedCatalog is necessary for overwrite operations to simulate catalog behavior
+// during transaction commits without requiring a real catalog implementation.
+type mockedCatalog struct {
+	metadata table.Metadata
+}
+
+func (m *mockedCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	return nil, nil
+}
+
+func (m *mockedCatalog) CommitTable(ctx context.Context, ident table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	meta, err := table.UpdateTableMetadata(m.metadata, updates, "")
+	if err != nil {
+		return nil, "", err
+	}
+
+	m.metadata = meta
+
+	return meta, "", nil
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFiles() {
+	fs := iceio.LocalFS{}
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/replace_data_files_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "replace_data_files_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion)})
+	t.Require().NoError(err)
+
+	ctx := context.Background()
+
+	tbl := table.New(
+		ident,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		&mockedCatalog{meta},
+	)
+	for i := range 5 {
+		tx := tbl.NewTransaction()
+		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		tbl, err = tx.Commit(ctx)
+		t.Require().NoError(err)
+	}
+
+	mflist, err := tbl.CurrentSnapshot().Manifests(mustFS(t.T(), tbl))
+	t.Require().NoError(err)
+	t.Len(mflist, 5)
+
+	// create a parquet file that is essentially as if we merged two of
+	// the data files together
+	cols := make([]arrow.Column, 0, t.arrTablePromotedTypes.NumCols())
+	for i := range int(t.arrTablePromotedTypes.NumCols()) {
+		chkd := t.arrTablePromotedTypes.Column(i).Data()
+		duplicated := arrow.NewChunked(chkd.DataType(), append(chkd.Chunks(), chkd.Chunks()...))
+		defer duplicated.Release()
+
+		col := arrow.NewColumn(t.arrSchemaPromotedTypes.Fields()[i], duplicated)
+		defer col.Release()
+
+		cols = append(cols, *col)
+	}
+
+	combined := array.NewTable(t.arrSchemaPromotedTypes, cols, -1)
+	defer combined.Release()
+
+	combinedFilePath := fmt.Sprintf("%s/replace_data_files_v%d/combined.parquet", t.location, t.formatVersion)
+	t.writeParquet(fs, combinedFilePath, combined)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.ReplaceDataFiles(ctx, files[:2], []string{combinedFilePath}, nil))
+
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+
+	t.Equal(&table.Summary{
+		Operation: table.OpOverwrite,
+		Properties: iceberg.Properties{
+			"added-data-files":       "1",
+			"added-files-size":       "967",
+			"added-records":          "4",
+			"deleted-data-files":     "2",
+			"deleted-records":        "4",
+			"iceberg-version":        "Apache Iceberg Go " + iceberg.Version(),
+			"removed-files-size":     "1822",
+			"total-data-files":       "4",
+			"total-delete-files":     "0",
+			"total-equality-deletes": "0",
+			"total-files-size":       "3700",
+			"total-position-deletes": "0",
+			"total-records":          "10",
+		},
+	}, staged.CurrentSnapshot().Summary)
+}
+
+func (t *TableWritingTestSuite) TestAddDataFiles() {
+	ident := table.Identifier{"default", "add_data_files_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	filePath := fmt.Sprintf("%s/add_data_files_v%d/test.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+
+	df := t.mustDataFile(*iceberg.UnpartitionedSpec, filePath, nil, 1, mustFileSize(t.T(), filePath))
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddDataFiles(t.ctx, []iceberg.DataFile{df}, nil))
+
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.Equal(table.OpAppend, staged.CurrentSnapshot().Summary.Operation)
+	t.Equal("1", staged.CurrentSnapshot().Summary.Properties["added-data-files"])
+}
+
+// TestAddDataFilesMultipleSpecs pins that a single commit may add data files
+// targeting any partition spec registered in the table metadata, with one
+// manifest written per spec — the shape of Java's MergingSnapshotProducer.
+// This is what allows writers to keep producing under a previous spec after a
+// partition evolution, and rewrites to migrate files between specs.
+func (t *TableWritingTestSuite) TestAddDataFilesMultipleSpecs() {
+	ident := table.Identifier{"default", "add_data_files_multispec_v" + strconv.Itoa(t.formatVersion)}
+	oldSpec := iceberg.NewPartitionSpec(
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
+	)
+	tbl := t.createTable(ident, t.formatVersion, oldSpec, t.tableSchema)
+
+	// Evolve the default spec; the identity(baz) spec 0 stays registered.
+	// Partition summaries are off by default, so opt in for the summary
+	// assertions below.
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.SetProperties(iceberg.Properties{table.WritePartitionSummaryLimitKey: "10"}))
+	t.Require().NoError(tx.UpdateSpec(false).AddField("bar", iceberg.IdentityTransform{}, "").Commit())
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+	newSpec := tbl.Spec()
+	t.Require().Equal(1, newSpec.ID())
+	t.Require().Len(tbl.Metadata().PartitionSpecs(), 2)
+
+	fs := mustFS(t.T(), tbl).(iceio.WriteFileIO)
+	oldPath := fmt.Sprintf("%s/%s/old-spec.parquet", t.location, ident[1])
+	newPath := fmt.Sprintf("%s/%s/new-spec.parquet", t.location, ident[1])
+	t.writeParquet(fs, oldPath, t.arrTbl)
+	t.writeParquet(fs, newPath, t.arrTbl)
+
+	// One file per spec, each with its partition tuple encoded under its own
+	// spec, committed in a single transaction. The row data is
+	// {baz: 123, bar: "bar_string"} in both files. v3 files must carry
+	// caller-supplied first-row-ids; make them disjoint (one row each).
+	newDataFile := func(spec iceberg.PartitionSpec, path string, partition map[int]any, firstRowID int64) iceberg.DataFile {
+		builder, err := iceberg.NewDataFileBuilder(spec, iceberg.EntryContentData,
+			path, iceberg.ParquetFile, partition, nil, nil, 1, mustFileSize(t.T(), path))
+		t.Require().NoError(err)
+		if t.formatVersion >= 3 {
+			builder = builder.FirstRowID(firstRowID)
+		}
+
+		return builder.Build()
+	}
+	fileOld := newDataFile(oldSpec, oldPath, map[int]any{1000: int32(123)}, 0)
+	fileNew := newDataFile(newSpec, newPath,
+		map[int]any{1000: int32(123), 1001: "bar_string"}, 1)
+
+	tx = tbl.NewTransaction()
+	t.Require().NoError(tx.AddDataFiles(t.ctx, []iceberg.DataFile{fileOld, fileNew}, nil))
+	tbl, err = tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	// One manifest per spec, each declaring its own spec id and carrying
+	// entries whose spec ids and partition tuples round-trip.
+	snap := tbl.CurrentSnapshot()
+	manifests, err := snap.Manifests(fs)
+	t.Require().NoError(err)
+	t.Require().Len(manifests, 2)
+
+	filesBySpec := map[int32]iceberg.DataFile{}
+	for _, m := range manifests {
+		numEntries := 0
+		for entry, err := range m.Entries(fs, false) {
+			t.Require().NoError(err)
+			numEntries++
+			df := entry.DataFile()
+			t.Equal(m.PartitionSpecID(), df.SpecID())
+			filesBySpec[m.PartitionSpecID()] = df
+		}
+		t.Equal(1, numEntries)
+	}
+	t.Require().Contains(filesBySpec, int32(0))
+	t.Require().Contains(filesBySpec, int32(1))
+	t.Equal(oldPath, filesBySpec[0].FilePath())
+	t.Equal(newPath, filesBySpec[1].FilePath())
+	t.Equal(int32(123), filesBySpec[0].Partition()[1000])
+	t.Equal(int32(123), filesBySpec[1].Partition()[1000])
+	t.Equal("bar_string", filesBySpec[1].Partition()[1001])
+
+	// The mixed-spec commit's summary renders each partition path with the
+	// file's own spec, not the default.
+	t.Equal("2", snap.Summary.Properties["added-data-files"])
+	t.Equal("2", snap.Summary.Properties["changed-partition-count"])
+	t.Contains(snap.Summary.Properties, "partitions.baz=123")
+	t.Contains(snap.Summary.Properties, "partitions.baz=123/bar=bar_string")
+
+	// Read back: a full scan returns the rows of both specs' files.
+	full, err := tbl.Scan().ToArrowTable(t.ctx)
+	t.Require().NoError(err)
+	defer full.Release()
+	t.EqualValues(2, full.NumRows())
+
+	// Partition pruning evaluates each manifest with its own spec. Neither
+	// file carries column stats, so only partition pruning can drop files.
+	planned := func(filter iceberg.BooleanExpression) []string {
+		tasks, err := tbl.Scan(table.WithRowFilter(filter)).PlanFiles(t.ctx)
+		t.Require().NoError(err)
+		paths := make([]string, 0, len(tasks))
+		for _, task := range tasks {
+			paths = append(paths, task.File.FilePath())
+		}
+
+		return paths
+	}
+	t.ElementsMatch([]string{oldPath, newPath},
+		planned(iceberg.EqualTo(iceberg.Reference("baz"), int32(123))))
+	// bar is a partition column only in the new spec: the new-spec manifest is
+	// pruned via its own spec while the old-spec file cannot be.
+	t.ElementsMatch([]string{oldPath},
+		planned(iceberg.EqualTo(iceberg.Reference("bar"), "nope")))
+	// baz prunes both manifests, each evaluated with its own spec.
+	t.Empty(planned(iceberg.EqualTo(iceberg.Reference("baz"), int32(456))))
+
+	// Row-id assignment (v3) is indifferent to the multi-spec grouping: the
+	// snapshot covers both groups' rows from a single first-row-id and the
+	// caller-supplied per-file ids round-trip unchanged.
+	if t.formatVersion >= 3 {
+		t.Require().NotNil(snap.FirstRowID)
+		t.EqualValues(0, *snap.FirstRowID)
+		t.Require().NotNil(snap.AddedRows)
+		t.EqualValues(2, *snap.AddedRows)
+		t.EqualValues(2, tbl.Metadata().NextRowID())
+		t.Require().NotNil(filesBySpec[0].FirstRowID())
+		t.EqualValues(0, *filesBySpec[0].FirstRowID())
+		t.Require().NotNil(filesBySpec[1].FirstRowID())
+		t.EqualValues(1, *filesBySpec[1].FirstRowID())
+	}
+
+	// A spec id that is not registered in the table metadata is rejected.
+	ghost := iceberg.NewPartitionSpecID(99,
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
+	)
+	fileGhost := t.mustDataFile(ghost, fmt.Sprintf("%s/%s/ghost.parquet", t.location, ident[1]),
+		map[int]any{1000: int32(123)}, 1, 1)
+	tx = tbl.NewTransaction()
+	err = tx.AddDataFiles(t.ctx, []iceberg.DataFile{fileGhost}, nil)
+	t.ErrorContains(err, "unregistered partition spec id 99")
+}
+
+func (t *TableWritingTestSuite) TestAddDataFilesAutoNameMapping() {
+	for _, tc := range []struct {
+		name      string
+		opts      []table.WriteOption
+		expectSet bool
+	}{
+		{"default", nil, true},
+		{"disabled", []table.WriteOption{table.WithoutAutoNameMapping()}, false},
+	} {
+		t.Run(tc.name, func() {
+			ident := table.Identifier{"default", fmt.Sprintf("add_data_files_name_mapping_%s_v%d", tc.name, t.formatVersion)}
+			tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+			_, hasMapping := tbl.Properties()[table.DefaultNameMappingKey]
+			t.False(hasMapping, "freshly created table should have no name mapping")
+
+			filePath := fmt.Sprintf("%s/%s/test.parquet", t.location, ident[1])
+			t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+			df := t.mustDataFile(*iceberg.UnpartitionedSpec, filePath, nil, 1, mustFileSize(t.T(), filePath))
+
+			tx := tbl.NewTransaction()
+			t.Require().NoError(tx.AddDataFiles(t.ctx, []iceberg.DataFile{df}, nil, tc.opts...))
+
+			staged, err := tx.StagedTable()
+			t.Require().NoError(err)
+			_, hasMapping = staged.Properties()[table.DefaultNameMappingKey]
+			t.Equal(tc.expectSet, hasMapping)
+		})
+	}
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesAutoNameMapping() {
+	for _, tc := range []struct {
+		name      string
+		opts      []table.WriteOption
+		expectSet bool
+	}{
+		{"default", nil, true},
+		{"disabled", []table.WriteOption{table.WithoutAutoNameMapping()}, false},
+	} {
+		t.Run(tc.name, func() {
+			ident := table.Identifier{"default", fmt.Sprintf("replace_data_files_name_mapping_%s_v%d", tc.name, t.formatVersion)}
+			tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+			filePath := fmt.Sprintf("%s/%s/data.parquet", t.location, ident[1])
+			t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+			df := t.mustDataFile(*iceberg.UnpartitionedSpec, filePath, nil, 1, mustFileSize(t.T(), filePath))
+
+			// Seed the table without setting a name mapping.
+			tx := tbl.NewTransaction()
+			t.Require().NoError(tx.AddDataFiles(t.ctx, []iceberg.DataFile{df}, nil, table.WithoutAutoNameMapping()))
+			tbl, err := tx.Commit(t.ctx)
+			t.Require().NoError(err)
+
+			_, hasMapping := tbl.Properties()[table.DefaultNameMappingKey]
+			t.False(hasMapping, "setup: table should have no name mapping")
+
+			replacementPath := fmt.Sprintf("%s/%s/replacement.parquet", t.location, ident[1])
+			t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), replacementPath, t.arrTbl)
+
+			deleteFile := t.mustDataFile(*iceberg.UnpartitionedSpec, filePath, nil, 1, mustFileSize(t.T(), filePath))
+			addFile := t.mustDataFile(*iceberg.UnpartitionedSpec, replacementPath, nil, 1, mustFileSize(t.T(), replacementPath))
+
+			tx = tbl.NewTransaction()
+			t.Require().NoError(tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil, tc.opts...))
+
+			staged, err := tx.StagedTable()
+			t.Require().NoError(err)
+			_, hasMapping = staged.Properties()[table.DefaultNameMappingKey]
+			t.Equal(tc.expectSet, hasMapping)
+		})
+	}
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFiles() {
+	ident := table.Identifier{"default", "replace_data_files_with_datafiles_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	files := make([]string, 0, 3)
+	for i := range 3 {
+		filePath := fmt.Sprintf("%s/replace_data_files_with_datafiles_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+		files = append(files, filePath)
+	}
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	replacementPath := fmt.Sprintf("%s/replace_data_files_with_datafiles_v%d/replacement.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), replacementPath, t.arrTbl)
+
+	deleteFiles := []iceberg.DataFile{
+		t.mustDataFile(*iceberg.UnpartitionedSpec, files[0], nil, 1, mustFileSize(t.T(), files[0])),
+		t.mustDataFile(*iceberg.UnpartitionedSpec, files[1], nil, 1, mustFileSize(t.T(), files[1])),
+	}
+	addFile := t.mustDataFile(*iceberg.UnpartitionedSpec, replacementPath, nil, 1, mustFileSize(t.T(), replacementPath))
+
+	tx = tbl.NewTransaction()
+	t.Require().NoError(tx.ReplaceDataFilesWithDataFiles(t.ctx, deleteFiles, []iceberg.DataFile{addFile}, nil))
+
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.Equal(table.OpOverwrite, staged.CurrentSnapshot().Summary.Operation)
+	t.Equal("1", staged.CurrentSnapshot().Summary.Properties["added-data-files"])
+	t.Equal("2", staged.CurrentSnapshot().Summary.Properties["deleted-data-files"])
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDoesNotCarryEmptyManifests() {
+	ident := table.Identifier{"default", "replace_data_files_drops_empty_manifests_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	writeDataFile := func(name string) iceberg.DataFile {
+		path := fmt.Sprintf("%s/%s/%s.parquet", t.location, ident[1], name)
+		t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), path, t.arrTbl)
+
+		return t.mustDataFile(*iceberg.UnpartitionedSpec, path, nil, 1, mustFileSize(t.T(), path))
+	}
+
+	current := writeDataFile("data-0")
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddDataFiles(t.ctx, []iceberg.DataFile{current}, nil))
+	var err error
+	tbl, err = tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	for i := 1; i <= 5; i++ {
+		next := writeDataFile(fmt.Sprintf("data-%d", i))
+		tx = tbl.NewTransaction()
+		t.Require().NoError(tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{current}, []iceberg.DataFile{next}, nil))
+		tbl, err = tx.Commit(t.ctx)
+		t.Require().NoError(err)
+		current = next
+	}
+
+	manifests, err := tbl.CurrentSnapshot().Manifests(mustFS(t.T(), tbl))
+	t.Require().NoError(err)
+	t.Len(manifests, 2, "repeated overwrites should keep only the current add manifest and current delete manifest")
+
+	var liveEntries, emptyCurrentManifests int
+	for _, manifest := range manifests {
+		manifestLiveEntries := 0
+		for entry, err := range manifest.Entries(mustFS(t.T(), tbl), true) {
+			t.Require().NoError(err)
+			t.Equal(current.FilePath(), entry.DataFile().FilePath())
+			manifestLiveEntries++
+			liveEntries++
+		}
+		if manifestLiveEntries == 0 {
+			t.Equal(tbl.CurrentSnapshot().SnapshotID, manifest.SnapshotID(), "only the current overwrite's delete manifest should remain empty")
+			emptyCurrentManifests++
+		}
+	}
+	t.Equal(1, liveEntries)
+	t.Equal(1, emptyCurrentManifests)
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartitionSpecID() {
+	ident := table.Identifier{"default", "replace_data_files_with_datafiles_spec_validation_v" + strconv.Itoa(t.formatVersion)}
+	spec := iceberg.NewPartitionSpec(
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
+	)
+	tbl := t.createTable(ident, t.formatVersion, spec, t.tableSchema)
+
+	existingPath := fmt.Sprintf("%s/replace_data_files_with_datafiles_spec_validation_v%d/existing.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	invalidSpec := iceberg.NewPartitionSpecID(999,
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
+	)
+
+	deleteFile := t.mustDataFile(spec, existingPath, map[int]any{1000: int32(123)}, 1, mustFileSize(t.T(), existingPath))
+	addFile := t.mustDataFile(invalidSpec,
+		fmt.Sprintf("%s/replace_data_files_with_datafiles_spec_validation_v%d/replacement.parquet", t.location, t.formatVersion),
+		map[int]any{1000: int32(123)}, 1, 1)
+
+	tx = tbl.NewTransaction()
+	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "unregistered partition spec id 999")
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartitionData() {
+	ident := table.Identifier{"default", "replace_data_files_with_datafiles_partition_validation_v" + strconv.Itoa(t.formatVersion)}
+	spec := iceberg.NewPartitionSpec(
+		iceberg.PartitionField{SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz"},
+	)
+	tbl := t.createTable(ident, t.formatVersion, spec, t.tableSchema)
+
+	existingPath := fmt.Sprintf("%s/replace_data_files_with_datafiles_partition_validation_v%d/existing.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	deleteFile := t.mustDataFile(spec, existingPath, map[int]any{1000: int32(123)}, 1, mustFileSize(t.T(), existingPath))
+	addFile := t.mustDataFile(spec,
+		fmt.Sprintf("%s/replace_data_files_with_datafiles_partition_validation_v%d/replacement.parquet", t.location, t.formatVersion),
+		map[int]any{}, 1, 1)
+
+	tx = tbl.NewTransaction()
+	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "missing partition value")
+}
+
+// ============================================================================
+// AddDataFiles Error Path Tests
+// ============================================================================
+
+func (t *TableWritingTestSuite) TestAddDataFilesDuplicateFilePaths() {
+	ident := table.Identifier{"default", "add_data_files_duplicate_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	filePath := fmt.Sprintf("%s/add_data_files_duplicate_v%d/test.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+
+	df := t.mustDataFile(*iceberg.UnpartitionedSpec, filePath, nil, 1, mustFileSize(t.T(), filePath))
+
+	tx := tbl.NewTransaction()
+	err := tx.AddDataFiles(t.ctx, []iceberg.DataFile{df, df}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "add data file paths must be unique for AddDataFiles")
+}
+
+func (t *TableWritingTestSuite) TestAddDataFilesAlreadyReferencedByTable() {
+	ident := table.Identifier{"default", "add_data_files_already_referenced_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	filePath := fmt.Sprintf("%s/add_data_files_already_referenced_v%d/test.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+
+	df := t.mustDataFile(*iceberg.UnpartitionedSpec, filePath, nil, 1, mustFileSize(t.T(), filePath))
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddDataFiles(t.ctx, []iceberg.DataFile{df}, nil))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	tx = tbl.NewTransaction()
+	err = tx.AddDataFiles(t.ctx, []iceberg.DataFile{df}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "cannot add files that are already referenced by table")
+}
+
+func (t *TableWritingTestSuite) TestAddDataFilesWithoutDuplicateCheck() {
+	ident := table.Identifier{"default", "add_data_files_skip_dup_check_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	filePath := fmt.Sprintf("%s/add_data_files_skip_dup_check_v%d/test.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+
+	df := t.mustDataFile(*iceberg.UnpartitionedSpec, filePath, nil, 1, mustFileSize(t.T(), filePath))
+
+	// Seed the table with an initial file.
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddDataFiles(t.ctx, []iceberg.DataFile{df}, nil))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	// Adding the same file again without the option should fail.
+	tx = tbl.NewTransaction()
+	err = tx.AddDataFiles(t.ctx, []iceberg.DataFile{df}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "cannot add files that are already referenced by table")
+
+	// Adding the same file again with WithoutDuplicateCheck should succeed.
+	tx = tbl.NewTransaction()
+	t.Require().NoError(tx.AddDataFiles(t.ctx, []iceberg.DataFile{df}, nil, table.WithoutDuplicateCheck()))
+
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.Equal(table.OpAppend, staged.CurrentSnapshot().Summary.Operation)
+}
+
+func (t *TableWritingTestSuite) TestAddDataFilesNilDataFile() {
+	ident := table.Identifier{"default", "add_data_files_nil_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	tx := tbl.NewTransaction()
+	err := tx.AddDataFiles(t.ctx, []iceberg.DataFile{nil}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "nil data file at index 0")
+}
+
+func (t *TableWritingTestSuite) TestAddDataFilesInvalidContentType() {
+	ident := table.Identifier{"default", "add_data_files_invalid_content_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	filePath := fmt.Sprintf("%s/add_data_files_invalid_content_v%d/test.parquet", t.location, t.formatVersion)
+
+	builder, err := iceberg.NewDataFileBuilder(*iceberg.UnpartitionedSpec, iceberg.EntryContentPosDeletes, filePath, iceberg.ParquetFile, nil, nil, nil, 1, 100)
+	t.Require().NoError(err)
+	df := builder.Build()
+
+	tx := tbl.NewTransaction()
+	err = tx.AddDataFiles(t.ctx, []iceberg.DataFile{df}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "adding files other than data files is not yet implemented")
+}
+
+func (t *TableWritingTestSuite) TestAddDataFilesEmptySlice() {
+	ident := table.Identifier{"default", "add_data_files_empty_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	tx := tbl.NewTransaction()
+	err := tx.AddDataFiles(t.ctx, []iceberg.DataFile{}, nil)
+	t.NoError(err)
+
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.Nil(staged.CurrentSnapshot())
+}
+
+// ============================================================================
+// ReplaceDataFilesWithDataFiles Error Path Tests
+// ============================================================================
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDuplicateAddPaths() {
+	ident := table.Identifier{"default", "replace_data_files_dup_add_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	existingPath := fmt.Sprintf("%s/replace_data_files_dup_add_v%d/existing.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	deleteFile := t.mustDataFile(*iceberg.UnpartitionedSpec, existingPath, nil, 1, mustFileSize(t.T(), existingPath))
+	addFile := t.mustDataFile(*iceberg.UnpartitionedSpec,
+		fmt.Sprintf("%s/replace_data_files_dup_add_v%d/new.parquet", t.location, t.formatVersion), nil, 1, 100)
+
+	tx = tbl.NewTransaction()
+	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile, addFile}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "add data file paths must be unique for ReplaceDataFilesWithDataFiles")
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDuplicateDeletePaths() {
+	ident := table.Identifier{"default", "replace_data_files_dup_del_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	existingPath := fmt.Sprintf("%s/replace_data_files_dup_del_v%d/existing.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	deleteFile := t.mustDataFile(*iceberg.UnpartitionedSpec, existingPath, nil, 1, mustFileSize(t.T(), existingPath))
+	addFile := t.mustDataFile(*iceberg.UnpartitionedSpec,
+		fmt.Sprintf("%s/replace_data_files_dup_del_v%d/new.parquet", t.location, t.formatVersion), nil, 1, 100)
+
+	tx = tbl.NewTransaction()
+	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile, deleteFile}, []iceberg.DataFile{addFile}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "delete data file paths must be unique for ReplaceDataFilesWithDataFiles")
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesAddAlreadyReferenced() {
+	ident := table.Identifier{"default", "replace_data_files_add_ref_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	existingPath1 := fmt.Sprintf("%s/replace_data_files_add_ref_v%d/existing1.parquet", t.location, t.formatVersion)
+	existingPath2 := fmt.Sprintf("%s/replace_data_files_add_ref_v%d/existing2.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath1, t.arrTbl)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath2, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath1, existingPath2}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	deleteFile := t.mustDataFile(*iceberg.UnpartitionedSpec, existingPath1, nil, 1, mustFileSize(t.T(), existingPath1))
+	addFile := t.mustDataFile(*iceberg.UnpartitionedSpec, existingPath2, nil, 1, mustFileSize(t.T(), existingPath2))
+
+	tx = tbl.NewTransaction()
+	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "cannot add files that are already referenced by table")
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDeleteNotInTable() {
+	ident := table.Identifier{"default", "replace_data_files_del_not_found_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	existingPath := fmt.Sprintf("%s/replace_data_files_del_not_found_v%d/existing.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	nonExistentFile := t.mustDataFile(*iceberg.UnpartitionedSpec,
+		fmt.Sprintf("%s/replace_data_files_del_not_found_v%d/nonexistent.parquet", t.location, t.formatVersion), nil, 1, 100)
+	addFile := t.mustDataFile(*iceberg.UnpartitionedSpec,
+		fmt.Sprintf("%s/replace_data_files_del_not_found_v%d/new.parquet", t.location, t.formatVersion), nil, 1, 100)
+
+	tx = tbl.NewTransaction()
+	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{nonExistentFile}, []iceberg.DataFile{addFile}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "cannot delete files that do not belong to the table")
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesNilDeleteFile() {
+	ident := table.Identifier{"default", "replace_data_files_nil_del_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	existingPath := fmt.Sprintf("%s/replace_data_files_nil_del_v%d/existing.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	addFile := t.mustDataFile(*iceberg.UnpartitionedSpec,
+		fmt.Sprintf("%s/replace_data_files_nil_del_v%d/new.parquet", t.location, t.formatVersion), nil, 1, 100)
+
+	tx = tbl.NewTransaction()
+	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{nil}, []iceberg.DataFile{addFile}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "nil data file at index 0")
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesNilAddFile() {
+	ident := table.Identifier{"default", "replace_data_files_nil_add_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	existingPath := fmt.Sprintf("%s/replace_data_files_nil_add_v%d/existing.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	deleteFile := t.mustDataFile(*iceberg.UnpartitionedSpec, existingPath, nil, 1, mustFileSize(t.T(), existingPath))
+
+	tx = tbl.NewTransaction()
+	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{nil}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "nil data file at index 0")
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesNoSnapshot() {
+	ident := table.Identifier{"default", "replace_data_files_no_snapshot_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	deleteFile := t.mustDataFile(*iceberg.UnpartitionedSpec,
+		fmt.Sprintf("%s/replace_data_files_no_snapshot_v%d/delete.parquet", t.location, t.formatVersion), nil, 1, 100)
+	addFile := t.mustDataFile(*iceberg.UnpartitionedSpec,
+		fmt.Sprintf("%s/replace_data_files_no_snapshot_v%d/add.parquet", t.location, t.formatVersion), nil, 1, 100)
+
+	tx := tbl.NewTransaction()
+	err := tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{addFile}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "cannot replace files in a table without an existing snapshot")
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesInvalidAddContentType() {
+	ident := table.Identifier{"default", "replace_data_files_invalid_add_content_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	existingPath := fmt.Sprintf("%s/replace_data_files_invalid_add_content_v%d/existing.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	deleteFile := t.mustDataFile(*iceberg.UnpartitionedSpec, existingPath, nil, 1, mustFileSize(t.T(), existingPath))
+
+	builder, err := iceberg.NewDataFileBuilder(*iceberg.UnpartitionedSpec, iceberg.EntryContentPosDeletes,
+		fmt.Sprintf("%s/replace_data_files_invalid_add_content_v%d/new.parquet", t.location, t.formatVersion),
+		iceberg.ParquetFile, nil, nil, nil, 1, 100)
+	t.Require().NoError(err)
+	invalidAddFile := builder.Build()
+
+	tx = tbl.NewTransaction()
+	err = tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{deleteFile}, []iceberg.DataFile{invalidAddFile}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "adding files other than data files is not yet implemented")
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesEmptyBoth() {
+	ident := table.Identifier{"default", "replace_data_files_empty_both_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	tx := tbl.NewTransaction()
+	err := tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{}, []iceberg.DataFile{}, nil)
+	t.NoError(err)
+
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.Nil(staged.CurrentSnapshot())
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDelegatesToAddDataFiles() {
+	ident := table.Identifier{"default", "replace_data_files_delegate_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	filePath := fmt.Sprintf("%s/replace_data_files_delegate_v%d/test.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
+
+	addFile := t.mustDataFile(*iceberg.UnpartitionedSpec, filePath, nil, 1, mustFileSize(t.T(), filePath))
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.ReplaceDataFilesWithDataFiles(t.ctx, []iceberg.DataFile{}, []iceberg.DataFile{addFile}, nil))
+
+	staged, err := tx.StagedTable()
+	t.Require().NoError(err)
+	t.Equal(table.OpAppend, staged.CurrentSnapshot().Summary.Operation)
+	t.Equal("1", staged.CurrentSnapshot().Summary.Properties["added-data-files"])
+}
+
+// ============================================================================
+// ReplaceDataFiles (string paths) Error Path Tests
+// ============================================================================
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateDeletePaths() {
+	ident := table.Identifier{"default", "replace_data_files_dup_del_paths_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	existingPath := fmt.Sprintf("%s/replace_data_files_dup_del_paths_v%d/existing.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	newPath := fmt.Sprintf("%s/replace_data_files_dup_del_paths_v%d/new.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), newPath, t.arrTbl)
+
+	tx = tbl.NewTransaction()
+	err = tx.ReplaceDataFiles(t.ctx, []string{existingPath, existingPath}, []string{newPath}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "delete file paths must be unique for ReplaceDataFiles")
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateAddPaths() {
+	ident := table.Identifier{"default", "replace_data_files_dup_add_paths_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	existingPath := fmt.Sprintf("%s/replace_data_files_dup_add_paths_v%d/existing.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	newPath := fmt.Sprintf("%s/replace_data_files_dup_add_paths_v%d/new.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), newPath, t.arrTbl)
+
+	tx = tbl.NewTransaction()
+	err = tx.ReplaceDataFiles(t.ctx, []string{existingPath}, []string{newPath, newPath}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "add file paths must be unique for ReplaceDataFiles")
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesAddAlreadyReferenced() {
+	ident := table.Identifier{"default", "replace_data_files_add_already_ref_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	existingPath1 := fmt.Sprintf("%s/replace_data_files_add_already_ref_v%d/existing1.parquet", t.location, t.formatVersion)
+	existingPath2 := fmt.Sprintf("%s/replace_data_files_add_already_ref_v%d/existing2.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath1, t.arrTbl)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath2, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath1, existingPath2}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	tx = tbl.NewTransaction()
+	err = tx.ReplaceDataFiles(t.ctx, []string{existingPath1}, []string{existingPath2}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "cannot add files that are already referenced by table")
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesDeleteNotInTable() {
+	ident := table.Identifier{"default", "replace_data_files_del_not_in_table_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	existingPath := fmt.Sprintf("%s/replace_data_files_del_not_in_table_v%d/existing.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	tbl, err := tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	newPath := fmt.Sprintf("%s/replace_data_files_del_not_in_table_v%d/new.parquet", t.location, t.formatVersion)
+	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), newPath, t.arrTbl)
+
+	nonExistentPath := fmt.Sprintf("%s/replace_data_files_del_not_in_table_v%d/nonexistent.parquet", t.location, t.formatVersion)
+
+	tx = tbl.NewTransaction()
+	err = tx.ReplaceDataFiles(t.ctx, []string{nonExistentPath}, []string{newPath}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "cannot delete files that do not belong to the table")
+}
+
+func (t *TableWritingTestSuite) TestReplaceDataFilesNoSnapshot() {
+	ident := table.Identifier{"default", "replace_data_files_no_snapshot_paths_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	tx := tbl.NewTransaction()
+	err := tx.ReplaceDataFiles(t.ctx, []string{"delete.parquet"}, []string{"add.parquet"}, nil)
+	t.Error(err)
+	t.ErrorContains(err, "cannot replace files in a table without an existing snapshot")
+}
+
+func (t *TableWritingTestSuite) TestExpireSnapshots() {
+	fs := iceio.LocalFS{}
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/replace_data_files_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "replace_data_files_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion)})
+	t.Require().NoError(err)
+
+	ctx := context.Background()
+
+	tbl := table.New(
+		ident,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		&mockedCatalog{meta},
+	)
+
+	tblfs, err := tbl.FS(ctx)
+
+	t.Require().NoError(err)
+
+	for i := range 5 {
+		tx := tbl.NewTransaction()
+		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		tbl, err = tx.Commit(ctx)
+		t.Require().NoError(err)
+	}
+
+	mflist, err := tbl.CurrentSnapshot().Manifests(tblfs)
+	t.Require().NoError(err)
+	t.Len(mflist, 5)
+	t.Require().Equal(5, len(tbl.Metadata().Snapshots()))
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.ExpireSnapshots(table.WithOlderThan(0), table.WithRetainLast(2)))
+	tbl, err = tx.Commit(ctx)
+	t.Require().NoError(err)
+	t.Require().Equal(2, len(tbl.Metadata().Snapshots()))
+	t.Require().Equal(2, len(slices.Collect(tbl.Metadata().SnapshotLogs())))
+}
+
+// TestExpireSnapshotsNoOpWhenNothingToExpire verifies that when there are no
+// snapshots to expire, no new metadata file is created. This prevents unnecessary
+// metadata file proliferation when the maintenance job runs but finds nothing to do.
+func (t *TableWritingTestSuite) TestExpireSnapshotsNoOpWhenNothingToExpire() {
+	fs := iceio.LocalFS{}
+
+	files := make([]string, 0)
+	for i := range 3 {
+		filePath := fmt.Sprintf("%s/expire_noop_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "expire_noop_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion)})
+	t.Require().NoError(err)
+
+	ctx := context.Background()
+
+	tbl := table.New(
+		ident,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		&mockedCatalog{meta},
+	)
+
+	// Create 3 snapshots
+	for i := range 3 {
+		tx := tbl.NewTransaction()
+		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		tbl, err = tx.Commit(ctx)
+		t.Require().NoError(err)
+	}
+
+	t.Require().Equal(3, len(tbl.Metadata().Snapshots()))
+
+	// Record the metadata location before ExpireSnapshots
+	metadataLocationBefore := tbl.MetadataLocation()
+
+	// Call ExpireSnapshots with parameters that won't expire anything:
+	// - RetainLast(10) keeps more snapshots than we have
+	// - OlderThan(time.Hour) won't expire recent snapshots
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.ExpireSnapshots(table.WithOlderThan(time.Hour), table.WithRetainLast(10)))
+	tbl, err = tx.Commit(ctx)
+	t.Require().NoError(err)
+
+	// Verify no snapshots were removed
+	t.Require().Equal(3, len(tbl.Metadata().Snapshots()))
+
+	// Verify no new metadata file was created (metadata location unchanged)
+	t.Require().Equal(metadataLocationBefore, tbl.MetadataLocation(),
+		"metadata location should not change when there are no snapshots to expire")
+}
+
+// TestExpireSnapshotsUsesTableProperties verifies that ExpireSnapshots reads
+// the standard history.expire.* properties when no explicit options are
+// provided by the caller (mirrors Java behaviour).
+func (t *TableWritingTestSuite) TestExpireSnapshotsUsesTableProperties() {
+	fs := iceio.LocalFS{}
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/expire_props_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "expire_props_v" + strconv.Itoa(t.formatVersion)}
+	// Set table-level retention properties — no caller options will be passed to
+	// ExpireSnapshots, so these must be picked up automatically.
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{
+			table.PropertyFormatVersion: strconv.Itoa(t.formatVersion),
+			table.MinSnapshotsToKeepKey: "2",
+			table.MaxSnapshotAgeMsKey:   "0", // expire everything older than "now"
+			// max-ref-age-ms is intentionally absent to prove that a missing
+			// property correctly falls back to the standard forever default.
+		})
+	t.Require().NoError(err)
+
+	ctx := context.Background()
+
+	tbl := table.New(
+		ident,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		&mockedCatalog{meta},
+	)
+
+	for i := range 5 {
+		tx := tbl.NewTransaction()
+		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		tbl, err = tx.Commit(ctx)
+		t.Require().NoError(err)
+	}
+
+	t.Require().Equal(5, len(tbl.Metadata().Snapshots()))
+
+	// Call ExpireSnapshots with NO options — must rely entirely on table properties.
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.ExpireSnapshots())
+	tbl, err = tx.Commit(ctx)
+	t.Require().NoError(err)
+
+	// min-snapshots-to-keep=2, so exactly 2 snapshots should survive.
+	t.Require().Equal(2, len(tbl.Metadata().Snapshots()))
+}
+
+func (t *TableWritingTestSuite) TestExpireSnapshotsWithMissingParent() {
+	// This test validates the fix for handling missing parent snapshots.
+	// After expiring snapshots, remaining snapshots may have parent-snapshot-id
+	// references pointing to snapshots that no longer exist. ExpireSnapshots should
+	// treat missing parents as the end of the chain rather than returning an error.
+
+	fs := iceio.LocalFS{}
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/expire_with_missing_parent_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "expire_with_missing_parent_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion)})
+	t.Require().NoError(err)
+
+	ctx := context.Background()
+
+	tbl := table.New(
+		ident,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		&mockedCatalog{meta},
+	)
+
+	// Create 5 snapshots, each one with a parent pointing to the previous
+	for i := range 5 {
+		tx := tbl.NewTransaction()
+		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		tbl, err = tx.Commit(ctx)
+		t.Require().NoError(err)
+	}
+
+	t.Require().Equal(5, len(tbl.Metadata().Snapshots()))
+
+	// Get the snapshot IDs before expiration
+	snapshotsBeforeExpire := tbl.Metadata().Snapshots()
+	snapshot3ID := snapshotsBeforeExpire[2].SnapshotID
+	snapshot4ID := snapshotsBeforeExpire[3].SnapshotID
+
+	// Expire the first 3 snapshots, keeping only the last 2
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.ExpireSnapshots(table.WithOlderThan(0), table.WithRetainLast(2)))
+	tbl, err = tx.Commit(ctx)
+	t.Require().NoError(err)
+	t.Require().Equal(2, len(tbl.Metadata().Snapshots()))
+
+	// Verify that the 4th snapshot's parent (snapshot 3) is no longer in the metadata
+	remainingSnapshots := tbl.Metadata().Snapshots()
+	var snapshot4 *table.Snapshot
+	for i := range remainingSnapshots {
+		if remainingSnapshots[i].SnapshotID == snapshot4ID {
+			snapshot4 = &remainingSnapshots[i]
+
+			break
+		}
+	}
+	t.Require().NotNil(snapshot4, "snapshot 4 should still exist")
+	t.Require().NotNil(snapshot4.ParentSnapshotID, "snapshot 4 should have a parent ID")
+	t.Require().Equal(snapshot3ID, *snapshot4.ParentSnapshotID, "snapshot 4's parent should be snapshot 3")
+
+	// Verify snapshot 3 is no longer in the metadata
+	t.Nil(tbl.Metadata().SnapshotByID(snapshot3ID), "snapshot 3 should have been removed")
+
+	// At this point, the 4th snapshot has a parent-snapshot-id pointing to
+	// the 3rd snapshot which no longer exists. Try to expire again - this
+	// should not fail even though the parent is missing. Use WithRetainLast(2)
+	// to force walking the full parent chain.
+	tx = tbl.NewTransaction()
+	// This should succeed without error despite the missing parent.
+	// WithRetainLast(2) will cause it to walk back through snapshot 4's parent chain,
+	// encountering the missing snapshot 3.
+	err = tx.ExpireSnapshots(table.WithOlderThan(0), table.WithRetainLast(2))
+	t.Require().NoError(err, "ExpireSnapshots should handle missing parent gracefully")
+
+	tbl, err = tx.Commit(ctx)
+	t.Require().NoError(err)
+	t.Require().Equal(2, len(tbl.Metadata().Snapshots()), "should still have 2 snapshots")
+}
+
+// validatingCatalog validates requirements before applying updates,
+// simulating real catalog behavior for concurrent modification tests.
+type validatingCatalog struct {
+	metadata table.Metadata
+}
+
+func (m *validatingCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	return nil, nil
+}
+
+func (m *validatingCatalog) CommitTable(ctx context.Context, ident table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	// Validate requirements against current metadata (simulates catalog behavior)
+	for _, req := range reqs {
+		if err := req.Validate(m.metadata); err != nil {
+			return nil, "", err
+		}
+	}
+
+	meta, err := table.UpdateTableMetadata(m.metadata, updates, "")
+	if err != nil {
+		return nil, "", err
+	}
+
+	m.metadata = meta
+
+	return meta, "", nil
+}
+
+// TestExpireSnapshotsRejectsOnRefRollback verifies that ExpireSnapshots fails
+// when a ref is rolled back to an ancestor snapshot concurrently.
+//
+// Scenario:
+//   - main -> snapshot 5 (newest), chain: 5 <- 4 <- 3 <- 2 <- 1
+//   - ExpireSnapshots calculates: keep {5, 4, 3}, delete {2, 1}
+//   - Concurrently, client rolls main -> snapshot 2
+//   - Without assertion: would delete snapshots 1, leaving main with only 1 accessible snapshot
+//   - With assertion: commit fails because main's snapshot ID changed
+func (t *TableWritingTestSuite) TestExpireSnapshotsRejectsOnRefRollback() {
+	fs := iceio.LocalFS{}
+
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/expire_reject_rollback_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "expire_reject_rollback_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion)})
+	t.Require().NoError(err)
+
+	ctx := context.Background()
+	cat := &validatingCatalog{meta}
+
+	tbl := table.New(
+		ident,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		cat,
+	)
+
+	// Create 5 snapshots
+	for i := range 5 {
+		tx := tbl.NewTransaction()
+		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		tbl, err = tx.Commit(ctx)
+		t.Require().NoError(err)
+	}
+
+	t.Require().Equal(5, len(tbl.Metadata().Snapshots()))
+
+	// Get snapshot IDs for later use
+	snapshots := tbl.Metadata().Snapshots()
+	snapshot2 := snapshots[1] // Second snapshot (index 1)
+
+	// Start ExpireSnapshots transaction (will calculate based on current main -> snapshot 5)
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.ExpireSnapshots(table.WithOlderThan(0), table.WithRetainLast(3)))
+
+	// Simulate concurrent rollback: update catalog's metadata to point main -> snapshot 2
+	// This simulates another client rolling back main before ExpireSnapshots commits
+	rollbackUpdates := []table.Update{
+		table.NewSetSnapshotRefUpdate("main", snapshot2.SnapshotID, table.BranchRef, -1, -1, -1),
+	}
+	cat.metadata, _, err = cat.CommitTable(ctx, ident, nil, rollbackUpdates)
+	t.Require().NoError(err)
+
+	// Attempt to commit ExpireSnapshots - should fail due to AssertRefSnapshotID
+	_, err = tx.Commit(ctx)
+	t.Require().Error(err)
+	t.Require().Contains(err.Error(), "requirement failed")
+	t.Require().Contains(err.Error(), "main")
+}
+
+// TestExpireSnapshotsRejectsOnRefUpdate verifies that ExpireSnapshots fails
+// when a ref eligible for deletion is concurrently updated to a newer snapshot.
+//
+// Scenario:
+//   - tag1 -> old snapshot, eligible for deletion (maxRefAgeMs exceeded)
+//   - ExpireSnapshots decides to remove tag1
+//   - Concurrently, client updates tag1 -> newer snapshot (no longer eligible)
+//   - Without assertion: tag1 would be deleted despite being updated
+//   - With assertion: commit fails because tag1's snapshot ID changed
+func (t *TableWritingTestSuite) TestExpireSnapshotsRejectsOnRefUpdate() {
+	fs := iceio.LocalFS{}
+
+	files := make([]string, 0)
+	for i := range 3 {
+		filePath := fmt.Sprintf("%s/expire_reject_update_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "expire_reject_update_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion)})
+	t.Require().NoError(err)
+
+	ctx := context.Background()
+	cat := &validatingCatalog{meta}
+
+	tbl := table.New(
+		ident,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		cat,
+	)
+
+	// Create 3 snapshots
+	for i := range 3 {
+		tx := tbl.NewTransaction()
+		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		tbl, err = tx.Commit(ctx)
+		t.Require().NoError(err)
+	}
+	t.Require().Equal(3, len(tbl.Metadata().Snapshots()))
+
+	snapshots := tbl.Metadata().Snapshots()
+	oldSnapshot := snapshots[0]   // Oldest snapshot
+	newerSnapshot := snapshots[2] // Newest snapshot
+
+	// Create a tag pointing to the old snapshot with a short maxRefAgeMs
+	// This tag will be eligible for deletion
+	maxRefAgeMs := int64(1) // 1ms - will definitely be exceeded
+	tagUpdates := []table.Update{
+		table.NewSetSnapshotRefUpdate("expiring-tag", oldSnapshot.SnapshotID, table.TagRef, maxRefAgeMs, -1, -1),
+	}
+	cat.metadata, _, err = cat.CommitTable(ctx, ident, nil, tagUpdates)
+	t.Require().NoError(err)
+
+	// Reload table with updated metadata
+	tbl = table.New(
+		ident,
+		cat.metadata,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		cat,
+	)
+
+	// Wait a bit to ensure the tag's ref age exceeds maxRefAgeMs
+	time.Sleep(10 * time.Millisecond)
+
+	// Start ExpireSnapshots transaction (will identify expiring-tag as eligible for deletion)
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.ExpireSnapshots(table.WithOlderThan(time.Hour), table.WithRetainLast(1)))
+
+	// Simulate concurrent update: another client updates the tag to point to a newer snapshot
+	// This makes the tag no longer eligible for deletion
+	updateTagUpdates := []table.Update{
+		table.NewSetSnapshotRefUpdate("expiring-tag", newerSnapshot.SnapshotID, table.TagRef, maxRefAgeMs, -1, -1),
+	}
+	cat.metadata, _, err = cat.CommitTable(ctx, ident, nil, updateTagUpdates)
+	t.Require().NoError(err)
+
+	// Attempt to commit ExpireSnapshots - should fail due to AssertRefSnapshotID
+	_, err = tx.Commit(ctx)
+	t.Require().Error(err)
+	t.Require().Contains(err.Error(), "requirement failed")
+	t.Require().Contains(err.Error(), "expiring-tag")
+}
+
+func (t *TableWritingTestSuite) TestWriteSpecialCharacterColumn() {
+	ident := table.Identifier{"default", "write_special_character_column"}
+	colNameWithSpecialChar := "letter/abc"
+
+	s := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: colNameWithSpecialChar, Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 2, Name: "id", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 3, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: true},
+		iceberg.NestedField{ID: 4, Name: "address", Required: true, Type: &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 5, Name: "street", Type: iceberg.PrimitiveTypes.String, Required: true},
+				{ID: 6, Name: "city", Type: iceberg.PrimitiveTypes.String, Required: true},
+				{ID: 7, Name: "zip", Type: iceberg.PrimitiveTypes.Int32, Required: true},
+				{ID: 8, Name: colNameWithSpecialChar, Type: iceberg.PrimitiveTypes.String, Required: true},
+			},
+		}})
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: colNameWithSpecialChar, Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "name", Type: arrow.BinaryTypes.String},
+		{Name: "address", Type: arrow.StructOf(
+			arrow.Field{Name: "street", Type: arrow.BinaryTypes.String},
+			arrow.Field{Name: "city", Type: arrow.BinaryTypes.String},
+			arrow.Field{Name: "zip", Type: arrow.PrimitiveTypes.Int32},
+			arrow.Field{Name: colNameWithSpecialChar, Type: arrow.BinaryTypes.String},
+		)},
+	}, nil)
+
+	arrowTable, err := array.TableFromJSON(memory.DefaultAllocator, arrowSchema, []string{
+		`[
+			{
+				"letter/abc": "a",
+				"id": 1,
+				"name": "AB",
+				"address": {"street": "123", "city": "SFO", "zip": 12345, "letter/abc": "a"}
+			},
+			{
+				"letter/abc": null,
+				"id": 2,
+				"name": "CD",
+				"address": {"street": "456", "city": "SW", "zip": 67890, "letter/abc": "b"}
+			},
+			{
+				"letter/abc": "z",
+				"id": 3,
+				"name": "EF",
+				"address": {"street": "789", "city": "Random", "zip": 10112, "letter/abc": "c"}
+			}
+		 ]`,
+	})
+	t.Require().NoError(err)
+	defer arrowTable.Release()
+
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, s)
+	rdr := array.NewTableReader(arrowTable, 1)
+	defer rdr.Release()
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.Append(t.ctx, rdr, nil))
+
+	scan, err := tx.Scan()
+	t.Require().NoError(err)
+
+	result, err := scan.ToArrowTable(t.ctx)
+	t.Require().NoError(err)
+	defer result.Release()
+
+	t.True(array.TableEqual(arrowTable, result), "expected:\n %s\ngot:\n %s", arrowTable, result)
+}
+
+func (t *TableWritingTestSuite) getInMemCatalog() catalog.Catalog {
+	cat, err := catalog.Load(context.Background(), "default", iceberg.Properties{
+		"uri":          ":memory:",
+		"type":         "sql",
+		sql.DriverKey:  sqliteshim.ShimName,
+		sql.DialectKey: string(sql.SQLite),
+		"warehouse":    "file://" + t.location,
+	})
+	t.Require().NoError(err)
+
+	return cat
+}
+
+func (t *TableWritingTestSuite) createTableWithProps(identifier table.Identifier, props iceberg.Properties, sc *iceberg.Schema) *table.Table {
+	cat := t.getInMemCatalog()
+	cat.DropTable(t.ctx, identifier)
+	cat.DropNamespace(t.ctx, catalog.NamespaceFromIdent(identifier))
+
+	t.Require().NoError(cat.CreateNamespace(t.ctx, catalog.NamespaceFromIdent(identifier), nil))
+	tbl, err := cat.CreateTable(t.ctx, identifier, sc, catalog.WithProperties(props),
+		catalog.WithLocation("file://"+t.location))
+
+	t.Require().NoError(err)
+
+	return tbl
+}
+
+func tableSchema() *iceberg.Schema {
+	return iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "bool", Type: iceberg.PrimitiveTypes.Bool},
+		iceberg.NestedField{ID: 2, Name: "string", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 3, Name: "string_long", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 4, Name: "int", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 5, Name: "long", Type: iceberg.PrimitiveTypes.Int64},
+		iceberg.NestedField{ID: 6, Name: "float", Type: iceberg.PrimitiveTypes.Float32},
+		iceberg.NestedField{ID: 7, Name: "double", Type: iceberg.PrimitiveTypes.Float64},
+		iceberg.NestedField{ID: 8, Name: "time", Type: iceberg.PrimitiveTypes.Time},
+		iceberg.NestedField{ID: 9, Name: "timestamp", Type: iceberg.PrimitiveTypes.Timestamp},
+		iceberg.NestedField{ID: 10, Name: "timestamptz", Type: iceberg.PrimitiveTypes.TimestampTz},
+		iceberg.NestedField{ID: 11, Name: "date", Type: iceberg.PrimitiveTypes.Date},
+		iceberg.NestedField{ID: 12, Name: "uuid", Type: iceberg.PrimitiveTypes.UUID},
+		iceberg.NestedField{ID: 13, Name: "binary", Type: iceberg.PrimitiveTypes.Binary},
+		iceberg.NestedField{ID: 14, Name: "fixed", Type: iceberg.FixedTypeOf(16)},
+		iceberg.NestedField{ID: 15, Name: "small_dec", Type: iceberg.DecimalTypeOf(8, 2)},
+		iceberg.NestedField{ID: 16, Name: "med_dec", Type: iceberg.DecimalTypeOf(16, 2)},
+		iceberg.NestedField{ID: 17, Name: "large_dec", Type: iceberg.DecimalTypeOf(24, 2)},
+	)
+}
+
+func arrowTableWithNull() arrow.Table {
+	sc, err := table.SchemaToArrowSchema(tableSchema(), nil, true, false)
+	if err != nil {
+		panic(err)
+	}
+
+	arrTable, err := array.TableFromJSON(memory.DefaultAllocator, sc, []string{
+		`[
+			{
+				"bool": false,
+				"string": "a",
+				"string_long": "` + strings.Repeat("a", 22) + `",
+				"int": 1,
+				"long": 1,
+				"float": 0.0,
+				"double": 0.0,
+				"time": "00:00:01.000000",
+				"timestamp": "2023-01-01T11:25:00.000000",
+				"timestamptz": "2023-01-01T19:25:00.000000Z",
+				"date": "2023-01-01",
+				"uuid": "00000000-0000-0000-0000-000000000000",
+				"binary": "AQ==",
+				"fixed": "AAAAAAAAAAAAAAAAAAAAAA==",
+				"small_dec": "123456.78",
+				"med_dec": "12345678901234.56",
+				"large_dec": "1234567890123456789012.34"
+			},
+			{
+				"bool": null,
+				"string": null,
+				"string_long": null,
+				"int": null,
+				"long": null,
+				"float": null,
+				"double": null,
+				"time": null,
+				"timestamp": null,
+				"timestamptz": null,
+				"date": null,
+				"uuid": null,
+				"binary": null,
+				"fixed": null,
+				"small_dec": null,
+				"med_dec": null,
+				"large_dec": null
+			},
+			{
+				"bool": true,
+				"string": "z",
+				"string_long": "` + strings.Repeat("z", 22) + `",
+				"int": 9,
+				"long": 9,
+				"float": 0.9,
+				"double": 0.9,
+				"time": "00:00:03.000000",
+				"timestamp": "2023-03-01T11:25:00.000000",
+				"timestamptz": "2023-03-01T19:25:00.000000Z",
+				"date": "2023-03-01",
+				"uuid": "11111111-1111-1111-1111-111111111111",
+				"binary": "Eg==",
+				"fixed": "EREREREREREREREREREREQ==",
+				"small_dec": "876543.21",
+				"med_dec": "65432109876543.21",
+				"large_dec": "4321098765432109876543.21"
+			}
+		 ]`,
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	return arrTable
+}
+
+func (t *TableWritingTestSuite) validateManifestFileLength(fs iceio.IO, m iceberg.ManifestFile) {
+	f, err := fs.Open(m.FilePath())
+	t.Require().NoError(err)
+	defer f.Close()
+
+	info, err := f.Stat()
+	t.Require().NoError(err)
+
+	t.EqualValues(info.Size(), m.Length(), "expected size: %d, got: %d", info.Size(), m.Length())
+}
+
+func (t *TableWritingTestSuite) TestMergeManifests() {
+	tblA := t.createTableWithProps(table.Identifier{"default", "merge_manifest_a"},
+		iceberg.Properties{
+			table.ParquetCompressionKey:    "snappy",
+			table.ManifestMergeEnabledKey:  "true",
+			table.ManifestMinMergeCountKey: "1",
+			table.PropertyFormatVersion:    strconv.Itoa(t.formatVersion),
+		}, tableSchema())
+
+	tblB := t.createTableWithProps(table.Identifier{"default", "merge_manifest_b"},
+		iceberg.Properties{
+			table.ParquetCompressionKey:      "snappy",
+			table.ManifestMergeEnabledKey:    "true",
+			table.ManifestMinMergeCountKey:   "1",
+			table.ManifestTargetSizeBytesKey: "1",
+			table.PropertyFormatVersion:      strconv.Itoa(t.formatVersion),
+		}, tableSchema())
+
+	tblC := t.createTableWithProps(table.Identifier{"default", "merge_manifest_c"},
+		iceberg.Properties{
+			table.ParquetCompressionKey:    "snappy",
+			table.ManifestMinMergeCountKey: "1",
+			table.PropertyFormatVersion:    strconv.Itoa(t.formatVersion),
+		}, tableSchema())
+
+	arrTable := arrowTableWithNull()
+	defer arrTable.Release()
+
+	var err error
+	// tblA should merge all manifests into 1
+	tblA, err = tblA.AppendTable(t.ctx, arrTable, 1, nil)
+	t.Require().NoError(err)
+	tblA, err = tblA.AppendTable(t.ctx, arrTable, 1, nil)
+	t.Require().NoError(err)
+	tblA, err = tblA.AppendTable(t.ctx, arrTable, 1, nil)
+	t.Require().NoError(err)
+
+	// tblB should not merge any manifests because the target size is too small
+	tblB, err = tblB.AppendTable(t.ctx, arrTable, 1, nil)
+	t.Require().NoError(err)
+	tblB, err = tblB.AppendTable(t.ctx, arrTable, 1, nil)
+	t.Require().NoError(err)
+	tblB, err = tblB.AppendTable(t.ctx, arrTable, 1, nil)
+	t.Require().NoError(err)
+
+	// tblC should not merge any manifests because merging is disabled
+	tblC, err = tblC.AppendTable(t.ctx, arrTable, 1, nil)
+	t.Require().NoError(err)
+	tblC, err = tblC.AppendTable(t.ctx, arrTable, 1, nil)
+	t.Require().NoError(err)
+	tblC, err = tblC.AppendTable(t.ctx, arrTable, 1, nil)
+	t.Require().NoError(err)
+
+	manifestList, err := tblA.CurrentSnapshot().Manifests(mustFS(t.T(), tblA))
+	t.Require().NoError(err)
+	t.Len(manifestList, 1)
+	t.validateManifestFileLength(mustFS(t.T(), tblA), manifestList[0])
+
+	entries := make([]iceberg.ManifestEntry, 0, 3)
+	for entry, err := range manifestList[0].Entries(mustFS(t.T(), tblA), false) {
+		t.Require().NoError(err)
+		entries = append(entries, entry)
+	}
+	t.Len(entries, 3)
+
+	// entries should match the snapshot ID they were added in
+	snapshotList := tblA.Metadata().Snapshots()
+	slices.Reverse(snapshotList)
+	for i, entry := range entries {
+		t.Equal(snapshotList[i].SnapshotID, entry.SnapshotID())
+		if t.formatVersion > 1 {
+			t.EqualValues(3-i, entry.SequenceNum())
+		}
+	}
+
+	manifestList, err = tblB.CurrentSnapshot().Manifests(mustFS(t.T(), tblB))
+	t.Require().NoError(err)
+	t.Len(manifestList, 3)
+
+	for _, m := range manifestList {
+		t.validateManifestFileLength(mustFS(t.T(), tblB), m)
+	}
+
+	manifestList, err = tblC.CurrentSnapshot().Manifests(mustFS(t.T(), tblC))
+	t.Require().NoError(err)
+	t.Len(manifestList, 3)
+
+	for _, m := range manifestList {
+		t.validateManifestFileLength(mustFS(t.T(), tblC), m)
+	}
+
+	resultA, err := tblA.Scan().ToArrowTable(t.ctx)
+	t.Require().NoError(err)
+	defer resultA.Release()
+
+	resultB, err := tblB.Scan().ToArrowTable(t.ctx)
+	t.Require().NoError(err)
+	defer resultB.Release()
+
+	resultC, err := tblC.Scan().ToArrowTable(t.ctx)
+	t.Require().NoError(err)
+	defer resultC.Release()
+
+	// tblA and tblC should contain the same data
+	t.True(array.TableEqual(resultA, resultC), "expected:\n %s\ngot:\n %s", resultA, resultC)
+	// tblB and tblC should contain the same data
+	t.True(array.TableEqual(resultB, resultC), "expected:\n %s\ngot:\n %s", resultB, resultC)
+}
+
+// TestOverwriteTable verifies that Table.OverwriteTable properly delegates to Transaction.OverwriteTable
+func (t *TableWritingTestSuite) TestOverwriteTable() {
+	ident := table.Identifier{"default", "overwrite_table_wrapper_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+	newTable, err := array.TableFromJSON(memory.DefaultAllocator, t.arrSchema, []string{
+		`[{"foo": false, "bar": "wrapper_test", "baz": 123, "qux": "2024-01-01"}]`,
+	})
+	t.Require().NoError(err)
+	defer newTable.Release()
+	resultTbl, err := tbl.OverwriteTable(t.ctx, newTable, 1, nil)
+	t.Require().NoError(err)
+	t.NotNil(resultTbl)
+
+	snapshot := resultTbl.CurrentSnapshot()
+	t.NotNil(snapshot)
+	t.Equal(table.OpAppend, snapshot.Summary.Operation) // Empty table overwrite becomes append
+}
+
+// TestOverwriteRecord verifies that Table.Overwrite properly delegates to Transaction.Overwrite
+func (t *TableWritingTestSuite) TestOverwriteRecord() {
+	ident := table.Identifier{"default", "overwrite_record_wrapper_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	// Create test data as RecordReader
+	testTable, err := array.TableFromJSON(memory.DefaultAllocator, t.arrSchema, []string{
+		`[{"foo": true, "bar": "record_test", "baz": 456, "qux": "2024-01-02"}]`,
+	})
+	t.Require().NoError(err)
+	defer testTable.Release()
+
+	rdr := array.NewTableReader(testTable, 1)
+	defer rdr.Release()
+
+	// Test that Table.Overwrite works (delegates to transaction)
+	resultTbl, err := tbl.Overwrite(t.ctx, rdr, nil, table.WithOverwriteConcurrency(1))
+	t.Require().NoError(err)
+	t.NotNil(resultTbl)
+
+	// Verify the operation worked
+	snapshot := resultTbl.CurrentSnapshot()
+	t.NotNil(snapshot)
+	t.Equal(table.OpAppend, snapshot.Summary.Operation) // Empty table overwrite becomes append
+}
+
+// TestOverwriteRowCountWarning verifies that Transaction.Overwrite emits a
+// slog.Warn when the written data files contain fewer rows than deleted.
+func (t *TableWritingTestSuite) TestOverwriteRowCountWarning() {
+	ident := table.Identifier{"default", "overwrite_row_warn_v" + strconv.Itoa(t.formatVersion)}
+	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
+
+	// Append two rows so there is data to overwrite.
+	initialData, err := array.TableFromJSON(memory.DefaultAllocator, t.arrSchema, []string{
+		`[{"foo": true, "bar": "row1", "baz": 1, "qux": "2024-01-01"},
+		  {"foo": false, "bar": "row2", "baz": 2, "qux": "2024-01-02"}]`,
+	})
+	t.Require().NoError(err)
+	defer initialData.Release()
+
+	tbl, err = tbl.Append(t.ctx, array.NewTableReader(initialData, -1), nil)
+	t.Require().NoError(err)
+
+	// Capture slog output by installing a temporary handler on the default logger.
+	var buf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(origLogger)
+
+	// Overwrite with only one row — fewer than the two rows deleted.
+	oneRow, err := array.TableFromJSON(memory.DefaultAllocator, t.arrSchema, []string{
+		`[{"foo": true, "bar": "row1", "baz": 1, "qux": "2024-01-01"}]`,
+	})
+	t.Require().NoError(err)
+	defer oneRow.Release()
+
+	tx := tbl.NewTransaction()
+	t.Require().NoError(tx.Overwrite(t.ctx, array.NewTableReader(oneRow, -1), nil))
+	_, err = tx.Commit(t.ctx)
+	t.Require().NoError(err)
+
+	logged := buf.String()
+	t.Contains(logged, "Overwrite produced fewer rows than deleted")
+	t.Contains(logged, "added_rows=1")
+	t.Contains(logged, "deleted_rows=2")
+}
+
+// TestDelete verifies that Table.Delete properly delegates to Transaction.Delete
+func (t *TableWritingTestSuite) TestDelete() {
+	testCases := []struct {
+		name                     string
+		table                    *table.Table
+		formatVersionRequirement int
+		expectedSnapshotSummary  *table.Summary
+		expectedErr              error
+	}{
+		{
+			name: "success with copy-on-write",
+			table: t.createTable(
+				table.Identifier{"default", "overwrite_record_wrapper_v" + strconv.Itoa(t.formatVersion)},
+				t.formatVersion,
+				*iceberg.UnpartitionedSpec,
+				t.tableSchema,
+			),
+			expectedSnapshotSummary: &table.Summary{
+				Operation: table.OpDelete,
+				Properties: map[string]string{
+					"added-data-files":       "1",
+					"added-records":          "1",
+					"deleted-data-files":     "1",
+					"deleted-records":        "2",
+					"total-data-files":       "1",
+					"total-delete-files":     "0",
+					"total-equality-deletes": "0",
+					"total-position-deletes": "0",
+					"total-records":          "1",
+				},
+			},
+			expectedErr: nil,
+		},
+		{
+			name:                     "fallback to copy-on-write when on v1 format",
+			formatVersionRequirement: 1,
+			table: t.createTableWithProps(
+				table.Identifier{"default", "overwrite_record_wrapper_v" + strconv.Itoa(t.formatVersion)},
+				map[string]string{
+					table.PropertyFormatVersion: strconv.Itoa(t.formatVersion),
+					table.WriteDeleteModeKey:    table.WriteModeMergeOnRead,
+				},
+				t.tableSchema,
+			),
+			expectedSnapshotSummary: &table.Summary{
+				Operation: table.OpDelete,
+				Properties: map[string]string{
+					"added-data-files":       "1",
+					"added-records":          "1",
+					"deleted-data-files":     "1",
+					"deleted-records":        "2",
+					"total-data-files":       "1",
+					"total-delete-files":     "0",
+					"total-equality-deletes": "0",
+					"total-position-deletes": "0",
+					"total-records":          "1",
+				},
+			},
+			expectedErr: nil,
+		},
+		{
+			name: "success with merge-on-read on v2 format",
+			table: t.createTableWithProps(
+				table.Identifier{"default", "overwrite_record_wrapper_v" + strconv.Itoa(t.formatVersion)},
+				map[string]string{
+					table.PropertyFormatVersion: strconv.Itoa(t.formatVersion),
+					table.WriteDeleteModeKey:    table.WriteModeMergeOnRead,
+				},
+				t.tableSchema,
+			),
+			// Position deletes are only
+			formatVersionRequirement: 2,
+			expectedSnapshotSummary: &table.Summary{
+				Operation: table.OpDelete,
+				Properties: map[string]string{
+					"added-delete-files":          "1",
+					"added-position-delete-files": "1",
+					"added-position-deletes":      "1",
+					"total-data-files":            "1",
+					"total-delete-files":          "1",
+					"total-equality-deletes":      "0",
+					"total-position-deletes":      "1",
+					"total-records":               "2",
+				},
+			},
+			expectedErr: nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func() {
+			// Skip this test case execution if the format version isn't the one the test case is limited to. This
+			// is because some test cases don't have the same expected behavior or don't apply because of format
+			// specific features
+			if tc.formatVersionRequirement > 0 && tc.formatVersionRequirement != t.formatVersion {
+				return
+			}
+			// Set up the test table with some data. Include more than just one row so that the delete operation
+			// is not a straight file deletion
+			newTable, err := array.TableFromJSON(memory.DefaultAllocator, t.arrSchema, []string{
+				`[{"foo": false, "bar": "wrapper_test", "baz": 123, "qux": "2024-01-01"},
+                  {"foo": true, "bar": "keep_this", "baz": 456, "qux": "2024-01-02"}]`,
+			})
+			t.Require().NoError(err)
+			defer newTable.Release()
+
+			tbl, err := tc.table.OverwriteTable(t.ctx, newTable, 1, nil)
+			t.Require().NoError(err)
+
+			// Validate the pre-requisite that data is present on the table before we go ahead and delete it
+			arrowTable, err := tbl.Scan().ToArrowTable(t.ctx)
+			t.Require().NoError(err)
+			t.Equal(int64(2), arrowTable.NumRows())
+
+			tbl, err = tbl.Delete(t.ctx, iceberg.EqualTo(iceberg.Reference("bar"), "wrapper_test"), nil)
+			// If an error was expected, check that it's the correct one and abort validating the operation
+			if tc.expectedErr != nil {
+				t.Require().ErrorContains(err, tc.expectedErr.Error())
+
+				return
+			}
+
+			snapshot := tbl.CurrentSnapshot()
+			t.NotNil(snapshot)
+			t.NoError(equalSnapshotSummary(tc.expectedSnapshotSummary, snapshot.Summary))
+
+			arrowTable, err = tbl.Scan().ToArrowTable(t.ctx)
+			t.Require().NoError(err)
+
+			t.Equal(int64(1), arrowTable.NumRows())
+		})
+	}
+}
+
+func (t *TableWritingTestSuite) TestScanPanicOnMapStringKeyStringListValue() {
+	schema := arrow.NewSchema([]arrow.Field{
+		{
+			Name:     "tags",
+			Type:     arrow.MapOf(arrow.BinaryTypes.String, arrow.ListOf(arrow.BinaryTypes.String)),
+			Nullable: true,
+		},
+	}, nil)
+	toIceberg, err := table.ArrowSchemaToIcebergWithFreshIDs(schema, false)
+	t.Require().NoError(err)
+
+	tbl := t.createTable(
+		table.Identifier{"default", "map_panic"},
+		t.formatVersion,
+		*iceberg.UnpartitionedSpec,
+		toIceberg,
+	)
+	mem := memory.NewGoAllocator()
+
+	bldr := array.NewRecordBuilder(mem, schema)
+	// First row with null tags
+	tagBuilder := bldr.Field(0)
+	tagBuilder.AppendNull()
+
+	batch := bldr.NewRecordBatch()
+	// Second row with a key but null values
+	reader, err := array.NewRecordReader(schema, []arrow.RecordBatch{batch})
+	t.Require().NoError(err)
+
+	tbl, err = tbl.Append(t.ctx, reader, nil)
+	t.Require().NoError(err)
+
+	scan := tbl.Scan()
+	arrowTable, err := scan.ToArrowTable(t.ctx)
+	t.Require().NoError(err)
+
+	t.Require().Equal(int64(1), arrowTable.NumRows())
+}
+
+func TestTableWriting(t *testing.T) {
+	suite.Run(t, &TableWritingTestSuite{formatVersion: 1})
+	suite.Run(t, &TableWritingTestSuite{formatVersion: 2})
+	suite.Run(t, &TableWritingTestSuite{formatVersion: 3})
+}
+
+func TestNullableStructRequiredField(t *testing.T) {
+	loc := filepath.ToSlash(t.TempDir())
+
+	cat, err := catalog.Load(context.Background(), "default", iceberg.Properties{
+		"uri":          ":memory:",
+		"type":         "sql",
+		sql.DriverKey:  sqliteshim.ShimName,
+		sql.DialectKey: string(sql.SQLite),
+		"warehouse":    "file://" + loc,
+	})
+	require.NoError(t, err)
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{
+			Name: "analytic", Type: arrow.StructOf(
+				arrow.Field{Name: "category", Type: arrow.BinaryTypes.String, Nullable: true},
+				arrow.Field{Name: "desc", Type: arrow.BinaryTypes.String, Nullable: true},
+				arrow.Field{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+				arrow.Field{Name: "related_analytics", Type: arrow.ListOf(
+					arrow.StructOf(
+						arrow.Field{Name: "category", Type: arrow.BinaryTypes.String, Nullable: true},
+						arrow.Field{Name: "desc", Type: arrow.BinaryTypes.String, Nullable: true},
+						arrow.Field{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+						arrow.Field{Name: "type", Type: arrow.BinaryTypes.String, Nullable: true},
+						arrow.Field{Name: "type_id", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+						arrow.Field{Name: "uid", Type: arrow.BinaryTypes.String, Nullable: true},
+						arrow.Field{Name: "version", Type: arrow.BinaryTypes.String, Nullable: true},
+					),
+				), Nullable: true},
+				arrow.Field{Name: "type", Type: arrow.BinaryTypes.String, Nullable: true},
+				arrow.Field{Name: "type_id", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+				arrow.Field{Name: "uid", Type: arrow.BinaryTypes.String, Nullable: true},
+				arrow.Field{Name: "version", Type: arrow.BinaryTypes.String, Nullable: true},
+			), Nullable: true,
+		},
+		{Name: "uid", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+
+	sc, err := table.ArrowSchemaToIcebergWithFreshIDs(arrowSchema, false)
+	require.NoError(t, err)
+
+	require.NoError(t, cat.CreateNamespace(context.Background(), table.Identifier{"testing"}, nil))
+	tbl, err := cat.CreateTable(context.Background(), table.Identifier{"testing", "nullable_struct_required_field"}, sc,
+		catalog.WithProperties(iceberg.Properties{table.PropertyFormatVersion: "2"}),
+		catalog.WithLocation("file://"+loc))
+	require.NoError(t, err)
+	require.NotNil(t, tbl)
+
+	bldr := array.NewRecordBuilder(memory.DefaultAllocator, arrowSchema)
+	defer bldr.Release()
+
+	const N = 100
+	bldr.Field(0).AppendNulls(N)
+	bldr.Field(1).AppendNulls(N)
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	arrTable := array.NewTableFromRecords(arrowSchema, []arrow.RecordBatch{rec})
+	defer arrTable.Release()
+
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.AppendTable(t.Context(), arrTable, N, nil))
+	stagedTbl, err := tx.StagedTable()
+	require.NoError(t, err)
+	require.NotNil(t, stagedTbl)
+}
+
+type DeleteOldMetadataMockedCatalog struct {
+	metadata table.Metadata
+}
+
+func (m *DeleteOldMetadataMockedCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	return nil, nil
+}
+
+func (m *DeleteOldMetadataMockedCatalog) CommitTable(ctx context.Context, ident table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	bldr, err := table.MetadataBuilderFromBase(m.metadata, "")
+	if err != nil {
+		return nil, "", err
+	}
+
+	location := m.metadata.Location()
+
+	randid := uuid.New().String()
+	metadatafile := fmt.Sprintf("%s/metadata/%s.metadata.json", location, randid)
+
+	// removing old metadata files
+	bldr.TrimMetadataLogs(0)
+
+	bldr.AppendMetadataLog(table.MetadataLogEntry{
+		MetadataFile: metadatafile,
+		TimestampMs:  time.Now().UnixMilli(),
+	})
+
+	for _, u := range updates {
+		if err := u.Apply(bldr); err != nil {
+			return nil, "", err
+		}
+	}
+
+	meta, err := bldr.Build()
+	if err != nil {
+		return nil, "", err
+	}
+
+	m.metadata = meta
+
+	return meta, metadatafile, nil
+}
+
+func createMetadataFile(metadatadir, metadataFile string) error {
+	// Ensure the directory exists
+	metadataDir := filepath.Dir(metadatadir)
+	err := os.MkdirAll(metadataDir, 0o755)
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile(metadataFile, []byte("first commit metadata content"), 0o644)
+
+	return err
+}
+
+func (t *TableWritingTestSuite) TestDeleteOldMetadataLogsErrorOnFileNotFound() {
+	// capture logs to validate that no error is logged
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr) // restore default output
+
+	fs := iceio.LocalFS{}
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/file_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "file_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion), "write.metadata.delete-after-commit.enabled": "true"})
+	t.Require().NoError(err)
+
+	tbl := table.New(ident, meta, t.getMetadataLoc(), func(ctx context.Context) (iceio.IO, error) {
+		return fs, nil
+	}, &DeleteOldMetadataMockedCatalog{meta})
+	ctx := context.Background()
+
+	// transaction 1 to create metadata file
+	tx := tbl.NewTransaction()
+	tx.AddFiles(ctx, files[0:1], nil, false)
+	tbl_new, err := tx.Commit(ctx)
+	t.Require().NoError(err)
+
+	// transaction 2 to add files
+	tx_new := tbl_new.NewTransaction()
+	tx_new.AddFiles(ctx, files[1:2], nil, false)
+
+	_, err = tx_new.Commit(ctx)
+	t.Require().NoError(err)
+
+	// validate that error is logged
+	logOutput := logBuf.String()
+	t.Contains(logOutput, "Warning: Failed to delete old metadata file")
+	if runtime.GOOS == "windows" {
+		t.Contains(logOutput, "The system cannot find the file specified")
+	} else {
+		t.Contains(logOutput, "no such file or directory")
+	}
+}
+
+func (t *TableWritingTestSuite) TestDeleteOldMetadataNoErrorLogsOnFileFound() {
+	// capture logs to validate that no error is logged
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr) // restore default output
+
+	fs := iceio.LocalFS{}
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/file_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "file_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec, table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion), "write.metadata.delete-after-commit.enabled": "true"})
+	t.Require().NoError(err)
+
+	tbl := table.New(
+		ident,
+		meta,
+		t.getMetadataLoc(),
+		func(ctx context.Context) (iceio.IO, error) {
+			return fs, nil
+		},
+		&DeleteOldMetadataMockedCatalog{meta},
+	)
+
+	ctx := context.Background()
+
+	// transaction 1 to create metadata file
+	tx := tbl.NewTransaction()
+	tx.AddFiles(ctx, files[0:1], nil, false)
+	tbl_new, err := tx.Commit(ctx)
+	t.Require().NoError(err)
+
+	// Now we have the first metadata location - create the file there so that deleteOldMetadata does not log an error
+	firstMetadataLoc := tbl_new.MetadataLocation()
+	metadataFile := tbl_new.MetadataLocation()
+	err = createMetadataFile(firstMetadataLoc, metadataFile)
+	t.Require().NoError(err)
+
+	// transaction 2 to add files
+	tx_new := tbl_new.NewTransaction()
+	tx_new.AddFiles(ctx, files[1:2], nil, false)
+	_, err = tx_new.Commit(ctx)
+	t.Require().NoError(err)
+
+	// validate that no error is logged
+	logOutput := logBuf.String()
+	t.NotContains(logOutput, "Warning: Failed to delete old metadata file")
+	t.NotContains(logOutput, "no such file or directory")
+}
+
+// testing issue reported in https://github.com/apache/iceberg-go/issues/595
+func TestWriteMapType(t *testing.T) {
+	loc := filepath.ToSlash(t.TempDir())
+
+	cat, err := catalog.Load(context.Background(), "default", iceberg.Properties{
+		"uri":          ":memory:",
+		"type":         "sql",
+		sql.DriverKey:  sqliteshim.ShimName,
+		sql.DialectKey: string(sql.SQLite),
+		"warehouse":    "file://" + loc,
+	})
+	require.NoError(t, err)
+
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	defer mem.AssertSize(t, 0)
+
+	ctx := compute.WithAllocator(context.Background(), mem)
+	cat.CreateNamespace(ctx, catalog.ToIdentifier("default"), nil)
+	iceSch := iceberg.NewSchema(1,
+		iceberg.NestedField{
+			ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.String, Required: true,
+		},
+		iceberg.NestedField{
+			ID: 2, Name: "attrs", Required: true, Type: &iceberg.MapType{
+				KeyID:         3,
+				KeyType:       iceberg.PrimitiveTypes.String,
+				ValueID:       4,
+				ValueType:     iceberg.PrimitiveTypes.String,
+				ValueRequired: false,
+			},
+		})
+
+	ident := catalog.ToIdentifier("default", "repro_map")
+	tbl, err := cat.CreateTable(ctx, ident, iceSch, catalog.WithLocation(loc))
+	require.NoError(t, err)
+
+	arrowSch, err := table.SchemaToArrowSchema(iceSch, nil, true, false)
+	require.NoError(t, err)
+
+	bldr := array.NewRecordBuilder(mem, arrowSch)
+	defer bldr.Release()
+
+	idbldr := bldr.Field(0).(*array.StringBuilder)
+	attrBldr := bldr.Field(1).(*array.MapBuilder)
+	attrKeyBldr := attrBldr.KeyBuilder().(*array.StringBuilder)
+	attrItemBldr := attrBldr.ItemBuilder().(*array.StringBuilder)
+
+	idbldr.Append("row-0")
+	attrBldr.Append(true)
+	attrKeyBldr.Append("a")
+	attrItemBldr.Append("1")
+
+	idbldr.Append("row-1")
+	attrBldr.Append(true)
+	attrKeyBldr.AppendValues([]string{"b", "c"}, nil)
+	attrItemBldr.AppendValues([]string{"2", "3"}, nil)
+
+	rec := bldr.NewRecordBatch()
+	defer rec.Release()
+
+	rr, err := array.NewRecordReader(arrowSch, []arrow.RecordBatch{rec})
+	require.NoError(t, err)
+	defer rr.Release()
+
+	result, err := tbl.Append(ctx, rr, nil)
+	require.NoError(t, err)
+
+	resultTbl, err := result.Scan().ToArrowTable(ctx)
+	require.NoError(t, err)
+	defer resultTbl.Release()
+
+	expectedSchema, err := table.SchemaToArrowSchema(iceSch, nil, false, false)
+	require.NoError(t, err)
+	expected, err := array.TableFromJSON(mem, expectedSchema, []string{
+		`[
+			{"id": "row-0", "attrs": [{"key": "a", "value": "1"}]},
+			{"id": "row-1", "attrs": [{"key": "b", "value": "2"}, {"key": "c", "value": "3"}]}
+		]`,
+	})
+	require.NoError(t, err)
+	defer expected.Release()
+
+	require.True(t, array.TableEqual(expected, resultTbl), "expected:\n %s\ngot:\n %s", expected, resultTbl)
+}
+
+func (t *TableTestSuite) TestRefresh() {
+	cat, err := catalog.Load(context.Background(), "default", iceberg.Properties{
+		"uri":          ":memory:",
+		"type":         "sql",
+		sql.DriverKey:  sqliteshim.ShimName,
+		sql.DialectKey: string(sql.SQLite),
+		"warehouse":    "file://" + t.T().TempDir(),
+	})
+	t.Require().NoError(err)
+
+	ident := table.Identifier{"test", "refresh_table"}
+	t.Require().NoError(cat.CreateNamespace(context.Background(), catalog.NamespaceFromIdent(ident), nil))
+
+	tbl, err := cat.CreateTable(context.Background(), ident, t.tbl.Schema(),
+		catalog.WithProperties(iceberg.Properties{"original": "true"}))
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl)
+
+	originalProperties := tbl.Properties()
+	originalIdentifier := tbl.Identifier()
+	originalLocation := tbl.Location()
+	originalSchema := tbl.Schema()
+	originalSpec := tbl.Spec()
+
+	_, _, err = cat.CommitTable(context.Background(), tbl.Identifier(), nil, []table.Update{
+		table.NewSetPropertiesUpdate(iceberg.Properties{
+			"refreshed": "true",
+			"timestamp": strconv.FormatInt(time.Now().Unix(), 10),
+		}),
+	})
+	t.Require().NoError(err)
+
+	err = tbl.Refresh(context.Background())
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl)
+
+	t.Equal("true", tbl.Properties()["refreshed"])
+	t.NotEqual(originalProperties, tbl.Properties())
+
+	t.Equal(originalIdentifier, tbl.Identifier())
+	t.Equal(originalLocation, tbl.Location())
+	t.True(originalSchema.Equals(tbl.Schema()))
+	t.Equal(originalSpec, tbl.Spec())
+}
+
+func (t *TableTestSuite) TestTransactionRemoveProperties() {
+	cat, err := catalog.Load(context.Background(), "default", iceberg.Properties{
+		"uri":          ":memory:",
+		"type":         "sql",
+		sql.DriverKey:  sqliteshim.ShimName,
+		sql.DialectKey: string(sql.SQLite),
+		"warehouse":    "file://" + t.T().TempDir(),
+	})
+	t.Require().NoError(err)
+
+	ident := table.Identifier{"test", "remove_properties_table"}
+	t.Require().NoError(cat.CreateNamespace(context.Background(), catalog.NamespaceFromIdent(ident), nil))
+
+	tbl, err := cat.CreateTable(context.Background(), ident, t.tbl.Schema(),
+		catalog.WithProperties(iceberg.Properties{"keep": "true", "drop": "true"}))
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl)
+
+	txn := tbl.NewTransaction()
+	t.Require().NoError(txn.RemoveProperties([]string{"drop", "absent"}))
+
+	updated, err := txn.Commit(context.Background())
+	t.Require().NoError(err)
+
+	t.Equal("true", updated.Properties()["keep"])
+	_, ok := updated.Properties()["drop"]
+	t.False(ok)
+}
+
+func (t *TableTestSuite) TestMetadataCompressionRoundTrip() {
+	cat, err := catalog.Load(context.Background(), "default", iceberg.Properties{
+		"uri":          ":memory:",
+		"type":         "sql",
+		sql.DriverKey:  sqliteshim.ShimName,
+		sql.DialectKey: string(sql.SQLite),
+		"warehouse":    "file://" + t.T().TempDir(),
+	})
+	t.Require().NoError(err)
+
+	ident := table.Identifier{"test", "compression_table"}
+	t.Require().NoError(cat.CreateNamespace(context.Background(), catalog.NamespaceFromIdent(ident), nil))
+
+	// Test with gzip compression enabled
+	tbl, err := cat.CreateTable(context.Background(), ident, t.tbl.Schema(),
+		catalog.WithProperties(iceberg.Properties{
+			table.MetadataCompressionKey: "gzip",
+		}))
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl)
+
+	// Verify the metadata location has the correct extension for gzipped files
+	metadataLoc := tbl.MetadataLocation()
+	t.Contains(metadataLoc, ".gz.metadata.json")
+
+	// Test that we can read the gzipped metadata
+	fs, err := tbl.FS(context.Background())
+	t.Require().NoError(err)
+
+	// Read the metadata file and verify it's gzipped
+	file, err := fs.Open(metadataLoc)
+	t.Require().NoError(err)
+	defer file.Close()
+
+	metadataBytes, err := io.ReadAll(file)
+	t.Require().NoError(err)
+
+	// Verify it's gzipped by trying to decompress it
+	gzReader, err := gzip.NewReader(bytes.NewReader(metadataBytes))
+	t.Require().NoError(err)
+	defer gzReader.Close()
+
+	decompressed, err := io.ReadAll(gzReader)
+	t.Require().NoError(err)
+
+	// Verify the decompressed content is valid JSON
+	var metadata map[string]any
+	err = json.Unmarshal(decompressed, &metadata)
+	t.Require().NoError(err)
+
+	// Verify it contains expected Iceberg metadata fields
+	t.Contains(metadata, "format-version")
+	t.Contains(metadata, "table-uuid")
+	t.Contains(metadata, "location")
+
+	// Verify that we can load the table from the metadata location
+	tbl2, err := cat.LoadTable(context.Background(), ident)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(tbl.Equals(*tbl2))
+}
+
+func (t *TableTestSuite) TestMetadataCompressionRoundTripZstd() {
+	cat, err := catalog.Load(context.Background(), "default", iceberg.Properties{
+		"uri":          ":memory:",
+		"type":         "sql",
+		sql.DriverKey:  sqliteshim.ShimName,
+		sql.DialectKey: string(sql.SQLite),
+		"warehouse":    "file://" + t.T().TempDir(),
+	})
+	t.Require().NoError(err)
+
+	ident := table.Identifier{"test", "zstd_compression_table"}
+	t.Require().NoError(cat.CreateNamespace(context.Background(), catalog.NamespaceFromIdent(ident), nil))
+
+	tbl, err := cat.CreateTable(context.Background(), ident, t.tbl.Schema(),
+		catalog.WithProperties(iceberg.Properties{
+			table.MetadataCompressionKey: "zstd",
+		}))
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl)
+
+	metadataLoc := tbl.MetadataLocation()
+	t.Contains(metadataLoc, ".zstd.metadata.json")
+
+	fs, err := tbl.FS(context.Background())
+	t.Require().NoError(err)
+
+	file, err := fs.Open(metadataLoc)
+	t.Require().NoError(err)
+	defer file.Close()
+
+	metadataBytes, err := io.ReadAll(file)
+	t.Require().NoError(err)
+
+	dec, err := zstd.NewReader(bytes.NewReader(metadataBytes))
+	t.Require().NoError(err)
+	defer dec.Close()
+
+	decompressed, err := io.ReadAll(dec)
+	t.Require().NoError(err)
+
+	var metadata map[string]any
+	err = json.Unmarshal(decompressed, &metadata)
+	t.Require().NoError(err)
+
+	t.Contains(metadata, "format-version")
+	t.Contains(metadata, "table-uuid")
+	t.Contains(metadata, "location")
+
+	tbl2, err := cat.LoadTable(context.Background(), ident)
+	t.Require().NoError(err)
+	t.Require().NotNil(tbl2)
+
+	t.True(tbl.Equals(*tbl2))
+}
+
+type snapshotSummaryMatcher struct{}
+
+func (m *snapshotSummaryMatcher) Matches(expected *table.Summary, actual *table.Summary) bool {
+	if expected == nil && actual == nil {
+		return true
+	}
+	if expected == nil {
+		return false
+	}
+	if actual == nil {
+		return false
+	}
+	// Filter properties to validate by deleting all the ones that aren't in the expected summary properties. This is
+	// to allow ignoring the properties that vary per environment/test execution like file sizes
+	filtered := cloneSummaryAndFilterProperties(expected, actual)
+
+	return reflect.DeepEqual(expected, filtered)
+}
+
+// cloneSummaryAndFilterProperties clones a summary and filters out any summary properties that aren't part of the
+// expected summary. This is useful to ignore properties that we don't wish to validate
+func cloneSummaryAndFilterProperties(expected *table.Summary, actual *table.Summary) *table.Summary {
+	actualPropertiesFiltered := maps.Clone(actual.Properties)
+	maps.DeleteFunc(actualPropertiesFiltered, func(k string, v string) bool {
+		_, ok := expected.Properties[k]
+
+		return !ok
+	})
+	filtered := *actual
+	filtered.Properties = actualPropertiesFiltered
+
+	return &filtered
+}
+
+func (m *snapshotSummaryMatcher) Format(val *table.Summary) string {
+	if val == nil {
+		return "nil"
+	}
+
+	return fmt.Sprintf("{Operation: %s, Properties: %#v}", val.Operation, val.Properties)
+}
+
+// equalSnapshotSummary invokes a snapshotSummaryMatcher to compare two snapshot summary values.
+// Its return value is nil if both values are equal and an error with a meaningful formatted message to help
+// show the mismatch in case they are not. This is meant to be used with testify like:
+//
+//	assert.NoError(t, equalSnapshotSummary(expected, actual))
+func equalSnapshotSummary(expected *table.Summary, actual *table.Summary) (err error) {
+	matcher := &snapshotSummaryMatcher{}
+	if !matcher.Matches(expected, actual) {
+		return fmt.Errorf("Expected: %s\nActual:   %s", matcher.Format(expected), matcher.Format(actual))
+	}
+
+	return nil
+}
+
+// The spec forbids committing files against a partition spec with an unknown
+// transform. Run across format versions -- v3 is where reading such a table is
+// required, so it's where the write rejection matters most.
+func TestWritesToUnknownTransformSpecFail(t *testing.T) {
+	tableSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "foo", Type: iceberg.PrimitiveTypes.Bool},
+		iceberg.NestedField{ID: 2, Name: "bar", Type: iceberg.PrimitiveTypes.String},
+		iceberg.NestedField{ID: 4, Name: "baz", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 10, Name: "qux", Type: iceberg.PrimitiveTypes.Date})
+	arrSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "foo", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
+		{Name: "bar", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "baz", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "qux", Type: arrow.FixedWidthTypes.Date32, Nullable: true},
+	}, nil)
+
+	unknown, err := iceberg.ParseTransform("custom_transform[42]")
+	require.NoError(t, err)
+	unknownSpec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{4}, FieldID: 1000, Transform: unknown, Name: "baz_custom",
+	})
+
+	fsF := func(ctx context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }
+	newTable := func(t *testing.T, location string, formatVersion int, spec iceberg.PartitionSpec) *table.Table {
+		t.Helper()
+
+		meta, err := table.NewMetadata(tableSchema, &spec, table.UnsortedSortOrder, location,
+			iceberg.Properties{
+				table.PropertyFormatVersion: strconv.Itoa(formatVersion),
+				table.WriteDeleteModeKey:    table.WriteModeMergeOnRead,
+			})
+		require.NoError(t, err)
+		metaLoc := fmt.Sprintf("%s/metadata/%05d-%s.metadata.json", location, 1, uuid.New().String())
+
+		return table.New(table.Identifier{"default", "unknown_transform"}, meta, metaLoc, fsF, &mockedCatalog{meta})
+	}
+
+	for _, formatVersion := range []int{1, 2, 3} {
+		t.Run("v"+strconv.Itoa(formatVersion), func(t *testing.T) {
+			location := filepath.ToSlash(strings.ReplaceAll(t.TempDir(), "#", ""))
+			ctx := context.Background()
+
+			t.Run("AddFiles", func(t *testing.T) {
+				tbl := newTable(t, location, formatVersion, unknownSpec)
+				arrTable, err := array.TableFromJSON(memory.DefaultAllocator, arrSchema, []string{
+					`[{"foo": true, "bar": "bar_string", "baz": 1, "qux": "2024-03-07"}]`,
+				})
+				require.NoError(t, err)
+				defer arrTable.Release()
+
+				filePath := location + "/data/add-files.parquet"
+				fo, err := mustFS(t, tbl).(iceio.WriteFileIO).Create(filePath)
+				require.NoError(t, err)
+				require.NoError(t, pqarrow.WriteTable(arrTable, fo, arrTable.NumRows(), nil, pqarrow.DefaultWriterProps()))
+
+				err = tbl.NewTransaction().AddFiles(ctx, []string{filePath}, nil, false)
+				require.ErrorIs(t, err, iceberg.ErrInvalidTransform)
+				assert.ErrorContains(t, err, "custom_transform[42]")
+			})
+
+			t.Run("AddDataFiles", func(t *testing.T) {
+				tbl := newTable(t, location, formatVersion, unknownSpec)
+				df, err := iceberg.NewDataFileBuilder(unknownSpec, iceberg.EntryContentData,
+					location+"/data/add-data-files.parquet", iceberg.ParquetFile, nil, nil, nil, 1, 1024)
+				require.NoError(t, err)
+
+				err = tbl.NewTransaction().AddDataFiles(ctx, []iceberg.DataFile{df.Build()}, nil)
+				require.ErrorIs(t, err, iceberg.ErrInvalidTransform)
+				assert.ErrorContains(t, err, "custom_transform[42]")
+			})
+
+			t.Run("WriteRecords", func(t *testing.T) {
+				tbl := newTable(t, location, formatVersion, unknownSpec)
+				arrTable, err := array.TableFromJSON(memory.DefaultAllocator, arrSchema, []string{
+					`[{"foo": true, "bar": "bar_string", "baz": 1, "qux": "2024-03-07"}]`,
+				})
+				require.NoError(t, err)
+				defer arrTable.Release()
+
+				_, err = tbl.AppendTable(ctx, arrTable, 1, nil)
+				require.ErrorIs(t, err, iceberg.ErrInvalidTransform)
+				assert.ErrorContains(t, err, "custom_transform[42]")
+			})
+
+			// v1 requires sequential partition field IDs, so a second spec can't
+			// be added there.
+			if formatVersion < 2 {
+				return
+			}
+
+			t.Run("Delete", func(t *testing.T) {
+				identitySpec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+					SourceIDs: []int{4}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "baz",
+				})
+				tbl := newTable(t, location, formatVersion, identitySpec)
+
+				// One partition, so deleting a subset writes delete files rather
+				// than dropping the whole data file.
+				arrTable, err := array.TableFromJSON(memory.DefaultAllocator, arrSchema, []string{
+					`[{"foo": false, "bar": "delete_me", "baz": 123, "qux": "2024-01-01"},
+					  {"foo": true, "bar": "keep_this", "baz": 123, "qux": "2024-01-02"}]`,
+				})
+				require.NoError(t, err)
+				defer arrTable.Release()
+
+				tbl, err = tbl.OverwriteTable(ctx, arrTable, 1, nil)
+				require.NoError(t, err)
+
+				// Evolve onto the unknown spec after the data is written, since
+				// writing against it directly is already rejected above.
+				evolvedSpec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+					SourceIDs: []int{4}, FieldID: 1001, Transform: unknown, Name: "baz_custom",
+				})
+				builder, err := table.MetadataBuilderFromBase(tbl.Metadata(), tbl.MetadataLocation())
+				require.NoError(t, err)
+				require.NoError(t, builder.AddPartitionSpec(&evolvedSpec, false))
+				require.NoError(t, builder.SetDefaultSpecID(-1))
+				evolved, err := builder.Build()
+				require.NoError(t, err)
+
+				tbl = table.New(tbl.Identifier(), evolved, tbl.MetadataLocation(), fsF, &mockedCatalog{evolved})
+
+				// The data is still readable; only the delete write is blocked.
+				scanned, err := tbl.Scan().ToArrowTable(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, int64(2), scanned.NumRows())
+
+				_, err = tbl.Delete(ctx, iceberg.EqualTo(iceberg.Reference("bar"), "delete_me"), nil)
+				require.ErrorIs(t, err, iceberg.ErrInvalidTransform)
+				assert.ErrorContains(t, err, "custom_transform[42]")
+			})
+		})
+	}
+}
+
+// Creating a table with an unknown-transform spec is allowed, matching Java's
+// builder; the spec sentence bites on write, not on create.
+func TestCreateTableWithUnknownTransformSpec(t *testing.T) {
+	ctx := context.Background()
+	location := filepath.ToSlash(strings.ReplaceAll(t.TempDir(), "#", ""))
+
+	cat, err := catalog.Load(ctx, "default", iceberg.Properties{
+		"uri":          ":memory:",
+		"type":         "sql",
+		sql.DriverKey:  sqliteshim.ShimName,
+		sql.DialectKey: string(sql.SQLite),
+		"warehouse":    "file://" + location,
+	})
+	require.NoError(t, err)
+
+	unknown, err := iceberg.ParseTransform("custom_transform[42]")
+	require.NoError(t, err)
+	spec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{1}, FieldID: 1000, Transform: unknown, Name: "id_custom",
+	})
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32})
+
+	ident := table.Identifier{"default", "created_unknown"}
+	require.NoError(t, cat.CreateNamespace(ctx, catalog.NamespaceFromIdent(ident), nil))
+	tbl, err := cat.CreateTable(ctx, ident, sc,
+		catalog.WithPartitionSpec(&spec),
+		catalog.WithLocation("file://"+location),
+		catalog.WithProperties(iceberg.Properties{table.PropertyFormatVersion: "3"}))
+	require.NoError(t, err)
+
+	loaded, err := cat.LoadTable(ctx, ident)
+	require.NoError(t, err)
+	loadedSpec := loaded.Metadata().PartitionSpec()
+	field := loadedSpec.Field(0)
+	_, ok := field.Transform.(iceberg.UnknownTransform)
+	assert.True(t, ok, "unknown transform should survive create and load")
+	assert.Equal(t, "custom_transform[42]", field.Transform.String())
+
+	// Evolving the spec of such a table is what's blocked.
+	_, err = tbl.NewTransaction().UpdateSpec(false).RemoveField("id_custom").Apply()
+	require.ErrorIs(t, err, iceberg.ErrInvalidTransform)
+}

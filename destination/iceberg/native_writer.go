@@ -73,20 +73,16 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 	if err := w.validateFormat(ctx); err != nil {
 		return nil, nil, err
 	}
-	columns, err := nativeStreamColumns(stream)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := w.evolveNativeSchema(ctx, columns, false); err != nil {
-		return nil, nil, err
-	}
+	// Existing source columns are reconciled by ApplySourceColumns after the
+	// SyncStart phase, when PostgreSQL defaults have become authoritative. Eager
+	// union here would consume additions before their initial defaults arrive.
 	if options.TableIndex != nil {
 		if err := w.migrateEqualityDeletes(ctx); err != nil {
 			return nil, nil, err
 		}
 	}
 	// Reconcile and return recovery from the loaded metadata, or from the
-	// successful format/schema/migration commit that replaced it. A no-op
+	// successful format/migration commit that replaced it. A no-op
 	// initialization must not issue another catalog GET.
 	if err := reconcileNativeTableIndex(ctx, options.TableIndex, w.table, constants.OlakeID); err != nil {
 		return nil, nil, err

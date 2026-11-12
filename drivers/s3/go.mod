@@ -145,4 +145,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
+replace github.com/apache/iceberg-go => ../../third_party/iceberg-go
+
 // TODO: Remove this replace directive after releasing olake v0.3.x with parser package
+
