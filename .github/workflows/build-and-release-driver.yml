@@ -39,13 +39,6 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v5
-        with:
-          java-version: "17"
-          distribution: "temurin"
-          cache: maven
-
       - name: Set Driver
         run: echo "DRIVER=${{ env.DRIVER }}" >> $GITHUB_ENV
       - name: Set VERSION

@@ -4,7 +4,6 @@ go 1.26.10
 
 replace (
 	cloud.google.com/go/compute => cloud.google.com/go/compute v1.23.3
-	cloud.google.com/go/compute/metadata => cloud.google.com/go/compute/metadata v0.6.0
 	github.com/datazip-inc/olake => ../../
 	github.com/ibmdb/go_ibm_db => github.com/datazip-inc/go_ibm_db v0.0.1
 	google.golang.org/genproto => google.golang.org/genproto v0.0.0-20240123012728-ef4313101c80

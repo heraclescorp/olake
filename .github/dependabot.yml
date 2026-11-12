@@ -26,23 +26,6 @@ updates:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
 
-  # Java Iceberg writer. Dependabot cannot fix a transitive Maven dependency,
-  # so keeping the parents current is the whole mechanism here.
-  - package-ecosystem: "maven"
-    directory: "/destination/iceberg/olake-iceberg-java-writer"
-    target-branch: "staging"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
-    labels:
-      - "dependencies"
-      - "java"
-    ignore:
-      # Majors are reviewed by hand: this module has no test suite, so a green
-      # build does not prove runtime behaviour is intact.
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
-
   - package-ecosystem: "github-actions"
     directories:
       - "/"

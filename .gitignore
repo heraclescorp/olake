@@ -1,21 +1,13 @@
 drivers/*/olake
 .vscode
 test
-# `test` matches any depth; keep the Iceberg writer's Maven test sources.
-!destination/iceberg/olake-iceberg-java-writer/src/test/
 .DS_Store
 __debug_bin*
 */**/examples
 */**/olake-table-index
 olake-data/
-olake-iceberg-java-writer-0.0.1-SNAPSHOT.jar
-destination/iceberg/olake-iceberg-java-writer/target/
-destination/iceberg/olake-iceberg-java-writer/target/**/
 destination/iceberg/local-test/data/
-olake-iceberg-java-writer.jar
 local-releaser.sh
-destination/iceberg/olake-iceberg-java-writer/.idea/
-destination/iceberg/olake-iceberg-java-writer/dependency-reduced-pom.xml
 tests/*/testdata/**/logs
 .cocoindex_code/
 CLAUDE.local.md

@@ -291,7 +291,8 @@ func (c *TestConfig) setupWorkingDir(t *testing.T) (err error) {
 // isolateSuiteConfigs derives every config the driver container reads from its committed base, so the base
 // files stay untouched, and retargets the copies at the names this suite owns.
 func (c *TestConfig) isolateSuiteConfigs() error {
-	enableArrowWrites := func(destinationConf map[string]interface{}) error {
+	// Historical compatibility baselines still use this fixture to exercise their Arrow path.
+	legacyArrowConfig := func(destinationConf map[string]interface{}) error {
 		writer, ok := destinationConf["writer"].(map[string]interface{})
 		if !ok {
 			return fmt.Errorf("no writer object in iceberg_s3_destination.json")
@@ -301,7 +302,7 @@ func (c *TestConfig) isolateSuiteConfigs() error {
 		return nil
 	}
 
-	err := CopyJSONWithEdit(c.GetFilePath("iceberg_s3_destination.json"), c.GetFilePath("iceberg_s3_destination_arrow.json"), enableArrowWrites)
+	err := CopyJSONWithEdit(c.GetFilePath("iceberg_s3_destination.json"), c.GetFilePath("iceberg_s3_destination_arrow.json"), legacyArrowConfig)
 	if err != nil {
 		return fmt.Errorf("failed to derive the arrow destination config of driver %q suite %q: %s", c.Driver, c.Suite, err)
 	}

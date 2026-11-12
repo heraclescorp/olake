@@ -12,7 +12,6 @@ import (
 
 const (
 	icebergDestinationFile      = "iceberg_s3_destination.json"
-	icebergArrowDestinationFile = "iceberg_s3_destination_arrow.json"
 	parquetS3DestinationFile    = "parquet_s3_destination.json"
 	parquetAzureDestinationFile = "parquet_azure_destination.json"
 )
@@ -20,9 +19,6 @@ const (
 type TestHandler struct {
 	*testutils.TestConfig
 
-	// icebergDestination is the destination config the next iceberg sync runs against, which is how
-	// IcebergWriter selects between the legacy and the arrow writer.
-	icebergDestination               string
 	ExpectedData                     map[string]interface{}
 	ExpectedUpdatedData              map[string]interface{}
 	ExpectedCDCUpdatedData           map[string]interface{} // CDC update row, when a CDC change leaves columns out
@@ -121,38 +117,16 @@ func (th *TestHandler) runSyncAndVerify(
 	return nil
 }
 
-// destinationFile names the destination config a sync of this kind runs against. The iceberg one
-// is whichever writer variant IcebergWriter selected, defaulting to the committed base config.
+// destinationFile names the configuration used by each destination.
 func (th *TestHandler) destinationFile(destinationType string) string {
 	if destinationType == "parquet" {
 		return parquetS3DestinationFile
 	}
-	if th.icebergDestination == "" {
-		return icebergDestinationFile
-	}
-	return th.icebergDestination
+	return icebergDestinationFile
 }
 
-// IcebergDestinationFile names the iceberg destination config the next sync runs against, for
-// suites whose expectations depend on which writer that config selects.
 func (th *TestHandler) IcebergDestinationFile() string {
-	return th.destinationFile("iceberg")
-}
-
-func (th *TestHandler) IcebergWriter(
-	ctx context.Context,
-	t *testing.T,
-	testTable string,
-	useArrowWriter bool,
-	testFunc func(context.Context, *testing.T, string) error,
-) error {
-	// Writer variants are separate config files, so no suite ever edits one in place; SyncArgs
-	// hands whichever is named here to --destination.
-	previous := th.icebergDestination
-	th.icebergDestination = testutils.Ternary(useArrowWriter, icebergArrowDestinationFile, icebergDestinationFile).(string)
-	defer func() { th.icebergDestination = previous }()
-
-	return testFunc(ctx, t, testTable)
+	return icebergDestinationFile
 }
 
 type syncTestCase struct {

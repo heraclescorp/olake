@@ -3,7 +3,6 @@ package iceberg
 import (
 	"context"
 	"errors"
-	"io"
 	"maps"
 	"slices"
 	"strings"
@@ -12,10 +11,8 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc"
 
 	"github.com/datazip-inc/olake/constants"
-	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/datazip-inc/olake/types"
 )
 
@@ -68,102 +65,36 @@ type testCell struct {
 // from the map is a column the data file does not carry.
 type testTable map[testCell]any
 
-// testReader answers ReadRows out of a testTable, standing in for the Java side, and keeps
-// every request it received. The embedded interface supplies the table index calls the
-// resolver never makes.
-type testReader struct {
-	proto.TableIndexServiceClient
-	table    testTable
-	readErr  error
-	recvErr  error
-	requests []*proto.ReadRowsRequest
-	// inParts sends each row the way the Java reader sends a large one: a part per column
-	inParts bool
+// testReader answers native file/physical-position projections and keeps each
+// per-file request. Missing cells represent columns absent from historical files.
+type testReadRequest struct {
+	path      string
+	positions []int64
+	columns   []string
 }
 
-func (r *testReader) ReadRows(_ context.Context, request *proto.ReadRowsRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[proto.ReadRowsBatch], error) {
-	r.requests = append(r.requests, request)
+type testReader struct {
+	table    testTable
+	readErr  error
+	requests []testReadRequest
+}
+
+func (r *testReader) ReadRows(_ context.Context, path string, positions []int64, columns []string) (map[int64]map[string]any, error) {
+	r.requests = append(r.requests, testReadRequest{path: path, positions: slices.Clone(positions), columns: slices.Clone(columns)})
 	if r.readErr != nil {
 		return nil, r.readErr
 	}
-
-	batch := &proto.ReadRowsBatch{}
-	for _, file := range request.GetFiles() {
-		for _, requested := range file.GetRows() {
-			position := requested.GetPosition()
-			row := &proto.ReadRowsBatch_Row{
-				FilePath: file.GetFilePath(),
-				Position: position,
-				Values:   map[string]*proto.IcebergPayload_IceRecord_FieldValue{},
+	rows := make(map[int64]map[string]any, len(positions))
+	for _, position := range positions {
+		row := make(map[string]any)
+		for _, column := range columns {
+			if value, present := r.table[testCell{filePath: path, position: position, column: column}]; present {
+				row[column] = value
 			}
-			for _, column := range requested.GetColumns() {
-				// a column the data file does not carry is left out, as the Java reader does
-				if value, present := r.table[testCell{filePath: file.GetFilePath(), position: position, column: column}]; present {
-					row.Values[column] = testFieldValue(value)
-				}
-			}
-			if r.inParts {
-				batch.Rows = append(batch.Rows, testRowParts(row)...)
-				continue
-			}
-			batch.Rows = append(batch.Rows, row)
 		}
+		rows[position] = row
 	}
-
-	return &testStream{batches: []*proto.ReadRowsBatch{batch}, err: r.recvErr}, nil
-}
-
-// testRowParts splits a row into a part per column, each carrying _op_type, as the Java
-// reader splits a row too large for one message.
-func testRowParts(row *proto.ReadRowsBatch_Row) []*proto.ReadRowsBatch_Row {
-	var parts []*proto.ReadRowsBatch_Row
-	for column, value := range row.GetValues() {
-		if column == constants.OpType {
-			continue
-		}
-		part := &proto.ReadRowsBatch_Row{
-			FilePath: row.GetFilePath(),
-			Position: row.GetPosition(),
-			Values:   map[string]*proto.IcebergPayload_IceRecord_FieldValue{column: value},
-		}
-		if opType, present := row.GetValues()[constants.OpType]; present {
-			part.Values[constants.OpType] = opType
-		}
-		parts = append(parts, part)
-	}
-
-	return parts
-}
-
-// testFieldValue mirrors what the Java reader sends: an unset value for a stored NULL.
-func testFieldValue(value any) *proto.IcebergPayload_IceRecord_FieldValue {
-	if text, ok := value.(string); ok {
-		return &proto.IcebergPayload_IceRecord_FieldValue{Value: &proto.IcebergPayload_IceRecord_FieldValue_StringValue{StringValue: text}}
-	}
-	return &proto.IcebergPayload_IceRecord_FieldValue{}
-}
-
-// testStream hands back canned batches, then err (io.EOF when unset). The embedded interface
-// supplies the rest of the streaming client, which the resolver never calls.
-type testStream struct {
-	grpc.ClientStream
-	batches []*proto.ReadRowsBatch
-	err     error
-	next    int
-}
-
-func (s *testStream) Recv() (*proto.ReadRowsBatch, error) {
-	if s.next >= len(s.batches) {
-		if s.err != nil {
-			return nil, s.err
-		}
-		return nil, io.EOF
-	}
-
-	batch := s.batches[s.next]
-	s.next++
-
-	return batch, nil
+	return rows, nil
 }
 
 // testConfiguredStream is a stream that keeps source column names, so destination columns
@@ -539,9 +470,9 @@ func TestResolve(t *testing.T) {
 	}
 }
 
-// A row too large for one message comes back in parts; each part must be merged into the row,
-// and a deleted row must stay unrecovered whichever part arrives first.
-func TestResolveRowInParts(t *testing.T) {
+// Every projected value of a row is recovered together, while soft-deleted
+// versions must never supply values to a later update.
+func TestResolveProjectedRow(t *testing.T) {
 	testCases := []struct {
 		name               string
 		opType             string
@@ -551,14 +482,14 @@ func TestResolveRowInParts(t *testing.T) {
 		expectedFilled     int64 // bytes Resolve reports it added to the batch
 	}{
 		{
-			name:              "every part of a live row is recovered",
+			name:              "every projected value of a live row is recovered",
 			opType:            "u",
 			expected:          map[string]any{"payload": "big value", "doc": "big doc"},
 			expectedRecovered: 2,
 			expectedFilled:    int64(len("big value") + len("big doc")),
 		},
 		{
-			name:               "no part of a deleted row is recovered",
+			name:               "no value of a deleted row is recovered",
 			opType:             "d",
 			expected:           map[string]any{"payload": placeholder, "doc": placeholder},
 			expectedUnresolved: 2,
@@ -573,7 +504,7 @@ func TestResolveRowInParts(t *testing.T) {
 				{"a.parquet", 0, "payload"}:        "big value",
 				{"a.parquet", 0, "doc"}:            "big doc",
 			}
-			resolver := testResolver(t, true, writer, &testReader{table: table, inParts: true})
+			resolver := testResolver(t, true, writer, &testReader{table: table})
 
 			records := []types.RawRecord{testRecord("1", "u", map[string]any{"id": 1, "payload": placeholder, "doc": placeholder}, "payload", "doc")}
 			require.NoError(t, resolver.Resolve(context.Background(), records))
@@ -613,13 +544,13 @@ func TestResolveReadRequest(t *testing.T) {
 		expectedRows    map[string]map[int64][]string // file -> position -> columns read
 		expectedFlushes [][]string
 	}{
-		// one call per batch, rows grouped by file, each row asking only for its own columns
+		// Native file reads share a union projection across the requested positions.
 		{
-			name:      "each row reads only the columns it is missing",
+			name:      "missing columns share one projection per file",
 			locations: locations,
 			records:   marked,
 			expectedRows: map[string]map[int64][]string{
-				"a.parquet": {9: {constants.OpType, "payload", "doc"}, 2: {constants.OpType, "doc"}},
+				"a.parquet": {9: {constants.OpType, "doc", "payload"}, 2: {constants.OpType, "doc", "payload"}},
 				"b.parquet": {5: {constants.OpType, "payload"}},
 			},
 			expectedFlushes: [][]string{{"a.parquet", "b.parquet"}},
@@ -664,22 +595,16 @@ func TestResolveReadRequest(t *testing.T) {
 				assert.Empty(t, reader.requests)
 				return
 			}
-			require.Len(t, reader.requests, 1)
-			request := reader.requests[0]
-			assert.Equal(t, "test-thread", request.GetThreadId())
-
-			// files are sorted, and rows within a file are in position order
+			require.Len(t, reader.requests, 2)
 			actual := make(map[string]map[int64][]string)
 			var paths []string
-			for _, file := range request.GetFiles() {
-				paths = append(paths, file.GetFilePath())
-				actual[file.GetFilePath()] = make(map[int64][]string)
-				var positions []int64
-				for _, row := range file.GetRows() {
-					positions = append(positions, row.GetPosition())
-					actual[file.GetFilePath()][row.GetPosition()] = row.GetColumns()
+			for _, request := range reader.requests {
+				paths = append(paths, request.path)
+				actual[request.path] = make(map[int64][]string)
+				for _, position := range request.positions {
+					actual[request.path][position] = request.columns
 				}
-				assert.True(t, slices.IsSorted(positions), "rows of %s in position order", file.GetFilePath())
+				assert.True(t, slices.IsSorted(request.positions), "rows in physical position order")
 			}
 			assert.Equal(t, []string{"a.parquet", "b.parquet"}, paths)
 			assert.Equal(t, tc.expectedRows, actual)
@@ -693,9 +618,9 @@ func TestResolveOpenFiles(t *testing.T) {
 		writer          func(files *testWriter) Writer
 		expectedFlushes [][]string
 	}{
-		// the arrow writer holds data files open on the Go side, so it is asked to close them
+		// A writer holding open files is asked to close them before native reads.
 		{
-			name: "arrow writer closes the files to read",
+			name: "writer closes the files to read",
 			writer: func(files *testWriter) Writer {
 				return struct {
 					Writer
@@ -704,9 +629,9 @@ func TestResolveOpenFiles(t *testing.T) {
 			},
 			expectedFlushes: [][]string{{"a.parquet"}},
 		},
-		// the legacy writer's files are closed by Java when ReadRows asks for them
+		// A writer that already closes files does not need a flush adapter.
 		{
-			name:   "legacy writer leaves open files to Java",
+			name:   "closed-file writer needs no flush",
 			writer: func(*testWriter) Writer { return struct{ Writer }{} },
 		},
 	}
@@ -753,12 +678,6 @@ func TestResolveErrors(t *testing.T) {
 			name:    "read call fails",
 			writer:  &testWriter{},
 			reader:  &testReader{readErr: failure},
-			message: "failed to read unavailable column values",
-		},
-		{
-			name:    "read stream breaks",
-			writer:  &testWriter{},
-			reader:  &testReader{table: testTable{}, recvErr: failure},
 			message: "failed to read unavailable column values",
 		},
 	}
@@ -882,36 +801,15 @@ func TestUnavailableValuesResolverCloseReleasesBudget(t *testing.T) {
 	assert.Empty(t, resolver.carry)
 }
 
-func TestFieldValue(t *testing.T) {
-	testCases := []struct {
-		name     string
-		value    *proto.IcebergPayload_IceRecord_FieldValue
-		expected any
-	}{
-		// an unset value is how the reader says the stored column is NULL
-		{name: "unset value is NULL", value: &proto.IcebergPayload_IceRecord_FieldValue{}, expected: nil},
-		{name: "string", value: &proto.IcebergPayload_IceRecord_FieldValue{Value: &proto.IcebergPayload_IceRecord_FieldValue_StringValue{StringValue: "hello"}}, expected: "hello"},
-		{name: "double", value: &proto.IcebergPayload_IceRecord_FieldValue{Value: &proto.IcebergPayload_IceRecord_FieldValue_DoubleValue{DoubleValue: 1.5}}, expected: 1.5},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.expected, fieldValue(tc.value))
-		})
-	}
-}
-
 func TestRowValuesWithoutNormalization(t *testing.T) {
-	stored := func(value *proto.IcebergPayload_IceRecord_FieldValue) map[string]*proto.IcebergPayload_IceRecord_FieldValue {
-		return map[string]*proto.IcebergPayload_IceRecord_FieldValue{constants.StringifiedData: value}
+	stored := func(value any) map[string]any {
+		return map[string]any{constants.StringifiedData: value}
 	}
-	text := func(value string) *proto.IcebergPayload_IceRecord_FieldValue {
-		return &proto.IcebergPayload_IceRecord_FieldValue{Value: &proto.IcebergPayload_IceRecord_FieldValue_StringValue{StringValue: value}}
-	}
+	text := func(value string) any { return value }
 
 	testCases := []struct {
 		name        string
-		stored      *proto.IcebergPayload_IceRecord_FieldValue
+		stored      any
 		columns     []string
 		expected    map[string]any
 		expectedErr bool
@@ -927,7 +825,7 @@ func TestRowValuesWithoutNormalization(t *testing.T) {
 		{name: "a key missing from the stored row is left out", stored: text(`{"id":1}`), columns: []string{"payload"}, expected: map[string]any{}},
 		{name: "a stored JSON null is left out", stored: text(`{"id":1,"payload":null}`), columns: []string{"payload"}, expected: map[string]any{}},
 		{name: "a stored placeholder is left out", stored: text(`{"id":1,"payload":"` + placeholder + `"}`), columns: []string{"payload"}, expected: map[string]any{}},
-		{name: "a stored value that is not text", stored: &proto.IcebergPayload_IceRecord_FieldValue{}, columns: []string{"payload"}, expectedErr: true},
+		{name: "a stored value that is not text", stored: 123, columns: []string{"payload"}, expectedErr: true},
 		{name: "invalid json", stored: text(`{not json`), columns: []string{"payload"}, expectedErr: true},
 	}
 

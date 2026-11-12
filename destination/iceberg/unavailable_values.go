@@ -3,19 +3,14 @@ package iceberg
 import (
 	"cmp"
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"maps"
-	"math"
 	"slices"
 	"sync/atomic"
 
 	"github.com/goccy/go-json"
-	"google.golang.org/grpc"
 
 	"github.com/datazip-inc/olake/constants"
-	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils/logger"
 )
@@ -24,15 +19,13 @@ import (
 // with the value from the row's previous version: from carry if this sync wrote the row,
 // else read from the destination at the location the row index (pos or dv) gives.
 type unavailableValuesResolver struct {
-	// openFiles uploads data files the writer still has open on the Go side (arrow), so
-	// their rows can be read; nil for the legacy writer, whose files Java closes itself
-	// when ReadRows asks for them.
+	// openFiles uploads data files the writer still has open so their rows can be read.
 	openFiles openFileWriter
 	// index locates a row's newest version: this thread's uncommitted writes first, then
 	// the committed index.
 	index *types.StreamIndexThread
-	// reader reads stored values out of data files (Java side).
-	reader   proto.TableIndexServiceClient
+	// reader reads stored values directly from native data files.
+	reader   nativeRowReader
 	threadID string
 	stream   types.StreamInterface
 
@@ -95,7 +88,11 @@ type openFileWriter interface {
 	EnsureReadable(ctx context.Context, paths []string) error
 }
 
-func newUnavailableValuesResolver(threadID string, stream types.StreamInterface, writer Writer, index *types.StreamIndexThread, reader proto.TableIndexServiceClient) *unavailableValuesResolver {
+type nativeRowReader interface {
+	ReadRows(ctx context.Context, path string, positions []int64, columns []string) (map[int64]map[string]any, error)
+}
+
+func newUnavailableValuesResolver(threadID string, stream types.StreamInterface, writer Writer, index *types.StreamIndexThread, reader nativeRowReader) *unavailableValuesResolver {
 	openFiles, _ := writer.(openFileWriter)
 	return &unavailableValuesResolver{
 		openFiles: openFiles,
@@ -247,60 +244,43 @@ func (r *unavailableValuesResolver) readColumns(columns []string) []string {
 	return read
 }
 
-// read reads the pending rows in one streamed call and adds their values to carry. Values
-// that cannot be read are left out, so the record keeps the placeholder.
+// read groups physical positions and projected columns by file. All open files are
+// flushed before any reads, without committing their pending table changes.
 func (r *unavailableValuesResolver) read(ctx context.Context, reads map[types.RowLocation]*pendingRead) error {
-	rows := make(map[string][]*proto.ReadRowsRequest_Row) // data file -> rows to read in it
+	rows := make(map[string][]int64)
+	columns := make(map[string]map[string]struct{})
 	for location, pending := range reads {
-		rows[location.FilePath] = append(rows[location.FilePath], &proto.ReadRowsRequest_Row{
-			Position: location.Position,
-			Columns:  r.readColumns(pending.columns),
-		})
+		rows[location.FilePath] = append(rows[location.FilePath], location.Position)
+		if columns[location.FilePath] == nil {
+			columns[location.FilePath] = make(map[string]struct{})
+		}
+		for _, column := range r.readColumns(pending.columns) {
+			columns[location.FilePath][column] = struct{}{}
+		}
 	}
-
 	paths := slices.Sorted(maps.Keys(rows))
-	// a file still being written has no footer and cannot be read: the arrow writer uploads
-	// its own here, Java closes the legacy writer's before serving ReadRows
 	if r.openFiles != nil {
 		if err := r.openFiles.EnsureReadable(ctx, paths); err != nil {
 			return err
 		}
 	}
-
-	request := &proto.ReadRowsRequest{ThreadId: r.threadID}
 	for _, path := range paths {
-		// Java reads a file front to back, so it takes the rows in position order
-		slices.SortFunc(rows[path], func(a, b *proto.ReadRowsRequest_Row) int {
-			return cmp.Compare(a.GetPosition(), b.GetPosition())
-		})
-		request.Files = append(request.Files, &proto.ReadRowsRequest_FileRows{FilePath: path, Rows: rows[path]})
-	}
-
-	// The limit applies per streamed message; the 4 MB default is too small for one large
-	// value. Java keeps each message to 64 rows or 16 MB.
-	stream, err := r.reader.ReadRows(ctx, request, grpc.MaxCallRecvMsgSize(math.MaxInt32))
-	if err != nil {
-		return fmt.Errorf("failed to read unavailable column values: %w", err)
-	}
-
-	for {
-		batch, err := stream.Recv()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
+		slices.Sort(rows[path])
+		stored, err := r.reader.ReadRows(ctx, path, rows[path], slices.Sorted(maps.Keys(columns[path])))
 		if err != nil {
 			return fmt.Errorf("failed to read unavailable column values: %w", err)
 		}
-
-		for _, row := range batch.GetRows() {
-			pending := reads[types.RowLocation{FilePath: row.GetFilePath(), Position: row.GetPosition()}]
-			if opType, _ := fieldValue(row.GetValues()[constants.OpType]).(string); opType == "d" {
+		for position, row := range stored {
+			pending := reads[types.RowLocation{FilePath: path, Position: position}]
+			if pending == nil {
+				return fmt.Errorf("native row reader returned an unrequested position %d", position)
+			}
+			if opType, _ := row[constants.OpType].(string); opType == "d" {
 				continue
 			}
-
-			values, err := r.rowValues(row.GetValues(), pending.columns)
+			values, err := r.rowValues(row, pending.columns)
 			if err != nil {
-				return fmt.Errorf("failed to read row %d of %s: %w", row.GetPosition(), row.GetFilePath(), err)
+				return fmt.Errorf("failed to decode stored row at position %d: %w", position, err)
 			}
 			for column, value := range values {
 				r.remember(pending.olakeID, column, value)
@@ -308,6 +288,7 @@ func (r *unavailableValuesResolver) read(ctx context.Context, reads map[types.Ro
 			}
 		}
 	}
+	return nil
 }
 
 // rowValues picks the wanted source columns out of one stored row, keyed by destination
@@ -317,18 +298,18 @@ func (r *unavailableValuesResolver) read(ctx context.Context, reads map[types.Ro
 // written without the value, for example while the column was deselected. Without
 // normalization the row is one JSON document, parsed once, and each column's raw JSON is
 // returned.
-func (r *unavailableValuesResolver) rowValues(stored map[string]*proto.IcebergPayload_IceRecord_FieldValue, columns []string) (map[string]any, error) {
+func (r *unavailableValuesResolver) rowValues(stored map[string]any, columns []string) (map[string]any, error) {
 	values := make(map[string]any, len(columns))
 	if r.stream.NormalizationEnabled() {
 		for _, column := range columns {
-			if value := fieldValue(stored[r.stream.ResolveColumnName(column)]); value != nil && !isUnavailable(value) {
+			if value := stored[r.stream.ResolveColumnName(column)]; value != nil && !isUnavailable(value) {
 				values[column] = value
 			}
 		}
 		return values, nil
 	}
 
-	encoded, _ := fieldValue(stored[constants.StringifiedData]).(string)
+	encoded, _ := stored[constants.StringifiedData].(string)
 	var row map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(encoded), &row); err != nil {
 		return nil, fmt.Errorf("failed to parse stored row: %s", err)
@@ -442,18 +423,4 @@ func valueSize(value any) int64 {
 func isUnavailable(value any) bool {
 	text, ok := value.(string)
 	return ok && text == constants.UnavailableValue
-}
-
-// fieldValue converts one stored value for the record; unset means NULL. The columns read
-// are text (Postgres text, json, arrays and the like, _op_type, the stored row) or numeric
-// stored as double.
-func fieldValue(value *proto.IcebergPayload_IceRecord_FieldValue) any {
-	switch stored := value.GetValue().(type) {
-	case *proto.IcebergPayload_IceRecord_FieldValue_StringValue:
-		return stored.StringValue
-	case *proto.IcebergPayload_IceRecord_FieldValue_DoubleValue:
-		return stored.DoubleValue
-	default:
-		return nil
-	}
 }

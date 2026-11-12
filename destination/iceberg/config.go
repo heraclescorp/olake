@@ -2,7 +2,6 @@ package iceberg
 
 import (
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 
@@ -65,9 +64,7 @@ type Config struct {
 
 	// Iceberg Configuration
 	IcebergDatabase string `json:"iceberg_db,omitempty"`
-	IcebergS3Path   string `json:"iceberg_s3_path"`                // e.g. s3://bucket/path
-	JarPath         string `json:"sink_jar_path,omitempty"`        // Path to the Iceberg sink JAR
-	ServerHost      string `json:"sink_rpc_server_host,omitempty"` // gRPC server host
+	IcebergS3Path   string `json:"iceberg_s3_path"`
 
 	// Rest Catalog Configuration
 	RestCatalogURL    string `json:"rest_catalog_url,omitempty"`
@@ -88,8 +85,6 @@ type Config struct {
 
 	// Horizon
 	RESTAccessDelegation string `json:"rest_access_delegation,omitempty"`
-
-	UseArrowWrites bool `json:"arrow_writes,omitempty"`
 }
 
 func (c *Config) Validate() error {
@@ -115,9 +110,9 @@ func (c *Config) Validate() error {
 	if c.CatalogType == "unity" {
 		c.NoIdentifierFields = true
 	}
-	// BigLake requires GoogleAuthManager for authentication
+	// BigLake uses Google application/service-account credentials.
 	if c.CatalogType == "biglake" {
-		c.RestAuthType = "org.apache.iceberg.gcp.auth.GoogleAuthManager"
+		c.RestAuthType = "google"
 	}
 	// Horizon requires access delegation
 	if c.CatalogType == "horizon" {
@@ -174,40 +169,6 @@ func (c *Config) Validate() error {
 			fmt.Errorf("unsupported catalog_type: %s", c.CatalogType))
 	}
 
-	if c.JarPath == "" {
-		// Set JarPath based on file existence in two possible locations
-		execDir, err := os.Getwd()
-		if err != nil {
-			return fmt.Errorf("failed to get current directory for searching jar file: %w", err)
-		}
-
-		// Remove /drivers/* from execDir if present
-		if idx := strings.LastIndex(execDir, "/drivers/"); idx != -1 {
-			execDir = execDir[:idx]
-		}
-
-		// First, check if the JAR exists in the base directory
-		baseJarPath := fmt.Sprintf("%s/olake-iceberg-java-writer.jar", execDir)
-		if err := utils.CheckIfFilesExists(baseJarPath); err == nil {
-			// JAR file exists in base directory
-			logger.Infof("Iceberg JAR file found in base directory: %s", baseJarPath)
-			c.JarPath = baseJarPath
-		} else {
-			// Otherwise, look in the target directory
-			targetJarPath := fmt.Sprintf("%s/destination/iceberg/olake-iceberg-java-writer/target/olake-iceberg-java-writer-0.0.1-SNAPSHOT.jar", execDir)
-			if err := utils.CheckIfFilesExists(targetJarPath); err == nil {
-				logger.Infof("Iceberg JAR file found in target directory: %s", targetJarPath)
-				c.JarPath = targetJarPath
-			} else {
-				return errs.Precondition(errs.InternalError, codeJarNotFound,
-					fmt.Errorf("Iceberg JAR file not found in any of the expected locations: %s, %s. Go to destination/iceberg/olake-iceberg-java-writer/target/ directory and run mvn clean package -DskipTests",
-						baseJarPath, targetJarPath))
-			}
-		}
-	}
-	if c.ServerHost == "" {
-		c.ServerHost = "localhost"
-	}
 	return utils.Validate(c)
 }
 

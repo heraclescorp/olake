@@ -33,32 +33,20 @@ func (th *TestHandler) Test2PCIntegration(t *testing.T) {
 		}
 		t.Logf("Enabled normalization and added partition regex in %s", th.Catalog())
 
-		writerTypes := []struct {
-			name     string
-			useArrow bool
-		}{
-			{"Legacy", false},
-			{"Arrow", true},
-		}
-
 		if !slices.Contains(constants.SkipCDCDrivers, constants.DriverType(th.TestConfig.Driver)) {
-			for _, wt := range writerTypes {
-				t.Run(fmt.Sprintf("Iceberg (%s) 2PC CDC Recovery tests", wt.name), func(t *testing.T) {
-					if err := th.IcebergWriter(ctx, t, currentTestTable, wt.useArrow, th.Iceberg2PCCDCRecovery); err != nil {
-						t.Fatalf("Iceberg (%s) 2PC CDC Recovery tests failed: %v", wt.name, err)
-					}
-				})
-			}
+			t.Run("Native Iceberg 2PC CDC Recovery tests", func(t *testing.T) {
+				if err := th.Iceberg2PCCDCRecovery(ctx, t, currentTestTable); err != nil {
+					t.Fatalf("Iceberg 2PC CDC Recovery tests failed: %v", err)
+				}
+			})
 		}
 
 		if th.TestConfig.Driver != string(constants.Kafka) {
-			for _, wt := range writerTypes {
-				t.Run(fmt.Sprintf("Iceberg (%s) 2PC Incremental Recovery tests", wt.name), func(t *testing.T) {
-					if err := th.IcebergWriter(ctx, t, currentTestTable, wt.useArrow, th.Iceberg2PCIncrementalRecovery); err != nil {
-						t.Fatalf("Iceberg (%s) 2PC Incremental Recovery tests failed: %v", wt.name, err)
-					}
-				})
-			}
+			t.Run("Native Iceberg 2PC Incremental Recovery tests", func(t *testing.T) {
+				if err := th.Iceberg2PCIncrementalRecovery(ctx, t, currentTestTable); err != nil {
+					t.Fatalf("Iceberg 2PC Incremental Recovery tests failed: %v", err)
+				}
+			})
 		}
 
 		if testutils.KeepTestData() {

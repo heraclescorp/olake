@@ -33,14 +33,15 @@ if [ ${#missing[@]} -eq 0 ]; then
   exit 0
 fi
 
-echo "building the iceberg jar for $TAG..."
-started=$SECONDS
-if ! jar_log=$(make -C "$SRC" iceberg.jar 2>&1); then
-  echo "$jar_log"
-  echo "::error::failed to build the iceberg jar at $TAG"
-  exit 1
+# Historical compatibility baselines may still ship the Java writer.
+if [ -f "$SRC/destination/iceberg/olake-iceberg-java-writer/pom.xml" ]; then
+  echo "building the historical iceberg jar for $TAG..."
+  if ! jar_log=$(make -C "$SRC" iceberg.jar 2>&1); then
+    echo "$jar_log"
+    echo "::error::failed to build the historical iceberg jar at $TAG"
+    exit 1
+  fi
 fi
-echo "built the iceberg jar in $((SECONDS - started))s"
 
 # TODO: we can use make command for build once this PR merges as local builds gets tagged as olake/source... instead of olakego/source...
 build_driver_image() {

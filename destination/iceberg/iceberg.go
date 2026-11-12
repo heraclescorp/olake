@@ -2,25 +2,25 @@ package iceberg
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"maps"
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"errors"
+
+	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/table"
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/destination"
-	arrowwriter "github.com/datazip-inc/olake/destination/iceberg/arrow-writer"
 	"github.com/datazip-inc/olake/destination/iceberg/internal"
-	legacywriter "github.com/datazip-inc/olake/destination/iceberg/legacy-writer"
-	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/errs"
-	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/datazip-inc/olake/utils/typeutils"
 	"github.com/spf13/viper"
 )
@@ -30,16 +30,14 @@ type Iceberg struct {
 	config        *Config
 	stream        types.StreamInterface
 	partitionInfo []internal.PartitionInfo // ordered slice to preserve partition column order
-	server        *serverInstance          // shared Java server instance (per-process singleton)
-	schema        map[string]string        // schema for current thread associated with Java writer (col -> type)
-	writer        Writer                   // writer instance
+	catalog       catalog.Catalog
+	schema        map[string]string
+	writer        Writer
 	// unavailableValues recovers values the source could not send; nil unless the stream keeps a row index (pos or dv)
 	unavailableValues *unavailableValuesResolver
-	// syncStartColumns are columns added from the source catalog at sync start (see planSourceColumns)
+	// syncStartColumns are columns added from the source catalog at sync start (see planSourceColumns).
 	syncStartColumns map[string]struct{}
-	// Why Schema On Thread Level?
-	// Schema on thread level is identical to the writer instance available in the Java server.
-	// It defines when to complete the Java writer and when schema evolution is required.
+	// Schema is refreshed at explicit evolution and commit boundaries.
 }
 
 // Pre-computed lookup tables for type validation
@@ -68,105 +66,23 @@ func (i *Iceberg) Spec() any {
 }
 
 func (i *Iceberg) Setup(ctx context.Context, stream types.StreamInterface, _ any, options *destination.Options) (any, *types.MetadataState, error) {
-	i.options = options
-	i.stream = stream
-	i.partitionInfo = make([]internal.PartitionInfo, 0)
-	i.schema = make(map[string]string)
-
-	// parse partition regex
+	i.options, i.stream = options, stream
 	var err error
 	i.partitionInfo, err = parsePartitionRegex(stream.GetPartitionRegex(), stream.ResolveColumnName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse partition regex: %w", err)
+		return nil, nil, err
 	}
-	logger.Debugf("Thread[%s]: setting up iceberg writer for table[%s.%s]", i.options.ThreadID, stream.GetDestinationDatabase(&i.config.IcebergDatabase), stream.GetDestinationTable())
-
-	// when normalization=false, include partition columns in the Iceberg schema so
-	// the Java server can build the partition spec (spec references columns by field ID)
-	partitionFields := make([]string, 0, len(i.partitionInfo))
-	if !stream.NormalizationEnabled() {
-		for _, p := range i.partitionInfo {
-			partitionFields = append(partitionFields, p.Field)
-		}
-	}
-
-	icebergPartFields := make([]*proto.IcebergPayload_PartitionField, 0, len(i.partitionInfo))
-	for _, p := range i.partitionInfo {
-		icebergPartFields = append(icebergPartFields, &proto.IcebergPayload_PartitionField{
-			Field:     p.SchemaField,
-			Transform: p.Transform,
-		})
-	}
-
-	upsertMode := isUpsertMode(stream, options.Backfill)
-	deleteMode := stream.GetUpdateType()
-
-	// Row-identity column, sent even where the catalog forbids declaring it.
-	identifierField := constants.OlakeID
-	iceSchema := stream.Schema().ToIceberg(!stream.NormalizationEnabled(), i.stream, partitionFields...)
-	requestPayload := proto.IcebergPayload{
-		Type: proto.IcebergPayload_GET_OR_CREATE_TABLE,
-		Metadata: &proto.IcebergPayload_Metadata{
-			Schema:          iceSchema,
-			DestTableName:   stream.GetDestinationTable(),
-			ThreadId:        options.ThreadID,
-			IdentifierField: &identifierField,
-			// Unity Catalog rejects identifier columns; only equality deletes need them declared.
-			DeclareIdentifierFields: !i.config.NoIdentifierFields,
-			Namespace:               stream.GetDestinationDatabase(&i.config.IcebergDatabase),
-			Upsert:                  upsertMode,
-			DeleteMode:              protoDeleteMode(deleteMode),
-			PartitionFields:         icebergPartFields,
-		},
-	}
-
-	response, err := i.server.SendClientRequest(ctx, &requestPayload)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load or create table: %w", err)
-	}
-
-	// get schema from response
-	ingestResponse := response.(*proto.RecordIngestResponse)
-	schema, err := parseSchema(ingestResponse.GetResult())
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse schema from resp[%s]: %w", ingestResponse.GetResult(), err)
-	}
-
-	// get metadata state from response
-	var metadataState types.MetadataState
-	if olake2PCState := ingestResponse.GetOlake_2PcState(); olake2PCState != "" {
-		if err := json.Unmarshal([]byte(olake2PCState), &metadataState); err != nil {
-			return schema, nil, fmt.Errorf("failed to unmarshal 2pc metadata state: %w", err)
-		}
-	}
-
-	// set schema for current thread
-	i.schema = copySchema(schema)
-
-	if err := i.reconcileTableIndex(ctx, options.TableIndex, ingestResponse.GetSnapshotId(), ingestResponse.GetHasEqualityDeletes()); err != nil {
-		return schema, nil, err
-	}
-
-	// nil in equality mode; shared by the writer, which buffers this thread's row locations
-	// in it, and the unavailable values resolver, which looks rows up in it
 	indexThread := types.NewStreamIndexThread(options.TableIndex)
-	if i.config.UseArrowWrites {
-		i.writer, err = arrowwriter.New(ctx, i.options, i.partitionInfo, i.schema, i.stream, i.server, upsertMode, indexThread)
-		if err != nil {
-			return nil, nil, destination.WriteFailure(fmt.Errorf("failed to create arrow writer: %w", err))
-		}
-	} else {
-		i.writer = legacywriter.New(i.options, i.schema, i.stream, i.server, upsertMode, indexThread)
+	writer, state, err := newNativeWriter(ctx, i.config, stream, options, i.catalog, indexThread)
+	if err != nil {
+		return nil, nil, err
 	}
-
-	// Recovery needs the row's previous location, which only a thread with a stream index
-	// has. Equality mode cannot recover, so RejectUnavailableValues fails its marked records;
-	// backfill records never carry one.
+	i.writer = writer
+	i.schema = writer.schemaMap()
 	if indexThread != nil {
-		i.unavailableValues = newUnavailableValuesResolver(options.ThreadID, i.stream, i.writer, indexThread, i.server.tableIndexClient)
+		i.unavailableValues = newUnavailableValuesResolver(options.ThreadID, stream, writer, indexThread, writer)
 	}
-
-	return schema, &metadataState, nil
+	return i.schema, state, nil
 }
 
 // Write sends records in order, split into chunks of at most MaxDestinationBatchBytes when values
@@ -196,39 +112,15 @@ func (i *Iceberg) Write(ctx context.Context, records []types.RawRecord) error {
 	return i.writer.Write(ctx, records[start:])
 }
 
-func (i *Iceberg) Close(ctx context.Context, finalMetadataState any) (err error) {
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		req := &proto.IcebergPayload{
-			Type: proto.IcebergPayload_CLOSE_SESSION,
-			Metadata: &proto.IcebergPayload_Metadata{
-				ThreadId: i.options.ThreadID,
-			},
-		}
-
-		if _, cleanupErr := i.server.SendClientRequest(cleanupCtx, req); cleanupErr != nil {
-			if err == nil {
-				err = cleanupErr
-			} else {
-				err = fmt.Errorf("%w: cleanup error: %w", err, cleanupErr)
-			}
-		}
-	}()
-
+func (i *Iceberg) Close(ctx context.Context, finalMetadataState any) error {
 	if i.unavailableValues != nil {
 		i.unavailableValues.Close()
 	}
-
-	select {
-	case <-ctx.Done():
-		// skip commit in case of context cancellation
+	if err := ctx.Err(); err != nil {
 		i.writer.Abort()
-		return ctx.Err()
-	default:
-		return i.writer.Close(ctx, finalMetadataState)
+		return err
 	}
+	return i.writer.Close(ctx, finalMetadataState)
 }
 
 func (i *Iceberg) Check(ctx context.Context) error {
@@ -236,68 +128,41 @@ func (i *Iceberg) Check(ctx context.Context) error {
 	if prefix := viper.GetString(constants.DestinationDatabasePrefix); prefix != "" {
 		destinationDB = fmt.Sprintf("%s_%s", utils.Reformat(prefix), destinationDB)
 	}
-
 	ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
-
-	// Row-identity column, sent even where the catalog forbids declaring it.
-	identifierField := constants.OlakeID
-	request := &proto.IcebergPayload{
-		Type: proto.IcebergPayload_GET_OR_CREATE_TABLE,
-		Metadata: &proto.IcebergPayload_Metadata{
-			ThreadId:        i.server.defaultServerID,
-			DestTableName:   destinationDB,
-			Schema:          types.GetIcebergRawSchema(),
-			Namespace:       destinationDB,
-			Upsert:          false,
-			IdentifierField: &identifierField,
-			// Unity Catalog rejects identifier columns; only equality deletes need them declared.
-			DeclareIdentifierFields: !i.config.NoIdentifierFields,
-			// The check table is written once, appended, and never updated, so no
-			// delete mode is meaningful here. Equality is the one that constrains the
-			// table least: it creates at format version 2 and needs no table index.
-			DeleteMode: proto.IcebergPayload_DELETE_MODE_EQUALITY,
-		},
+	stream := types.NewStream(destinationDB, destinationDB, nil)
+	stream.DestinationDatabase, stream.DestinationTable = destinationDB, destinationDB
+	for name, dataType := range types.RawSchema {
+		if name != constants.StringifiedData {
+			stream.Schema.AddTypes(name, true, dataType)
+		}
 	}
-
-	res, err := i.server.SendClientRequest(ctx, request)
+	stream.Schema.AddTypes("name", false, types.String)
+	appendMode, normalized := true, false
+	configured := &types.ConfiguredStream{Stream: stream, StreamMetadata: types.StreamMetadata{
+		AppendMode: &appendMode, Normalization: &normalized,
+	}}
+	checker := &Iceberg{config: i.config, catalog: i.catalog}
+	if _, _, err := checker.Setup(ctx, configured, nil, &destination.Options{
+		ThreadID: "olake-check", Backfill: true,
+	}); err != nil {
+		return fmt.Errorf("initialize native Iceberg check: %w", err)
+	}
+	now := time.Now().UTC()
+	record := types.CreateRawRecord(map[string]any{"name": "olake"}, map[string]any{
+		constants.OlakeID: "olake", constants.OpType: "r", constants.OlakeTimestamp: now,
+		constants.CdcTimestamp: now,
+	}, nil)
+	_, records, _, err := checker.FlattenAndCleanData(ctx, []types.RawRecord{record})
 	if err != nil {
-		return fmt.Errorf("failed to create or get table: %w", err)
+		checker.writer.Abort()
+		return err
 	}
-
-	ingestResponse := res.(*proto.RecordIngestResponse)
-	logger.Infof("Thread[%s]: table created or loaded test olake: %s", i.server.defaultServerID, ingestResponse.GetResult())
-
-	// try writing record in dest table
-	currentTime := time.Now().UTC()
-	protoSchema := types.GetIcebergRawSchema()
-	record := types.CreateRawRecord(map[string]any{"name": "olake"}, map[string]any{constants.OlakeID: "olake", constants.OpType: "r", constants.CdcTimestamp: &currentTime}, nil)
-	protoColumns, err := legacywriter.RawDataColumnBuffer(record, protoSchema)
-	if err != nil {
-		return destination.WriteFailure(fmt.Errorf("failed to create raw data column buffer: %w", err))
+	if err := checker.Write(ctx, records); err != nil {
+		checker.writer.Abort()
+		return err
 	}
-	recrodInsertRequest := &proto.IcebergPayload{
-		Type: proto.IcebergPayload_RECORDS,
-		Metadata: &proto.IcebergPayload_Metadata{
-			// Session already created by the GET_OR_CREATE_TABLE above; RECORDS
-			// carries only the routing thread_id plus the schema for this batch.
-			ThreadId: i.server.defaultServerID,
-			Schema:   protoSchema,
-		},
-		Records: []*proto.IcebergPayload_IceRecord{{
-			Fields:     protoColumns,
-			RecordType: "r",
-		}},
-	}
-
-	resInsert, err := i.server.SendClientRequest(ctx, recrodInsertRequest)
-	if err != nil {
-		return fmt.Errorf("failed to insert request: %w", err)
-	}
-
-	ingestResponse = resInsert.(*proto.RecordIngestResponse)
-	logger.Debugf("Thread[%s]: record inserted successfully: %s", i.server.defaultServerID, ingestResponse.GetResult())
-	return nil
+	return checker.Close(ctx, nil)
 }
 
 // validate schema change & evolution and removes null records
@@ -455,83 +320,30 @@ func (i *Iceberg) FlattenAndCleanData(ctx context.Context, records []types.RawRe
 	return schemaDifference, records, recordsSchema, nil
 }
 
-// compares with global schema and update schema in destination accordingly
+// EvolveSchema reloads the current table and applies compatible source schema changes.
 func (i *Iceberg) EvolveSchema(ctx context.Context, globalSchema, recordsRawSchema any) (any, error) {
 	if !i.stream.NormalizationEnabled() {
 		return i.schema, nil
 	}
-	// cases as local thread schema has detected changes w.r.t. batch records schema
-	//  	i.  iceberg table already have changes (i.e. no difference with global schema), in this case
-	//		    only refresh table in iceberg for this thread.
-	// 		ii. Schema difference is detected w.r.t. iceberg table (i.e. global schema), in this case
-	// 			we need to evolve schema in iceberg table
-	// NOTE: All the above cases will also complete current writer (java writer instance) as schema change in thread detected
-
-	globalSchemaMap, ok := globalSchema.(map[string]string)
+	global, ok := globalSchema.(map[string]string)
 	if !ok {
-		return nil, fmt.Errorf("failed to convert globalSchema of type[%T] to map[string]string", globalSchema)
+		return nil, fmt.Errorf("invalid global schema type %T", globalSchema)
 	}
-
-	recordsSchema, ok := recordsRawSchema.(map[string]string)
+	records, ok := recordsRawSchema.(map[string]string)
 	if !ok {
-		return nil, fmt.Errorf("failed to convert newSchemaMap of type[%T] to map[string]string", recordsRawSchema)
+		return nil, fmt.Errorf("invalid record schema type %T", recordsRawSchema)
 	}
-
-	// case handled:
-	// 1. returns true if promotion is possible or new column is added
-	// 2. in case of int(globalType) and string(threadType) it return false
-	//    and write method will try to parse the string (write will fail if not parsable)
-	differentSchema := func(oldSchema, newSchema map[string]string) bool {
-		for fieldName, newType := range newSchema {
-			if oldType, exists := oldSchema[fieldName]; !exists {
-				return true
-			} else if isPromotionRequired(oldType, newType) {
-				return true
-			}
+	columns := copySchema(global)
+	for name, fieldType := range records {
+		if previous, found := columns[name]; !found || isPromotionRequired(previous, fieldType) {
+			columns[name] = fieldType
 		}
-		return false
 	}
-
-	request := proto.IcebergPayload{
-		Type: proto.IcebergPayload_EVOLVE_SCHEMA,
-		Metadata: &proto.IcebergPayload_Metadata{
-			ThreadId: i.options.ThreadID,
-		},
+	if err := i.writer.EvolveSchema(ctx, columns); err != nil {
+		return nil, destination.WriteFailure(fmt.Errorf("evolve native Iceberg schema: %w", err))
 	}
-
-	if differentSchema(globalSchemaMap, recordsSchema) {
-		logger.Infof("Thread[%s]: evolving schema in iceberg table", i.options.ThreadID)
-		for field, fieldType := range recordsSchema {
-			request.Metadata.Schema = append(request.Metadata.Schema, &proto.IcebergPayload_SchemaField{
-				Key:     field,
-				IceType: fieldType,
-			})
-		}
-	} else {
-		logger.Debugf("Thread[%s]: refreshing table schema", i.options.ThreadID)
-		request.Type = proto.IcebergPayload_REFRESH_TABLE_SCHEMA
-	}
-
-	resp, err := i.server.SendClientRequest(ctx, &request)
-	if err != nil {
-		return false, fmt.Errorf("failed to %s: %w", request.Type.String(), err)
-	}
-
-	ingestResponse := resp.(*proto.RecordIngestResponse)
-	response := ingestResponse.GetResult()
-
-	// only refresh table schema
-	schemaAfterEvolution, err := parseSchema(response)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse schema from resp[%s]: %w", response, err)
-	}
-
-	i.schema = copySchema(schemaAfterEvolution)
-	if err := i.writer.EvolveSchema(ctx, schemaAfterEvolution); err != nil {
-		return nil, destination.WriteFailure(fmt.Errorf("failed to evolve writer schema: %w", err))
-	}
-
-	return schemaAfterEvolution, nil
+	i.schema = i.writer.(*nativeWriter).schemaMap()
+	return i.schema, nil
 }
 
 // parsePartitionRegex parses the partition regex and populates the partitionInfo slice
@@ -590,74 +402,24 @@ func isPromotionRequired(oldType, newType string) bool {
 	return false
 }
 
-// drop streams required for clear destination
-func (i *Iceberg) DropStreams(ctx context.Context, tables []types.StreamInterface) error {
-	if len(tables) == 0 {
-		logger.Info("No streams selected for clearing Iceberg destination, skipping operation")
-		return nil
+// DropStreams purges only the selected destination tables.
+func (i *Iceberg) DropStreams(ctx context.Context, streams []types.StreamInterface) error {
+	purger, ok := i.catalog.(catalog.PurgeableTable)
+	if !ok {
+		return fmt.Errorf("Iceberg catalog %s does not support purging tables", i.config.CatalogType)
 	}
-	logger.Infof("Starting Clear Iceberg destination for %d selected tables", len(tables))
-
-	threadID := "iceberg_destination_drop"
-	for _, stream := range tables {
-		destDB := stream.GetDestinationDatabase(&i.config.IcebergDatabase)
-		destTable := stream.GetDestinationTable()
-		dropTable := fmt.Sprintf("%s.%s", destDB, destTable)
-
-		logger.Infof("Dropping Iceberg table: %s", dropTable)
-
-		request := proto.IcebergPayload{
-			Type: proto.IcebergPayload_DROP_TABLE,
-			Metadata: &proto.IcebergPayload_Metadata{
-				DestTableName: dropTable,
-				ThreadId:      threadID,
-				// Namespace is encoded inside DropTable (db.table) and parsed Java-side.
-			},
-		}
-		_, err := i.server.SendClientRequest(ctx, &request)
-		if err != nil {
-			return fmt.Errorf("failed to drop table %s: %w", dropTable, err)
+	for _, stream := range streams {
+		identifier := table.Identifier{stream.GetDestinationDatabase(&i.config.IcebergDatabase), stream.GetDestinationTable()}
+		if err := purger.PurgeTable(nativeCatalogContext(ctx, i.catalog), identifier); err != nil && !errors.Is(err, catalog.ErrNoSuchTable) {
+			return fmt.Errorf("purge Iceberg table %v: %w", identifier, err)
 		}
 	}
-
-	logger.Info("Successfully cleared Iceberg destination for selected streams")
 	return nil
 }
 
 // returns a new copy of schema
 func copySchema(schema map[string]string) map[string]string {
 	return maps.Clone(schema)
-}
-
-func parseSchema(schemaStr string) (map[string]string, error) {
-	// Remove the outer "table {" and "}"
-	schemaStr = strings.TrimPrefix(schemaStr, "table {")
-	schemaStr = strings.TrimSuffix(schemaStr, "}")
-
-	// Process each line
-	lines := strings.Split(schemaStr, "\n")
-	fields := make(map[string]string)
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		// Parse line like: "1: col_name: optional string"
-		parts := strings.SplitN(line, ":", 3)
-		if len(parts) < 3 {
-			continue
-		}
-
-		name := strings.TrimSpace(parts[1])
-		typeInfo := strings.TrimSpace(parts[2])
-
-		// typeInfo will contain `required type (id)` or `optional type`
-		types := strings.Split(typeInfo, " ")
-		fields[name] = types[1]
-	}
-	return fields, nil
 }
 
 func getCommonAncestorType(d1, d2 string) string {
@@ -676,54 +438,37 @@ func isUpsertMode(stream types.StreamInterface, backfill bool) bool {
 	return utils.Ternary(stream.AppendModeEnabled(), false, !backfill).(bool)
 }
 
-// protoDeleteMode maps the config-facing delete mode onto the wire enum. An
-// unknown mode reaches the server as UNSPECIFIED, which it rejects; config is
-// validated by types.UpdateType.Validate() long before this point.
-func protoDeleteMode(mode types.UpdateType) proto.IcebergPayload_DeleteMode {
-	switch mode {
-	case types.UpdateTypeEquality:
-		return proto.IcebergPayload_DELETE_MODE_EQUALITY
-	case types.UpdateTypePosition:
-		return proto.IcebergPayload_DELETE_MODE_POSITION
-	case types.UpdateTypeDeletionVector:
-		return proto.IcebergPayload_DELETE_MODE_DELETION_VECTOR
-	default:
-		return proto.IcebergPayload_DELETE_MODE_UNSPECIFIED
-	}
-}
-
 func init() {
-	var server *serverInstance
-	var icebergConfig *Config
-	destination.RegisteredWriters[types.Iceberg] = func(config any) (destination.Writer, func(ctx context.Context), error) {
-		if icebergConfig != nil || server != nil {
-			// for already initialized writer, return the same server and config instance
-			return &Iceberg{
-				config: icebergConfig,
-				server: server,
-			}, nil, nil
+	var mu sync.Mutex
+	var sharedCatalog catalog.Catalog
+	var sharedConfig *Config
+	destination.RegisteredWriters[types.Iceberg] = func(raw any) (destination.Writer, func(context.Context), error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if sharedCatalog != nil {
+			return &Iceberg{config: sharedConfig, catalog: sharedCatalog}, nil, nil
 		}
-
-		icebergConfig = &Config{}
-		// unmarshal config according to iceberg config struct
-		err := utils.Unmarshal(config, icebergConfig)
+		config := &Config{}
+		if err := utils.Unmarshal(raw, config); err != nil {
+			return nil, nil, fmt.Errorf("decode native Iceberg config: %w", err)
+		}
+		if err := config.Validate(); err != nil {
+			return nil, nil, err
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cat, closeCatalog, err := openNativeCatalog(ctx, config)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to unmarshal iceberg config: %w", err)
+			cancel()
+			return nil, nil, err
 		}
-
-		server, err = startServer(icebergConfig)
-		if err != nil {
-			icebergConfig = nil
-			return nil, nil, fmt.Errorf("failed to start iceberg server: %w", err)
+		sharedCatalog, sharedConfig = cat, config
+		cleanup := func(ctx context.Context) {
+			mu.Lock()
+			defer mu.Unlock()
+			defer cancel()
+			closeCatalog(ctx)
+			sharedCatalog, sharedConfig = nil, nil
 		}
-
-		return &Iceberg{
-				config: icebergConfig,
-				server: server,
-			}, func(ctx context.Context) {
-				server.Shutdown(ctx)
-				icebergConfig = nil
-				server = nil
-			}, nil
+		return &Iceberg{config: config, catalog: cat}, cleanup, nil
 	}
 }

@@ -2,43 +2,25 @@
 
 Writes to apache-iceberg. This writer takes configuration of catalog and s3 buckets and writes data received from the Olake source.
 
-## How It Works 
+## How It Works
 
-Iceberg writer writes data primarily as a equality delete which doesn't requires spark. 
+The destination uses Apache Iceberg Go v0.7.0 and Arrow Go to write Parquet files and commit directly to the catalog. It does not launch a JVM or use a gRPC writer service.
 
-For backfill --> Works in append mode
+- Backfill appends data files.
+- CDC supports equality deletes, positional deletes, and Iceberg v3 deletion vectors. Deletes retain OLake's soft-delete rows.
+- Recovery metadata and data/delete files publish in the same catalog transaction. Positional/deletion-vector modes preserve the durable Pebble index, rebuild it from the committed snapshot when necessary, and recover unchanged PostgreSQL TOAST values.
+- REST (including S3 Tables and Unity), Glue, JDBC PostgreSQL/SQLite, Hive, and Hadoop catalogs use native adapters. S3, GCS, local files, and HDFS use native FileIO. Managed REST catalogs choose physical table locations; `iceberg_s3_path` remains the warehouse identifier for their catalog configuration.
+- HTTP diagnostics emit one `iceberg_http` event per wire attempt with status, latency, request ID, and retry/conflict outcome. Credentials, query strings, headers, and bodies are omitted. REST throttling retries are bounded; ambiguous commit failures are not blindly replayed.
 
-For CDC --> Works in Upsert mode by creating delete files
+## Build and Runtime
 
-### Current Architecture :
-
-> Golang Code  --gRPC-->  Java (This Project)  --Write to Iceberg-->  S3 + Iceberg Catalog
-
-Important reason why we are using Java to write is, current Golang-iceberg project doesn't support Equality delete writes. We plan to move this to iceberg-rust to improve on memory footprint.
-
-1. Flow starts with iceberg.go file. 
-2. We create Java rpc server by a process call.
-3. Send records via rpc in batches of 256 mb (in-memory object size, not a real parquet size)
-
-### Java Iceberg Writer/sink : 
-
-Its based in the directory olake-iceberg-java-writer. Read more ./olake-iceberg-java-writer/README.md on how to run it in standalone mode and test.
-
-## Environment Variables
-
-### OLAKE_DEBUG_MODE
-
-Set this environment variable to enable debug mode for the Java Iceberg writer. When enabled, the Java process will start with remote debugging options, allowing you to attach a debugger on port 5005.
-
-**Note:** Debug mode is only enabled during sync operations (not during check operations) to avoid blocking the connection check process.
+Use the repository's Go toolchain. `make dev.postgres.build` and the container build enable CGO and the `kerberos` build tag for Hive SASL. Linux Hive SASL also needs the MIT GSSAPI runtime (`libgssapi_krb5.so`); the runtime image supplies it. A direct build is:
 
 ```bash
-# Enable debug mode
-export OLAKE_DEBUG_MODE=1
-
-# Run your sync command
-olake sync --config source.json --destination destination.json --catalog catalog.json
+CGO_ENABLED=1 go build -tags kerberos -o olake ./drivers/postgres
 ```
+
+`GOMEMLIMIT` controls the Go heap budget. `OLAKE_INDEX_DB_DIR` selects the durable index directory. `OLAKE_TIMING=1` enables phase timing logs. No JDK, Maven, writer JAR, RPC port, or Arrow/legacy writer selector is required.
 
 ## How to run 
 
@@ -98,9 +80,7 @@ Create a json for writer config (Works for S3 as storage and AWS Glue as a catal
       "iceberg_s3_path": "s3://bucket_name/olake_iceberg/test_olake",
       "aws_region": "ap-south-1",
       "aws_access_key": "XXX",
-      "aws_secret_key": "XXX",
-      "grpc_port": 50051,
-      "sink_rpc_server_host": "localhost"
+      "aws_secret_key": "XXX"
     }
   }  
 ```

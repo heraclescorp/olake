@@ -118,9 +118,6 @@ func Start(ctx context.Context) (func(context.Context) error, error) {
 		return func(context.Context) error { return nil }, errors.New("Go metrics already started")
 	}
 	logger.Infof("runtime budget: Go effective memory limit=%d bytes, GOMEMLIMIT configured=%t", debug.SetMemoryLimit(-1), os.Getenv("GOMEMLIMIT") != "")
-	if percent, err := strconv.Atoi(os.Getenv("OLAKE_JAVA_HEAP_PERCENT")); err == nil && percent >= 1 && percent <= 80 {
-		logger.Infof("runtime budget: configured per-JVM MaxRAMPercentage=%d", percent)
-	}
 	profiles := startProfiles()
 	var provider *sdkmetric.MeterProvider
 	var inst *instruments

@@ -323,18 +323,7 @@ func (th *TestHandler) TestIcebergPosIncremental(t *testing.T) {
 	ctx := t.Context()
 	testTable := th.GetTableName()
 
-	writerTypes := []struct {
-		name     string
-		useArrow bool
-	}{
-		{"Legacy", false},
-		{"Arrow", true},
-	}
-	for _, wt := range writerTypes {
-		t.Run(wt.name, func(t *testing.T) {
-			require.NoError(t, th.IcebergWriter(ctx, t, testTable, wt.useArrow, th.testIcebergPosIncrementalInsert))
-		})
-	}
+	require.NoError(t, th.testIcebergPosIncrementalInsert(ctx, t, testTable))
 
 	if testutils.KeepTestData() {
 		t.Logf("keeping %s source data for PosIncremental as (%s) is set", th.Driver, testutils.KeepTestDataEnvVar)
