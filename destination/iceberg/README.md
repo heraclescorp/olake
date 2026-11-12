@@ -18,6 +18,18 @@ The destination uses upstream `github.com/apache/iceberg-go v0.7.0` without patc
 - REST (including S3 Tables and Unity), Glue, JDBC PostgreSQL/SQLite, Hive, and Hadoop catalogs use native adapters. S3, GCS, local files, and HDFS use native FileIO. Managed REST catalogs choose physical table locations; `iceberg_s3_path` remains the warehouse identifier for their catalog configuration.
 - HTTP diagnostics emit one `iceberg_http` event per wire attempt with status, latency, request ID, and retry/conflict outcome. Credentials, query strings, headers, and bodies are omitted. REST throttling retries use cryptographically secure sub-10% jitter and remain bounded; ambiguous commit failures are not blindly replayed.
 
+## Index Diagnostics
+
+`native_index_reconcile` emits a `decision` and `complete` event per indexed table reconciliation, linked by `reconcile_id` within the connector process. Count `event=complete` by pod/table/mode/reason to measure frequency without double-counting decisions or confusing scan batches with separate rebuilds. Failures before planning emit a completion with the failing stage.
+
+- `skip / up_to_date`: reuse the durable checkpoint without scanning files.
+- `incremental / files_added`: index new files only; `snapshot_advanced_without_file_changes` advances only the checkpoint.
+- `rebuild / missing_or_invalid_checkpoint`: no usable checkpoint; this alone does not distinguish deployment, lost storage, or an interrupted scan.
+- `rebuild / files_removed`, `delete_sets_changed`, or `files_removed_and_delete_sets_changed`: changed physical file layout/deletes require rebuilding the table index.
+- `error / checkpoint_not_ancestor`: an explicit reset is required; no automatic destructive reset occurs.
+
+Events include old/target snapshots, the target snapshot's operation, file-delta counts, selected rows/bytes, scanned/indexed/skipped rows, completed files, flushes, checkpoint invalidation/publication, duration, and failure stage. Selected row/byte counts come from file metadata; indexed rows count entries staged, not distinct keys. The target operation is not proof of which engine performed maintenance. No row values, identifiers, credentials, or object paths are emitted.
+
 ## Build and Runtime
 
 Use the repository's Go toolchain. `make dev.postgres.build` and the container build enable CGO and the `kerberos` build tag for Hive SASL. Linux Hive SASL also needs the MIT GSSAPI runtime (`libgssapi_krb5.so`); the runtime image supplies it. A direct build is:

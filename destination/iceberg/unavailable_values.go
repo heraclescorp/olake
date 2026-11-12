@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -476,52 +477,133 @@ func isUnavailable(value any) bool {
 
 const indexScanFlushRows = 200_000
 
+var nativeIndexReconcileSequence atomic.Uint64
+
+type nativeIndexReconciliation struct {
+	id                                                                    uint64
+	table                                                                 string
+	started                                                               time.Time
+	indexed, target                                                       int64
+	checkpointRead                                                        bool
+	operation                                                             table.Operation
+	mode, reason, stage                                                   string
+	currentFiles, selectedFiles, addedFiles, removedFiles, changedDeletes int
+	selectedRows, selectedBytes, scannedRows, indexedRows, skippedRows    int64
+	completedFiles, flushes                                               int
+	checkpointInvalidated                                                 bool
+	checkpointCommitted                                                   bool
+}
+
+func (r *nativeIndexReconciliation) log(event, outcome string) {
+	logger.Infof("native_index_reconcile event=%s reconcile_id=%d table=%q mode=%s reason=%s stage=%s outcome=%s "+
+		"indexed_snapshot=%d target_snapshot=%d checkpoint_read=%t target_operation=%s "+
+		"current_files=%d selected_files=%d added_files=%d removed_files=%d changed_delete_sets=%d "+
+		"selected_rows=%d selected_bytes=%d scanned_rows=%d indexed_rows=%d skipped_rows=%d completed_files=%d "+
+		"flushes=%d checkpoint_invalidated=%t checkpoint_committed=%t duration_ms=%d",
+		event, r.id, r.table, r.mode, r.reason, r.stage, outcome,
+		r.indexed, r.target, r.checkpointRead, r.operation,
+		r.currentFiles, r.selectedFiles, r.addedFiles, r.removedFiles, r.changedDeletes,
+		r.selectedRows, r.selectedBytes, r.scannedRows, r.indexedRows, r.skippedRows, r.completedFiles,
+		r.flushes, r.checkpointInvalidated, r.checkpointCommitted, time.Since(r.started).Milliseconds())
+}
+
 // reconcileNativeTableIndex publishes the target checkpoint only after every row
 // is durable. Bounded partial flushes invalidate the old checkpoint atomically so
 // a crash followed by an external rewrite cannot leave stale partial-scan keys.
-func reconcileNativeTableIndex(ctx context.Context, index types.StreamIndex, tbl *table.Table, identifierField string) error {
+func reconcileNativeTableIndex(ctx context.Context, index types.StreamIndex, tbl *table.Table, identifierField string) (resultErr error) {
 	if index == nil {
 		return nil
 	}
+	report := nativeIndexReconciliation{id: nativeIndexReconcileSequence.Add(1), table: strings.Join(tbl.Identifier(), "."), started: time.Now(), mode: "undecided", reason: "checkpoint_unread", stage: "read_checkpoint"}
+	defer func() {
+		outcome := "success"
+		if resultErr != nil {
+			outcome = "error"
+			if report.mode == "undecided" {
+				report.mode, report.reason = "error", report.stage+"_failed"
+			}
+		}
+		report.log("complete", outcome)
+	}()
 	indexed, err := index.LastCommittedSnapshot()
 	if err != nil {
 		return fmt.Errorf("read native stream index checkpoint: %w", err)
 	}
+	report.indexed, report.checkpointRead = indexed, true
 	var target int64
 	if snapshot := tbl.CurrentSnapshot(); snapshot != nil {
 		target = snapshot.SnapshotID
+		if snapshot.Summary != nil {
+			report.operation = snapshot.Summary.Operation
+		}
 	}
+	report.target = target
 	if indexed == target {
+		report.mode, report.reason, report.stage = "skip", "up_to_date", "complete"
+		report.log("decision", "skip")
 		return nil
 	}
 	if indexed != 0 && !table.IsAncestorOf(target, indexed, tbl.SnapshotByID) {
+		report.mode, report.reason, report.stage = "error", "checkpoint_not_ancestor", "validate_checkpoint"
+		report.log("decision", "error")
 		return fmt.Errorf("cannot catch up stream index: snapshot %d is not an ancestor of destination snapshot %d; a full index reset is required", indexed, target)
 	}
+	report.stage = "plan_current"
 	current, err := planNativeIndexFiles(ctx, tbl, target)
 	if err != nil {
 		return err
 	}
+	report.currentFiles = len(current)
 	selected := current
 	rebuild := indexed == 0
+	report.mode, report.reason = "rebuild", "missing_or_invalid_checkpoint"
 	if !rebuild {
+		report.mode, report.reason = "undecided", "snapshot_changed"
+		report.stage = "plan_checkpoint"
 		previous, err := planNativeIndexFiles(ctx, tbl, indexed)
 		if err != nil {
 			return fmt.Errorf("read checkpoint snapshot %d: %w", indexed, err)
 		}
-		selected, rebuild = nativeIndexChanges(previous, current)
+		var changes nativeIndexDelta
+		selected, changes = nativeIndexChanges(previous, current)
+		report.mode = "rebuild"
+		report.addedFiles, report.removedFiles, report.changedDeletes = changes.added, changes.removed, changes.changedDeletes
+		rebuild = changes.removed != 0 || changes.changedDeletes != 0
+		switch {
+		case changes.removed != 0 && changes.changedDeletes != 0:
+			report.reason = "files_removed_and_delete_sets_changed"
+		case changes.removed != 0:
+			report.reason = "files_removed"
+		case changes.changedDeletes != 0:
+			report.reason = "delete_sets_changed"
+		case changes.added != 0:
+			report.mode, report.reason = "incremental", "files_added"
+		default:
+			report.mode, report.reason = "incremental", "snapshot_advanced_without_file_changes"
+		}
 	}
+	report.selectedFiles = len(selected)
+	for _, task := range selected {
+		report.selectedRows += task.File.Count()
+		report.selectedBytes += task.File.FileSizeBytes()
+	}
+	report.stage = "planned"
+	report.log("decision", "planned")
 	if rebuild {
+		report.stage = "truncate"
 		// Clearing also resets the checkpoint, making an interrupted rebuild restart
 		// from scratch rather than expose a partially replaced index on recovery.
 		if err := index.Truncate(); err != nil {
 			return fmt.Errorf("truncate native stream index: %w", err)
 		}
+		report.checkpointInvalidated = true
 		selected = current
 	}
 	pending := types.NewStreamIndexThread(index)
 	buffered := 0
 	checkpointInvalidated := rebuild
 	flush := func(checkpoint *int64) error {
+		report.stage = "flush_index"
 		var invalid int64
 		if checkpoint == nil && !checkpointInvalidated {
 			checkpoint = &invalid
@@ -529,34 +611,46 @@ func reconcileNativeTableIndex(ctx context.Context, index types.StreamIndex, tbl
 		if err := index.Commit(pending, checkpoint); err != nil {
 			return fmt.Errorf("persist native stream index: %w", err)
 		}
+		report.flushes++
+		if checkpoint != nil && *checkpoint == target {
+			report.checkpointCommitted = true
+		}
 		if checkpoint != nil && *checkpoint == 0 {
 			checkpointInvalidated = true
+			report.checkpointInvalidated = true
 		}
 		pending = types.NewStreamIndexThread(index)
 		buffered = 0
 		return nil
 	}
+	report.stage = "open_file_io"
 	fs, err := tbl.FS(ctx)
 	if err != nil {
 		return fmt.Errorf("open native index file IO: %w", err)
 	}
+	report.stage = "select_identifier"
 	projection, err := tbl.Schema().Select(true, identifierField)
 	if err != nil {
 		return fmt.Errorf("select native index identifier: %w", err)
 	}
 	cache := newNativeDeleteCache()
 	for _, task := range selected {
+		report.stage = "read_deletes"
 		deleted, err := cache.positions(ctx, fs, tbl, task, true)
 		if err != nil {
 			return fmt.Errorf("read native index deletes: %w", err)
 		}
+		report.stage = "scan_rows"
 		err = readNativePhysicalBatches(ctx, fs, tbl, task.File.FilePath(), projection, nil, func(base int64, batch arrow.RecordBatch) (bool, error) {
+			report.stage = "scan_rows"
+			report.scannedRows += batch.NumRows()
 			for row := range int(batch.NumRows()) {
 				position := base + int64(row)
 				if position < 0 {
 					return false, errors.New("native index row position is negative or overflows int64")
 				}
 				if deleted.Contains(uint64(position)) || batch.Column(0).IsNull(row) {
+					report.skippedRows++
 					continue
 				}
 				key, ok := nativeIndexValue(batch.Column(0), row).(string)
@@ -565,6 +659,7 @@ func reconcileNativeTableIndex(ctx context.Context, index types.StreamIndex, tbl
 				}
 				pending.Put(key, types.RowLocation{FilePath: task.File.FilePath(), Position: position})
 				buffered++
+				report.indexedRows++
 				if buffered >= indexScanFlushRows {
 					if err := flush(nil); err != nil {
 						return false, err
@@ -576,8 +671,13 @@ func reconcileNativeTableIndex(ctx context.Context, index types.StreamIndex, tbl
 		if err != nil {
 			return fmt.Errorf("scan native stream index data: %w", err)
 		}
+		report.completedFiles++
 	}
-	return flush(&target)
+	if err := flush(&target); err != nil {
+		return err
+	}
+	report.stage = "complete"
+	return nil
 }
 
 func planNativeIndexFiles(ctx context.Context, tbl *table.Table, snapshot int64) ([]table.FileScanTask, error) {
@@ -617,29 +717,36 @@ func planNativeIndexFiles(ctx context.Context, tbl *table.Table, snapshot int64)
 	return tasks, nil
 }
 
+type nativeIndexDelta struct {
+	added, removed, changedDeletes int
+}
+
 // The index has no key deletion operation. File removal or a changed delete set
 // therefore requires a full rebuild; only pure additions are safe incrementally.
-func nativeIndexChanges(previous, current []table.FileScanTask) ([]table.FileScanTask, bool) {
+func nativeIndexChanges(previous, current []table.FileScanTask) ([]table.FileScanTask, nativeIndexDelta) {
 	old := make(map[string]table.FileScanTask, len(previous))
 	for _, task := range previous {
 		old[task.File.FilePath()] = task
 	}
 	var added []table.FileScanTask
+	var changes nativeIndexDelta
 	for _, task := range current {
 		before, exists := old[task.File.FilePath()]
 		if !exists {
+			changes.added++
 			added = append(added, task)
 			continue
 		}
 		if nativeTaskDeleteSignature(before) != nativeTaskDeleteSignature(task) {
-			return current, true
+			changes.changedDeletes++
 		}
 		delete(old, task.File.FilePath())
 	}
-	if len(old) != 0 {
-		return current, true
+	changes.removed = len(old)
+	if changes.removed != 0 || changes.changedDeletes != 0 {
+		return current, changes
 	}
-	return added, false
+	return added, changes
 }
 
 func nativeTaskDeleteSignature(task table.FileScanTask) string {
