@@ -17,7 +17,8 @@ type ChangeFilter struct {
 	tables    map[string]types.StreamInterface
 	converter func(value interface{}, columnType string) (interface{}, error)
 	// columnType maps a source type name to the type its converted values have
-	columnType func(columnType string) types.DataType
+	columnType  func(columnType string) types.DataType
+	replayAfter map[string]pglogrepl.LSN
 }
 
 func NewChangeFilter(typeConverter func(value interface{}, columnType string) (interface{}, error), columnType func(columnType string) types.DataType, streams ...types.StreamInterface) ChangeFilter {
@@ -31,6 +32,11 @@ func NewChangeFilter(typeConverter func(value interface{}, columnType string) (i
 		filter.tables[stream.ID()] = stream
 	}
 	return filter
+}
+
+func (c ChangeFilter) skipTransaction(streamID string, commitLSN pglogrepl.LSN) bool {
+	boundary := c.replayAfter[streamID]
+	return boundary != 0 && commitLSN <= boundary
 }
 
 func (c ChangeFilter) FilterWalJsChange(ctx context.Context, change []byte, OnFiltered abstract.CDCMsgFn) (*pglogrepl.LSN, int, error) {
@@ -62,6 +68,9 @@ func (c ChangeFilter) FilterWalJsChange(ctx context.Context, change []byte, OnFi
 	for _, ch := range changes.Change {
 		stream, exists := c.tables[utils.StreamIdentifier(ch.Table, ch.Schema)]
 		if !exists {
+			continue
+		}
+		if c.skipTransaction(stream.ID(), nextLSN) {
 			continue
 		}
 		rowsCount++

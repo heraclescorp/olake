@@ -32,9 +32,9 @@ import io.grpc.stub.StreamObserver;
  *   old model  → each JVM owned one Table handle + one IcebergTableOperator
  *   new model  → each ThreadSession owns one Table handle + one IcebergTableOperator
  *
- * The single {@link #sessions} map (keyed by threadId) is the only shared
- * state. There are no cross-session table caches or locks — every session is
- * fully isolated from every other session, just as separate JVM processes were.
+ * Ordinary sessions retain independent operators. Resync target sessions share a
+ * private metadata overlay; its coordinator serializes preparation, publication
+ * and terminal abort without changing other tables' routing.
  *
  * Per-stream context (namespace, upsert, partition spec, identifier-field flag)
  * arrives once on the GET_OR_CREATE_TABLE payload and is captured on the
@@ -49,22 +49,32 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
     // Shared sessions map (one entry per active Go writer thread)
     // Used by both OlakeRowsIngester and OlakeArrowIngester
     private final ConcurrentMap<String, IcebergSession> sessions;
+    private final ResyncCoordinator resyncs;
 
     public OlakeRowsIngester(Catalog icebergCatalog, ConcurrentMap<String, IcebergSession> sessions) {
         this.icebergCatalog = icebergCatalog;
         this.sessions = sessions;
+        this.resyncs = new ResyncCoordinator(icebergCatalog, sessions);
     }
 
     @Override
     public void sendRecords(IcebergPayload request, StreamObserver<RecordIngest.RecordIngestResponse> responseObserver) {
         String requestId = String.format("[Thread-%d-%d]", Thread.currentThread().getId(), System.nanoTime());
         long startTime = System.currentTimeMillis();
+        IcebergSession session = null;
 
         try {
             IcebergPayload.Metadata metadata = request.getMetadata();
             String threadId = metadata.getThreadId();
             String destTableName = metadata.getDestTableName();
 
+            switch (request.getType()) {
+                case PREPARE_RESYNC, PUBLISH_RESYNC, ABORT_RESYNC, RESYNC_STATUS -> {
+                    sendResponse(responseObserver, resyncs.control(request.getType(), metadata));
+                    return;
+                }
+                default -> { }
+            }
             if (threadId == null || threadId.isEmpty()) {
                 throw new Exception("Thread id not present in metadata");
             }
@@ -72,7 +82,13 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
             // CLOSE_SESSION: release the session's Table handle and operator.
             // Mirrors what process exit did for free in the old per-JVM model.
             if (request.getType() == IcebergPayload.PayloadType.CLOSE_SESSION) {
-                sessions.remove(threadId);
+                synchronized (resyncs) {
+                    IcebergSession closing = sessions.get(threadId);
+                    if (closing != null) {
+                        closing.close();
+                        sessions.remove(threadId, closing);
+                    }
+                }
                 sendResponseString(responseObserver, requestId + " closed session " + threadId);
                 LOGGER.debug("{} closed session {}", requestId, threadId);
                 return;
@@ -92,7 +108,13 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
                 String dropNamespace = parts[0];
                 String dropTableName = parts[1];
                 LOGGER.warn("{} Dropping table {}.{}", requestId, dropNamespace, dropTableName);
-                boolean dropped = IcebergUtil.dropIcebergTable(dropNamespace, dropTableName, icebergCatalog);
+                boolean dropped;
+                synchronized (resyncs) {
+                    if (resyncs.route(TableIdentifier.of(dropNamespace, dropTableName)) != null) {
+                        throw new IllegalStateException("Cannot drop an active resync target");
+                    }
+                    dropped = IcebergUtil.dropIcebergTable(dropNamespace, dropTableName, icebergCatalog);
+                }
                 if (dropped) {
                     sendResponseString(responseObserver, "Successfully dropped table " + dropTableName);
                     LOGGER.info("{} Table {} dropped", requestId, dropTableName);
@@ -108,7 +130,6 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
             // create-identifier-fields, partition spec) rides only on the
             // GET_OR_CREATE_TABLE payload; the session captures it once. Every
             // later request omits those fields and we read them from the session.
-            IcebergSession session;
             if (request.getType() == IcebergPayload.PayloadType.GET_OR_CREATE_TABLE) {
                 if (destTableName == null || destTableName.isEmpty()) {
                     throw new Exception("Destination table name not present in metadata");
@@ -125,19 +146,18 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
                 List<Map<String, String>> partitionTransforms = toPartitionList(metadata.getPartitionFieldsList());
                 TableIdentifier tid = TableIdentifier.of(namespace, destTableName);
 
-                // If a session already exists for this threadId, remove it to force recreation
-                sessions.remove(threadId);
-
-                // computeIfAbsent creates a new session since we just removed any existing one
-                session = sessions.computeIfAbsent(threadId,
-                        k -> {
-                            // "" leaves the column undeclared, the only shape Unity Catalog accepts.
-                            Schema schema = new SchemaConvertor(
-                                    declareIdentifierFields ? identifierField : "", schemaMetadata)
-                                    .convertToIcebergSchema();
-                            Table icebergTable = loadOrCreateTable(tid, schema, partitionTransforms, deleteMode);
-                            return new IcebergSession(icebergTable, upsert, identifierField, deleteMode);
-                        });
+                synchronized (resyncs) {
+                    IcebergSession previous = sessions.get(threadId);
+                    if (previous != null) {
+                        previous.close();
+                        sessions.remove(threadId, previous);
+                    }
+                    Schema schema = new SchemaConvertor(
+                            declareIdentifierFields ? identifierField : "", schemaMetadata).convertToIcebergSchema();
+                    Table icebergTable = loadOrCreateTable(tid, schema, partitionTransforms, deleteMode);
+                    session = new IcebergSession(icebergTable, upsert, identifierField, deleteMode, tid);
+                    sessions.put(threadId, session);
+                }
             } else {
                 // RECORDS / COMMIT / EVOLVE_SCHEMA / REFRESH_TABLE_SCHEMA: the
                 // session must already exist (GET_OR_CREATE_TABLE runs first in
@@ -149,6 +169,8 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
                 }
             }
 
+            synchronized (session) {
+                session.requireOpen();
             switch (request.getType()) {
                 case COMMIT:
                     Long baseSnapshotId = metadata.hasBaseSnapshotId() ? metadata.getBaseSnapshotId() : null;
@@ -228,9 +250,13 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
                 default:
                     throw new IllegalArgumentException("Unknown payload type: " + request.getType());
             }
+            }
 
             LOGGER.info("{} Total time taken: {} ms", requestId, (System.currentTimeMillis() - startTime));
         } catch (Exception e) {
+            if (session != null) {
+                session.fail();
+            }
             String errorMessage = String.format("%s Failed to process request: %s", requestId, e.getMessage());
             LOGGER.error(errorMessage, e);
             responseObserver.onError(OlakeFailures.toStatusException(e, request.getType().name(), errorMessage));
@@ -263,7 +289,8 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
             String message, String olake2pcState, IcebergSession session) throws Exception {
         RecordIngest.RecordIngestResponse.Builder builder = RecordIngest.RecordIngestResponse.newBuilder()
                 .setResult(message)
-                .setOlake2PcState(olake2pcState);
+                .setOlake2PcState(olake2pcState)
+                .setResyncGeneration(session.icebergTable.properties().getOrDefault(ResyncCoordinator.GENERATION_PROPERTY, ""));
 
         Table table = session.icebergTable;
         Snapshot current = table.currentSnapshot();
@@ -280,6 +307,11 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
 
     private Table loadOrCreateTable(TableIdentifier tableId, Schema schema, List<Map<String, String>> partitionTransforms,
             DeleteMode deleteMode) {
+        Table staged = resyncs.route(tableId);
+        if (staged != null) {
+            validateOrUpgradeFormatVersion(staged, deleteMode);
+            return staged;
+        }
         java.util.Optional<Table> existing = IcebergUtil.loadIcebergTable(icebergCatalog, tableId);
         if (existing.isPresent()) {
             Table table = existing.get();

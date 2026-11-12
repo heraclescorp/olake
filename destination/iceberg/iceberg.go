@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/datazip-inc/olake/destination/iceberg/internal"
 	legacywriter "github.com/datazip-inc/olake/destination/iceberg/legacy-writer"
 	"github.com/datazip-inc/olake/destination/iceberg/proto"
+	"github.com/datazip-inc/olake/pkg/indexdb"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/errs"
@@ -33,6 +35,8 @@ type Iceberg struct {
 	server        *serverInstance          // shared Java server instance (per-process singleton)
 	schema        map[string]string        // schema for current thread associated with Java writer (col -> type)
 	writer        Writer                   // writer instance
+	resyncMu      sync.Mutex
+	resync        *resyncControl
 	// unavailableValues recovers values the source could not send; nil unless the stream keeps a row index (pos or dv)
 	unavailableValues *unavailableValuesResolver
 	// syncStartColumns are columns added from the source catalog at sync start (see planSourceColumns)
@@ -142,6 +146,9 @@ func (i *Iceberg) Setup(ctx context.Context, stream types.StreamInterface, _ any
 
 	// set schema for current thread
 	i.schema = copySchema(schema)
+	if err := indexdb.ReconcileGeneration(options.TableIndex, ingestResponse.GetResyncGeneration()); err != nil {
+		return schema, nil, fmt.Errorf("failed to reconcile stream index generation: %w", err)
+	}
 
 	if err := i.reconcileTableIndex(ctx, options.TableIndex, ingestResponse.GetSnapshotId(), ingestResponse.GetHasEqualityDeletes()); err != nil {
 		return schema, nil, err
@@ -695,8 +702,12 @@ func protoDeleteMode(mode types.UpdateType) proto.IcebergPayload_DeleteMode {
 func init() {
 	var server *serverInstance
 	var icebergConfig *Config
-	destination.RegisteredWriters[types.Iceberg] = func(config any) (destination.Writer, func(ctx context.Context), error) {
+	destination.RegisteredWriters[types.Iceberg] = func(ctx context.Context, config any) (destination.Writer, func(ctx context.Context), error) {
+		_, atomicResync := types.ResyncFromContext(ctx)
 		if icebergConfig != nil || server != nil {
+			if atomicResync && (icebergConfig == nil || !icebergConfig.atomicResync) {
+				return nil, nil, fmt.Errorf("atomic resync requires a fresh JVM with bounded catalog timeouts")
+			}
 			// for already initialized writer, return the same server and config instance
 			return &Iceberg{
 				config: icebergConfig,
@@ -710,6 +721,7 @@ func init() {
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to unmarshal iceberg config: %w", err)
 		}
+		icebergConfig.atomicResync = atomicResync
 
 		server, err = startServer(icebergConfig)
 		if err != nil {

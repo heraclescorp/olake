@@ -336,6 +336,14 @@ func (i *pebbleIndex) LastCommittedSnapshot() (int64, error) {
 }
 
 func (i *pebbleIndex) Truncate() error {
+	generation, err := i.resyncGeneration()
+	if err != nil {
+		return err
+	}
+	return i.truncateGeneration(generation)
+}
+
+func (i *pebbleIndex) truncateGeneration(generation string) error {
 	batch := i.db.NewBatch()
 	defer batch.Close()
 
@@ -347,6 +355,11 @@ func (i *pebbleIndex) Truncate() error {
 
 	if err := setCounter(batch, metaFormatVersion, formatVersion); err != nil {
 		return err
+	}
+	if generation != "" {
+		if err := batch.Set(metaKey(metaResyncGeneration), []byte(generation), nil); err != nil {
+			return fmt.Errorf("failed to stage stream index resync generation: %w", err)
+		}
 	}
 
 	if err := batch.Commit(pebble.Sync); err != nil {

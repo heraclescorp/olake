@@ -17,10 +17,11 @@ import java.util.Iterator;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileFormat;
-import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.parquet.Parquet;
@@ -34,10 +35,9 @@ import org.slf4j.LoggerFactory;
  * addresses. This is what lets a caller express a delete positionally instead of
  * by equality.
  *
- * <p>Rows are emitted oldest first, ordered by data sequence number and then by
- * path. A caller that overwrites entries as they arrive therefore ends up holding
- * the newest version of every identifier, which is the row a subsequent update or
- * delete has to evict.
+ * <p>Full scans apply Iceberg deletes and retain physical row positions. Incremental
+ * scans emit added files oldest first so a caller overwriting entries retains the
+ * newest version of each identifier.
  */
 public final class TableIndexScanner {
   private static final Logger LOGGER = LoggerFactory.getLogger(TableIndexScanner.class);
@@ -91,13 +91,35 @@ public final class TableIndexScanner {
       }
       Snapshot current = table.currentSnapshot();
       target = current == null ? 0L : current.snapshotId();
+      if (fromSnapshotId == null) {
+        consumer.begin(target);
+        if (current != null) {
+          Schema projection = new Schema(identifierField(table, identifierField),
+              MetadataColumns.FILE_PATH, MetadataColumns.ROW_POSITION);
+          // Explicit metadata fields retain the per-task reader's physical positions through delete filtering.
+          try (CloseableIterable<Record> rows = IcebergGenerics.read(table).useSnapshot(target)
+              .project(projection).reuseContainers().build()) {
+            for (Record row : rows) {
+              observations.visited++;
+              Object identifier = row.getField(identifierField);
+              if (identifier != null) {
+                consumer.accept(identifier.toString(), row.getField(MetadataColumns.FILE_PATH.name()).toString(),
+                    ((Number) row.getField(MetadataColumns.ROW_POSITION.name())).longValue());
+                observations.emitted++;
+              } else {
+                observations.nullRows++;
+              }
+            }
+          }
+        }
+        success = true;
+        return new ScanResult(target, observations.emitted);
+      }
       stage = System.nanoTime();
       List<DataFile> addedFiles;
       try {
         if (current == null) {
           addedFiles = List.of();
-        } else if (fromSnapshotId == null) {
-          addedFiles = currentDataFiles(table);
         } else if (fromSnapshotId == current.snapshotId()) {
           addedFiles = List.of();
         } else {
@@ -150,18 +172,6 @@ public final class TableIndexScanner {
     long visited, emitted, nullRows, completedFiles, removalObservationFailures;
     final Map<String, Long> operations = new HashMap<>();
     final Set<String> removedLater = new HashSet<>();
-  }
-
-  /** Every data file visible in the table's current snapshot, oldest first. */
-  private static List<DataFile> currentDataFiles(Table table) throws IOException {
-    Map<String, DataFile> unique = new HashMap<>();
-    try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
-      // planFiles may split one file into several tasks; index each file once.
-      for (FileScanTask task : tasks) {
-        unique.putIfAbsent(task.file().location(), task.file());
-      }
-    }
-    return sortedOldestFirst(unique.values());
   }
 
   /**
@@ -273,12 +283,16 @@ public final class TableIndexScanner {
   }
 
   static Schema identifierProjection(Table table, String identifierField) {
+    return new Schema(identifierField(table, identifierField));
+  }
+
+  private static NestedField identifierField(Table table, String identifierField) {
     NestedField field = table.schema().findField(identifierField);
     if (field == null) {
       throw new IllegalStateException(
           "table " + table.name() + " has no identifier column " + identifierField + " to index rows by");
     }
-    return new Schema(field);
+    return field;
   }
 
   /**

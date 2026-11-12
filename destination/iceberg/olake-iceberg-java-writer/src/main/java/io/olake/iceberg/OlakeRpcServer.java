@@ -65,6 +65,7 @@ public class OlakeRpcServer {
                 }
             });
 
+            configureResyncCatalog(stringConfigMap);
             stringConfigMap.forEach(hadoopConf::set);
             icebergProperties.putAll(stringConfigMap);
 
@@ -140,5 +141,19 @@ public class OlakeRpcServer {
         server.awaitTermination();
         telemetry.close();
         recording.close();
+    }
+    static void configureResyncCatalog(Map<String, String> properties) {
+        if (!Boolean.parseBoolean(properties.remove("atomic-resync-enabled"))) {
+            return;
+        }
+        boundTimeout(properties, "rest.client.connection-timeout-ms", 30_000);
+        boundTimeout(properties, "rest.client.socket-timeout-ms", 60_000);
+        int retries = Integer.parseInt(properties.getOrDefault("rest.client.max-retries", "5"));
+        properties.put("rest.client.max-retries", Integer.toString(Math.max(0, Math.min(5, retries))));
+    }
+
+    private static void boundTimeout(Map<String, String> properties, String key, long maximum) {
+        long configured = Long.parseLong(properties.getOrDefault(key, Long.toString(maximum)));
+        properties.put(key, Long.toString(configured > 0 ? Math.min(configured, maximum) : maximum));
     }
 }

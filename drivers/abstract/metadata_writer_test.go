@@ -23,7 +23,7 @@ func newMetadataWriterPool(t *testing.T, streams []types.StreamInterface, hooks 
 	t.Helper()
 	writerType := types.DestinationType(fmt.Sprintf("metadata-test-%d", metadataWriterPoolID.Add(1)))
 	previous, existed := destination.RegisteredWriters[writerType]
-	destination.RegisteredWriters[writerType] = func(any) (destination.Writer, func(context.Context), error) {
+	destination.RegisteredWriters[writerType] = func(context.Context, any) (destination.Writer, func(context.Context), error) {
 		return &metadataTestWriter{hooks: hooks}, nil, nil
 	}
 	t.Cleanup(func() {

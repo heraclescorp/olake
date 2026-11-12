@@ -244,6 +244,13 @@ func (p *Postgres) setupBackfillHost(ctx context.Context) (_ *sqlx.DB, err error
 // snapshot on the same connection contains every commit the writer had made durable by then.
 func (p *Postgres) backfillConn(ctx context.Context, stream types.StreamInterface) (*sqlx.Conn, error) {
 	ctx = observability.WithTable(ctx, stream.Namespace(), stream.Name())
+	if p.resync != nil && p.resync.streamID == stream.ID() {
+		conn, err := p.client.Connx(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to acquire writer connection for resync snapshot: %w", err)
+		}
+		return conn, nil
+	}
 	if err := p.ensureBackfillHost(ctx); err != nil {
 		return nil, err
 	}

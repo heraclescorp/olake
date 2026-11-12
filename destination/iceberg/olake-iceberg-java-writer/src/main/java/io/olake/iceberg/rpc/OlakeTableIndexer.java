@@ -102,8 +102,11 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
   @Override
   public void migrateEqualityDeletes(MigrateEqualityDeletesRequest request,
       StreamObserver<MigrateEqualityDeletesResponse> responseObserver) {
+    IcebergSession session = null;
     try {
-      IcebergSession session = requireSession(request.getThreadId());
+      session = requireSession(request.getThreadId());
+      synchronized (session) {
+      session.requireOpen();
       // target_mode wins when the caller set it; UNSPECIFIED falls back to the
       // session's own mode, since deleteMode.addressesPositions() is what gated this RPC.
       IcebergPayload.DeleteMode requestedMode = request.getTargetMode();
@@ -119,7 +122,11 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
           .setPositionalDeletesWritten(result.positionalDeletesWritten)
           .build());
       responseObserver.onCompleted();
+      }
     } catch (Exception e) {
+      if (session != null) {
+        session.fail();
+      }
       String message = String.format("failed to migrate equality deletes for thread %s: %s",
           request.getThreadId(), e.getMessage());
       LOGGER.error(message, e);
@@ -146,7 +153,10 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
         paths.add(file.getFilePath());
       }
       // Rows written earlier in this sync may sit in a file the writer still has open.
-      session.op.closeOpenDataFiles(paths);
+      synchronized (session) {
+        session.requireOpen();
+        session.op.closeOpenDataFiles(paths);
+      }
 
       reads = request.getFilesList().stream()
           .map(file -> CompletableFuture.runAsync(() -> emitter.read(session.icebergTable, file), READERS))
@@ -193,6 +203,7 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
       throw new Exception("No active session for thread " + threadId
           + "; GET_OR_CREATE_TABLE must be called before using the table index");
     }
+    session.requireOpen();
     return session;
   }
 

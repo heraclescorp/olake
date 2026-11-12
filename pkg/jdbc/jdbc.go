@@ -245,7 +245,16 @@ func PostgresChunkScanQuery(stream types.StreamInterface, filterColumn string, c
 		chunkCond = fmt.Sprintf("%s < %v", quotedFilterColumn, chunk.Max)
 	}
 
-	chunkCond = utils.Ternary(filter != "" && chunkCond != "", fmt.Sprintf("(%s) AND (%s)", chunkCond, filter), chunkCond).(string)
+	if filter != "" {
+		if chunkCond == "" {
+			chunkCond = filter
+		} else {
+			chunkCond = fmt.Sprintf("(%s) AND (%s)", chunkCond, filter)
+		}
+	}
+	if chunkCond == "" {
+		return "SELECT * FROM " + quotedTable
+	}
 	return fmt.Sprintf(`SELECT * FROM %s WHERE %s`, quotedTable, chunkCond)
 }
 

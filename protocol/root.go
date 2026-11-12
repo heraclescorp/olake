@@ -118,7 +118,13 @@ var RootCmd = &cobra.Command{
 		if cmd.Name() == "discover-new-tables" {
 			return utils.UploadArtifactOutput(cmd.Context(), enrollmentResultPath, enrollmentResultURI, noSave)
 		}
-		return utils.FinalizeS3Upload(cmd.Context(), noSave)
+		if err := utils.FinalizeS3Upload(cmd.Context(), noSave); err != nil {
+			return err
+		}
+		if cmd.Name() == "resync" {
+			return utils.UploadArtifactOutput(cmd.Context(), resyncResultPath, resyncResultURI, false)
+		}
+		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
@@ -185,7 +191,7 @@ func init() {
 	cobra.EnableTraverseRunHooks = true
 
 	// TODO: replace --catalog flag with --streams
-	commands = append(commands, specCmd, checkCmd, discoverCmd, discoverNewTablesCmd, syncCmd, clearCmd)
+	commands = append(commands, specCmd, checkCmd, discoverCmd, discoverNewTablesCmd, syncCmd, resyncCmd, clearCmd)
 	RootCmd.PersistentFlags().StringVarP(&configPath, "config", "", "not-set", "(Required) Config for connector")
 	RootCmd.PersistentFlags().StringVarP(&destinationConfigPath, "destination", "", "not-set", "(Required) Destination config for connector")
 	RootCmd.PersistentFlags().StringVarP(&destinationType, "destination-type", "", "not-set", "Destination type for spec")

@@ -1,6 +1,7 @@
 package types
 
 import (
+	"bytes"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -67,6 +68,8 @@ type State struct {
 	Version       int            `json:"version,omitempty"` // version of state file for backward compatibility
 	Global        *GlobalState   `json:"global,omitempty"`
 	Streams       []*StreamState `json:"streams,omitempty"` // TODO: make it set
+	// SuppressPersistence keeps an unpublished resync checkpoint in memory only.
+	SuppressPersistence bool `json:"-"`
 }
 
 var (
@@ -281,6 +284,9 @@ func (s *State) LogWithLock() {
 
 func (s *State) LogState() {
 	// function need to be called after state lock
+	if s.SuppressPersistence {
+		return
+	}
 	if s.isZero() {
 		logger.Debug("state is empty")
 		return
@@ -297,6 +303,23 @@ func (s *State) LogState() {
 	if err != nil {
 		logger.Fatalf("failed to write state file: %s", err)
 	}
+}
+
+// Clone snapshots the complete checkpoint without carrying attempt-only persistence policy.
+func (s *State) Clone() (*State, error) {
+	s.RLock()
+	defer s.RUnlock()
+	data, err := json.Marshal(s)
+	if err != nil {
+		return nil, err
+	}
+	checkpoint := &State{RWMutex: &sync.RWMutex{}}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(checkpoint); err != nil {
+		return nil, err
+	}
+	return checkpoint, nil
 }
 
 // MarshalJSON custom marshaller to handle sync.Map encoding
@@ -334,7 +357,9 @@ func (s *StreamState) UnmarshalJSON(data []byte) error {
 		Alias: (*Alias)(s),
 	}
 
-	if err := json.Unmarshal(data, &aux); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&aux); err != nil {
 		return err
 	}
 
@@ -354,7 +379,9 @@ func (s *StreamState) UnmarshalJSON(data []byte) error {
 			}
 
 			var chunks []Chunk
-			if err := json.Unmarshal(chunksJSON, &chunks); err != nil {
+			decoder := json.NewDecoder(bytes.NewReader(chunksJSON))
+			decoder.UseNumber()
+			if err := decoder.Decode(&chunks); err != nil {
 				return err
 			}
 

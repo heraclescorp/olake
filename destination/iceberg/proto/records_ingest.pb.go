@@ -32,20 +32,28 @@ const (
 	IcebergPayload_REFRESH_TABLE_SCHEMA IcebergPayload_PayloadType = 5
 	IcebergPayload_CLOSE_SESSION        IcebergPayload_PayloadType = 6
 	// Adds and drops columns named in added_columns / dropped_columns in one schema update.
-	IcebergPayload_ALTER_COLUMNS IcebergPayload_PayloadType = 7
+	IcebergPayload_ALTER_COLUMNS  IcebergPayload_PayloadType = 7
+	IcebergPayload_PREPARE_RESYNC IcebergPayload_PayloadType = 8
+	IcebergPayload_PUBLISH_RESYNC IcebergPayload_PayloadType = 9
+	IcebergPayload_ABORT_RESYNC   IcebergPayload_PayloadType = 10
+	IcebergPayload_RESYNC_STATUS  IcebergPayload_PayloadType = 11
 )
 
 // Enum value maps for IcebergPayload_PayloadType.
 var (
 	IcebergPayload_PayloadType_name = map[int32]string{
-		0: "RECORDS",
-		1: "COMMIT",
-		2: "EVOLVE_SCHEMA",
-		3: "DROP_TABLE",
-		4: "GET_OR_CREATE_TABLE",
-		5: "REFRESH_TABLE_SCHEMA",
-		6: "CLOSE_SESSION",
-		7: "ALTER_COLUMNS",
+		0:  "RECORDS",
+		1:  "COMMIT",
+		2:  "EVOLVE_SCHEMA",
+		3:  "DROP_TABLE",
+		4:  "GET_OR_CREATE_TABLE",
+		5:  "REFRESH_TABLE_SCHEMA",
+		6:  "CLOSE_SESSION",
+		7:  "ALTER_COLUMNS",
+		8:  "PREPARE_RESYNC",
+		9:  "PUBLISH_RESYNC",
+		10: "ABORT_RESYNC",
+		11: "RESYNC_STATUS",
 	}
 	IcebergPayload_PayloadType_value = map[string]int32{
 		"RECORDS":              0,
@@ -56,6 +64,10 @@ var (
 		"REFRESH_TABLE_SCHEMA": 5,
 		"CLOSE_SESSION":        6,
 		"ALTER_COLUMNS":        7,
+		"PREPARE_RESYNC":       8,
+		"PUBLISH_RESYNC":       9,
+		"ABORT_RESYNC":         10,
+		"RESYNC_STATUS":        11,
 	}
 )
 
@@ -274,8 +286,14 @@ type RecordIngestResponse struct {
 	// RECORDS: returned when rows are written, detailing where they landed so
 	// the sender can update its table index. Order matches the request records.
 	FilePositionMaps []*FilePositionMap `protobuf:"bytes,6,rep,name=file_position_maps,json=filePositionMaps,proto3" json:"file_position_maps,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	ResyncPublished  bool               `protobuf:"varint,7,opt,name=resync_published,json=resyncPublished,proto3" json:"resync_published,omitempty"`
+	ResyncCheckpoint string             `protobuf:"bytes,8,opt,name=resync_checkpoint,json=resyncCheckpoint,proto3" json:"resync_checkpoint,omitempty"`
+	// Durable replacement generation; also returned by GET_OR_CREATE_TABLE.
+	ResyncGeneration string `protobuf:"bytes,9,opt,name=resync_generation,json=resyncGeneration,proto3" json:"resync_generation,omitempty"`
+	// Publication receipts pair this UUID with the positive snapshot_id above.
+	ResyncTableUuid string `protobuf:"bytes,10,opt,name=resync_table_uuid,json=resyncTableUuid,proto3" json:"resync_table_uuid,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *RecordIngestResponse) Reset() {
@@ -348,6 +366,34 @@ func (x *RecordIngestResponse) GetFilePositionMaps() []*FilePositionMap {
 		return x.FilePositionMaps
 	}
 	return nil
+}
+
+func (x *RecordIngestResponse) GetResyncPublished() bool {
+	if x != nil {
+		return x.ResyncPublished
+	}
+	return false
+}
+
+func (x *RecordIngestResponse) GetResyncCheckpoint() string {
+	if x != nil {
+		return x.ResyncCheckpoint
+	}
+	return ""
+}
+
+func (x *RecordIngestResponse) GetResyncGeneration() string {
+	if x != nil {
+		return x.ResyncGeneration
+	}
+	return ""
+}
+
+func (x *RecordIngestResponse) GetResyncTableUuid() string {
+	if x != nil {
+		return x.ResyncTableUuid
+	}
+	return ""
 }
 
 // FilePositionMap describes row ranges written to a single data file.
@@ -881,8 +927,14 @@ type IcebergPayload_Metadata struct {
 	// ALTER_COLUMNS only.
 	AddedColumns   []*IcebergPayload_AddedColumn `protobuf:"bytes,13,rep,name=added_columns,json=addedColumns,proto3" json:"added_columns,omitempty"`
 	DroppedColumns []string                      `protobuf:"bytes,14,rep,name=dropped_columns,json=droppedColumns,proto3" json:"dropped_columns,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Resync control requests use namespace + dest_table_name, independently of sessions.
+	ResyncId string `protobuf:"bytes,15,opt,name=resync_id,json=resyncId,proto3" json:"resync_id,omitempty"`
+	// Full job checkpoint, atomically persisted with the completed operation marker.
+	ResyncCheckpoint string `protobuf:"bytes,16,opt,name=resync_checkpoint,json=resyncCheckpoint,proto3" json:"resync_checkpoint,omitempty"`
+	// Absolute fresh-attempt deadline; at most twelve hours from preparation.
+	ResyncDeadlineMs int64 `protobuf:"varint,17,opt,name=resync_deadline_ms,json=resyncDeadlineMs,proto3" json:"resync_deadline_ms,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *IcebergPayload_Metadata) Reset() {
@@ -1004,6 +1056,27 @@ func (x *IcebergPayload_Metadata) GetDroppedColumns() []string {
 		return x.DroppedColumns
 	}
 	return nil
+}
+
+func (x *IcebergPayload_Metadata) GetResyncId() string {
+	if x != nil {
+		return x.ResyncId
+	}
+	return ""
+}
+
+func (x *IcebergPayload_Metadata) GetResyncCheckpoint() string {
+	if x != nil {
+		return x.ResyncCheckpoint
+	}
+	return ""
+}
+
+func (x *IcebergPayload_Metadata) GetResyncDeadlineMs() int64 {
+	if x != nil {
+		return x.ResyncDeadlineMs
+	}
+	return 0
 }
 
 type IcebergPayload_AddedColumn struct {
@@ -2198,11 +2271,11 @@ var File_records_ingest_proto protoreflect.FileDescriptor
 
 const file_records_ingest_proto_rawDesc = "" +
 	"\n" +
-	"\x14records_ingest.proto\x12\x14io.olake.iceberg.rpc\"\xa7\x10\n" +
+	"\x14records_ingest.proto\x12\x14io.olake.iceberg.rpc\"\xec\x11\n" +
 	"\x0eIcebergPayload\x12D\n" +
 	"\x04type\x18\x01 \x01(\x0e20.io.olake.iceberg.rpc.IcebergPayload.PayloadTypeR\x04type\x12I\n" +
 	"\bmetadata\x18\x02 \x01(\v2-.io.olake.iceberg.rpc.IcebergPayload.MetadataR\bmetadata\x12H\n" +
-	"\arecords\x18\x03 \x03(\v2..io.olake.iceberg.rpc.IcebergPayload.IceRecordR\arecords\x1a\xe0\x05\n" +
+	"\arecords\x18\x03 \x03(\v2..io.olake.iceberg.rpc.IcebergPayload.IceRecordR\arecords\x1a\xd8\x06\n" +
 	"\bMetadata\x12&\n" +
 	"\x0fdest_table_name\x18\x01 \x01(\tR\rdestTableName\x12\x1b\n" +
 	"\tthread_id\x18\x02 \x01(\tR\bthreadId\x12.\n" +
@@ -2218,7 +2291,10 @@ const file_records_ingest_proto_rawDesc = "" +
 	"deleteMode\x12:\n" +
 	"\x19declare_identifier_fields\x18\f \x01(\bR\x17declareIdentifierFields\x12U\n" +
 	"\radded_columns\x18\r \x03(\v20.io.olake.iceberg.rpc.IcebergPayload.AddedColumnR\faddedColumns\x12'\n" +
-	"\x0fdropped_columns\x18\x0e \x03(\tR\x0edroppedColumnsB\x13\n" +
+	"\x0fdropped_columns\x18\x0e \x03(\tR\x0edroppedColumns\x12\x1b\n" +
+	"\tresync_id\x18\x0f \x01(\tR\bresyncId\x12+\n" +
+	"\x11resync_checkpoint\x18\x10 \x01(\tR\x10resyncCheckpoint\x12,\n" +
+	"\x12resync_deadline_ms\x18\x11 \x01(\x03R\x10resyncDeadlineMsB\x13\n" +
 	"\x11_identifier_fieldB\x13\n" +
 	"\x11_base_snapshot_id\x1a\x9e\x01\n" +
 	"\vAddedColumn\x12\x10\n" +
@@ -2252,7 +2328,7 @@ const file_records_ingest_proto_rawDesc = "" +
 	"bytesValueB\a\n" +
 	"\x05valueB\x13\n" +
 	"\x11_delete_file_pathB\x12\n" +
-	"\x10_delete_position\"\xa2\x01\n" +
+	"\x10_delete_position\"\xef\x01\n" +
 	"\vPayloadType\x12\v\n" +
 	"\aRECORDS\x10\x00\x12\n" +
 	"\n" +
@@ -2263,13 +2339,18 @@ const file_records_ingest_proto_rawDesc = "" +
 	"\x13GET_OR_CREATE_TABLE\x10\x04\x12\x18\n" +
 	"\x14REFRESH_TABLE_SCHEMA\x10\x05\x12\x11\n" +
 	"\rCLOSE_SESSION\x10\x06\x12\x11\n" +
-	"\rALTER_COLUMNS\x10\a\"~\n" +
+	"\rALTER_COLUMNS\x10\a\x12\x12\n" +
+	"\x0ePREPARE_RESYNC\x10\b\x12\x12\n" +
+	"\x0ePUBLISH_RESYNC\x10\t\x12\x10\n" +
+	"\fABORT_RESYNC\x10\n" +
+	"\x12\x11\n" +
+	"\rRESYNC_STATUS\x10\v\"~\n" +
 	"\n" +
 	"DeleteMode\x12\x1b\n" +
 	"\x17DELETE_MODE_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14DELETE_MODE_EQUALITY\x10\x01\x12\x18\n" +
 	"\x14DELETE_MODE_POSITION\x10\x02\x12\x1f\n" +
-	"\x1bDELETE_MODE_DELETION_VECTOR\x10\x03\"\x98\x02\n" +
+	"\x1bDELETE_MODE_DELETION_VECTOR\x10\x03\"\xc9\x03\n" +
 	"\x14RecordIngestResponse\x12\x16\n" +
 	"\x06result\x18\x01 \x01(\tR\x06result\x12\x18\n" +
 	"\asuccess\x18\x02 \x01(\bR\asuccess\x12&\n" +
@@ -2277,7 +2358,12 @@ const file_records_ingest_proto_rawDesc = "" +
 	"\vsnapshot_id\x18\x04 \x01(\x03R\n" +
 	"snapshotId\x120\n" +
 	"\x14has_equality_deletes\x18\x05 \x01(\bR\x12hasEqualityDeletes\x12S\n" +
-	"\x12file_position_maps\x18\x06 \x03(\v2%.io.olake.iceberg.rpc.FilePositionMapR\x10filePositionMaps\"\xe1\x01\n" +
+	"\x12file_position_maps\x18\x06 \x03(\v2%.io.olake.iceberg.rpc.FilePositionMapR\x10filePositionMaps\x12)\n" +
+	"\x10resync_published\x18\a \x01(\bR\x0fresyncPublished\x12+\n" +
+	"\x11resync_checkpoint\x18\b \x01(\tR\x10resyncCheckpoint\x12+\n" +
+	"\x11resync_generation\x18\t \x01(\tR\x10resyncGeneration\x12*\n" +
+	"\x11resync_table_uuid\x18\n" +
+	" \x01(\tR\x0fresyncTableUuid\"\xe1\x01\n" +
 	"\x0fFilePositionMap\x12\x1b\n" +
 	"\tfile_path\x18\x01 \x01(\tR\bfilePath\x12C\n" +
 	"\x06ranges\x18\x02 \x03(\v2+.io.olake.iceberg.rpc.FilePositionMap.RangeR\x06ranges\x1al\n" +

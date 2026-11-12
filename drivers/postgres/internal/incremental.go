@@ -21,7 +21,21 @@ func (p *Postgres) StreamIncrementalChanges(ctx context.Context, stream types.St
 		return fmt.Errorf("failed to build incremental condition: %w", err)
 	}
 
-	rows, err := p.client.QueryContext(ctx, incrementalQuery, queryArgs...)
+	query := p.client.QueryContext
+	if p.resync != nil && p.resync.streamID == stream.ID() {
+		conn, err := p.backfillConn(ctx, stream)
+		if err != nil {
+			return err
+		}
+		defer closeBackfillConn(conn)
+		tx, err := p.beginBackfillTx(ctx, conn, stream)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		query = tx.QueryContext
+	}
+	rows, err := query(ctx, incrementalQuery, queryArgs...)
 	if err != nil {
 		return fmt.Errorf("failed to execute incremental query: %w", err)
 	}
@@ -43,6 +57,39 @@ func (p *Postgres) StreamIncrementalChanges(ctx context.Context, stream types.St
 }
 
 func (p *Postgres) FetchMaxCursorValues(ctx context.Context, stream types.StreamInterface) (any, any, error) {
+	if p.resync != nil && p.resync.streamID == stream.ID() {
+		conn, err := p.backfillConn(ctx, stream)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer closeBackfillConn(conn)
+		tx, err := p.beginBackfillTx(ctx, conn, stream)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer func() { _ = tx.Rollback() }()
+		primary, secondary := stream.Cursor()
+		query := "SELECT MAX(" + jdbc.QuoteIdentifier(primary, constants.Postgres) + ")"
+		if secondary != "" {
+			query += ", MAX(" + jdbc.QuoteIdentifier(secondary, constants.Postgres) + ")"
+		}
+		query += " FROM " + jdbc.QuoteTable(stream.Namespace(), stream.Name(), constants.Postgres)
+		var first, second any
+		values := []any{&first}
+		if secondary != "" {
+			values = append(values, &second)
+		}
+		if err := tx.QueryRowContext(ctx, query).Scan(values...); err != nil {
+			return nil, nil, err
+		}
+		if value, ok := first.([]byte); ok {
+			first = string(value)
+		}
+		if value, ok := second.([]byte); ok {
+			second = string(value)
+		}
+		return first, second, nil
+	}
 	maxPrimaryCursorValue, maxSecondaryCursorValue, err := jdbc.GetMaxCursorValues(ctx, p.client, constants.Postgres, stream)
 	if err != nil {
 		return nil, nil, err

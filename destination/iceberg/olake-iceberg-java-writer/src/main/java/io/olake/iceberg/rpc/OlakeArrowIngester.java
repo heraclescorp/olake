@@ -53,6 +53,7 @@ public class OlakeArrowIngester extends ArrowIngestServiceGrpc.ArrowIngestServic
     @Override
     public void icebergAPI(ArrowPayload request, StreamObserver<RecordIngest.ArrowIngestResponse> responseObserver) {
         String requestId = String.format("[Arrow-%d-%d]", Thread.currentThread().getId(), System.nanoTime());
+        IcebergSession session = null;
 
         try {
             ArrowPayload.Metadata metadata = request.getMetadata();
@@ -64,12 +65,14 @@ public class OlakeArrowIngester extends ArrowIngestServiceGrpc.ArrowIngestServic
 
     // Every payload other than JSONSCHEMA must run against an existing
     // session created by the JSONSCHEMA handshake above.
-    IcebergSession session = sessions.get(threadId);
+    session = sessions.get(threadId);
     if (session == null) {
         throw new Exception("No active arrow session for thread " + threadId
                 + "; GET_OR_CREATE_TABLE handshake on row ingester must run before " + request.getType());
     }
 
+            synchronized (session) {
+                session.requireOpen();
             switch (request.getType()) {
                 case JSONSCHEMA -> {
                     session.icebergTable.refresh();
@@ -199,7 +202,11 @@ public class OlakeArrowIngester extends ArrowIngestServiceGrpc.ArrowIngestServic
 
                 default -> throw new IllegalArgumentException("Unknown payload type: " + request.getType());
             }
+            }
         } catch (Exception e) {
+            if (session != null) {
+                session.fail();
+            }
             String errorMessage = String.format("%s Failed to process request: %s", requestId, e.getMessage());
             LOGGER.error(errorMessage, e);
             responseObserver.onError(OlakeFailures.toStatusException(e, request.getType().name(), errorMessage));

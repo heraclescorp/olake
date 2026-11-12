@@ -20,6 +20,10 @@ message IcebergPayload {
     CLOSE_SESSION = 6;
     // Adds and drops columns named in added_columns / dropped_columns in one schema update.
     ALTER_COLUMNS = 7;
+    PREPARE_RESYNC = 8;
+    PUBLISH_RESYNC = 9;
+    ABORT_RESYNC = 10;
+    RESYNC_STATUS = 11;
   }
   
   PayloadType type = 1;
@@ -55,6 +59,12 @@ message IcebergPayload {
     // ALTER_COLUMNS only.
     repeated AddedColumn added_columns = 13;
     repeated string dropped_columns = 14;
+    // Resync control requests use namespace + dest_table_name, independently of sessions.
+    string resync_id = 15;
+    // Full job checkpoint, atomically persisted with the completed operation marker.
+    string resync_checkpoint = 16;
+    // Absolute fresh-attempt deadline; at most twelve hours from preparation.
+    int64 resync_deadline_ms = 17;
   }
 
   message AddedColumn {
@@ -117,6 +127,12 @@ message RecordIngestResponse {
   // RECORDS: returned when rows are written, detailing where they landed so
   // the sender can update its table index. Order matches the request records.
   repeated FilePositionMap file_position_maps = 6;
+  bool resync_published = 7;
+  string resync_checkpoint = 8;
+  // Durable replacement generation; also returned by GET_OR_CREATE_TABLE.
+  string resync_generation = 9;
+  // Publication receipts pair this UUID with the positive snapshot_id above.
+  string resync_table_uuid = 10;
 }
 
 // FilePositionMap describes row ranges written to a single data file.

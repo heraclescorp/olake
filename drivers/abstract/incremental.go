@@ -19,7 +19,6 @@ import (
 
 func (a *AbstractDriver) Incremental(mainCtx context.Context, pool *destination.WriterPool, streams ...types.StreamInterface) error {
 	backfillWaitChannel := make(chan string, len(streams))
-	defer close(backfillWaitChannel)
 
 	err := utils.ForEach(streams, func(stream types.StreamInterface) error {
 		primaryCursor, secondaryCursor := stream.Cursor()
@@ -88,6 +87,9 @@ func (a *AbstractDriver) Incremental(mainCtx context.Context, pool *destination.
 				}
 				a.state.SetCursor(stream.Self(), primaryCursor, a.FormatCursorValue(maxPrimaryCursorValue))
 				a.state.SetCursor(stream.Self(), secondaryCursor, a.FormatCursorValue(maxSecondaryCursorValue))
+				if _, resync := types.ResyncFromContext(mainCtx); resync && a.state.Type == types.GlobalType {
+					a.state.SetGlobal(nil, stream.ID())
+				}
 			}(incrementalCtx)
 
 			var mtState any

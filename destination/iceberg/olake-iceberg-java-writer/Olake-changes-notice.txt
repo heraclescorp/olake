@@ -86,4 +86,42 @@ Runtime memory and diagnostics:
   system properties or file/socket I/O. No profiling listener is opened;
   recording failures are nonfatal. The existing opt-in debugger is loopback-only.
 
+Atomic single-table resync:
+- PREPARE_RESYNC creates a private same-identity metadata overlay before any
+  format/schema mutation. Ordinary chunk transactions and CDC writers use it;
+  old data and delete files leave only the staged current snapshot.
+- PUBLISH_RESYNC requires every target writer closed successfully and commits
+  once against the original base. UUID, main reference, schema, partition, sort
+  and field identities are conflict-checked, including native REST assertions.
+  REST applies the same original-to-final metadata delta as whole-metadata
+  catalogs, preserving harmless concurrent properties. Publication keeps the
+  original snapshot history, references and statistics and adds one complete
+  overwrite snapshot parented to the original main snapshot. Fresh manifests
+  describe all replaced files without rewriting Parquet; per-file data/delete
+  sequences and V3 row IDs are retained. Private snapshots never enter history.
+- The stable operation id, full saved-job checkpoint, original baseline SHA-256,
+  generation and positive replacement snapshot id are committed together. The
+  olake.resync.baseline-sha256 property hashes the raw UTF-8 canonical full-job
+  checkpoint supplied by Go to PREPARE_RESYNC; active same-id prepares must match.
+  Published PREPARE recovery accepts only that original full baseline or the
+  exact published full checkpoint, never a newer target or unrelated-stream
+  checkpoint. Legacy receipts without a baseline hash fail closed for recovery.
+  Fresh staging clears previous receipt properties privately. Unknown publication
+  outcomes retain staged files; ABORT_RESYNC is serialized with publication and
+  leaves a terminal tombstone.
+- Fresh attempts have a hard twelve-hour deadline before staging and publication,
+  shorter than S3 Tables' minimum one-day unreferenced-file retention. Retries
+  never reuse old attempt files. Custom storage cleanup must respect this bound.
+  Resync-only REST clients cap connection timeout at 30 seconds, socket timeout
+  at 60 seconds and retries at five; ordinary sync transport is unchanged.
+  Catalog-side completion after a timed-out response remains an unknown outcome,
+  not permission to delete files or advance the source checkpoint.
+- Full index recovery applies equality, positional and deletion-vector deletes
+  and explicitly projects metadata fields to preserve original file paths and
+  physical positions. The durable replacement generation invalidates stale
+  canonical index locations.
+- Reserved olake_2pc and olake.resync.* properties are connector-owned. A table
+  must have a single OLake job owner; direct external edits of reserved metadata
+  are unsupported. Public resync never falls back to destructive table clearing.
+
 Copyright 2025 Datazip Inc.

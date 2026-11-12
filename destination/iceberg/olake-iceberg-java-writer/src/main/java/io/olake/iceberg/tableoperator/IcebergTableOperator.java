@@ -113,6 +113,10 @@ public class IcebergTableOperator {
     this.cdcSourceTsMsField = "_cdc_timestamp";
   }
 
+  public boolean hasPendingWrites() {
+    return writer != null || !filesToCommit.isEmpty() || !rewrittenDeleteFiles.isEmpty();
+  }
+
   static final ImmutableMap<Operation, Integer> CDC_OPERATION_PRIORITY = ImmutableMap.of(
       Operation.INSERT, 1, Operation.CREATE, 1,
       Operation.READ, 2, Operation.UPDATE, 3, Operation.DELETE, 4);
@@ -493,12 +497,12 @@ public class IcebergTableOperator {
           writer.close();
         }
       } catch (IOException e) {
-        LOGGER.warn("Failed to close writer", e);
         flushed = false;
+        throw new RuntimeException("Failed to close writer", e);
+      } finally {
+        writer = null;
+        RuntimeTelemetry.recordDuration(Stage.FLUSH, flushStarted, flushed);
       }
-      // to reinitiate 
-      writer = null;
-      RuntimeTelemetry.recordDuration(Stage.FLUSH, flushStarted, flushed);
     }
   }
 

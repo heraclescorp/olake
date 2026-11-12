@@ -3,11 +3,13 @@ package iceberg
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,12 +31,15 @@ const (
 type serverInstance struct {
 	port               int
 	cmd                *exec.Cmd
+	processExited      <-chan error
 	client             proto.RecordIngestServiceClient
 	arrowClient        proto.ArrowIngestServiceClient
 	tableIndexClient   proto.TableIndexServiceClient
 	conn               *grpc.ClientConn
 	defaultServerID    string
 	gcpCredentialsTemp string // temp file holding gcp_service_account_json content, if used; cleaned up on Shutdown
+	shutdownOnce       sync.Once
+	shutdownErr        error
 }
 
 // getServerConfigJSON builds the catalog/storage-level config the JVM consumes
@@ -49,6 +54,9 @@ func getServerConfigJSON(config *Config, port int, arrowWriterEnabled bool, gcpC
 		"table-prefix":         "",
 		"write.format.default": "parquet",
 		"arrow-writer-enabled": strconv.FormatBool(arrowWriterEnabled),
+	}
+	if config.atomicResync {
+		serverConfig["atomic-resync-enabled"] = "true"
 	}
 
 	addMapKeyIfNotEmpty := func(key, value string) {
@@ -279,11 +287,12 @@ func startServer(config *Config) (*serverInstance, error) {
 	// GCSFileIO auths separately from GoogleAuthManager; only via ADC env var. No-op if empty.
 	appendEnv("GOOGLE_APPLICATION_CREDENTIALS", gcpCredsTemp)
 
-	if err := logger.SetupAndStartProcess(fmt.Sprintf("Iceberg[%d]", port), serverCmd); err != nil {
+	processExited, startErr := logger.SetupAndStartProcess(fmt.Sprintf("Iceberg[%d]", port), serverCmd)
+	if startErr != nil {
 		if gcpCredsTemp != "" {
 			os.Remove(gcpCredsTemp)
 		}
-		return nil, fmt.Errorf("%w: %w", errJVMStart, err)
+		return nil, fmt.Errorf("%w: %w", errJVMStart, startErr)
 	}
 
 	conn, err := grpc.NewClient(fmt.Sprintf("%s:%s", config.ServerHost, strconv.Itoa(port)),
@@ -303,6 +312,7 @@ func startServer(config *Config) (*serverInstance, error) {
 	return &serverInstance{
 		port:               port,
 		cmd:                serverCmd,
+		processExited:      processExited,
 		client:             proto.NewRecordIngestServiceClient(conn),
 		arrowClient:        proto.NewArrowIngestServiceClient(conn),
 		tableIndexClient:   proto.NewTableIndexServiceClient(conn),
@@ -327,33 +337,57 @@ func (s *serverInstance) SendClientRequest(ctx context.Context, payload interfac
 // Signal-driven teardown flows through here too: the root context cancels on
 // signal, the command returns, and its deferred Close runs this.
 func (s *serverInstance) Shutdown(_ context.Context) {
-	if s == nil {
-		return
+	if err := s.shutdownResync(); err != nil {
+		logger.Errorf("failed to shut down shared Iceberg JVM: %s", err)
 	}
+}
 
-	logger.Infof("Shutting down shared Iceberg JVM on port %d", s.port)
-	if s.conn != nil {
-		_ = s.conn.Close()
+func (s *serverInstance) shutdownResync() error {
+	if s == nil {
+		return nil
 	}
-	if s.cmd != nil && s.cmd.Process != nil {
-		// Allow the JVM to drain and flush metrics even when the request context
-		// is canceled. The independent grace is bounded to ten seconds.
-		_ = s.cmd.Process.Signal(syscall.SIGTERM)
-		done := make(chan struct{}, 1)
-		go func() {
-			_, _ = s.cmd.Process.Wait()
-			done <- struct{}{}
-		}()
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			logger.Warnf("Iceberg JVM did not exit within 10s after SIGTERM, killing")
-			_ = s.cmd.Process.Kill()
+	s.shutdownOnce.Do(func() {
+		logger.Infof("Shutting down shared Iceberg JVM on port %d", s.port)
+		if s.conn != nil {
+			s.shutdownErr = errors.Join(s.shutdownErr, s.conn.Close())
+		}
+		if s.cmd != nil && s.cmd.Process != nil {
+			if err := s.cmd.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				s.shutdownErr = errors.Join(s.shutdownErr, fmt.Errorf("failed to stop Iceberg JVM: %w", err))
+			}
+			select {
+			case err := <-s.processExited:
+				s.shutdownErr = errors.Join(s.shutdownErr, expectedJVMExit(err))
+			case <-time.After(10 * time.Second):
+				s.shutdownErr = errors.Join(s.shutdownErr, fmt.Errorf("Iceberg JVM did not exit within 10 seconds"), s.cmd.Process.Kill())
+				select {
+				case <-s.processExited:
+				case <-time.After(10 * time.Second):
+					s.shutdownErr = errors.Join(s.shutdownErr, fmt.Errorf("Iceberg JVM remained alive after kill"))
+				}
+			}
+		}
+		if s.gcpCredentialsTemp != "" {
+			if err := os.Remove(s.gcpCredentialsTemp); err != nil && !errors.Is(err, os.ErrNotExist) {
+				s.shutdownErr = errors.Join(s.shutdownErr, err)
+			}
+		}
+	})
+	return s.shutdownErr
+}
+
+func expectedJVMExit(err error) error {
+	if err == nil {
+		return nil
+	}
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) {
+		status, ok := exitError.Sys().(syscall.WaitStatus)
+		if (ok && status.Signaled() && status.Signal() == syscall.SIGTERM) || exitError.ExitCode() == 128+int(syscall.SIGTERM) {
+			return nil
 		}
 	}
-	if s.gcpCredentialsTemp != "" {
-		os.Remove(s.gcpCredentialsTemp)
-	}
+	return fmt.Errorf("Iceberg JVM exited unexpectedly during cleanup: %w", err)
 }
 
 // reclaimPort frees the given port by killing whatever process is currently

@@ -20,13 +20,13 @@ import (
 
 // pgoutputReplicator implements Replicator for pgoutput
 type pgoutputReplicator struct {
-	socket               *Socket
-	publication          string
-	txnCommitTime        time.Time                             // transaction commit time
-	relationIDToMsgMap   map[uint32]*pglogrepl.RelationMessage // map to store relation id
-	transactionCompleted bool                                  // if both begin and commit message received, then transaction is completed
-	preserveToastValues  bool                                  // mark columns Postgres left out of an UPDATE so the destination can recover them
-	db                   *sqlx.DB                              // regular connection for catalog reads; the replication connection cannot run queries mid-stream
+	socket              *Socket
+	publication         string
+	txnCommitTime       time.Time // transaction commit time
+	txnFinalLSN         pglogrepl.LSN
+	relationIDToMsgMap  map[uint32]*pglogrepl.RelationMessage // map to store relation id
+	preserveToastValues bool                                  // mark columns Postgres left out of an UPDATE so the destination can recover them
+	db                  *sqlx.DB                              // regular connection for catalog reads; the replication connection cannot run queries mid-stream
 }
 
 func (p *pgoutputReplicator) Socket() *Socket {
@@ -52,8 +52,8 @@ func (p *pgoutputReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, ins
 
 	cdcStartTime := time.Now()
 	messageReceived := false
-	// transactionCompleted default true
-	p.transactionCompleted = true
+	// A run may stop only between complete transactions.
+	p.socket.TransactionOpen = false
 
 	for {
 		select {
@@ -64,7 +64,7 @@ func (p *pgoutputReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, ins
 				return fmt.Errorf("%w, try increasing it or do full load", constants.ErrNonRetryable)
 			}
 
-			if p.transactionCompleted && p.socket.ClientXLogPos >= p.socket.CurrentWalPosition {
+			if !p.socket.TransactionOpen && p.socket.ClientXLogPos >= p.socket.CurrentWalPosition {
 				logger.Infof("finishing sync, reached wal position: %s", p.socket.CurrentWalPosition)
 				return nil
 			}
@@ -137,8 +137,9 @@ func (p *pgoutputReplicator) processPgoutputWAL(ctx context.Context, walData []b
 		}
 		return p.emitRelationColumns(ctx, msg, insertFn)
 	case *pglogrepl.BeginMessage:
-		p.transactionCompleted = false
+		p.socket.TransactionOpen = true
 		p.txnCommitTime = msg.CommitTime
+		p.txnFinalLSN = msg.FinalLSN
 		return nil
 	case *pglogrepl.InsertMessage:
 		return p.emitInsert(ctx, msg, insertFn)
@@ -147,7 +148,8 @@ func (p *pgoutputReplicator) processPgoutputWAL(ctx context.Context, walData []b
 	case *pglogrepl.DeleteMessage:
 		return p.emitDelete(ctx, msg, insertFn)
 	case *pglogrepl.CommitMessage:
-		p.transactionCompleted = true
+		p.socket.TransactionOpen = false
+		p.socket.ClientXLogPos = msg.TransactionEndLSN
 		return nil
 	default:
 		return nil
@@ -237,6 +239,9 @@ func (p *pgoutputReplicator) emitInsert(ctx context.Context, m *pglogrepl.Insert
 	if stream == nil {
 		return nil
 	}
+	if p.socket.changeFilter.skipTransaction(stream.ID(), p.txnFinalLSN) {
+		return nil
+	}
 
 	values, rowBytes, _, err := p.tupleValuesToMap(rel, m.Tuple, nil)
 	if err != nil {
@@ -257,6 +262,9 @@ func (p *pgoutputReplicator) emitUpdate(ctx context.Context, m *pglogrepl.Update
 	if stream == nil {
 		return nil
 	}
+	if p.socket.changeFilter.skipTransaction(stream.ID(), p.txnFinalLSN) {
+		return nil
+	}
 
 	values, rowBytes, unchangedToastColumns, err := p.tupleValuesToMap(rel, m.NewTuple, m.OldTuple)
 	if err != nil {
@@ -275,6 +283,9 @@ func (p *pgoutputReplicator) emitDelete(ctx context.Context, m *pglogrepl.Delete
 
 	stream := p.socket.changeFilter.tables[fmt.Sprintf("%s.%s", rel.Namespace, rel.RelationName)]
 	if stream == nil {
+		return nil
+	}
+	if p.socket.changeFilter.skipTransaction(stream.ID(), p.txnFinalLSN) {
 		return nil
 	}
 

@@ -28,6 +28,8 @@ const (
 
 // TODO: add validation for each catalog properly
 type Config struct {
+	atomicResync bool
+
 	// S3-compatible Storage Configuration
 	Region             string `json:"aws_region,omitempty"`
 	AccessKey          string `json:"aws_access_key,omitempty"`

@@ -147,6 +147,22 @@ public final class RecordIngest {
        * <code>ALTER_COLUMNS = 7;</code>
        */
       ALTER_COLUMNS(7),
+      /**
+       * <code>PREPARE_RESYNC = 8;</code>
+       */
+      PREPARE_RESYNC(8),
+      /**
+       * <code>PUBLISH_RESYNC = 9;</code>
+       */
+      PUBLISH_RESYNC(9),
+      /**
+       * <code>ABORT_RESYNC = 10;</code>
+       */
+      ABORT_RESYNC(10),
+      /**
+       * <code>RESYNC_STATUS = 11;</code>
+       */
+      RESYNC_STATUS(11),
       UNRECOGNIZED(-1),
       ;
 
@@ -186,6 +202,22 @@ public final class RecordIngest {
        * <code>ALTER_COLUMNS = 7;</code>
        */
       public static final int ALTER_COLUMNS_VALUE = 7;
+      /**
+       * <code>PREPARE_RESYNC = 8;</code>
+       */
+      public static final int PREPARE_RESYNC_VALUE = 8;
+      /**
+       * <code>PUBLISH_RESYNC = 9;</code>
+       */
+      public static final int PUBLISH_RESYNC_VALUE = 9;
+      /**
+       * <code>ABORT_RESYNC = 10;</code>
+       */
+      public static final int ABORT_RESYNC_VALUE = 10;
+      /**
+       * <code>RESYNC_STATUS = 11;</code>
+       */
+      public static final int RESYNC_STATUS_VALUE = 11;
 
 
       public final int getNumber() {
@@ -220,6 +252,10 @@ public final class RecordIngest {
           case 5: return REFRESH_TABLE_SCHEMA;
           case 6: return CLOSE_SESSION;
           case 7: return ALTER_COLUMNS;
+          case 8: return PREPARE_RESYNC;
+          case 9: return PUBLISH_RESYNC;
+          case 10: return ABORT_RESYNC;
+          case 11: return RESYNC_STATUS;
           default: return null;
         }
       }
@@ -661,6 +697,56 @@ public final class RecordIngest {
        */
       com.google.protobuf.ByteString
           getDroppedColumnsBytes(int index);
+
+      /**
+       * <pre>
+       * Resync control requests use namespace + dest_table_name, independently of sessions.
+       * </pre>
+       *
+       * <code>string resync_id = 15;</code>
+       * @return The resyncId.
+       */
+      java.lang.String getResyncId();
+      /**
+       * <pre>
+       * Resync control requests use namespace + dest_table_name, independently of sessions.
+       * </pre>
+       *
+       * <code>string resync_id = 15;</code>
+       * @return The bytes for resyncId.
+       */
+      com.google.protobuf.ByteString
+          getResyncIdBytes();
+
+      /**
+       * <pre>
+       * Full job checkpoint, atomically persisted with the completed operation marker.
+       * </pre>
+       *
+       * <code>string resync_checkpoint = 16;</code>
+       * @return The resyncCheckpoint.
+       */
+      java.lang.String getResyncCheckpoint();
+      /**
+       * <pre>
+       * Full job checkpoint, atomically persisted with the completed operation marker.
+       * </pre>
+       *
+       * <code>string resync_checkpoint = 16;</code>
+       * @return The bytes for resyncCheckpoint.
+       */
+      com.google.protobuf.ByteString
+          getResyncCheckpointBytes();
+
+      /**
+       * <pre>
+       * Absolute fresh-attempt deadline; at most twelve hours from preparation.
+       * </pre>
+       *
+       * <code>int64 resync_deadline_ms = 17;</code>
+       * @return The resyncDeadlineMs.
+       */
+      long getResyncDeadlineMs();
     }
     /**
      * Protobuf type {@code io.olake.iceberg.rpc.IcebergPayload.Metadata}
@@ -686,6 +772,8 @@ public final class RecordIngest {
         addedColumns_ = java.util.Collections.emptyList();
         droppedColumns_ =
             com.google.protobuf.LazyStringArrayList.emptyList();
+        resyncId_ = "";
+        resyncCheckpoint_ = "";
       }
 
       @java.lang.Override
@@ -1187,6 +1275,115 @@ public final class RecordIngest {
         return droppedColumns_.getByteString(index);
       }
 
+      public static final int RESYNC_ID_FIELD_NUMBER = 15;
+      @SuppressWarnings("serial")
+      private volatile java.lang.Object resyncId_ = "";
+      /**
+       * <pre>
+       * Resync control requests use namespace + dest_table_name, independently of sessions.
+       * </pre>
+       *
+       * <code>string resync_id = 15;</code>
+       * @return The resyncId.
+       */
+      @java.lang.Override
+      public java.lang.String getResyncId() {
+        java.lang.Object ref = resyncId_;
+        if (ref instanceof java.lang.String) {
+          return (java.lang.String) ref;
+        } else {
+          com.google.protobuf.ByteString bs = 
+              (com.google.protobuf.ByteString) ref;
+          java.lang.String s = bs.toStringUtf8();
+          resyncId_ = s;
+          return s;
+        }
+      }
+      /**
+       * <pre>
+       * Resync control requests use namespace + dest_table_name, independently of sessions.
+       * </pre>
+       *
+       * <code>string resync_id = 15;</code>
+       * @return The bytes for resyncId.
+       */
+      @java.lang.Override
+      public com.google.protobuf.ByteString
+          getResyncIdBytes() {
+        java.lang.Object ref = resyncId_;
+        if (ref instanceof java.lang.String) {
+          com.google.protobuf.ByteString b = 
+              com.google.protobuf.ByteString.copyFromUtf8(
+                  (java.lang.String) ref);
+          resyncId_ = b;
+          return b;
+        } else {
+          return (com.google.protobuf.ByteString) ref;
+        }
+      }
+
+      public static final int RESYNC_CHECKPOINT_FIELD_NUMBER = 16;
+      @SuppressWarnings("serial")
+      private volatile java.lang.Object resyncCheckpoint_ = "";
+      /**
+       * <pre>
+       * Full job checkpoint, atomically persisted with the completed operation marker.
+       * </pre>
+       *
+       * <code>string resync_checkpoint = 16;</code>
+       * @return The resyncCheckpoint.
+       */
+      @java.lang.Override
+      public java.lang.String getResyncCheckpoint() {
+        java.lang.Object ref = resyncCheckpoint_;
+        if (ref instanceof java.lang.String) {
+          return (java.lang.String) ref;
+        } else {
+          com.google.protobuf.ByteString bs = 
+              (com.google.protobuf.ByteString) ref;
+          java.lang.String s = bs.toStringUtf8();
+          resyncCheckpoint_ = s;
+          return s;
+        }
+      }
+      /**
+       * <pre>
+       * Full job checkpoint, atomically persisted with the completed operation marker.
+       * </pre>
+       *
+       * <code>string resync_checkpoint = 16;</code>
+       * @return The bytes for resyncCheckpoint.
+       */
+      @java.lang.Override
+      public com.google.protobuf.ByteString
+          getResyncCheckpointBytes() {
+        java.lang.Object ref = resyncCheckpoint_;
+        if (ref instanceof java.lang.String) {
+          com.google.protobuf.ByteString b = 
+              com.google.protobuf.ByteString.copyFromUtf8(
+                  (java.lang.String) ref);
+          resyncCheckpoint_ = b;
+          return b;
+        } else {
+          return (com.google.protobuf.ByteString) ref;
+        }
+      }
+
+      public static final int RESYNC_DEADLINE_MS_FIELD_NUMBER = 17;
+      private long resyncDeadlineMs_ = 0L;
+      /**
+       * <pre>
+       * Absolute fresh-attempt deadline; at most twelve hours from preparation.
+       * </pre>
+       *
+       * <code>int64 resync_deadline_ms = 17;</code>
+       * @return The resyncDeadlineMs.
+       */
+      @java.lang.Override
+      public long getResyncDeadlineMs() {
+        return resyncDeadlineMs_;
+      }
+
       private byte memoizedIsInitialized = -1;
       @java.lang.Override
       public final boolean isInitialized() {
@@ -1239,6 +1436,15 @@ public final class RecordIngest {
         }
         for (int i = 0; i < droppedColumns_.size(); i++) {
           com.google.protobuf.GeneratedMessageV3.writeString(output, 14, droppedColumns_.getRaw(i));
+        }
+        if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(resyncId_)) {
+          com.google.protobuf.GeneratedMessageV3.writeString(output, 15, resyncId_);
+        }
+        if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(resyncCheckpoint_)) {
+          com.google.protobuf.GeneratedMessageV3.writeString(output, 16, resyncCheckpoint_);
+        }
+        if (resyncDeadlineMs_ != 0L) {
+          output.writeInt64(17, resyncDeadlineMs_);
         }
         getUnknownFields().writeTo(output);
       }
@@ -1300,6 +1506,16 @@ public final class RecordIngest {
           size += dataSize;
           size += 1 * getDroppedColumnsList().size();
         }
+        if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(resyncId_)) {
+          size += com.google.protobuf.GeneratedMessageV3.computeStringSize(15, resyncId_);
+        }
+        if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(resyncCheckpoint_)) {
+          size += com.google.protobuf.GeneratedMessageV3.computeStringSize(16, resyncCheckpoint_);
+        }
+        if (resyncDeadlineMs_ != 0L) {
+          size += com.google.protobuf.CodedOutputStream
+            .computeInt64Size(17, resyncDeadlineMs_);
+        }
         size += getUnknownFields().getSerializedSize();
         memoizedSize = size;
         return size;
@@ -1346,6 +1562,12 @@ public final class RecordIngest {
             .equals(other.getAddedColumnsList())) return false;
         if (!getDroppedColumnsList()
             .equals(other.getDroppedColumnsList())) return false;
+        if (!getResyncId()
+            .equals(other.getResyncId())) return false;
+        if (!getResyncCheckpoint()
+            .equals(other.getResyncCheckpoint())) return false;
+        if (getResyncDeadlineMs()
+            != other.getResyncDeadlineMs()) return false;
         if (!getUnknownFields().equals(other.getUnknownFields())) return false;
         return true;
       }
@@ -1398,6 +1620,13 @@ public final class RecordIngest {
           hash = (37 * hash) + DROPPED_COLUMNS_FIELD_NUMBER;
           hash = (53 * hash) + getDroppedColumnsList().hashCode();
         }
+        hash = (37 * hash) + RESYNC_ID_FIELD_NUMBER;
+        hash = (53 * hash) + getResyncId().hashCode();
+        hash = (37 * hash) + RESYNC_CHECKPOINT_FIELD_NUMBER;
+        hash = (53 * hash) + getResyncCheckpoint().hashCode();
+        hash = (37 * hash) + RESYNC_DEADLINE_MS_FIELD_NUMBER;
+        hash = (53 * hash) + com.google.protobuf.Internal.hashLong(
+            getResyncDeadlineMs());
         hash = (29 * hash) + getUnknownFields().hashCode();
         memoizedHashCode = hash;
         return hash;
@@ -1561,6 +1790,9 @@ public final class RecordIngest {
           bitField0_ = (bitField0_ & ~0x00000800);
           droppedColumns_ =
               com.google.protobuf.LazyStringArrayList.emptyList();
+          resyncId_ = "";
+          resyncCheckpoint_ = "";
+          resyncDeadlineMs_ = 0L;
           return this;
         }
 
@@ -1658,6 +1890,15 @@ public final class RecordIngest {
           if (((from_bitField0_ & 0x00001000) != 0)) {
             droppedColumns_.makeImmutable();
             result.droppedColumns_ = droppedColumns_;
+          }
+          if (((from_bitField0_ & 0x00002000) != 0)) {
+            result.resyncId_ = resyncId_;
+          }
+          if (((from_bitField0_ & 0x00004000) != 0)) {
+            result.resyncCheckpoint_ = resyncCheckpoint_;
+          }
+          if (((from_bitField0_ & 0x00008000) != 0)) {
+            result.resyncDeadlineMs_ = resyncDeadlineMs_;
           }
           result.bitField0_ |= to_bitField0_;
         }
@@ -1831,6 +2072,19 @@ public final class RecordIngest {
             }
             onChanged();
           }
+          if (!other.getResyncId().isEmpty()) {
+            resyncId_ = other.resyncId_;
+            bitField0_ |= 0x00002000;
+            onChanged();
+          }
+          if (!other.getResyncCheckpoint().isEmpty()) {
+            resyncCheckpoint_ = other.resyncCheckpoint_;
+            bitField0_ |= 0x00004000;
+            onChanged();
+          }
+          if (other.getResyncDeadlineMs() != 0L) {
+            setResyncDeadlineMs(other.getResyncDeadlineMs());
+          }
           this.mergeUnknownFields(other.getUnknownFields());
           onChanged();
           return this;
@@ -1947,6 +2201,21 @@ public final class RecordIngest {
                   droppedColumns_.add(s);
                   break;
                 } // case 114
+                case 122: {
+                  resyncId_ = input.readStringRequireUtf8();
+                  bitField0_ |= 0x00002000;
+                  break;
+                } // case 122
+                case 130: {
+                  resyncCheckpoint_ = input.readStringRequireUtf8();
+                  bitField0_ |= 0x00004000;
+                  break;
+                } // case 130
+                case 136: {
+                  resyncDeadlineMs_ = input.readInt64();
+                  bitField0_ |= 0x00008000;
+                  break;
+                } // case 136
                 default: {
                   if (!super.parseUnknownField(input, extensionRegistry, tag)) {
                     done = true; // was an endgroup tag
@@ -3473,6 +3742,234 @@ public final class RecordIngest {
           ensureDroppedColumnsIsMutable();
           droppedColumns_.add(value);
           bitField0_ |= 0x00001000;
+          onChanged();
+          return this;
+        }
+
+        private java.lang.Object resyncId_ = "";
+        /**
+         * <pre>
+         * Resync control requests use namespace + dest_table_name, independently of sessions.
+         * </pre>
+         *
+         * <code>string resync_id = 15;</code>
+         * @return The resyncId.
+         */
+        public java.lang.String getResyncId() {
+          java.lang.Object ref = resyncId_;
+          if (!(ref instanceof java.lang.String)) {
+            com.google.protobuf.ByteString bs =
+                (com.google.protobuf.ByteString) ref;
+            java.lang.String s = bs.toStringUtf8();
+            resyncId_ = s;
+            return s;
+          } else {
+            return (java.lang.String) ref;
+          }
+        }
+        /**
+         * <pre>
+         * Resync control requests use namespace + dest_table_name, independently of sessions.
+         * </pre>
+         *
+         * <code>string resync_id = 15;</code>
+         * @return The bytes for resyncId.
+         */
+        public com.google.protobuf.ByteString
+            getResyncIdBytes() {
+          java.lang.Object ref = resyncId_;
+          if (ref instanceof String) {
+            com.google.protobuf.ByteString b = 
+                com.google.protobuf.ByteString.copyFromUtf8(
+                    (java.lang.String) ref);
+            resyncId_ = b;
+            return b;
+          } else {
+            return (com.google.protobuf.ByteString) ref;
+          }
+        }
+        /**
+         * <pre>
+         * Resync control requests use namespace + dest_table_name, independently of sessions.
+         * </pre>
+         *
+         * <code>string resync_id = 15;</code>
+         * @param value The resyncId to set.
+         * @return This builder for chaining.
+         */
+        public Builder setResyncId(
+            java.lang.String value) {
+          if (value == null) { throw new NullPointerException(); }
+          resyncId_ = value;
+          bitField0_ |= 0x00002000;
+          onChanged();
+          return this;
+        }
+        /**
+         * <pre>
+         * Resync control requests use namespace + dest_table_name, independently of sessions.
+         * </pre>
+         *
+         * <code>string resync_id = 15;</code>
+         * @return This builder for chaining.
+         */
+        public Builder clearResyncId() {
+          resyncId_ = getDefaultInstance().getResyncId();
+          bitField0_ = (bitField0_ & ~0x00002000);
+          onChanged();
+          return this;
+        }
+        /**
+         * <pre>
+         * Resync control requests use namespace + dest_table_name, independently of sessions.
+         * </pre>
+         *
+         * <code>string resync_id = 15;</code>
+         * @param value The bytes for resyncId to set.
+         * @return This builder for chaining.
+         */
+        public Builder setResyncIdBytes(
+            com.google.protobuf.ByteString value) {
+          if (value == null) { throw new NullPointerException(); }
+          checkByteStringIsUtf8(value);
+          resyncId_ = value;
+          bitField0_ |= 0x00002000;
+          onChanged();
+          return this;
+        }
+
+        private java.lang.Object resyncCheckpoint_ = "";
+        /**
+         * <pre>
+         * Full job checkpoint, atomically persisted with the completed operation marker.
+         * </pre>
+         *
+         * <code>string resync_checkpoint = 16;</code>
+         * @return The resyncCheckpoint.
+         */
+        public java.lang.String getResyncCheckpoint() {
+          java.lang.Object ref = resyncCheckpoint_;
+          if (!(ref instanceof java.lang.String)) {
+            com.google.protobuf.ByteString bs =
+                (com.google.protobuf.ByteString) ref;
+            java.lang.String s = bs.toStringUtf8();
+            resyncCheckpoint_ = s;
+            return s;
+          } else {
+            return (java.lang.String) ref;
+          }
+        }
+        /**
+         * <pre>
+         * Full job checkpoint, atomically persisted with the completed operation marker.
+         * </pre>
+         *
+         * <code>string resync_checkpoint = 16;</code>
+         * @return The bytes for resyncCheckpoint.
+         */
+        public com.google.protobuf.ByteString
+            getResyncCheckpointBytes() {
+          java.lang.Object ref = resyncCheckpoint_;
+          if (ref instanceof String) {
+            com.google.protobuf.ByteString b = 
+                com.google.protobuf.ByteString.copyFromUtf8(
+                    (java.lang.String) ref);
+            resyncCheckpoint_ = b;
+            return b;
+          } else {
+            return (com.google.protobuf.ByteString) ref;
+          }
+        }
+        /**
+         * <pre>
+         * Full job checkpoint, atomically persisted with the completed operation marker.
+         * </pre>
+         *
+         * <code>string resync_checkpoint = 16;</code>
+         * @param value The resyncCheckpoint to set.
+         * @return This builder for chaining.
+         */
+        public Builder setResyncCheckpoint(
+            java.lang.String value) {
+          if (value == null) { throw new NullPointerException(); }
+          resyncCheckpoint_ = value;
+          bitField0_ |= 0x00004000;
+          onChanged();
+          return this;
+        }
+        /**
+         * <pre>
+         * Full job checkpoint, atomically persisted with the completed operation marker.
+         * </pre>
+         *
+         * <code>string resync_checkpoint = 16;</code>
+         * @return This builder for chaining.
+         */
+        public Builder clearResyncCheckpoint() {
+          resyncCheckpoint_ = getDefaultInstance().getResyncCheckpoint();
+          bitField0_ = (bitField0_ & ~0x00004000);
+          onChanged();
+          return this;
+        }
+        /**
+         * <pre>
+         * Full job checkpoint, atomically persisted with the completed operation marker.
+         * </pre>
+         *
+         * <code>string resync_checkpoint = 16;</code>
+         * @param value The bytes for resyncCheckpoint to set.
+         * @return This builder for chaining.
+         */
+        public Builder setResyncCheckpointBytes(
+            com.google.protobuf.ByteString value) {
+          if (value == null) { throw new NullPointerException(); }
+          checkByteStringIsUtf8(value);
+          resyncCheckpoint_ = value;
+          bitField0_ |= 0x00004000;
+          onChanged();
+          return this;
+        }
+
+        private long resyncDeadlineMs_ ;
+        /**
+         * <pre>
+         * Absolute fresh-attempt deadline; at most twelve hours from preparation.
+         * </pre>
+         *
+         * <code>int64 resync_deadline_ms = 17;</code>
+         * @return The resyncDeadlineMs.
+         */
+        @java.lang.Override
+        public long getResyncDeadlineMs() {
+          return resyncDeadlineMs_;
+        }
+        /**
+         * <pre>
+         * Absolute fresh-attempt deadline; at most twelve hours from preparation.
+         * </pre>
+         *
+         * <code>int64 resync_deadline_ms = 17;</code>
+         * @param value The resyncDeadlineMs to set.
+         * @return This builder for chaining.
+         */
+        public Builder setResyncDeadlineMs(long value) {
+
+          resyncDeadlineMs_ = value;
+          bitField0_ |= 0x00008000;
+          onChanged();
+          return this;
+        }
+        /**
+         * <pre>
+         * Absolute fresh-attempt deadline; at most twelve hours from preparation.
+         * </pre>
+         *
+         * <code>int64 resync_deadline_ms = 17;</code>
+         * @return This builder for chaining.
+         */
+        public Builder clearResyncDeadlineMs() {
+          bitField0_ = (bitField0_ & ~0x00008000);
+          resyncDeadlineMs_ = 0L;
           onChanged();
           return this;
         }
@@ -9650,6 +10147,64 @@ public final class RecordIngest {
      */
     io.olake.iceberg.rpc.RecordIngest.FilePositionMapOrBuilder getFilePositionMapsOrBuilder(
         int index);
+
+    /**
+     * <code>bool resync_published = 7;</code>
+     * @return The resyncPublished.
+     */
+    boolean getResyncPublished();
+
+    /**
+     * <code>string resync_checkpoint = 8;</code>
+     * @return The resyncCheckpoint.
+     */
+    java.lang.String getResyncCheckpoint();
+    /**
+     * <code>string resync_checkpoint = 8;</code>
+     * @return The bytes for resyncCheckpoint.
+     */
+    com.google.protobuf.ByteString
+        getResyncCheckpointBytes();
+
+    /**
+     * <pre>
+     * Durable replacement generation; also returned by GET_OR_CREATE_TABLE.
+     * </pre>
+     *
+     * <code>string resync_generation = 9;</code>
+     * @return The resyncGeneration.
+     */
+    java.lang.String getResyncGeneration();
+    /**
+     * <pre>
+     * Durable replacement generation; also returned by GET_OR_CREATE_TABLE.
+     * </pre>
+     *
+     * <code>string resync_generation = 9;</code>
+     * @return The bytes for resyncGeneration.
+     */
+    com.google.protobuf.ByteString
+        getResyncGenerationBytes();
+
+    /**
+     * <pre>
+     * Publication receipts pair this UUID with the positive snapshot_id above.
+     * </pre>
+     *
+     * <code>string resync_table_uuid = 10;</code>
+     * @return The resyncTableUuid.
+     */
+    java.lang.String getResyncTableUuid();
+    /**
+     * <pre>
+     * Publication receipts pair this UUID with the positive snapshot_id above.
+     * </pre>
+     *
+     * <code>string resync_table_uuid = 10;</code>
+     * @return The bytes for resyncTableUuid.
+     */
+    com.google.protobuf.ByteString
+        getResyncTableUuidBytes();
   }
   /**
    * Protobuf type {@code io.olake.iceberg.rpc.RecordIngestResponse}
@@ -9667,6 +10222,9 @@ public final class RecordIngest {
       result_ = "";
       olake2PcState_ = "";
       filePositionMaps_ = java.util.Collections.emptyList();
+      resyncCheckpoint_ = "";
+      resyncGeneration_ = "";
+      resyncTableUuid_ = "";
     }
 
     @java.lang.Override
@@ -9889,6 +10447,150 @@ public final class RecordIngest {
       return filePositionMaps_.get(index);
     }
 
+    public static final int RESYNC_PUBLISHED_FIELD_NUMBER = 7;
+    private boolean resyncPublished_ = false;
+    /**
+     * <code>bool resync_published = 7;</code>
+     * @return The resyncPublished.
+     */
+    @java.lang.Override
+    public boolean getResyncPublished() {
+      return resyncPublished_;
+    }
+
+    public static final int RESYNC_CHECKPOINT_FIELD_NUMBER = 8;
+    @SuppressWarnings("serial")
+    private volatile java.lang.Object resyncCheckpoint_ = "";
+    /**
+     * <code>string resync_checkpoint = 8;</code>
+     * @return The resyncCheckpoint.
+     */
+    @java.lang.Override
+    public java.lang.String getResyncCheckpoint() {
+      java.lang.Object ref = resyncCheckpoint_;
+      if (ref instanceof java.lang.String) {
+        return (java.lang.String) ref;
+      } else {
+        com.google.protobuf.ByteString bs = 
+            (com.google.protobuf.ByteString) ref;
+        java.lang.String s = bs.toStringUtf8();
+        resyncCheckpoint_ = s;
+        return s;
+      }
+    }
+    /**
+     * <code>string resync_checkpoint = 8;</code>
+     * @return The bytes for resyncCheckpoint.
+     */
+    @java.lang.Override
+    public com.google.protobuf.ByteString
+        getResyncCheckpointBytes() {
+      java.lang.Object ref = resyncCheckpoint_;
+      if (ref instanceof java.lang.String) {
+        com.google.protobuf.ByteString b = 
+            com.google.protobuf.ByteString.copyFromUtf8(
+                (java.lang.String) ref);
+        resyncCheckpoint_ = b;
+        return b;
+      } else {
+        return (com.google.protobuf.ByteString) ref;
+      }
+    }
+
+    public static final int RESYNC_GENERATION_FIELD_NUMBER = 9;
+    @SuppressWarnings("serial")
+    private volatile java.lang.Object resyncGeneration_ = "";
+    /**
+     * <pre>
+     * Durable replacement generation; also returned by GET_OR_CREATE_TABLE.
+     * </pre>
+     *
+     * <code>string resync_generation = 9;</code>
+     * @return The resyncGeneration.
+     */
+    @java.lang.Override
+    public java.lang.String getResyncGeneration() {
+      java.lang.Object ref = resyncGeneration_;
+      if (ref instanceof java.lang.String) {
+        return (java.lang.String) ref;
+      } else {
+        com.google.protobuf.ByteString bs = 
+            (com.google.protobuf.ByteString) ref;
+        java.lang.String s = bs.toStringUtf8();
+        resyncGeneration_ = s;
+        return s;
+      }
+    }
+    /**
+     * <pre>
+     * Durable replacement generation; also returned by GET_OR_CREATE_TABLE.
+     * </pre>
+     *
+     * <code>string resync_generation = 9;</code>
+     * @return The bytes for resyncGeneration.
+     */
+    @java.lang.Override
+    public com.google.protobuf.ByteString
+        getResyncGenerationBytes() {
+      java.lang.Object ref = resyncGeneration_;
+      if (ref instanceof java.lang.String) {
+        com.google.protobuf.ByteString b = 
+            com.google.protobuf.ByteString.copyFromUtf8(
+                (java.lang.String) ref);
+        resyncGeneration_ = b;
+        return b;
+      } else {
+        return (com.google.protobuf.ByteString) ref;
+      }
+    }
+
+    public static final int RESYNC_TABLE_UUID_FIELD_NUMBER = 10;
+    @SuppressWarnings("serial")
+    private volatile java.lang.Object resyncTableUuid_ = "";
+    /**
+     * <pre>
+     * Publication receipts pair this UUID with the positive snapshot_id above.
+     * </pre>
+     *
+     * <code>string resync_table_uuid = 10;</code>
+     * @return The resyncTableUuid.
+     */
+    @java.lang.Override
+    public java.lang.String getResyncTableUuid() {
+      java.lang.Object ref = resyncTableUuid_;
+      if (ref instanceof java.lang.String) {
+        return (java.lang.String) ref;
+      } else {
+        com.google.protobuf.ByteString bs = 
+            (com.google.protobuf.ByteString) ref;
+        java.lang.String s = bs.toStringUtf8();
+        resyncTableUuid_ = s;
+        return s;
+      }
+    }
+    /**
+     * <pre>
+     * Publication receipts pair this UUID with the positive snapshot_id above.
+     * </pre>
+     *
+     * <code>string resync_table_uuid = 10;</code>
+     * @return The bytes for resyncTableUuid.
+     */
+    @java.lang.Override
+    public com.google.protobuf.ByteString
+        getResyncTableUuidBytes() {
+      java.lang.Object ref = resyncTableUuid_;
+      if (ref instanceof java.lang.String) {
+        com.google.protobuf.ByteString b = 
+            com.google.protobuf.ByteString.copyFromUtf8(
+                (java.lang.String) ref);
+        resyncTableUuid_ = b;
+        return b;
+      } else {
+        return (com.google.protobuf.ByteString) ref;
+      }
+    }
+
     private byte memoizedIsInitialized = -1;
     @java.lang.Override
     public final boolean isInitialized() {
@@ -9921,6 +10623,18 @@ public final class RecordIngest {
       for (int i = 0; i < filePositionMaps_.size(); i++) {
         output.writeMessage(6, filePositionMaps_.get(i));
       }
+      if (resyncPublished_ != false) {
+        output.writeBool(7, resyncPublished_);
+      }
+      if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(resyncCheckpoint_)) {
+        com.google.protobuf.GeneratedMessageV3.writeString(output, 8, resyncCheckpoint_);
+      }
+      if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(resyncGeneration_)) {
+        com.google.protobuf.GeneratedMessageV3.writeString(output, 9, resyncGeneration_);
+      }
+      if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(resyncTableUuid_)) {
+        com.google.protobuf.GeneratedMessageV3.writeString(output, 10, resyncTableUuid_);
+      }
       getUnknownFields().writeTo(output);
     }
 
@@ -9952,6 +10666,19 @@ public final class RecordIngest {
         size += com.google.protobuf.CodedOutputStream
           .computeMessageSize(6, filePositionMaps_.get(i));
       }
+      if (resyncPublished_ != false) {
+        size += com.google.protobuf.CodedOutputStream
+          .computeBoolSize(7, resyncPublished_);
+      }
+      if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(resyncCheckpoint_)) {
+        size += com.google.protobuf.GeneratedMessageV3.computeStringSize(8, resyncCheckpoint_);
+      }
+      if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(resyncGeneration_)) {
+        size += com.google.protobuf.GeneratedMessageV3.computeStringSize(9, resyncGeneration_);
+      }
+      if (!com.google.protobuf.GeneratedMessageV3.isStringEmpty(resyncTableUuid_)) {
+        size += com.google.protobuf.GeneratedMessageV3.computeStringSize(10, resyncTableUuid_);
+      }
       size += getUnknownFields().getSerializedSize();
       memoizedSize = size;
       return size;
@@ -9979,6 +10706,14 @@ public final class RecordIngest {
           != other.getHasEqualityDeletes()) return false;
       if (!getFilePositionMapsList()
           .equals(other.getFilePositionMapsList())) return false;
+      if (getResyncPublished()
+          != other.getResyncPublished()) return false;
+      if (!getResyncCheckpoint()
+          .equals(other.getResyncCheckpoint())) return false;
+      if (!getResyncGeneration()
+          .equals(other.getResyncGeneration())) return false;
+      if (!getResyncTableUuid()
+          .equals(other.getResyncTableUuid())) return false;
       if (!getUnknownFields().equals(other.getUnknownFields())) return false;
       return true;
     }
@@ -10007,6 +10742,15 @@ public final class RecordIngest {
         hash = (37 * hash) + FILE_POSITION_MAPS_FIELD_NUMBER;
         hash = (53 * hash) + getFilePositionMapsList().hashCode();
       }
+      hash = (37 * hash) + RESYNC_PUBLISHED_FIELD_NUMBER;
+      hash = (53 * hash) + com.google.protobuf.Internal.hashBoolean(
+          getResyncPublished());
+      hash = (37 * hash) + RESYNC_CHECKPOINT_FIELD_NUMBER;
+      hash = (53 * hash) + getResyncCheckpoint().hashCode();
+      hash = (37 * hash) + RESYNC_GENERATION_FIELD_NUMBER;
+      hash = (53 * hash) + getResyncGeneration().hashCode();
+      hash = (37 * hash) + RESYNC_TABLE_UUID_FIELD_NUMBER;
+      hash = (53 * hash) + getResyncTableUuid().hashCode();
       hash = (29 * hash) + getUnknownFields().hashCode();
       memoizedHashCode = hash;
       return hash;
@@ -10150,6 +10894,10 @@ public final class RecordIngest {
           filePositionMapsBuilder_.clear();
         }
         bitField0_ = (bitField0_ & ~0x00000020);
+        resyncPublished_ = false;
+        resyncCheckpoint_ = "";
+        resyncGeneration_ = "";
+        resyncTableUuid_ = "";
         return this;
       }
 
@@ -10210,6 +10958,18 @@ public final class RecordIngest {
         }
         if (((from_bitField0_ & 0x00000010) != 0)) {
           result.hasEqualityDeletes_ = hasEqualityDeletes_;
+        }
+        if (((from_bitField0_ & 0x00000040) != 0)) {
+          result.resyncPublished_ = resyncPublished_;
+        }
+        if (((from_bitField0_ & 0x00000080) != 0)) {
+          result.resyncCheckpoint_ = resyncCheckpoint_;
+        }
+        if (((from_bitField0_ & 0x00000100) != 0)) {
+          result.resyncGeneration_ = resyncGeneration_;
+        }
+        if (((from_bitField0_ & 0x00000200) != 0)) {
+          result.resyncTableUuid_ = resyncTableUuid_;
         }
       }
 
@@ -10302,6 +11062,24 @@ public final class RecordIngest {
             }
           }
         }
+        if (other.getResyncPublished() != false) {
+          setResyncPublished(other.getResyncPublished());
+        }
+        if (!other.getResyncCheckpoint().isEmpty()) {
+          resyncCheckpoint_ = other.resyncCheckpoint_;
+          bitField0_ |= 0x00000080;
+          onChanged();
+        }
+        if (!other.getResyncGeneration().isEmpty()) {
+          resyncGeneration_ = other.resyncGeneration_;
+          bitField0_ |= 0x00000100;
+          onChanged();
+        }
+        if (!other.getResyncTableUuid().isEmpty()) {
+          resyncTableUuid_ = other.resyncTableUuid_;
+          bitField0_ |= 0x00000200;
+          onChanged();
+        }
         this.mergeUnknownFields(other.getUnknownFields());
         onChanged();
         return this;
@@ -10366,6 +11144,26 @@ public final class RecordIngest {
                 }
                 break;
               } // case 50
+              case 56: {
+                resyncPublished_ = input.readBool();
+                bitField0_ |= 0x00000040;
+                break;
+              } // case 56
+              case 66: {
+                resyncCheckpoint_ = input.readStringRequireUtf8();
+                bitField0_ |= 0x00000080;
+                break;
+              } // case 66
+              case 74: {
+                resyncGeneration_ = input.readStringRequireUtf8();
+                bitField0_ |= 0x00000100;
+                break;
+              } // case 74
+              case 82: {
+                resyncTableUuid_ = input.readStringRequireUtf8();
+                bitField0_ |= 0x00000200;
+                break;
+              } // case 82
               default: {
                 if (!super.parseUnknownField(input, extensionRegistry, tag)) {
                   done = true; // was an endgroup tag
@@ -11016,6 +11814,294 @@ public final class RecordIngest {
           filePositionMaps_ = null;
         }
         return filePositionMapsBuilder_;
+      }
+
+      private boolean resyncPublished_ ;
+      /**
+       * <code>bool resync_published = 7;</code>
+       * @return The resyncPublished.
+       */
+      @java.lang.Override
+      public boolean getResyncPublished() {
+        return resyncPublished_;
+      }
+      /**
+       * <code>bool resync_published = 7;</code>
+       * @param value The resyncPublished to set.
+       * @return This builder for chaining.
+       */
+      public Builder setResyncPublished(boolean value) {
+
+        resyncPublished_ = value;
+        bitField0_ |= 0x00000040;
+        onChanged();
+        return this;
+      }
+      /**
+       * <code>bool resync_published = 7;</code>
+       * @return This builder for chaining.
+       */
+      public Builder clearResyncPublished() {
+        bitField0_ = (bitField0_ & ~0x00000040);
+        resyncPublished_ = false;
+        onChanged();
+        return this;
+      }
+
+      private java.lang.Object resyncCheckpoint_ = "";
+      /**
+       * <code>string resync_checkpoint = 8;</code>
+       * @return The resyncCheckpoint.
+       */
+      public java.lang.String getResyncCheckpoint() {
+        java.lang.Object ref = resyncCheckpoint_;
+        if (!(ref instanceof java.lang.String)) {
+          com.google.protobuf.ByteString bs =
+              (com.google.protobuf.ByteString) ref;
+          java.lang.String s = bs.toStringUtf8();
+          resyncCheckpoint_ = s;
+          return s;
+        } else {
+          return (java.lang.String) ref;
+        }
+      }
+      /**
+       * <code>string resync_checkpoint = 8;</code>
+       * @return The bytes for resyncCheckpoint.
+       */
+      public com.google.protobuf.ByteString
+          getResyncCheckpointBytes() {
+        java.lang.Object ref = resyncCheckpoint_;
+        if (ref instanceof String) {
+          com.google.protobuf.ByteString b = 
+              com.google.protobuf.ByteString.copyFromUtf8(
+                  (java.lang.String) ref);
+          resyncCheckpoint_ = b;
+          return b;
+        } else {
+          return (com.google.protobuf.ByteString) ref;
+        }
+      }
+      /**
+       * <code>string resync_checkpoint = 8;</code>
+       * @param value The resyncCheckpoint to set.
+       * @return This builder for chaining.
+       */
+      public Builder setResyncCheckpoint(
+          java.lang.String value) {
+        if (value == null) { throw new NullPointerException(); }
+        resyncCheckpoint_ = value;
+        bitField0_ |= 0x00000080;
+        onChanged();
+        return this;
+      }
+      /**
+       * <code>string resync_checkpoint = 8;</code>
+       * @return This builder for chaining.
+       */
+      public Builder clearResyncCheckpoint() {
+        resyncCheckpoint_ = getDefaultInstance().getResyncCheckpoint();
+        bitField0_ = (bitField0_ & ~0x00000080);
+        onChanged();
+        return this;
+      }
+      /**
+       * <code>string resync_checkpoint = 8;</code>
+       * @param value The bytes for resyncCheckpoint to set.
+       * @return This builder for chaining.
+       */
+      public Builder setResyncCheckpointBytes(
+          com.google.protobuf.ByteString value) {
+        if (value == null) { throw new NullPointerException(); }
+        checkByteStringIsUtf8(value);
+        resyncCheckpoint_ = value;
+        bitField0_ |= 0x00000080;
+        onChanged();
+        return this;
+      }
+
+      private java.lang.Object resyncGeneration_ = "";
+      /**
+       * <pre>
+       * Durable replacement generation; also returned by GET_OR_CREATE_TABLE.
+       * </pre>
+       *
+       * <code>string resync_generation = 9;</code>
+       * @return The resyncGeneration.
+       */
+      public java.lang.String getResyncGeneration() {
+        java.lang.Object ref = resyncGeneration_;
+        if (!(ref instanceof java.lang.String)) {
+          com.google.protobuf.ByteString bs =
+              (com.google.protobuf.ByteString) ref;
+          java.lang.String s = bs.toStringUtf8();
+          resyncGeneration_ = s;
+          return s;
+        } else {
+          return (java.lang.String) ref;
+        }
+      }
+      /**
+       * <pre>
+       * Durable replacement generation; also returned by GET_OR_CREATE_TABLE.
+       * </pre>
+       *
+       * <code>string resync_generation = 9;</code>
+       * @return The bytes for resyncGeneration.
+       */
+      public com.google.protobuf.ByteString
+          getResyncGenerationBytes() {
+        java.lang.Object ref = resyncGeneration_;
+        if (ref instanceof String) {
+          com.google.protobuf.ByteString b = 
+              com.google.protobuf.ByteString.copyFromUtf8(
+                  (java.lang.String) ref);
+          resyncGeneration_ = b;
+          return b;
+        } else {
+          return (com.google.protobuf.ByteString) ref;
+        }
+      }
+      /**
+       * <pre>
+       * Durable replacement generation; also returned by GET_OR_CREATE_TABLE.
+       * </pre>
+       *
+       * <code>string resync_generation = 9;</code>
+       * @param value The resyncGeneration to set.
+       * @return This builder for chaining.
+       */
+      public Builder setResyncGeneration(
+          java.lang.String value) {
+        if (value == null) { throw new NullPointerException(); }
+        resyncGeneration_ = value;
+        bitField0_ |= 0x00000100;
+        onChanged();
+        return this;
+      }
+      /**
+       * <pre>
+       * Durable replacement generation; also returned by GET_OR_CREATE_TABLE.
+       * </pre>
+       *
+       * <code>string resync_generation = 9;</code>
+       * @return This builder for chaining.
+       */
+      public Builder clearResyncGeneration() {
+        resyncGeneration_ = getDefaultInstance().getResyncGeneration();
+        bitField0_ = (bitField0_ & ~0x00000100);
+        onChanged();
+        return this;
+      }
+      /**
+       * <pre>
+       * Durable replacement generation; also returned by GET_OR_CREATE_TABLE.
+       * </pre>
+       *
+       * <code>string resync_generation = 9;</code>
+       * @param value The bytes for resyncGeneration to set.
+       * @return This builder for chaining.
+       */
+      public Builder setResyncGenerationBytes(
+          com.google.protobuf.ByteString value) {
+        if (value == null) { throw new NullPointerException(); }
+        checkByteStringIsUtf8(value);
+        resyncGeneration_ = value;
+        bitField0_ |= 0x00000100;
+        onChanged();
+        return this;
+      }
+
+      private java.lang.Object resyncTableUuid_ = "";
+      /**
+       * <pre>
+       * Publication receipts pair this UUID with the positive snapshot_id above.
+       * </pre>
+       *
+       * <code>string resync_table_uuid = 10;</code>
+       * @return The resyncTableUuid.
+       */
+      public java.lang.String getResyncTableUuid() {
+        java.lang.Object ref = resyncTableUuid_;
+        if (!(ref instanceof java.lang.String)) {
+          com.google.protobuf.ByteString bs =
+              (com.google.protobuf.ByteString) ref;
+          java.lang.String s = bs.toStringUtf8();
+          resyncTableUuid_ = s;
+          return s;
+        } else {
+          return (java.lang.String) ref;
+        }
+      }
+      /**
+       * <pre>
+       * Publication receipts pair this UUID with the positive snapshot_id above.
+       * </pre>
+       *
+       * <code>string resync_table_uuid = 10;</code>
+       * @return The bytes for resyncTableUuid.
+       */
+      public com.google.protobuf.ByteString
+          getResyncTableUuidBytes() {
+        java.lang.Object ref = resyncTableUuid_;
+        if (ref instanceof String) {
+          com.google.protobuf.ByteString b = 
+              com.google.protobuf.ByteString.copyFromUtf8(
+                  (java.lang.String) ref);
+          resyncTableUuid_ = b;
+          return b;
+        } else {
+          return (com.google.protobuf.ByteString) ref;
+        }
+      }
+      /**
+       * <pre>
+       * Publication receipts pair this UUID with the positive snapshot_id above.
+       * </pre>
+       *
+       * <code>string resync_table_uuid = 10;</code>
+       * @param value The resyncTableUuid to set.
+       * @return This builder for chaining.
+       */
+      public Builder setResyncTableUuid(
+          java.lang.String value) {
+        if (value == null) { throw new NullPointerException(); }
+        resyncTableUuid_ = value;
+        bitField0_ |= 0x00000200;
+        onChanged();
+        return this;
+      }
+      /**
+       * <pre>
+       * Publication receipts pair this UUID with the positive snapshot_id above.
+       * </pre>
+       *
+       * <code>string resync_table_uuid = 10;</code>
+       * @return This builder for chaining.
+       */
+      public Builder clearResyncTableUuid() {
+        resyncTableUuid_ = getDefaultInstance().getResyncTableUuid();
+        bitField0_ = (bitField0_ & ~0x00000200);
+        onChanged();
+        return this;
+      }
+      /**
+       * <pre>
+       * Publication receipts pair this UUID with the positive snapshot_id above.
+       * </pre>
+       *
+       * <code>string resync_table_uuid = 10;</code>
+       * @param value The bytes for resyncTableUuid to set.
+       * @return This builder for chaining.
+       */
+      public Builder setResyncTableUuidBytes(
+          com.google.protobuf.ByteString value) {
+        if (value == null) { throw new NullPointerException(); }
+        checkByteStringIsUtf8(value);
+        resyncTableUuid_ = value;
+        bitField0_ |= 0x00000200;
+        onChanged();
+        return this;
       }
       @java.lang.Override
       public final Builder setUnknownFields(
@@ -29990,12 +31076,12 @@ io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue defaultVal
   static {
     java.lang.String[] descriptorData = {
       "\n\023record_ingest.proto\022\024io.olake.iceberg." +
-      "rpc\"\230\r\n\016IcebergPayload\022>\n\004type\030\001 \001(\01620.i" +
+      "rpc\"\257\016\n\016IcebergPayload\022>\n\004type\030\001 \001(\01620.i" +
       "o.olake.iceberg.rpc.IcebergPayload.Paylo" +
       "adType\022?\n\010metadata\030\002 \001(\0132-.io.olake.iceb" +
       "erg.rpc.IcebergPayload.Metadata\022?\n\007recor" +
       "ds\030\003 \003(\0132..io.olake.iceberg.rpc.IcebergP" +
-      "ayload.IceRecord\032\256\004\n\010Metadata\022\027\n\017dest_ta" +
+      "ayload.IceRecord\032\370\004\n\010Metadata\022\027\n\017dest_ta" +
       "ble_name\030\001 \001(\t\022\021\n\tthread_id\030\002 \001(\t\022\035\n\020ide" +
       "ntifier_field\030\003 \001(\tH\000\210\001\001\022@\n\006schema\030\004 \003(\013" +
       "20.io.olake.iceberg.rpc.IcebergPayload.S" +
@@ -30008,120 +31094,127 @@ io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue defaultVal
       "de\022!\n\031declare_identifier_fields\030\014 \001(\010\022G\n" +
       "\radded_columns\030\r \003(\01320.io.olake.iceberg." +
       "rpc.IcebergPayload.AddedColumn\022\027\n\017droppe" +
-      "d_columns\030\016 \003(\tB\023\n\021_identifier_fieldB\023\n\021" +
-      "_base_snapshot_id\032\200\001\n\013AddedColumn\022\013\n\003key" +
-      "\030\001 \001(\t\022\020\n\010ice_type\030\002 \001(\t\022R\n\017initial_defa" +
-      "ult\030\003 \001(\01329.io.olake.iceberg.rpc.Iceberg" +
-      "Payload.IceRecord.FieldValue\032,\n\013SchemaFi" +
-      "eld\022\020\n\010ice_type\030\001 \001(\t\022\013\n\003key\030\002 \001(\t\0322\n\016Pa" +
-      "rtitionField\022\r\n\005field\030\001 \001(\t\022\021\n\ttransform" +
-      "\030\002 \001(\t\032\210\003\n\tIceRecord\022I\n\006fields\030\001 \003(\01329.i" +
-      "o.olake.iceberg.rpc.IcebergPayload.IceRe" +
-      "cord.FieldValue\022\023\n\013record_type\030\002 \001(\t\022\035\n\020" +
-      "delete_file_path\030\003 \001(\tH\000\210\001\001\022\034\n\017delete_po" +
-      "sition\030\004 \001(\003H\001\210\001\001\032\264\001\n\nFieldValue\022\026\n\014stri" +
-      "ng_value\030\001 \001(\tH\000\022\023\n\tint_value\030\002 \001(\005H\000\022\024\n" +
-      "\nlong_value\030\003 \001(\003H\000\022\025\n\013float_value\030\004 \001(\002" +
-      "H\000\022\026\n\014double_value\030\005 \001(\001H\000\022\024\n\nbool_value" +
-      "\030\006 \001(\010H\000\022\025\n\013bytes_value\030\007 \001(\014H\000B\007\n\005value" +
-      "B\023\n\021_delete_file_pathB\022\n\020_delete_positio" +
-      "n\"\242\001\n\013PayloadType\022\013\n\007RECORDS\020\000\022\n\n\006COMMIT" +
-      "\020\001\022\021\n\rEVOLVE_SCHEMA\020\002\022\016\n\nDROP_TABLE\020\003\022\027\n" +
-      "\023GET_OR_CREATE_TABLE\020\004\022\030\n\024REFRESH_TABLE_" +
-      "SCHEMA\020\005\022\021\n\rCLOSE_SESSION\020\006\022\021\n\rALTER_COL" +
-      "UMNS\020\007\"~\n\nDeleteMode\022\033\n\027DELETE_MODE_UNSP" +
-      "ECIFIED\020\000\022\030\n\024DELETE_MODE_EQUALITY\020\001\022\030\n\024D" +
-      "ELETE_MODE_POSITION\020\002\022\037\n\033DELETE_MODE_DEL" +
-      "ETION_VECTOR\020\003\"\306\001\n\024RecordIngestResponse\022" +
-      "\016\n\006result\030\001 \001(\t\022\017\n\007success\030\002 \001(\010\022\027\n\017olak" +
-      "e_2pc_state\030\003 \001(\t\022\023\n\013snapshot_id\030\004 \001(\003\022\034" +
-      "\n\024has_equality_deletes\030\005 \001(\010\022A\n\022file_pos" +
-      "ition_maps\030\006 \003(\0132%.io.olake.iceberg.rpc." +
-      "FilePositionMap\"\252\001\n\017FilePositionMap\022\021\n\tf" +
-      "ile_path\030\001 \001(\t\022;\n\006ranges\030\002 \003(\0132+.io.olak" +
-      "e.iceberg.rpc.FilePositionMap.Range\032G\n\005R" +
-      "ange\022\027\n\017batch_start_idx\030\001 \001(\005\022\026\n\016start_p" +
-      "osition\030\002 \001(\003\022\r\n\005count\030\003 \001(\005\"\235\n\n\014ArrowPa" +
-      "yload\022<\n\004type\030\001 \001(\0162..io.olake.iceberg.r" +
-      "pc.ArrowPayload.PayloadType\022=\n\010metadata\030" +
-      "\002 \001(\0132+.io.olake.iceberg.rpc.ArrowPayloa" +
-      "d.Metadata\032\337\002\n\014FileMetadata\022\021\n\tfile_type" +
-      "\030\001 \001(\t\022\021\n\tfile_path\030\002 \001(\t\022\024\n\014record_coun" +
-      "t\030\003 \001(\003\022X\n\020partition_values\030\005 \003(\0132>.io.o" +
-      "lake.iceberg.rpc.ArrowPayload.FileMetada" +
-      "ta.PartitionValue\032\270\001\n\016PartitionValue\022\023\n\t" +
-      "int_value\030\001 \001(\005H\000\022\024\n\nlong_value\030\002 \001(\003H\000\022" +
-      "\026\n\014string_value\030\003 \001(\tH\000\022\025\n\013float_value\030\004" +
-      " \001(\002H\000\022\026\n\014double_value\030\005 \001(\001H\000\022\024\n\nbool_v" +
-      "alue\030\006 \001(\010H\000\022\025\n\013bytes_value\030\007 \001(\014H\000B\007\n\005v" +
-      "alue\0329\n\021FileUploadRequest\022\021\n\tfile_data\030\001" +
-      " \001(\014\022\021\n\tfile_path\030\002 \001(\t\032\363\001\n\023DeletionVect" +
-      "orBatch\022M\n\007entries\030\001 \003(\0132<.io.olake.iceb" +
-      "erg.rpc.ArrowPayload.DeletionVectorBatch" +
-      ".Entry\032\214\001\n\005Entry\022\026\n\016data_file_path\030\001 \001(\t" +
-      "\022\021\n\tpositions\030\002 \003(\003\022X\n\020partition_values\030" +
-      "\003 \003(\0132>.io.olake.iceberg.rpc.ArrowPayloa" +
-      "d.FileMetadata.PartitionValue\032\217\003\n\010Metada" +
-      "ta\022\027\n\017dest_table_name\030\001 \001(\t\022\021\n\tthread_id" +
-      "\030\002 \001(\t\022F\n\rfile_metadata\030\003 \003(\0132/.io.olake" +
-      ".iceberg.rpc.ArrowPayload.FileMetadata\022N" +
-      "\n\013file_upload\030\004 \001(\01324.io.olake.iceberg.r" +
-      "pc.ArrowPayload.FileUploadRequestH\000\210\001\001\022\017" +
-      "\n\007payload\030\006 \001(\t\022\035\n\020base_snapshot_id\030\007 \001(" +
-      "\003H\001\210\001\001\022U\n\020deletion_vectors\030\010 \001(\01326.io.ol" +
-      "ake.iceberg.rpc.ArrowPayload.DeletionVec" +
-      "torBatchH\002\210\001\001B\016\n\014_file_uploadB\023\n\021_base_s" +
-      "napshot_idB\023\n\021_deletion_vectors\"k\n\013Paylo" +
-      "adType\022\017\n\013UPLOAD_FILE\020\000\022\027\n\023REGISTER_AND_" +
-      "COMMIT\020\001\022\016\n\nJSONSCHEMA\020\002\022\014\n\010FILEPATH\020\003\022\024" +
-      "\n\020DELETION_VECTORS\020\004\"\335\001\n\023ArrowIngestResp" +
-      "onse\022\016\n\006result\030\001 \001(\t\022U\n\016icebergSchemas\030\002" +
-      " \003(\0132=.io.olake.iceberg.rpc.ArrowIngestR" +
-      "esponse.IcebergSchemasEntry\022\030\n\013snapshot_" +
-      "id\030\003 \001(\003H\000\210\001\001\0325\n\023IcebergSchemasEntry\022\013\n\003" +
-      "key\030\001 \001(\t\022\r\n\005value\030\002 \001(\t:\0028\001B\016\n\014_snapsho" +
-      "t_id\"^\n\025TableIndexScanRequest\022\021\n\tthread_" +
-      "id\030\001 \001(\t\022\035\n\020from_snapshot_id\030\002 \001(\003H\000\210\001\001B" +
-      "\023\n\021_from_snapshot_id\"\254\001\n\023TableIndexScanB" +
-      "atch\022@\n\007entries\030\001 \003(\0132/.io.olake.iceberg" +
-      ".rpc.TableIndexScanBatch.Entry\022\023\n\013snapsh" +
-      "ot_id\030\002 \001(\003\032>\n\005Entry\022\020\n\010olake_id\030\001 \001(\t\022\021" +
-      "\n\tfile_path\030\002 \001(\t\022\020\n\010position\030\003 \001(\003\"x\n\035M" +
-      "igrateEqualityDeletesRequest\022\021\n\tthread_i" +
-      "d\030\001 \001(\t\022D\n\013target_mode\030\002 \001(\0162/.io.olake." +
-      "iceberg.rpc.IcebergPayload.DeleteMode\"y\n" +
-      "\036MigrateEqualityDeletesResponse\022\023\n\013snaps" +
-      "hot_id\030\001 \001(\003\022\036\n\026rewritten_delete_files\030\002" +
-      " \001(\003\022\"\n\032positional_deletes_written\030\003 \001(\003" +
-      "\"\345\001\n\017ReadRowsRequest\022\021\n\tthread_id\030\001 \001(\t\022" +
-      "=\n\005files\030\002 \003(\0132..io.olake.iceberg.rpc.Re" +
-      "adRowsRequest.FileRows\032(\n\003Row\022\020\n\010positio" +
-      "n\030\001 \001(\003\022\017\n\007columns\030\002 \003(\t\032V\n\010FileRows\022\021\n\t" +
-      "file_path\030\001 \001(\t\0227\n\004rows\030\002 \003(\0132).io.olake" +
-      ".iceberg.rpc.ReadRowsRequest.Row\"\242\002\n\rRea" +
-      "dRowsBatch\0225\n\004rows\030\001 \003(\0132\'.io.olake.iceb" +
-      "erg.rpc.ReadRowsBatch.Row\032\331\001\n\003Row\022\021\n\tfil" +
-      "e_path\030\001 \001(\t\022\020\n\010position\030\002 \001(\003\022C\n\006values" +
-      "\030\003 \003(\01323.io.olake.iceberg.rpc.ReadRowsBa" +
-      "tch.Row.ValuesEntry\032h\n\013ValuesEntry\022\013\n\003ke" +
-      "y\030\001 \001(\t\022H\n\005value\030\002 \001(\01329.io.olake.iceber" +
-      "g.rpc.IcebergPayload.IceRecord.FieldValu" +
-      "e:\0028\0012v\n\023RecordIngestService\022_\n\013SendReco" +
-      "rds\022$.io.olake.iceberg.rpc.IcebergPayloa" +
-      "d\032*.io.olake.iceberg.rpc.RecordIngestRes" +
-      "ponse2q\n\022ArrowIngestService\022[\n\nIcebergAP" +
-      "I\022\".io.olake.iceberg.rpc.ArrowPayload\032)." +
-      "io.olake.iceberg.rpc.ArrowIngestResponse" +
-      "2\345\002\n\021TableIndexService\022p\n\024ScanTableForIn" +
-      "dexing\022+.io.olake.iceberg.rpc.TableIndex" +
-      "ScanRequest\032).io.olake.iceberg.rpc.Table" +
-      "IndexScanBatch0\001\022\203\001\n\026MigrateEqualityDele" +
-      "tes\0223.io.olake.iceberg.rpc.MigrateEquali" +
-      "tyDeletesRequest\0324.io.olake.iceberg.rpc." +
-      "MigrateEqualityDeletesResponse\022X\n\010ReadRo" +
-      "ws\022%.io.olake.iceberg.rpc.ReadRowsReques" +
-      "t\032#.io.olake.iceberg.rpc.ReadRowsBatch0\001" +
-      "B\035B\014RecordIngestZ\riceberg/protob\006proto3"
+      "d_columns\030\016 \003(\t\022\021\n\tresync_id\030\017 \001(\t\022\031\n\021re" +
+      "sync_checkpoint\030\020 \001(\t\022\032\n\022resync_deadline" +
+      "_ms\030\021 \001(\003B\023\n\021_identifier_fieldB\023\n\021_base_" +
+      "snapshot_id\032\200\001\n\013AddedColumn\022\013\n\003key\030\001 \001(\t" +
+      "\022\020\n\010ice_type\030\002 \001(\t\022R\n\017initial_default\030\003 " +
+      "\001(\01329.io.olake.iceberg.rpc.IcebergPayloa" +
+      "d.IceRecord.FieldValue\032,\n\013SchemaField\022\020\n" +
+      "\010ice_type\030\001 \001(\t\022\013\n\003key\030\002 \001(\t\0322\n\016Partitio" +
+      "nField\022\r\n\005field\030\001 \001(\t\022\021\n\ttransform\030\002 \001(\t" +
+      "\032\210\003\n\tIceRecord\022I\n\006fields\030\001 \003(\01329.io.olak" +
+      "e.iceberg.rpc.IcebergPayload.IceRecord.F" +
+      "ieldValue\022\023\n\013record_type\030\002 \001(\t\022\035\n\020delete" +
+      "_file_path\030\003 \001(\tH\000\210\001\001\022\034\n\017delete_position" +
+      "\030\004 \001(\003H\001\210\001\001\032\264\001\n\nFieldValue\022\026\n\014string_val" +
+      "ue\030\001 \001(\tH\000\022\023\n\tint_value\030\002 \001(\005H\000\022\024\n\nlong_" +
+      "value\030\003 \001(\003H\000\022\025\n\013float_value\030\004 \001(\002H\000\022\026\n\014" +
+      "double_value\030\005 \001(\001H\000\022\024\n\nbool_value\030\006 \001(\010" +
+      "H\000\022\025\n\013bytes_value\030\007 \001(\014H\000B\007\n\005valueB\023\n\021_d" +
+      "elete_file_pathB\022\n\020_delete_position\"\357\001\n\013" +
+      "PayloadType\022\013\n\007RECORDS\020\000\022\n\n\006COMMIT\020\001\022\021\n\r" +
+      "EVOLVE_SCHEMA\020\002\022\016\n\nDROP_TABLE\020\003\022\027\n\023GET_O" +
+      "R_CREATE_TABLE\020\004\022\030\n\024REFRESH_TABLE_SCHEMA" +
+      "\020\005\022\021\n\rCLOSE_SESSION\020\006\022\021\n\rALTER_COLUMNS\020\007" +
+      "\022\022\n\016PREPARE_RESYNC\020\010\022\022\n\016PUBLISH_RESYNC\020\t" +
+      "\022\020\n\014ABORT_RESYNC\020\n\022\021\n\rRESYNC_STATUS\020\013\"~\n" +
+      "\nDeleteMode\022\033\n\027DELETE_MODE_UNSPECIFIED\020\000" +
+      "\022\030\n\024DELETE_MODE_EQUALITY\020\001\022\030\n\024DELETE_MOD" +
+      "E_POSITION\020\002\022\037\n\033DELETE_MODE_DELETION_VEC" +
+      "TOR\020\003\"\261\002\n\024RecordIngestResponse\022\016\n\006result" +
+      "\030\001 \001(\t\022\017\n\007success\030\002 \001(\010\022\027\n\017olake_2pc_sta" +
+      "te\030\003 \001(\t\022\023\n\013snapshot_id\030\004 \001(\003\022\034\n\024has_equ" +
+      "ality_deletes\030\005 \001(\010\022A\n\022file_position_map" +
+      "s\030\006 \003(\0132%.io.olake.iceberg.rpc.FilePosit" +
+      "ionMap\022\030\n\020resync_published\030\007 \001(\010\022\031\n\021resy" +
+      "nc_checkpoint\030\010 \001(\t\022\031\n\021resync_generation" +
+      "\030\t \001(\t\022\031\n\021resync_table_uuid\030\n \001(\t\"\252\001\n\017Fi" +
+      "lePositionMap\022\021\n\tfile_path\030\001 \001(\t\022;\n\006rang" +
+      "es\030\002 \003(\0132+.io.olake.iceberg.rpc.FilePosi" +
+      "tionMap.Range\032G\n\005Range\022\027\n\017batch_start_id" +
+      "x\030\001 \001(\005\022\026\n\016start_position\030\002 \001(\003\022\r\n\005count" +
+      "\030\003 \001(\005\"\235\n\n\014ArrowPayload\022<\n\004type\030\001 \001(\0162.." +
+      "io.olake.iceberg.rpc.ArrowPayload.Payloa" +
+      "dType\022=\n\010metadata\030\002 \001(\0132+.io.olake.icebe" +
+      "rg.rpc.ArrowPayload.Metadata\032\337\002\n\014FileMet" +
+      "adata\022\021\n\tfile_type\030\001 \001(\t\022\021\n\tfile_path\030\002 " +
+      "\001(\t\022\024\n\014record_count\030\003 \001(\003\022X\n\020partition_v" +
+      "alues\030\005 \003(\0132>.io.olake.iceberg.rpc.Arrow" +
+      "Payload.FileMetadata.PartitionValue\032\270\001\n\016" +
+      "PartitionValue\022\023\n\tint_value\030\001 \001(\005H\000\022\024\n\nl" +
+      "ong_value\030\002 \001(\003H\000\022\026\n\014string_value\030\003 \001(\tH" +
+      "\000\022\025\n\013float_value\030\004 \001(\002H\000\022\026\n\014double_value" +
+      "\030\005 \001(\001H\000\022\024\n\nbool_value\030\006 \001(\010H\000\022\025\n\013bytes_" +
+      "value\030\007 \001(\014H\000B\007\n\005value\0329\n\021FileUploadRequ" +
+      "est\022\021\n\tfile_data\030\001 \001(\014\022\021\n\tfile_path\030\002 \001(" +
+      "\t\032\363\001\n\023DeletionVectorBatch\022M\n\007entries\030\001 \003" +
+      "(\0132<.io.olake.iceberg.rpc.ArrowPayload.D" +
+      "eletionVectorBatch.Entry\032\214\001\n\005Entry\022\026\n\016da" +
+      "ta_file_path\030\001 \001(\t\022\021\n\tpositions\030\002 \003(\003\022X\n" +
+      "\020partition_values\030\003 \003(\0132>.io.olake.icebe" +
+      "rg.rpc.ArrowPayload.FileMetadata.Partiti" +
+      "onValue\032\217\003\n\010Metadata\022\027\n\017dest_table_name\030" +
+      "\001 \001(\t\022\021\n\tthread_id\030\002 \001(\t\022F\n\rfile_metadat" +
+      "a\030\003 \003(\0132/.io.olake.iceberg.rpc.ArrowPayl" +
+      "oad.FileMetadata\022N\n\013file_upload\030\004 \001(\01324." +
+      "io.olake.iceberg.rpc.ArrowPayload.FileUp" +
+      "loadRequestH\000\210\001\001\022\017\n\007payload\030\006 \001(\t\022\035\n\020bas" +
+      "e_snapshot_id\030\007 \001(\003H\001\210\001\001\022U\n\020deletion_vec" +
+      "tors\030\010 \001(\01326.io.olake.iceberg.rpc.ArrowP" +
+      "ayload.DeletionVectorBatchH\002\210\001\001B\016\n\014_file" +
+      "_uploadB\023\n\021_base_snapshot_idB\023\n\021_deletio" +
+      "n_vectors\"k\n\013PayloadType\022\017\n\013UPLOAD_FILE\020" +
+      "\000\022\027\n\023REGISTER_AND_COMMIT\020\001\022\016\n\nJSONSCHEMA" +
+      "\020\002\022\014\n\010FILEPATH\020\003\022\024\n\020DELETION_VECTORS\020\004\"\335" +
+      "\001\n\023ArrowIngestResponse\022\016\n\006result\030\001 \001(\t\022U" +
+      "\n\016icebergSchemas\030\002 \003(\0132=.io.olake.iceber" +
+      "g.rpc.ArrowIngestResponse.IcebergSchemas" +
+      "Entry\022\030\n\013snapshot_id\030\003 \001(\003H\000\210\001\001\0325\n\023Icebe" +
+      "rgSchemasEntry\022\013\n\003key\030\001 \001(\t\022\r\n\005value\030\002 \001" +
+      "(\t:\0028\001B\016\n\014_snapshot_id\"^\n\025TableIndexScan" +
+      "Request\022\021\n\tthread_id\030\001 \001(\t\022\035\n\020from_snaps" +
+      "hot_id\030\002 \001(\003H\000\210\001\001B\023\n\021_from_snapshot_id\"\254" +
+      "\001\n\023TableIndexScanBatch\022@\n\007entries\030\001 \003(\0132" +
+      "/.io.olake.iceberg.rpc.TableIndexScanBat" +
+      "ch.Entry\022\023\n\013snapshot_id\030\002 \001(\003\032>\n\005Entry\022\020" +
+      "\n\010olake_id\030\001 \001(\t\022\021\n\tfile_path\030\002 \001(\t\022\020\n\010p" +
+      "osition\030\003 \001(\003\"x\n\035MigrateEqualityDeletesR" +
+      "equest\022\021\n\tthread_id\030\001 \001(\t\022D\n\013target_mode" +
+      "\030\002 \001(\0162/.io.olake.iceberg.rpc.IcebergPay" +
+      "load.DeleteMode\"y\n\036MigrateEqualityDelete" +
+      "sResponse\022\023\n\013snapshot_id\030\001 \001(\003\022\036\n\026rewrit" +
+      "ten_delete_files\030\002 \001(\003\022\"\n\032positional_del" +
+      "etes_written\030\003 \001(\003\"\345\001\n\017ReadRowsRequest\022\021" +
+      "\n\tthread_id\030\001 \001(\t\022=\n\005files\030\002 \003(\0132..io.ol" +
+      "ake.iceberg.rpc.ReadRowsRequest.FileRows" +
+      "\032(\n\003Row\022\020\n\010position\030\001 \001(\003\022\017\n\007columns\030\002 \003" +
+      "(\t\032V\n\010FileRows\022\021\n\tfile_path\030\001 \001(\t\0227\n\004row" +
+      "s\030\002 \003(\0132).io.olake.iceberg.rpc.ReadRowsR" +
+      "equest.Row\"\242\002\n\rReadRowsBatch\0225\n\004rows\030\001 \003" +
+      "(\0132\'.io.olake.iceberg.rpc.ReadRowsBatch." +
+      "Row\032\331\001\n\003Row\022\021\n\tfile_path\030\001 \001(\t\022\020\n\010positi" +
+      "on\030\002 \001(\003\022C\n\006values\030\003 \003(\01323.io.olake.iceb" +
+      "erg.rpc.ReadRowsBatch.Row.ValuesEntry\032h\n" +
+      "\013ValuesEntry\022\013\n\003key\030\001 \001(\t\022H\n\005value\030\002 \001(\013" +
+      "29.io.olake.iceberg.rpc.IcebergPayload.I" +
+      "ceRecord.FieldValue:\0028\0012v\n\023RecordIngestS" +
+      "ervice\022_\n\013SendRecords\022$.io.olake.iceberg" +
+      ".rpc.IcebergPayload\032*.io.olake.iceberg.r" +
+      "pc.RecordIngestResponse2q\n\022ArrowIngestSe" +
+      "rvice\022[\n\nIcebergAPI\022\".io.olake.iceberg.r" +
+      "pc.ArrowPayload\032).io.olake.iceberg.rpc.A" +
+      "rrowIngestResponse2\345\002\n\021TableIndexService" +
+      "\022p\n\024ScanTableForIndexing\022+.io.olake.iceb" +
+      "erg.rpc.TableIndexScanRequest\032).io.olake" +
+      ".iceberg.rpc.TableIndexScanBatch0\001\022\203\001\n\026M" +
+      "igrateEqualityDeletes\0223.io.olake.iceberg" +
+      ".rpc.MigrateEqualityDeletesRequest\0324.io." +
+      "olake.iceberg.rpc.MigrateEqualityDeletes" +
+      "Response\022X\n\010ReadRows\022%.io.olake.iceberg." +
+      "rpc.ReadRowsRequest\032#.io.olake.iceberg.r" +
+      "pc.ReadRowsBatch0\001B\035B\014RecordIngestZ\riceb" +
+      "erg/protob\006proto3"
     };
     descriptor = com.google.protobuf.Descriptors.FileDescriptor
       .internalBuildGeneratedFileFrom(descriptorData,
@@ -30138,7 +31231,7 @@ io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue defaultVal
     internal_static_io_olake_iceberg_rpc_IcebergPayload_Metadata_fieldAccessorTable = new
       com.google.protobuf.GeneratedMessageV3.FieldAccessorTable(
         internal_static_io_olake_iceberg_rpc_IcebergPayload_Metadata_descriptor,
-        new java.lang.String[] { "DestTableName", "ThreadId", "IdentifierField", "Schema", "Payload", "Namespace", "Upsert", "PartitionFields", "BaseSnapshotId", "DeleteMode", "DeclareIdentifierFields", "AddedColumns", "DroppedColumns", });
+        new java.lang.String[] { "DestTableName", "ThreadId", "IdentifierField", "Schema", "Payload", "Namespace", "Upsert", "PartitionFields", "BaseSnapshotId", "DeleteMode", "DeclareIdentifierFields", "AddedColumns", "DroppedColumns", "ResyncId", "ResyncCheckpoint", "ResyncDeadlineMs", });
     internal_static_io_olake_iceberg_rpc_IcebergPayload_AddedColumn_descriptor =
       internal_static_io_olake_iceberg_rpc_IcebergPayload_descriptor.getNestedTypes().get(1);
     internal_static_io_olake_iceberg_rpc_IcebergPayload_AddedColumn_fieldAccessorTable = new
@@ -30174,7 +31267,7 @@ io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue defaultVal
     internal_static_io_olake_iceberg_rpc_RecordIngestResponse_fieldAccessorTable = new
       com.google.protobuf.GeneratedMessageV3.FieldAccessorTable(
         internal_static_io_olake_iceberg_rpc_RecordIngestResponse_descriptor,
-        new java.lang.String[] { "Result", "Success", "Olake2PcState", "SnapshotId", "HasEqualityDeletes", "FilePositionMaps", });
+        new java.lang.String[] { "Result", "Success", "Olake2PcState", "SnapshotId", "HasEqualityDeletes", "FilePositionMaps", "ResyncPublished", "ResyncCheckpoint", "ResyncGeneration", "ResyncTableUuid", });
     internal_static_io_olake_iceberg_rpc_FilePositionMap_descriptor =
       getDescriptor().getMessageTypes().get(2);
     internal_static_io_olake_iceberg_rpc_FilePositionMap_fieldAccessorTable = new

@@ -1,6 +1,7 @@
 package iceberg
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -56,5 +57,30 @@ func TestJavaHeapPolicyRejectsOptionsThatBypassContainerBudget(t *testing.T) {
 				t.Fatalf("accepted %s bypassing the per-job budget", key)
 			}
 		}
+	}
+}
+
+func TestAtomicResyncStartupPolicyIsInternalAndResyncOnly(t *testing.T) {
+	for _, resync := range []bool{false, true} {
+		config := &Config{CatalogType: RestCatalog, atomicResync: resync}
+		encoded, err := getServerConfigJSON(config, defaultServerPort, true, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var startup map[string]string
+		if err := json.Unmarshal(encoded, &startup); err != nil {
+			t.Fatal(err)
+		}
+		marker, exists := startup["atomic-resync-enabled"]
+		if exists != resync || (resync && marker != "true") {
+			t.Fatalf("resync=%t: unexpected startup policy marker %q, present=%t", resync, marker, exists)
+		}
+	}
+	var userConfig Config
+	if err := json.Unmarshal([]byte(`{"atomicResync":true,"atomic-resync-enabled":true}`), &userConfig); err != nil {
+		t.Fatal(err)
+	}
+	if userConfig.atomicResync {
+		t.Fatal("ordinary destination JSON must not enable the internal resync startup policy")
 	}
 }
