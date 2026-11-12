@@ -34,8 +34,12 @@ jobs:
             python3 - "$RUNNER_TEMP/unit-tests.log" <<'PY'
           import pathlib, re, sys
           lines = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
-          failures = [line for line in lines if re.search(r"FAIL|panic:|fatal error:|Error:|error:|\.go:\d+", line)]
-          message = "\n".join(failures)[-60000:] or "Unit test command failed; inspect the job log."
+          selected = set()
+          for index, line in enumerate(lines):
+              if re.search(r"FAIL|panic:|fatal error|error|\.go:\d+", line, re.IGNORECASE):
+                  selected.update(range(max(0, index - 4), min(len(lines), index + 5)))
+          failures = [lines[index] for index in sorted(selected)]
+          message = "\n".join(failures)[-3800:] or "Unit test command failed; inspect the job log."
           message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
           print("::error title=Unit test failure details::" + message)
           PY

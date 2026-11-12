@@ -81,7 +81,7 @@ jobs:
           if [ "$status" -ne 0 ]; then
             python3 - "$RUNNER_TEMP/gosec.log" <<'PY'
           import pathlib, sys
-          message = pathlib.Path(sys.argv[1]).read_text(errors="replace")[-60000:]
+          message = pathlib.Path(sys.argv[1]).read_text(errors="replace")[-3800:]
           message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
           print("::error title=GoSec failure details::" + message)
           PY
