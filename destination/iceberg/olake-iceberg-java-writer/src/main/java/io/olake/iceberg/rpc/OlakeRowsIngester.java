@@ -15,6 +15,8 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.olake.iceberg.ExecutionFence;
+import io.olake.iceberg.FencedTableOperations;
 import io.olake.iceberg.IcebergUtil;
 import io.olake.iceberg.RuntimeTelemetry;
 import io.olake.iceberg.RuntimeTelemetry.Stage;
@@ -64,6 +66,28 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
         IcebergSession session = null;
 
         try {
+            if (request.getType() == IcebergPayload.PayloadType.ABORT_RESYNC
+                    || request.getType() == IcebergPayload.PayloadType.RESYNC_STATUS
+                    || request.getType() == IcebergPayload.PayloadType.EXECUTION_RETIRE) {
+                ExecutionFence.runtime().checkReconciliation();
+            } else {
+                ExecutionFence.runtime().check();
+            }
+            if (request.getType() == IcebergPayload.PayloadType.EXECUTION_CAPABILITY) {
+                sendResponse(responseObserver, RecordIngest.RecordIngestResponse.newBuilder()
+                        .setSuccess(true).setResult(ExecutionFence.runtime().capabilityJson()).build());
+                return;
+            }
+            if (request.getType() == IcebergPayload.PayloadType.EXECUTION_RETIRE) {
+                sendResponse(responseObserver, RecordIngest.RecordIngestResponse.newBuilder()
+                        .setSuccess(true).setResult(ExecutionFence.runtime().retireJson()).build());
+                return;
+            }
+            if (ExecutionFence.runtime().recoveryOnly()
+                    && request.getType() != IcebergPayload.PayloadType.PREPARE_RESYNC
+                    && request.getType() != IcebergPayload.PayloadType.RESYNC_STATUS) {
+                throw new IllegalStateException("Recovery-only runtime accepts only resync reconciliation");
+            }
             IcebergPayload.Metadata metadata = request.getMetadata();
             String threadId = metadata.getThreadId();
             String destTableName = metadata.getDestTableName();
@@ -113,6 +137,7 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
                     if (resyncs.route(TableIdentifier.of(dropNamespace, dropTableName)) != null) {
                         throw new IllegalStateException("Cannot drop an active resync target");
                     }
+                    ExecutionFence.requireMutation();
                     dropped = IcebergUtil.dropIcebergTable(dropNamespace, dropTableName, icebergCatalog);
                 }
                 if (dropped) {
@@ -314,15 +339,16 @@ public class OlakeRowsIngester extends RecordIngestServiceGrpc.RecordIngestServi
         }
         java.util.Optional<Table> existing = IcebergUtil.loadIcebergTable(icebergCatalog, tableId);
         if (existing.isPresent()) {
-            Table table = existing.get();
+            Table table = FencedTableOperations.wrap(existing.get());
             validateOrUpgradeFormatVersion(table, deleteMode);
             return table;
         }
 
         try {
+            ExecutionFence.requireMutation();
             // no need to check if the table already exists, because the table is created by the thread that calls the get_or_create_table method
-            return IcebergUtil.createIcebergTable(icebergCatalog, tableId, schema, "parquet", partitionTransforms,
-                    deleteMode.minimumFormatVersion());
+            return FencedTableOperations.wrap(IcebergUtil.createIcebergTable(icebergCatalog, tableId, schema, "parquet", partitionTransforms,
+                    deleteMode.minimumFormatVersion()));
         } catch (Exception e) {
             String errorMessage = String.format("Failed to create table %s from record schema. Error: %s",
                                                 tableId, e.getMessage());

@@ -123,7 +123,8 @@ func TestRecoverPublishedResyncAcknowledgesOnlyCommittedCheckpoint(t *testing.T)
 			if slotLSN == "0/100" {
 				mock.ExpectQuery(fmt.Sprintf(waljs.AdvanceLSNTemplate, "saved_slot", "0/300")).WillReturnRows(sqlmock.NewRows([]string{"end_lsn"}).AddRow("0/300"))
 			}
-			err := p.RecoverResync(context.Background(), checkpoint, types.NewStream("items", "public", nil).Wrap(0))
+			ctx := types.WithResync(context.Background(), &types.ResyncOptions{RecoverOnly: true})
+			err := p.RecoverResync(ctx, checkpoint, types.NewStream("items", "public", nil).Wrap(0))
 			if slotLSN == "0/400" {
 				require.ErrorContains(t, err, "ahead")
 			} else {

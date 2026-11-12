@@ -40,6 +40,8 @@ type serverInstance struct {
 	gcpCredentialsTemp string // temp file holding gcp_service_account_json content, if used; cleaned up on Shutdown
 	shutdownOnce       sync.Once
 	shutdownErr        error
+	retire             func(bool)
+	executionConfig    *Config
 }
 
 // getServerConfigJSON builds the catalog/storage-level config the JVM consumes
@@ -57,6 +59,20 @@ func getServerConfigJSON(config *Config, port int, arrowWriterEnabled bool, gcpC
 	}
 	if config.atomicResync {
 		serverConfig["atomic-resync-enabled"] = "true"
+	}
+	if config.executionID != "" || config.executionFence != "" {
+		serverConfig["execution-id"] = config.executionID
+		serverConfig["execution-fence"] = config.executionFence
+		serverConfig["execution-command"] = config.executionCommand
+		if config.executionCommand != "" {
+			serverConfig["execution-launch-id"] = config.executionID
+		}
+	}
+	if config.resyncLaunchID != "" {
+		serverConfig["resync-launch-id"] = config.resyncLaunchID
+	}
+	if config.resyncRecoverOnly {
+		serverConfig["resync-recover-only"] = "true"
 	}
 
 	addMapKeyIfNotEmpty := func(key, value string) {
@@ -210,6 +226,30 @@ func javaHeapEnvironment(env []string) ([]string, error) {
 	return childEnv, nil
 }
 
+// executionFenceEnvironment preserves runtime credentials before destination
+// credentials replace AWS_* in the child. Empty originals deliberately force
+// the fence reader to use IRSA/profile credentials, not the destination's keys.
+func executionFenceEnvironment(env []string) []string {
+	result := make([]string, 0, len(env)+7)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, "OLAKE_EXECUTION_AWS_") {
+			result = append(result, entry)
+		}
+	}
+	result = append(result, "OLAKE_EXECUTION_AWS_CAPTURED=true")
+	for _, key := range []string{"ACCESS_KEY_ID", "SECRET_ACCESS_KEY", "SESSION_TOKEN", "REGION", "DEFAULT_REGION", "PROFILE"} {
+		value := ""
+		for _, entry := range env {
+			if original, ok := strings.CutPrefix(entry, "AWS_"+key+"="); ok {
+				value = original
+				break
+			}
+		}
+		result = append(result, "OLAKE_EXECUTION_AWS_"+key+"="+value)
+	}
+	return result
+}
+
 // startServer launches the JVM and returns the running instance. Invoked once
 // from Iceberg.Initialize (via WriterPool.NewWriterPool) before any
 // sync/check/clear work begins.
@@ -261,6 +301,9 @@ func startServer(config *Config) (*serverInstance, error) {
 	}
 
 	serverCmd.Env = javaEnv
+	if config.executionID != "" {
+		serverCmd.Env = executionFenceEnvironment(serverCmd.Env)
+	}
 	if percent, present := os.LookupEnv("OLAKE_JAVA_HEAP_PERCENT"); present {
 		logger.Infof("Iceberg JVM launch memory: MaxRAMPercentage=%s (per-job override)", percent)
 	} else {
@@ -287,8 +330,13 @@ func startServer(config *Config) (*serverInstance, error) {
 	// GCSFileIO auths separately from GoogleAuthManager; only via ADC env var. No-op if empty.
 	appendEnv("GOOGLE_APPLICATION_CREDENTIALS", gcpCredsTemp)
 
+	retire := func(bool) {}
+	if config.executionContext != nil {
+		retire = utils.BeginExecutionParticipant(config.executionContext)
+	}
 	processExited, startErr := logger.SetupAndStartProcess(fmt.Sprintf("Iceberg[%d]", port), serverCmd)
 	if startErr != nil {
+		retire(false)
 		if gcpCredsTemp != "" {
 			os.Remove(gcpCredsTemp)
 		}
@@ -299,6 +347,7 @@ func startServer(config *Config) (*serverInstance, error) {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)))
 	if err != nil {
+		retire(false)
 		if serverCmd != nil && serverCmd.Process != nil {
 			_ = serverCmd.Process.Kill()
 		}
@@ -308,8 +357,7 @@ func startServer(config *Config) (*serverInstance, error) {
 		return nil, fmt.Errorf("failed to create new grpc client: %w", err)
 	}
 
-	logger.Infof("Started shared Iceberg JVM on port %d", port)
-	return &serverInstance{
+	instance := &serverInstance{
 		port:               port,
 		cmd:                serverCmd,
 		processExited:      processExited,
@@ -319,10 +367,61 @@ func startServer(config *Config) (*serverInstance, error) {
 		conn:               conn,
 		defaultServerID:    serverID,
 		gcpCredentialsTemp: gcpCredsTemp,
-	}, nil
+		retire:             retire,
+		executionConfig:    config,
+	}
+	if config.executionID != "" || config.executionFence != "" || config.resyncRecoverOnly {
+		// Startup JSON is extensible and old/custom jars may silently ignore it.
+		// This new read-only payload must be positively acknowledged before even
+		// the connection-check or Clear Destination can send table mutations.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if err := instance.confirmExecutionCapability(ctx, config); err != nil {
+			retire(false)
+			return nil, fmt.Errorf("Java writer does not confirm runtime fencing/recovery capability: %w", errors.Join(err, instance.shutdownResync()))
+		}
+	}
+	logger.Infof("Started shared Iceberg JVM on port %d", port)
+	return instance, nil
+}
+
+func (s *serverInstance) confirmExecutionCapability(ctx context.Context, config *Config) error {
+	if config.executionID != "" || config.executionFence != "" {
+		ctx = utils.WithExecution(ctx, &utils.ExecutionOptions{ID: config.executionID, Fence: config.executionFence})
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
+	response, err := s.client.SendRecords(ctx, &proto.IcebergPayload{
+		Type:     proto.IcebergPayload_EXECUTION_CAPABILITY,
+		Metadata: &proto.IcebergPayload_Metadata{},
+	})
+	if err != nil {
+		return err
+	}
+	if response == nil || !response.GetSuccess() {
+		return fmt.Errorf("writer rejected execution capability handshake")
+	}
+	var capability struct {
+		Version     int    `json:"version"`
+		ExecutionID string `json:"execution_id"`
+		LaunchID    string `json:"launch_id"`
+		RecoverOnly bool   `json:"recover_only"`
+		FenceState  string `json:"fence_state"`
+	}
+	if err := json.Unmarshal([]byte(response.GetResult()), &capability); err != nil {
+		return fmt.Errorf("writer returned invalid execution capability: %w", err)
+	}
+	if capability.Version != 1 || capability.ExecutionID != config.executionID || capability.LaunchID != config.resyncLaunchID || capability.RecoverOnly != config.resyncRecoverOnly || capability.FenceState != "open" {
+		return fmt.Errorf("writer execution capability does not match configured runtime, launch, recovery mode and open fence")
+	}
+	return nil
 }
 
 func (s *serverInstance) SendClientRequest(ctx context.Context, payload interface{}) (interface{}, error) {
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return nil, err
+	}
 	switch p := payload.(type) {
 	case *proto.IcebergPayload:
 		return s.client.SendRecords(ctx, p)
@@ -347,6 +446,12 @@ func (s *serverInstance) shutdownResync() error {
 		return nil
 	}
 	s.shutdownOnce.Do(func() {
+		settled := false
+		if s.retire != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			settled = s.confirmExecutionRetirement(ctx, s.executionConfig)
+			cancel()
+		}
 		logger.Infof("Shutting down shared Iceberg JVM on port %d", s.port)
 		if s.conn != nil {
 			s.shutdownErr = errors.Join(s.shutdownErr, s.conn.Close())
@@ -371,6 +476,9 @@ func (s *serverInstance) shutdownResync() error {
 			if err := os.Remove(s.gcpCredentialsTemp); err != nil && !errors.Is(err, os.ErrNotExist) {
 				s.shutdownErr = errors.Join(s.shutdownErr, err)
 			}
+		}
+		if s.retire != nil {
+			s.retire(settled && s.shutdownErr == nil)
 		}
 	})
 	return s.shutdownErr

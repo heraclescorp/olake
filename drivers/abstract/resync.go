@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
 )
 
 // AtomicResyncSource must establish a source-consistent replacement without advancing
@@ -34,6 +35,12 @@ func (a *AbstractDriver) ValidateResync(ctx context.Context, target types.Stream
 }
 
 func (a *AbstractDriver) PrepareResync(ctx context.Context, target types.StreamInterface) error {
+	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
+		return fmt.Errorf("recovery-only resync cannot prepare a source snapshot")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
 	source, err := a.resyncSource()
 	if err != nil {
 		return err
@@ -42,6 +49,9 @@ func (a *AbstractDriver) PrepareResync(ctx context.Context, target types.StreamI
 }
 
 func (a *AbstractDriver) RecoverResync(ctx context.Context, checkpoint *types.State, target types.StreamInterface) error {
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
 	source, err := a.resyncSource()
 	if err != nil {
 		return err
@@ -90,7 +100,7 @@ func (a *AbstractDriver) finishResync(ctx context.Context, publish func(context.
 		return fmt.Errorf("failed to publish atomic resync: %w", err)
 	}
 	for _, identifier := range a.resyncPostCDC {
-		if err := ctx.Err(); err != nil {
+		if err := utils.CheckExecutionFence(ctx); err != nil {
 			return err
 		}
 		if err := a.driver.PostCDC(ctx, identifier); err != nil {

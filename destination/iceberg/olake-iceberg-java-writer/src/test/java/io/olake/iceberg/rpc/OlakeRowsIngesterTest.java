@@ -7,6 +7,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -23,6 +25,10 @@ import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.olake.iceberg.ExecutionFence;
 
 import io.grpc.stub.StreamObserver;
 import io.olake.iceberg.rpc.RecordIngest.IcebergPayload;
@@ -32,9 +38,11 @@ class OlakeRowsIngesterTest {
     private static final TableIdentifier TABLE_ID = TableIdentifier.of("db", "stream");
     private InMemoryCatalog catalog;
     private OlakeRowsIngester ingester;
+    @TempDir Path directory;
 
     @BeforeEach
     void setUp() {
+        ExecutionFence.configure(Map.of());
         catalog = new InMemoryCatalog();
         catalog.initialize("test", Map.of());
         catalog.createNamespace(Namespace.of("db"));
@@ -43,6 +51,7 @@ class OlakeRowsIngesterTest {
 
     @AfterEach
     void closeCatalog() throws Exception {
+        ExecutionFence.configure(Map.of());
         catalog.close();
     }
 
@@ -64,6 +73,60 @@ class OlakeRowsIngesterTest {
             @Override public void onCompleted() { }
         });
         return response.get(10, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void capabilityReportsStartupAuthorityWithoutTableOrSessionMutation() throws Exception {
+        Path fence = directory.resolve("fence.json");
+        Files.writeString(fence, "{\"version\":1,\"execution_id\":\"configured-runtime\",\"state\":\"open\"}");
+        ExecutionFence.configure(Map.of("execution-id", "configured-runtime", "execution-fence", fence.toString(),
+                "resync-launch-id", "original-launch", "resync-recover-only", "true"));
+        IcebergPayload request = IcebergPayload.newBuilder().setType(IcebergPayload.PayloadType.EXECUTION_CAPABILITY).build();
+        RecordIngestResponse response = call(request);
+        assertTrue(response.getSuccess());
+        JsonNode capability = new ObjectMapper().readTree(response.getResult());
+        assertEquals(1, capability.path("version").asInt());
+        assertEquals("configured-runtime", capability.path("execution_id").asText());
+        assertEquals("original-launch", capability.path("launch_id").asText());
+        assertTrue(capability.path("recover_only").asBoolean());
+        assertEquals("open", capability.path("fence_state").asText());
+        assertTrue(catalog.listTables(Namespace.of("db")).isEmpty());
+        Files.writeString(fence, "{\"version\":1,\"execution_id\":\"configured-runtime\",\"state\":\"closed\"}");
+        assertThrows(java.util.concurrent.ExecutionException.class, () -> call(request));
+        assertTrue(catalog.listTables(Namespace.of("db")).isEmpty());
+    }
+
+    @Test
+    void terminalRpcUsesConfiguredIdentityNotRequestMetadataAndAcceptsClosedFence() throws Exception {
+        Path fence = directory.resolve("retirement.json");
+        Files.writeString(fence, "{\"version\":1,\"execution_id\":\"runtime\",\"state\":\"open\"}");
+        ExecutionFence.configure(Map.of("execution-id", "runtime", "execution-fence", fence.toString(),
+                "execution-launch-id", "runtime", "execution-command", "clear-destination"));
+        Files.writeString(fence, "{\"version\":1,\"execution_id\":\"runtime\",\"state\":\"closed\"}");
+        IcebergPayload request = IcebergPayload.newBuilder().setType(IcebergPayload.PayloadType.EXECUTION_RETIRE)
+                .setMetadata(IcebergPayload.Metadata.newBuilder().setResyncId("forged-request-identity")).build();
+        RecordIngestResponse response = call(request);
+        assertTrue(response.getSuccess());
+        JsonNode proof = new ObjectMapper().readTree(response.getResult());
+        assertEquals(1, proof.path("version").asInt());
+        assertEquals("runtime", proof.path("execution_id").asText());
+        assertEquals("runtime", proof.path("launch_id").asText());
+        assertEquals("clear-destination", proof.path("command").asText());
+        assertEquals("not_started", proof.path("outcome").asText());
+        assertTrue(catalog.listTables(Namespace.of("db")).isEmpty());
+        Files.writeString(fence, "{\"version\":1,\"execution_id\":\"other\",\"state\":\"closed\"}");
+        assertThrows(java.util.concurrent.ExecutionException.class, () -> call(request));
+    }
+
+    @Test
+    void standaloneRecoveryCapabilityDoesNotInventRuntimeIdentity() throws Exception {
+        ExecutionFence.configure(Map.of("resync-launch-id", "original-launch", "resync-recover-only", "true"));
+        JsonNode capability = new ObjectMapper().readTree(call(IcebergPayload.newBuilder()
+                .setType(IcebergPayload.PayloadType.EXECUTION_CAPABILITY).build()).getResult());
+        assertEquals("", capability.path("execution_id").asText());
+        assertEquals("original-launch", capability.path("launch_id").asText());
+        assertTrue(capability.path("recover_only").asBoolean());
+        assertTrue(catalog.listTables(Namespace.of("db")).isEmpty());
     }
 
     @Test
@@ -151,5 +214,29 @@ class OlakeRowsIngesterTest {
                         .setResyncDeadlineMs(System.currentTimeMillis() + 60_000)).build();
         assertThrows(java.util.concurrent.ExecutionException.class, () -> call(request));
         assertFalse(catalog.tableExists(TABLE_ID));
+    }
+    @Test
+    void closedRuntimeAllowsOnlyReadOnlyRetirementControlsAfterPrepare() throws Exception {
+        catalog.createTable(TABLE_ID, new Schema(Types.NestedField.required(1, "id", Types.LongType.get())));
+        Path fence = directory.resolve("retirement-fence.json");
+        Files.writeString(fence, "{\"version\":1,\"execution_id\":\"runtime\",\"state\":\"open\"}");
+        ExecutionFence.configure(Map.of("execution-id", "runtime", "execution-fence", fence.toString(),
+                "resync-launch-id", "launch"));
+        IcebergPayload.Metadata metadata = IcebergPayload.Metadata.newBuilder().setNamespace("db")
+                .setDestTableName("stream").setResyncId("operation").setResyncCheckpoint("{\"type\":\"STREAM\"}")
+                .setResyncDeadlineMs(System.currentTimeMillis() + 60_000).build();
+        call(IcebergPayload.newBuilder().setType(IcebergPayload.PayloadType.PREPARE_RESYNC).setMetadata(metadata).build());
+        Files.writeString(fence, "{\"version\":1,\"execution_id\":\"runtime\",\"state\":\"closed\"}");
+        for (IcebergPayload.PayloadType type : new IcebergPayload.PayloadType[] {
+                IcebergPayload.PayloadType.RESYNC_STATUS, IcebergPayload.PayloadType.ABORT_RESYNC,
+                IcebergPayload.PayloadType.RESYNC_STATUS}) {
+            RecordIngestResponse response = call(IcebergPayload.newBuilder().setType(type).setMetadata(metadata).build());
+            assertTrue(response.getSuccess());
+            assertFalse(response.getResyncPublished());
+        }
+        assertThrows(java.util.concurrent.ExecutionException.class, () -> call(IcebergPayload.newBuilder()
+                .setType(IcebergPayload.PayloadType.PUBLISH_RESYNC).setMetadata(metadata).build()));
+        assertThrows(java.util.concurrent.ExecutionException.class, () -> call(IcebergPayload.newBuilder()
+                .setType(IcebergPayload.PayloadType.EXECUTION_CAPABILITY).build()));
     }
 }

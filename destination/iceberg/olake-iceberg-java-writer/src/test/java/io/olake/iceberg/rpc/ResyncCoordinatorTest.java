@@ -85,6 +85,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 
+import io.olake.iceberg.ExecutionFence;
 import io.olake.iceberg.rpc.RecordIngest.IcebergPayload;
 import io.olake.iceberg.rpc.RecordIngest.RecordIngestResponse;
 import io.olake.iceberg.tableIndex.TableIndexScanner;
@@ -105,6 +106,7 @@ class ResyncCoordinatorTest {
 
     @BeforeEach
     void setUp() {
+        ExecutionFence.configure(Map.of());
         catalog = new FaultCatalog(new Configuration(), directory.toString());
         sessions = new ConcurrentHashMap<>();
         clock = new MutableClock();
@@ -113,7 +115,80 @@ class ResyncCoordinatorTest {
 
     @AfterEach
     void close() throws Exception {
+        ExecutionFence.configure(Map.of());
         catalog.close();
+    }
+
+    @Test
+    void closureAfterOrdinaryUpdatePreparationBlocksCatalogCommit() throws Exception {
+        Table table = create(2);
+        Path fence = directory.resolve("ordinary-fence.json");
+        java.nio.file.Files.writeString(fence, "{\"version\":1,\"execution_id\":\"runtime\",\"state\":\"open\"}");
+        ExecutionFence.configure(Map.of("execution-id", "runtime", "execution-fence", fence.toString()));
+        org.apache.iceberg.UpdateProperties update = io.olake.iceberg.FencedTableOperations.wrap(table)
+                .updateProperties().set("owner", "new");
+        int commits = catalog.commits;
+        java.nio.file.Files.writeString(fence, "{\"version\":1,\"execution_id\":\"runtime\",\"state\":\"closed\"}");
+        assertThrows(IllegalStateException.class, update::commit);
+        assertEquals(commits, catalog.commits);
+    }
+
+    @Test
+    void finalConflictCannotEraseEarlierDispatchedAmbiguity() throws Exception {
+        create(2);
+        prepare();
+        transactionAppend(coordinator.route(TARGET), "new");
+        catalog.delayThenConflict = true;
+        assertThrows(CommitStateUnknownException.class, this::publish);
+        assertThrows(CommitStateUnknownException.class,
+                () -> coordinator.control(IcebergPayload.PayloadType.ABORT_RESYNC, request().build()));
+        catalog.delayedCommit.run();
+        assertTrue(coordinator.control(IcebergPayload.PayloadType.RESYNC_STATUS, request().build()).getResyncPublished());
+    }
+
+    @Test
+    void recoveryWithoutMarkerNeverCreatesStageOrAbortEvidence() throws Exception {
+        create(2);
+        int commits = catalog.commits;
+        int writes = catalog.metadataWrites;
+        ExecutionFence.configure(Map.of("resync-recover-only", "true", "resync-launch-id", "launch-a"));
+        assertThrows(CommitStateUnknownException.class, this::prepare);
+        assertNull(coordinator.route(TARGET));
+        assertThrows(IllegalStateException.class,
+                () -> coordinator.control(IcebergPayload.PayloadType.ABORT_RESYNC, request().build()));
+        assertEquals(commits, catalog.commits);
+        assertEquals(writes, catalog.metadataWrites);
+    }
+
+    @Test
+    void recoveryRequiresOriginalLaunchAndBaseline() throws Exception {
+        create(2);
+        ExecutionFence.configure(Map.of("resync-launch-id", "launch-a"));
+        prepare();
+        transactionAppend(coordinator.route(TARGET), "new");
+        publish();
+        ExecutionFence.configure(Map.of("resync-recover-only", "true", "resync-launch-id", "launch-a"));
+        ResyncCoordinator recovery = new ResyncCoordinator(catalog, sessions, clock);
+        assertTrue(recovery.control(IcebergPayload.PayloadType.PREPARE_RESYNC, request().build()).getResyncPublished());
+        assertThrows(IllegalStateException.class, () -> recovery.control(IcebergPayload.PayloadType.PREPARE_RESYNC,
+                request().setResyncCheckpoint("{\"wrong\":true}").build()));
+        ExecutionFence.configure(Map.of("resync-recover-only", "true", "resync-launch-id", "launch-b"));
+        assertThrows(IllegalStateException.class,
+                () -> recovery.control(IcebergPayload.PayloadType.PREPARE_RESYNC, request().build()));
+    }
+
+    @Test
+    void closureBeforePublicationDispatchLeavesCatalogUntouched() throws Exception {
+        create(2);
+        Path fence = directory.resolve("execution-fence.json");
+        java.nio.file.Files.writeString(fence, "{\"version\":1,\"execution_id\":\"runtime\",\"state\":\"open\"}");
+        ExecutionFence.configure(Map.of("execution-id", "runtime", "execution-fence", fence.toString()));
+        prepare();
+        transactionAppend(coordinator.route(TARGET), "new");
+        int commits = catalog.commits;
+        java.nio.file.Files.writeString(fence, "{\"version\":1,\"execution_id\":\"runtime\",\"state\":\"closed\"}");
+        assertThrows(IllegalStateException.class, this::publish);
+        assertEquals(commits, catalog.commits);
     }
 
     @ParameterizedTest
@@ -814,6 +889,42 @@ class ResyncCoordinatorTest {
         assertEquals(oldFiles, removed);
     }
 
+    @Test
+    void closedFenceStillPermitsDefinitiveSerializedAbortAndStatus() throws Exception {
+        create(2);
+        java.nio.file.Path fence = directory.resolve("closed-reconciliation.json");
+        java.nio.file.Files.writeString(fence, "{\"version\":1,\"execution_id\":\"runtime\",\"state\":\"open\"}");
+        ExecutionFence.configure(Map.of("execution-id", "runtime", "execution-fence", fence.toString(),
+                "resync-launch-id", "launch"));
+        prepare();
+        int commits = catalog.commits;
+        java.nio.file.Files.writeString(fence, "{\"version\":1,\"execution_id\":\"runtime\",\"state\":\"closed\"}");
+        assertFalse(coordinator.control(IcebergPayload.PayloadType.RESYNC_STATUS, request().build()).getResyncPublished());
+        assertFalse(coordinator.control(IcebergPayload.PayloadType.ABORT_RESYNC, request().build()).getResyncPublished());
+        assertFalse(coordinator.control(IcebergPayload.PayloadType.RESYNC_STATUS, request().build()).getResyncPublished());
+        assertThrows(IllegalStateException.class, this::publish);
+        assertEquals(commits, catalog.commits);
+    }
+
+    @Test
+    void closedFenceCannotTurnPreviouslyDispatchedUnknownIntoUnpublished() throws Exception {
+        create(2);
+        java.nio.file.Path fence = directory.resolve("closed-unknown.json");
+        java.nio.file.Files.writeString(fence, "{\"version\":1,\"execution_id\":\"runtime\",\"state\":\"open\"}");
+        ExecutionFence.configure(Map.of("execution-id", "runtime", "execution-fence", fence.toString(),
+                "resync-launch-id", "launch"));
+        prepare();
+        catalog.delayThenConflict = true;
+        assertThrows(CommitStateUnknownException.class, this::publish);
+        java.nio.file.Files.writeString(fence, "{\"version\":1,\"execution_id\":\"runtime\",\"state\":\"closed\"}");
+        assertThrows(CommitStateUnknownException.class,
+                () -> coordinator.control(IcebergPayload.PayloadType.ABORT_RESYNC, request().build()));
+        assertThrows(CommitStateUnknownException.class,
+                () -> coordinator.control(IcebergPayload.PayloadType.RESYNC_STATUS, request().build()));
+        catalog.delayedCommit.run();
+        assertTrue(coordinator.control(IcebergPayload.PayloadType.RESYNC_STATUS, request().build()).getResyncPublished());
+    }
+
     private Table create(int version) {
         return catalog.createTable(TARGET, SCHEMA, PartitionSpec.unpartitioned(),
                 Map.of("format-version", Integer.toString(version)));
@@ -1084,6 +1195,8 @@ class ResyncCoordinatorTest {
     private static final class FaultCatalog extends HadoopCatalog {
         boolean failBeforeCommit;
         boolean failAfterCommit;
+        boolean delayThenConflict;
+        Runnable delayedCommit;
         int commits;
         int metadataWrites;
 
@@ -1097,6 +1210,11 @@ class ResyncCoordinatorTest {
                 @Override public TableMetadata current() { return delegate.current(); }
                 @Override public TableMetadata refresh() { return delegate.refresh(); }
                 @Override public void commit(TableMetadata base, TableMetadata metadata) {
+                    if (delayThenConflict) {
+                        delayedCommit = () -> delegate.commit(base, metadata);
+                        // The earlier 503 request is still in flight when a retry returns 409.
+                        throw new CommitFailedException("Final 409 after an earlier ambiguous 503");
+                    }
                     if (failBeforeCommit) {
                         throw new CommitStateUnknownException("Injected lost catalog response", new IOException("catalog unavailable"));
                     }

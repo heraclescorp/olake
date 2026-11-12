@@ -37,6 +37,10 @@ const (
 	IcebergPayload_PUBLISH_RESYNC IcebergPayload_PayloadType = 9
 	IcebergPayload_ABORT_RESYNC   IcebergPayload_PayloadType = 10
 	IcebergPayload_RESYNC_STATUS  IcebergPayload_PayloadType = 11
+	// Read-only startup handshake; old writers reject this unknown type before any table mutation.
+	IcebergPayload_EXECUTION_CAPABILITY IcebergPayload_PayloadType = 12
+	// Terminal local admission seal and catalog-dispatch outcome, never a data publication.
+	IcebergPayload_EXECUTION_RETIRE IcebergPayload_PayloadType = 13
 )
 
 // Enum value maps for IcebergPayload_PayloadType.
@@ -54,6 +58,8 @@ var (
 		9:  "PUBLISH_RESYNC",
 		10: "ABORT_RESYNC",
 		11: "RESYNC_STATUS",
+		12: "EXECUTION_CAPABILITY",
+		13: "EXECUTION_RETIRE",
 	}
 	IcebergPayload_PayloadType_value = map[string]int32{
 		"RECORDS":              0,
@@ -68,6 +74,8 @@ var (
 		"PUBLISH_RESYNC":       9,
 		"ABORT_RESYNC":         10,
 		"RESYNC_STATUS":        11,
+		"EXECUTION_CAPABILITY": 12,
+		"EXECUTION_RETIRE":     13,
 	}
 )
 
@@ -2271,7 +2279,7 @@ var File_records_ingest_proto protoreflect.FileDescriptor
 
 const file_records_ingest_proto_rawDesc = "" +
 	"\n" +
-	"\x14records_ingest.proto\x12\x14io.olake.iceberg.rpc\"\xec\x11\n" +
+	"\x14records_ingest.proto\x12\x14io.olake.iceberg.rpc\"\x9c\x12\n" +
 	"\x0eIcebergPayload\x12D\n" +
 	"\x04type\x18\x01 \x01(\x0e20.io.olake.iceberg.rpc.IcebergPayload.PayloadTypeR\x04type\x12I\n" +
 	"\bmetadata\x18\x02 \x01(\v2-.io.olake.iceberg.rpc.IcebergPayload.MetadataR\bmetadata\x12H\n" +
@@ -2328,7 +2336,7 @@ const file_records_ingest_proto_rawDesc = "" +
 	"bytesValueB\a\n" +
 	"\x05valueB\x13\n" +
 	"\x11_delete_file_pathB\x12\n" +
-	"\x10_delete_position\"\xef\x01\n" +
+	"\x10_delete_position\"\x9f\x02\n" +
 	"\vPayloadType\x12\v\n" +
 	"\aRECORDS\x10\x00\x12\n" +
 	"\n" +
@@ -2344,7 +2352,9 @@ const file_records_ingest_proto_rawDesc = "" +
 	"\x0ePUBLISH_RESYNC\x10\t\x12\x10\n" +
 	"\fABORT_RESYNC\x10\n" +
 	"\x12\x11\n" +
-	"\rRESYNC_STATUS\x10\v\"~\n" +
+	"\rRESYNC_STATUS\x10\v\x12\x18\n" +
+	"\x14EXECUTION_CAPABILITY\x10\f\x12\x14\n" +
+	"\x10EXECUTION_RETIRE\x10\r\"~\n" +
 	"\n" +
 	"DeleteMode\x12\x1b\n" +
 	"\x17DELETE_MODE_UNSPECIFIED\x10\x00\x12\x18\n" +

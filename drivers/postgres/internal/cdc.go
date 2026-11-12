@@ -323,6 +323,9 @@ func (p *Postgres) StreamChanges(ctx context.Context, _ int, metadataStates map[
 }
 
 func (p *Postgres) PostCDC(ctx context.Context, _ int) error {
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
 	if p.replicator == nil {
 		return nil
 	}

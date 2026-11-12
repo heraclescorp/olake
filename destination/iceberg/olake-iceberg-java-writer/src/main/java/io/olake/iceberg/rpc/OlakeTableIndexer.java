@@ -69,6 +69,7 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
     boolean completed = false;
 
     try {
+      io.olake.iceberg.ExecutionFence.requireMutation();
       IcebergSession session = requireSession(request.getThreadId());
       tableName = session.icebergTable.name();
       Long fromSnapshotId = request.hasFromSnapshotId() ? request.getFromSnapshotId() : null;
@@ -104,6 +105,7 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
       StreamObserver<MigrateEqualityDeletesResponse> responseObserver) {
     IcebergSession session = null;
     try {
+      io.olake.iceberg.ExecutionFence.requireMutation();
       session = requireSession(request.getThreadId());
       synchronized (session) {
       session.requireOpen();
@@ -147,6 +149,7 @@ public class OlakeTableIndexer extends TableIndexServiceGrpc.TableIndexServiceIm
     CompletableFuture<?>[] reads;
 
     try {
+      io.olake.iceberg.ExecutionFence.requireMutation();
       IcebergSession session = requireSession(request.getThreadId());
       Set<String> paths = new HashSet<>();
       for (ReadRowsRequest.FileRows file : request.getFilesList()) {

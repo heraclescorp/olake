@@ -57,6 +57,9 @@ type Replicator interface {
 }
 
 func ConnectReplication(ctx context.Context, config *Config) (*pgconn.PgConn, error) {
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return nil, err
+	}
 	// Build PostgreSQL connection config
 	connURL := config.Connection
 	q := connURL.Query()
@@ -158,8 +161,14 @@ func AdvanceLSN(ctx context.Context, db *sqlx.DB, slot, currentWalPos string) (p
 	defer cancel()
 	for {
 		var endLSN pglogrepl.LSN
-		if err := db.QueryRowContext(timeoutCtx, fmt.Sprintf(AdvanceLSNTemplate, slot, currentWalPos)).Scan(&endLSN); err != nil {
-			return 0, fmt.Errorf("failed to advance replication slot: %w", err)
+		if err := utils.CheckExecutionFence(timeoutCtx); err != nil {
+			return 0, err
+		}
+		settled := utils.BeginExecutionParticipant(timeoutCtx)
+		advanceErr := db.QueryRowContext(timeoutCtx, fmt.Sprintf(AdvanceLSNTemplate, slot, currentWalPos)).Scan(&endLSN)
+		settled(advanceErr == nil)
+		if advanceErr != nil {
+			return 0, fmt.Errorf("failed to advance replication slot: %w", advanceErr)
 		}
 		if endLSN >= target {
 			logger.Debugf("advanced LSN to %s", endLSN)
@@ -178,9 +187,16 @@ func AdvanceLSN(ctx context.Context, db *sqlx.DB, slot, currentWalPos string) (p
 
 // Confirm that Logs has been recorded
 // in fake ack prev confirmed flush lsn is sent
-func AcknowledgeLSN(ctx context.Context, db *sqlx.DB, socket *Socket, fakeAck bool) error {
+func AcknowledgeLSN(ctx context.Context, db *sqlx.DB, socket *Socket, fakeAck bool) (err error) {
 	walPosition := utils.Ternary(fakeAck, socket.ConfirmedFlushLSN, socket.ClientXLogPos).(pglogrepl.LSN)
-	err := pglogrepl.SendStandbyStatusUpdate(ctx, socket.pgConn, pglogrepl.StandbyStatusUpdate{
+	if !fakeAck {
+		if err := utils.CheckExecutionFence(ctx); err != nil {
+			return err
+		}
+		settled := utils.BeginExecutionParticipant(ctx)
+		defer func() { settled(err == nil) }()
+	}
+	err = pglogrepl.SendStandbyStatusUpdate(ctx, socket.pgConn, pglogrepl.StandbyStatusUpdate{
 		WALWritePosition: walPosition,
 		WALFlushPosition: walPosition,
 		ClientTime:       time.Now(),

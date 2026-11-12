@@ -60,6 +60,7 @@ public class IcebergUtil {
     // multiple threads can try to create the namespace concurrently;
     // AlreadyExists means another thread won the race, which is fine.
     try {
+      ExecutionFence.requireCatalogMutation(icebergCatalog);
       ((SupportsNamespaces) icebergCatalog).createNamespace(tableIdentifier.namespace());
       LOGGER.warn("Created namespace:'{}'", tableIdentifier.namespace());
     } catch (AlreadyExistsException e) {
@@ -71,6 +72,7 @@ public class IcebergUtil {
 
   public static Table createIcebergTable(Catalog icebergCatalog, TableIdentifier tableIdentifier, Schema schema) {
     ensureNamespace(icebergCatalog, tableIdentifier);
+    ExecutionFence.requireCatalogMutation(icebergCatalog);
     return icebergCatalog.createTable(tableIdentifier, schema);
   }
 
@@ -102,6 +104,7 @@ public class IcebergUtil {
     // If we have partition transforms, create a PartitionSpec
     if (partitionTransforms.isEmpty()) {
       // No partitioning - create a table as before
+      ExecutionFence.requireCatalogMutation(icebergCatalog);
       return icebergCatalog.buildTable(tableIdentifier, schema)
               .withProperty(FORMAT_VERSION, String.valueOf(formatVersion))
               .withProperty(DEFAULT_FILE_FORMAT, writeFormat.toLowerCase(Locale.ENGLISH))
@@ -162,6 +165,7 @@ public class IcebergUtil {
       }
       
       // Create the table with the partition spec
+      ExecutionFence.requireCatalogMutation(icebergCatalog);
       return icebergCatalog.buildTable(tableIdentifier, schema)
               .withProperty(FORMAT_VERSION, String.valueOf(formatVersion))
               .withProperty(DEFAULT_FILE_FORMAT, writeFormat.toLowerCase(Locale.ENGLISH))
@@ -239,6 +243,7 @@ public class IcebergUtil {
         LOGGER.warn("Table not found: {}", tableID.toString());
         return false;
       }
+      ExecutionFence.requireCatalogMutation(icebergCatalog);
       return icebergCatalog.dropTable(tableID, true);
     } catch(Exception e){
       LOGGER.error("Failed to drop table {}.{}: {}", namespace, tableName, e.getMessage());

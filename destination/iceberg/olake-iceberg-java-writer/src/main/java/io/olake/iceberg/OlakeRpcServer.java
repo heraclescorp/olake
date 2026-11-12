@@ -9,6 +9,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.catalog.Catalog;
 import org.slf4j.Logger;
+import org.apache.iceberg.rest.RESTCatalog;
 import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -65,13 +66,14 @@ public class OlakeRpcServer {
                 }
             });
 
+            ExecutionFence.configure(stringConfigMap);
             configureResyncCatalog(stringConfigMap);
             stringConfigMap.forEach(hadoopConf::set);
             icebergProperties.putAll(stringConfigMap);
 
             String catalogName = stringConfigMap.getOrDefault("catalog-name", "iceberg");
 
-            icebergCatalog = CatalogUtil.buildIcebergCatalog(catalogName, icebergProperties, hadoopConf);
+            icebergCatalog = buildCatalog(catalogName, icebergProperties, hadoopConf);
 
             boolean arrowWriterEnabled = Boolean.parseBoolean(
                 stringConfigMap.getOrDefault("arrow-writer-enabled", "false"));
@@ -142,6 +144,17 @@ public class OlakeRpcServer {
         telemetry.close();
         recording.close();
     }
+    static Catalog buildCatalog(String name, Map<String, String> properties, Configuration conf) {
+        if (!properties.getOrDefault("execution-id", "").isBlank()
+                && "org.apache.iceberg.rest.RESTCatalog".equals(properties.get("catalog-impl"))) {
+            RESTCatalog catalog = new RESTCatalog(SingleAttemptRESTClient::new);
+            catalog.setConf(conf);
+            catalog.initialize(name, properties);
+            return catalog;
+        }
+        return CatalogUtil.buildIcebergCatalog(name, properties, conf);
+    }
+
     static void configureResyncCatalog(Map<String, String> properties) {
         if (!Boolean.parseBoolean(properties.remove("atomic-resync-enabled"))) {
             return;
@@ -149,7 +162,7 @@ public class OlakeRpcServer {
         boundTimeout(properties, "rest.client.connection-timeout-ms", 30_000);
         boundTimeout(properties, "rest.client.socket-timeout-ms", 60_000);
         int retries = Integer.parseInt(properties.getOrDefault("rest.client.max-retries", "5"));
-        properties.put("rest.client.max-retries", Integer.toString(Math.max(0, Math.min(5, retries))));
+        properties.put("rest.client.max-retries", Integer.toString(Math.max(1, Math.min(5, retries))));
     }
 
     private static void boundTimeout(Map<String, String> properties, String key, long maximum) {

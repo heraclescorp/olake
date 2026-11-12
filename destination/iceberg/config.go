@@ -1,6 +1,7 @@
 package iceberg
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"slices"
@@ -28,7 +29,13 @@ const (
 
 // TODO: add validation for each catalog properly
 type Config struct {
-	atomicResync bool
+	atomicResync      bool
+	executionID       string
+	executionFence    string
+	executionCommand  string
+	executionContext  context.Context
+	resyncLaunchID    string
+	resyncRecoverOnly bool
 
 	// S3-compatible Storage Configuration
 	Region             string `json:"aws_region,omitempty"`

@@ -14,6 +14,7 @@ import (
 	"github.com/datazip-inc/olake/destination"
 	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
 )
 
 type resyncControl struct {
@@ -30,7 +31,7 @@ type resyncControl struct {
 func (i *Iceberg) PrepareResync(ctx context.Context, stream types.StreamInterface, operationID string, baseline *types.State) (*types.State, error) {
 	i.resyncMu.Lock()
 	defer i.resyncMu.Unlock()
-	if err := ctx.Err(); err != nil {
+	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return nil, err
 	}
 	if strings.TrimSpace(operationID) == "" {
@@ -60,6 +61,9 @@ func (i *Iceberg) PrepareResync(ctx context.Context, stream types.StreamInterfac
 		return nil, fmt.Errorf("failed to prepare atomic resync: %w", err)
 	}
 	if !response.GetResyncPublished() {
+		if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
+			return nil, fmt.Errorf("UNKNOWN: recovery-only resync has no matching durable publication marker")
+		}
 		return nil, nil
 	}
 	return i.acceptPublishedResync(response, "")
@@ -68,6 +72,9 @@ func (i *Iceberg) PrepareResync(ctx context.Context, stream types.StreamInterfac
 func (i *Iceberg) PublishResync(ctx context.Context, checkpoint *types.State) error {
 	i.resyncMu.Lock()
 	defer i.resyncMu.Unlock()
+	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
+		return fmt.Errorf("recovery-only resync cannot publish replacement data")
+	}
 	if i.resync == nil || i.resync.aborted {
 		return fmt.Errorf("atomic resync has not been prepared or was aborted")
 	}
@@ -156,6 +163,13 @@ func (i *Iceberg) ResyncReceipt() (string, int64) {
 }
 
 func (i *Iceberg) resyncRequest(ctx context.Context, kind proto.IcebergPayload_PayloadType, checkpoint string) (*proto.RecordIngestResponse, error) {
+	// Status/abort do not dispatch new data publication. Let the JVM decide
+	// whether reconciliation is still possible; rejection must remain UNKNOWN.
+	if kind == proto.IcebergPayload_PREPARE_RESYNC || kind == proto.IcebergPayload_PUBLISH_RESYNC {
+		if err := utils.CheckExecutionFence(ctx); err != nil {
+			return nil, err
+		}
+	}
 	response, err := i.server.client.SendRecords(ctx, &proto.IcebergPayload{
 		Type: kind,
 		Metadata: &proto.IcebergPayload_Metadata{

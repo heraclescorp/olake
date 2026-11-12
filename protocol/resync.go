@@ -34,6 +34,8 @@ var (
 	resyncResultURI   string
 	resyncFailurePath string
 	resyncFailureURI  string
+	resyncLaunchID    string
+	resyncRecoverOnly bool
 )
 
 var resyncCmd = &cobra.Command{
@@ -65,7 +67,7 @@ var resyncCmd = &cobra.Command{
 				return fmt.Errorf("remove previous resync evidence: %w", err)
 			}
 		}
-		return writeResyncEvidence(cmd.Context(), resyncFailurePath, resyncFailureURI, resyncID, resyncNamespace, resyncTable, "in_progress")
+		return writeResyncEvidence(cmd.Context(), resyncFailurePath, resyncFailureURI, resyncID, resyncNamespace, resyncTable, "in_progress", executionID, resyncLaunchID)
 	},
 	RunE: runResync,
 }
@@ -74,6 +76,8 @@ func init() {
 	resyncCmd.Flags().StringVar(&resyncNamespace, "resync-namespace", "", "Required source namespace of the saved selected table")
 	resyncCmd.Flags().StringVar(&resyncTable, "resync-table", "", "Required source name of the saved selected table")
 	resyncCmd.Flags().StringVar(&resyncID, "resync-id", "", "Required stable operation ID; reuse unchanged when retrying this request")
+	resyncCmd.Flags().StringVar(&resyncLaunchID, "resync-launch-id", "", "Admitted data launch identity, preserved by recovery runtimes")
+	resyncCmd.Flags().BoolVar(&resyncRecoverOnly, "resync-recover-only", false, "Recover only an existing durable publication; never stage or publish replacement data")
 }
 
 func validateResyncFlags() error {
@@ -90,14 +94,23 @@ func validateResyncFlags() error {
 	if noSave {
 		return fmt.Errorf("atomic resync requires final state and publication receipt; --no-save is not supported")
 	}
+	if (executionID != "" || executionFence != "") && strings.TrimSpace(resyncLaunchID) == "" {
+		return fmt.Errorf("controlled atomic resync requires --resync-launch-id")
+	}
+	if resyncRecoverOnly && strings.TrimSpace(resyncLaunchID) == "" {
+		return fmt.Errorf("recovery-only atomic resync requires --resync-launch-id")
+	}
 	return nil
 }
 
 func runResync(cmd *cobra.Command, _ []string) (err error) {
 	ctx, cancel := context.WithTimeout(cmd.Context(), resyncMaximumDuration)
 	defer cancel()
-	ctx = types.WithResync(ctx, &types.ResyncOptions{Namespace: resyncNamespace, Table: resyncTable, ID: resyncID})
+	ctx = types.WithResync(ctx, &types.ResyncOptions{Namespace: resyncNamespace, Table: resyncTable, ID: resyncID, LaunchID: resyncLaunchID, RecoverOnly: resyncRecoverOnly})
 	defer recoverToError(&err)
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
 	if err := connector.Setup(ctx); err != nil {
 		return err
 	}
@@ -144,7 +157,7 @@ func runResync(cmd *cobra.Command, _ []string) (err error) {
 	}
 	defer pool.Shutdown(context.Background())
 	defer func() {
-		if !pool.ResyncPublished() {
+		if !resyncRecoverOnly && !pool.ResyncPublished() {
 			if abortErr := pool.AbortResync(context.Background()); abortErr != nil {
 				err = errors.Join(err, fmt.Errorf("abort resync: %w", abortErr))
 				return
@@ -153,7 +166,7 @@ func runResync(cmd *cobra.Command, _ []string) (err error) {
 				err = errors.Join(err, fmt.Errorf("resync cleanup: %w", cleanupErr))
 				return
 			}
-			if evidenceErr := writeResyncFailure(resyncFailurePath, resyncFailureURI, resyncID, resyncNamespace, resyncTable); evidenceErr != nil {
+			if evidenceErr := writeResyncFailure(resyncFailurePath, resyncFailureURI, resyncID, resyncNamespace, resyncTable, executionID, resyncLaunchID); evidenceErr != nil {
 				err = errors.Join(err, fmt.Errorf("emit definite resync failure: %w", evidenceErr))
 			}
 		}
@@ -170,6 +183,9 @@ func runResync(cmd *cobra.Command, _ []string) (err error) {
 			return err
 		}
 	} else {
+		if resyncRecoverOnly {
+			return fmt.Errorf("UNKNOWN: no matching durable publication checkpoint for recovery-only resync")
+		}
 		state.SuppressPersistence = true
 		if err := connector.PrepareResync(ctx, target); err != nil {
 			return err
@@ -197,10 +213,13 @@ func runResync(cmd *cobra.Command, _ []string) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
 	uuid, snapshot := pool.ResyncReceipt()
 	if err := writeResyncArtifacts(viper.GetString(constants.StatePath), resyncResultPath, state, resyncReceipt{
 		Version: 1, ResyncID: resyncID, Namespace: resyncNamespace, StreamName: resyncTable,
-		TableUUID: uuid, SnapshotID: snapshot,
+		TableUUID: uuid, SnapshotID: snapshot, ExecutionID: executionID, LaunchID: resyncLaunchID,
 	}); err != nil {
 		return err
 	}
@@ -267,6 +286,8 @@ type resyncReceipt struct {
 	TableUUID   string `json:"table_uuid"`
 	SnapshotID  int64  `json:"snapshot_id"`
 	StateSHA256 string `json:"state_sha256"`
+	ExecutionID string `json:"execution_id"`
+	LaunchID    string `json:"launch_id"`
 }
 
 func canonicalResyncState(data []byte) ([]byte, error) {
@@ -289,6 +310,9 @@ func canonicalResyncState(data []byte) ([]byte, error) {
 func writeResyncArtifacts(stateFile, receiptFile string, finalState *types.State, receipt resyncReceipt) error {
 	if receipt.Version != 1 || strings.TrimSpace(receipt.ResyncID) == "" || strings.TrimSpace(receipt.TableUUID) == "" || receipt.SnapshotID <= 0 {
 		return fmt.Errorf("destination publication receipt is incomplete")
+	}
+	if receipt.ExecutionID != "" && strings.TrimSpace(receipt.LaunchID) == "" {
+		return fmt.Errorf("controlled destination publication receipt requires a launch identity")
 	}
 	data, err := finalState.MarshalJSON()
 	if err != nil {
@@ -313,20 +337,22 @@ func writeResyncArtifacts(stateFile, receiptFile string, finalState *types.State
 	return nil
 }
 
-func writeResyncFailure(path, uri, operationID, namespace, stream string) error {
+func writeResyncFailure(path, uri, operationID, namespace, stream, executionID, launchID string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	return writeResyncEvidence(ctx, path, uri, operationID, namespace, stream, "not_published")
+	return writeResyncEvidence(ctx, path, uri, operationID, namespace, stream, "not_published", executionID, launchID)
 }
 
-func writeResyncEvidence(ctx context.Context, path, uri, operationID, namespace, stream, publication string) error {
+func writeResyncEvidence(ctx context.Context, path, uri, operationID, namespace, stream, publication, executionID, launchID string) error {
 	data, err := json.Marshal(struct {
 		Version     int    `json:"version"`
 		ResyncID    string `json:"resync_id"`
 		Namespace   string `json:"namespace"`
 		StreamName  string `json:"stream_name"`
 		Publication string `json:"publication"`
-	}{1, operationID, namespace, stream, publication})
+		ExecutionID string `json:"execution_id"`
+		LaunchID    string `json:"launch_id"`
+	}{1, operationID, namespace, stream, publication, executionID, launchID})
 	if err != nil {
 		return err
 	}

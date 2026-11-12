@@ -309,18 +309,22 @@ func (a *AbstractDriver) ClearState(streams []types.StreamInterface) (*types.Sta
 
 func (a *AbstractDriver) Read(ctx context.Context, pool *destination.WriterPool, backfillStreams, cdcStreams, incrementalStreams []types.StreamInterface) (err error) {
 	_, resync := types.ResyncFromContext(ctx)
+	readCtx, cancel := context.WithCancel(ctx)
+	ctx = readCtx
+	// Every read generation inherits the actual command's runtime fence. The
+	// groups created before CLI flags were parsed cannot authorize worker work.
+	a.GlobalCtxGroup = utils.NewCGroup(ctx)
+	a.GlobalConnGroup = utils.NewCGroup(ctx)
 	if resync {
-		readCtx, cancel := context.WithCancel(ctx)
-		ctx = readCtx
-		a.GlobalCtxGroup = utils.NewCGroup(ctx)
-		a.GlobalConnGroup = utils.NewCGroup(ctx)
 		a.resyncPostCDC = nil
-		defer func() {
-			cancel()
-			// Early orchestration errors must join every running writer before abort.
-			err = errors.Join(err, a.GlobalCtxGroup.Block(), a.GlobalConnGroup.Block())
-		}()
 	}
+	defer func() {
+		cancel()
+		// A local read/TOAST error is not unsettled work: join all writers first,
+		// then report the drain independently of the operation's success status.
+		err = errors.Join(err, a.GlobalCtxGroup.Block(), a.GlobalConnGroup.Block())
+		utils.SourceDrained(ctx, nil)
+	}()
 	// set max read connections
 	if a.driver.MaxConnections() > 0 {
 		a.GlobalConnGroup = utils.NewCGroupWithLimit(ctx, a.driver.MaxConnections())

@@ -107,6 +107,7 @@ func TestResyncArtifactsBindPublishedIdentityAndFullCheckpoint(t *testing.T) {
 	}
 	require.NoError(t, writeResyncArtifacts(stateFile, receiptFile, checkpoint, resyncReceipt{
 		Version: 1, ResyncID: "workflow-stable-id", Namespace: "public", StreamName: "target", TableUUID: "original-uuid", SnapshotID: 123,
+		ExecutionID: "recovery-runtime-2", LaunchID: "admitted-launch-1",
 	}))
 	stateBytes, err := os.ReadFile(stateFile)
 	require.NoError(t, err)
@@ -122,6 +123,8 @@ func TestResyncArtifactsBindPublishedIdentityAndFullCheckpoint(t *testing.T) {
 	digest := sha256.Sum256(canonical)
 	require.Equal(t, hex.EncodeToString(digest[:]), receipt.StateSHA256)
 	require.Equal(t, "workflow-stable-id", receipt.ResyncID)
+	require.Equal(t, "recovery-runtime-2", receipt.ExecutionID)
+	require.Equal(t, "admitted-launch-1", receipt.LaunchID)
 	require.Equal(t, "original-uuid", receipt.TableUUID)
 	require.EqualValues(t, 123, receipt.SnapshotID)
 }
@@ -132,6 +135,8 @@ func TestResyncIncompletePublicationCannotReplaceStateOrEmitReceipt(t *testing.T
 		{Version: 1, ResyncID: "stable", TableUUID: "uuid"},
 		{Version: 1, TableUUID: "uuid", SnapshotID: 1},
 		{Version: 2, ResyncID: "stable", TableUUID: "uuid", SnapshotID: 1},
+		{Version: 1, ResyncID: "stable", TableUUID: "uuid", SnapshotID: 1, ExecutionID: "runtime"},
+		{Version: 1, ResyncID: "stable", TableUUID: "uuid", SnapshotID: 1, ExecutionID: "runtime", LaunchID: " "},
 	} {
 		dir := t.TempDir()
 		stateFile, receiptFile := filepath.Join(dir, "state.json"), filepath.Join(dir, "resync-result.json")
@@ -159,13 +164,15 @@ func TestResyncDefiniteFailureArtifactDoesNotTouchCheckpoint(t *testing.T) {
 	stateFile := filepath.Join(dir, "state.json")
 	require.NoError(t, os.WriteFile(stateFile, []byte("original"), 0600))
 	failureFile := filepath.Join(dir, "resync-failure.json")
-	require.NoError(t, writeResyncFailure(failureFile, "", "stable", "public", "target"))
+	require.NoError(t, writeResyncFailure(failureFile, "", "stable", "public", "target", "runtime-1", "launch-1"))
 	data, err := os.ReadFile(failureFile)
 	require.NoError(t, err)
 	var evidence map[string]any
 	require.NoError(t, json.Unmarshal(data, &evidence))
 	require.Equal(t, "not_published", evidence["publication"])
 	require.Equal(t, "stable", evidence["resync_id"])
+	require.Equal(t, "runtime-1", evidence["execution_id"])
+	require.Equal(t, "launch-1", evidence["launch_id"])
 	data, err = os.ReadFile(stateFile)
 	require.NoError(t, err)
 	require.Equal(t, "original", string(data))
@@ -176,7 +183,7 @@ func TestResyncDeadlineAndCommandContract(t *testing.T) {
 	require.Equal(t, 12*time.Hour, resyncMaximumDuration)
 	require.Equal(t, "resync", resyncCmd.Use)
 	require.Contains(t, strings.ToLower(resyncCmd.Long), "12 hours")
-	for _, name := range []string{"resync-namespace", "resync-table", "resync-id"} {
+	for _, name := range []string{"resync-namespace", "resync-table", "resync-id", "resync-launch-id", "resync-recover-only"} {
 		require.NotNil(t, resyncCmd.Flags().Lookup(name))
 	}
 	require.NotSame(t, clearCmd, resyncCmd)
@@ -184,8 +191,8 @@ func TestResyncDeadlineAndCommandContract(t *testing.T) {
 
 func TestResyncRetryInvalidatesPreviousAbortProof(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "resync-failure.json")
-	require.NoError(t, writeResyncFailure(path, "", "same-id", "public", "target"))
-	require.NoError(t, writeResyncEvidence(context.Background(), path, "", "same-id", "public", "target", "in_progress"))
+	require.NoError(t, writeResyncFailure(path, "", "same-id", "public", "target", "runtime", "launch"))
+	require.NoError(t, writeResyncEvidence(context.Background(), path, "", "same-id", "public", "target", "in_progress", "runtime", "launch"))
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 	var evidence map[string]any
@@ -234,4 +241,24 @@ func TestResyncMixedModeCatalogNeverSchedulesUnrelatedRebuilds(t *testing.T) {
 			require.Equal(t, []types.StreamInterface{saved.Streams[2]}, classification.IncrementalStreams)
 		})
 	}
+}
+
+func TestControlledResyncRequiresAdmittedLaunchIdentity(t *testing.T) {
+	namespace, table, operation, savedState, savedNoSave := resyncNamespace, resyncTable, resyncID, statePath, noSave
+	runtime, fence, launch, recoverOnly := executionID, executionFence, resyncLaunchID, resyncRecoverOnly
+	t.Cleanup(func() {
+		resyncNamespace, resyncTable, resyncID, statePath, noSave = namespace, table, operation, savedState, savedNoSave
+		executionID, executionFence, resyncLaunchID, resyncRecoverOnly = runtime, fence, launch, recoverOnly
+	})
+	resyncNamespace, resyncTable, resyncID, statePath, noSave = "public", "target", "stable", "state.json", false
+	executionID, executionFence, resyncLaunchID, resyncRecoverOnly = "runtime", "fence.json", "", false
+	require.ErrorContains(t, validateResyncFlags(), "--resync-launch-id")
+	resyncLaunchID = "original-launch"
+	require.NoError(t, validateResyncFlags())
+	resyncRecoverOnly = true
+	require.NoError(t, validateResyncFlags())
+	executionID, executionFence, resyncLaunchID = "", "", ""
+	require.ErrorContains(t, validateResyncFlags(), "recovery-only")
+	resyncRecoverOnly = false
+	require.NoError(t, validateResyncFlags(), "explicit standalone CLI remains supported")
 }

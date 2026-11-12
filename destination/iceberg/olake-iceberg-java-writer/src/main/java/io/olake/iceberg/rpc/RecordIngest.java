@@ -163,6 +163,22 @@ public final class RecordIngest {
        * <code>RESYNC_STATUS = 11;</code>
        */
       RESYNC_STATUS(11),
+      /**
+       * <pre>
+       * Read-only startup handshake; old writers reject this unknown type before any table mutation.
+       * </pre>
+       *
+       * <code>EXECUTION_CAPABILITY = 12;</code>
+       */
+      EXECUTION_CAPABILITY(12),
+      /**
+       * <pre>
+       * Terminal local admission seal and catalog-dispatch outcome, never a data publication.
+       * </pre>
+       *
+       * <code>EXECUTION_RETIRE = 13;</code>
+       */
+      EXECUTION_RETIRE(13),
       UNRECOGNIZED(-1),
       ;
 
@@ -218,6 +234,22 @@ public final class RecordIngest {
        * <code>RESYNC_STATUS = 11;</code>
        */
       public static final int RESYNC_STATUS_VALUE = 11;
+      /**
+       * <pre>
+       * Read-only startup handshake; old writers reject this unknown type before any table mutation.
+       * </pre>
+       *
+       * <code>EXECUTION_CAPABILITY = 12;</code>
+       */
+      public static final int EXECUTION_CAPABILITY_VALUE = 12;
+      /**
+       * <pre>
+       * Terminal local admission seal and catalog-dispatch outcome, never a data publication.
+       * </pre>
+       *
+       * <code>EXECUTION_RETIRE = 13;</code>
+       */
+      public static final int EXECUTION_RETIRE_VALUE = 13;
 
 
       public final int getNumber() {
@@ -256,6 +288,8 @@ public final class RecordIngest {
           case 9: return PUBLISH_RESYNC;
           case 10: return ABORT_RESYNC;
           case 11: return RESYNC_STATUS;
+          case 12: return EXECUTION_CAPABILITY;
+          case 13: return EXECUTION_RETIRE;
           default: return null;
         }
       }
@@ -31076,7 +31110,7 @@ io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue defaultVal
   static {
     java.lang.String[] descriptorData = {
       "\n\023record_ingest.proto\022\024io.olake.iceberg." +
-      "rpc\"\257\016\n\016IcebergPayload\022>\n\004type\030\001 \001(\01620.i" +
+      "rpc\"\337\016\n\016IcebergPayload\022>\n\004type\030\001 \001(\01620.i" +
       "o.olake.iceberg.rpc.IcebergPayload.Paylo" +
       "adType\022?\n\010metadata\030\002 \001(\0132-.io.olake.iceb" +
       "erg.rpc.IcebergPayload.Metadata\022?\n\007recor" +
@@ -31112,109 +31146,110 @@ io.olake.iceberg.rpc.RecordIngest.IcebergPayload.IceRecord.FieldValue defaultVal
       "value\030\003 \001(\003H\000\022\025\n\013float_value\030\004 \001(\002H\000\022\026\n\014" +
       "double_value\030\005 \001(\001H\000\022\024\n\nbool_value\030\006 \001(\010" +
       "H\000\022\025\n\013bytes_value\030\007 \001(\014H\000B\007\n\005valueB\023\n\021_d" +
-      "elete_file_pathB\022\n\020_delete_position\"\357\001\n\013" +
+      "elete_file_pathB\022\n\020_delete_position\"\237\002\n\013" +
       "PayloadType\022\013\n\007RECORDS\020\000\022\n\n\006COMMIT\020\001\022\021\n\r" +
       "EVOLVE_SCHEMA\020\002\022\016\n\nDROP_TABLE\020\003\022\027\n\023GET_O" +
       "R_CREATE_TABLE\020\004\022\030\n\024REFRESH_TABLE_SCHEMA" +
       "\020\005\022\021\n\rCLOSE_SESSION\020\006\022\021\n\rALTER_COLUMNS\020\007" +
       "\022\022\n\016PREPARE_RESYNC\020\010\022\022\n\016PUBLISH_RESYNC\020\t" +
-      "\022\020\n\014ABORT_RESYNC\020\n\022\021\n\rRESYNC_STATUS\020\013\"~\n" +
-      "\nDeleteMode\022\033\n\027DELETE_MODE_UNSPECIFIED\020\000" +
-      "\022\030\n\024DELETE_MODE_EQUALITY\020\001\022\030\n\024DELETE_MOD" +
-      "E_POSITION\020\002\022\037\n\033DELETE_MODE_DELETION_VEC" +
-      "TOR\020\003\"\261\002\n\024RecordIngestResponse\022\016\n\006result" +
-      "\030\001 \001(\t\022\017\n\007success\030\002 \001(\010\022\027\n\017olake_2pc_sta" +
-      "te\030\003 \001(\t\022\023\n\013snapshot_id\030\004 \001(\003\022\034\n\024has_equ" +
-      "ality_deletes\030\005 \001(\010\022A\n\022file_position_map" +
-      "s\030\006 \003(\0132%.io.olake.iceberg.rpc.FilePosit" +
-      "ionMap\022\030\n\020resync_published\030\007 \001(\010\022\031\n\021resy" +
-      "nc_checkpoint\030\010 \001(\t\022\031\n\021resync_generation" +
-      "\030\t \001(\t\022\031\n\021resync_table_uuid\030\n \001(\t\"\252\001\n\017Fi" +
-      "lePositionMap\022\021\n\tfile_path\030\001 \001(\t\022;\n\006rang" +
-      "es\030\002 \003(\0132+.io.olake.iceberg.rpc.FilePosi" +
-      "tionMap.Range\032G\n\005Range\022\027\n\017batch_start_id" +
-      "x\030\001 \001(\005\022\026\n\016start_position\030\002 \001(\003\022\r\n\005count" +
-      "\030\003 \001(\005\"\235\n\n\014ArrowPayload\022<\n\004type\030\001 \001(\0162.." +
-      "io.olake.iceberg.rpc.ArrowPayload.Payloa" +
-      "dType\022=\n\010metadata\030\002 \001(\0132+.io.olake.icebe" +
-      "rg.rpc.ArrowPayload.Metadata\032\337\002\n\014FileMet" +
-      "adata\022\021\n\tfile_type\030\001 \001(\t\022\021\n\tfile_path\030\002 " +
-      "\001(\t\022\024\n\014record_count\030\003 \001(\003\022X\n\020partition_v" +
-      "alues\030\005 \003(\0132>.io.olake.iceberg.rpc.Arrow" +
-      "Payload.FileMetadata.PartitionValue\032\270\001\n\016" +
-      "PartitionValue\022\023\n\tint_value\030\001 \001(\005H\000\022\024\n\nl" +
-      "ong_value\030\002 \001(\003H\000\022\026\n\014string_value\030\003 \001(\tH" +
-      "\000\022\025\n\013float_value\030\004 \001(\002H\000\022\026\n\014double_value" +
-      "\030\005 \001(\001H\000\022\024\n\nbool_value\030\006 \001(\010H\000\022\025\n\013bytes_" +
-      "value\030\007 \001(\014H\000B\007\n\005value\0329\n\021FileUploadRequ" +
-      "est\022\021\n\tfile_data\030\001 \001(\014\022\021\n\tfile_path\030\002 \001(" +
-      "\t\032\363\001\n\023DeletionVectorBatch\022M\n\007entries\030\001 \003" +
-      "(\0132<.io.olake.iceberg.rpc.ArrowPayload.D" +
-      "eletionVectorBatch.Entry\032\214\001\n\005Entry\022\026\n\016da" +
-      "ta_file_path\030\001 \001(\t\022\021\n\tpositions\030\002 \003(\003\022X\n" +
-      "\020partition_values\030\003 \003(\0132>.io.olake.icebe" +
-      "rg.rpc.ArrowPayload.FileMetadata.Partiti" +
-      "onValue\032\217\003\n\010Metadata\022\027\n\017dest_table_name\030" +
-      "\001 \001(\t\022\021\n\tthread_id\030\002 \001(\t\022F\n\rfile_metadat" +
-      "a\030\003 \003(\0132/.io.olake.iceberg.rpc.ArrowPayl" +
-      "oad.FileMetadata\022N\n\013file_upload\030\004 \001(\01324." +
-      "io.olake.iceberg.rpc.ArrowPayload.FileUp" +
-      "loadRequestH\000\210\001\001\022\017\n\007payload\030\006 \001(\t\022\035\n\020bas" +
-      "e_snapshot_id\030\007 \001(\003H\001\210\001\001\022U\n\020deletion_vec" +
-      "tors\030\010 \001(\01326.io.olake.iceberg.rpc.ArrowP" +
-      "ayload.DeletionVectorBatchH\002\210\001\001B\016\n\014_file" +
-      "_uploadB\023\n\021_base_snapshot_idB\023\n\021_deletio" +
-      "n_vectors\"k\n\013PayloadType\022\017\n\013UPLOAD_FILE\020" +
-      "\000\022\027\n\023REGISTER_AND_COMMIT\020\001\022\016\n\nJSONSCHEMA" +
-      "\020\002\022\014\n\010FILEPATH\020\003\022\024\n\020DELETION_VECTORS\020\004\"\335" +
-      "\001\n\023ArrowIngestResponse\022\016\n\006result\030\001 \001(\t\022U" +
-      "\n\016icebergSchemas\030\002 \003(\0132=.io.olake.iceber" +
-      "g.rpc.ArrowIngestResponse.IcebergSchemas" +
-      "Entry\022\030\n\013snapshot_id\030\003 \001(\003H\000\210\001\001\0325\n\023Icebe" +
-      "rgSchemasEntry\022\013\n\003key\030\001 \001(\t\022\r\n\005value\030\002 \001" +
-      "(\t:\0028\001B\016\n\014_snapshot_id\"^\n\025TableIndexScan" +
-      "Request\022\021\n\tthread_id\030\001 \001(\t\022\035\n\020from_snaps" +
-      "hot_id\030\002 \001(\003H\000\210\001\001B\023\n\021_from_snapshot_id\"\254" +
-      "\001\n\023TableIndexScanBatch\022@\n\007entries\030\001 \003(\0132" +
-      "/.io.olake.iceberg.rpc.TableIndexScanBat" +
-      "ch.Entry\022\023\n\013snapshot_id\030\002 \001(\003\032>\n\005Entry\022\020" +
-      "\n\010olake_id\030\001 \001(\t\022\021\n\tfile_path\030\002 \001(\t\022\020\n\010p" +
-      "osition\030\003 \001(\003\"x\n\035MigrateEqualityDeletesR" +
-      "equest\022\021\n\tthread_id\030\001 \001(\t\022D\n\013target_mode" +
-      "\030\002 \001(\0162/.io.olake.iceberg.rpc.IcebergPay" +
-      "load.DeleteMode\"y\n\036MigrateEqualityDelete" +
-      "sResponse\022\023\n\013snapshot_id\030\001 \001(\003\022\036\n\026rewrit" +
-      "ten_delete_files\030\002 \001(\003\022\"\n\032positional_del" +
-      "etes_written\030\003 \001(\003\"\345\001\n\017ReadRowsRequest\022\021" +
-      "\n\tthread_id\030\001 \001(\t\022=\n\005files\030\002 \003(\0132..io.ol" +
-      "ake.iceberg.rpc.ReadRowsRequest.FileRows" +
-      "\032(\n\003Row\022\020\n\010position\030\001 \001(\003\022\017\n\007columns\030\002 \003" +
-      "(\t\032V\n\010FileRows\022\021\n\tfile_path\030\001 \001(\t\0227\n\004row" +
-      "s\030\002 \003(\0132).io.olake.iceberg.rpc.ReadRowsR" +
-      "equest.Row\"\242\002\n\rReadRowsBatch\0225\n\004rows\030\001 \003" +
-      "(\0132\'.io.olake.iceberg.rpc.ReadRowsBatch." +
-      "Row\032\331\001\n\003Row\022\021\n\tfile_path\030\001 \001(\t\022\020\n\010positi" +
-      "on\030\002 \001(\003\022C\n\006values\030\003 \003(\01323.io.olake.iceb" +
-      "erg.rpc.ReadRowsBatch.Row.ValuesEntry\032h\n" +
-      "\013ValuesEntry\022\013\n\003key\030\001 \001(\t\022H\n\005value\030\002 \001(\013" +
-      "29.io.olake.iceberg.rpc.IcebergPayload.I" +
-      "ceRecord.FieldValue:\0028\0012v\n\023RecordIngestS" +
-      "ervice\022_\n\013SendRecords\022$.io.olake.iceberg" +
-      ".rpc.IcebergPayload\032*.io.olake.iceberg.r" +
-      "pc.RecordIngestResponse2q\n\022ArrowIngestSe" +
-      "rvice\022[\n\nIcebergAPI\022\".io.olake.iceberg.r" +
-      "pc.ArrowPayload\032).io.olake.iceberg.rpc.A" +
-      "rrowIngestResponse2\345\002\n\021TableIndexService" +
-      "\022p\n\024ScanTableForIndexing\022+.io.olake.iceb" +
-      "erg.rpc.TableIndexScanRequest\032).io.olake" +
-      ".iceberg.rpc.TableIndexScanBatch0\001\022\203\001\n\026M" +
-      "igrateEqualityDeletes\0223.io.olake.iceberg" +
-      ".rpc.MigrateEqualityDeletesRequest\0324.io." +
-      "olake.iceberg.rpc.MigrateEqualityDeletes" +
-      "Response\022X\n\010ReadRows\022%.io.olake.iceberg." +
-      "rpc.ReadRowsRequest\032#.io.olake.iceberg.r" +
-      "pc.ReadRowsBatch0\001B\035B\014RecordIngestZ\riceb" +
-      "erg/protob\006proto3"
+      "\022\020\n\014ABORT_RESYNC\020\n\022\021\n\rRESYNC_STATUS\020\013\022\030\n" +
+      "\024EXECUTION_CAPABILITY\020\014\022\024\n\020EXECUTION_RET" +
+      "IRE\020\r\"~\n\nDeleteMode\022\033\n\027DELETE_MODE_UNSPE" +
+      "CIFIED\020\000\022\030\n\024DELETE_MODE_EQUALITY\020\001\022\030\n\024DE" +
+      "LETE_MODE_POSITION\020\002\022\037\n\033DELETE_MODE_DELE" +
+      "TION_VECTOR\020\003\"\261\002\n\024RecordIngestResponse\022\016" +
+      "\n\006result\030\001 \001(\t\022\017\n\007success\030\002 \001(\010\022\027\n\017olake" +
+      "_2pc_state\030\003 \001(\t\022\023\n\013snapshot_id\030\004 \001(\003\022\034\n" +
+      "\024has_equality_deletes\030\005 \001(\010\022A\n\022file_posi" +
+      "tion_maps\030\006 \003(\0132%.io.olake.iceberg.rpc.F" +
+      "ilePositionMap\022\030\n\020resync_published\030\007 \001(\010" +
+      "\022\031\n\021resync_checkpoint\030\010 \001(\t\022\031\n\021resync_ge" +
+      "neration\030\t \001(\t\022\031\n\021resync_table_uuid\030\n \001(" +
+      "\t\"\252\001\n\017FilePositionMap\022\021\n\tfile_path\030\001 \001(\t" +
+      "\022;\n\006ranges\030\002 \003(\0132+.io.olake.iceberg.rpc." +
+      "FilePositionMap.Range\032G\n\005Range\022\027\n\017batch_" +
+      "start_idx\030\001 \001(\005\022\026\n\016start_position\030\002 \001(\003\022" +
+      "\r\n\005count\030\003 \001(\005\"\235\n\n\014ArrowPayload\022<\n\004type\030" +
+      "\001 \001(\0162..io.olake.iceberg.rpc.ArrowPayloa" +
+      "d.PayloadType\022=\n\010metadata\030\002 \001(\0132+.io.ola" +
+      "ke.iceberg.rpc.ArrowPayload.Metadata\032\337\002\n" +
+      "\014FileMetadata\022\021\n\tfile_type\030\001 \001(\t\022\021\n\tfile" +
+      "_path\030\002 \001(\t\022\024\n\014record_count\030\003 \001(\003\022X\n\020par" +
+      "tition_values\030\005 \003(\0132>.io.olake.iceberg.r" +
+      "pc.ArrowPayload.FileMetadata.PartitionVa" +
+      "lue\032\270\001\n\016PartitionValue\022\023\n\tint_value\030\001 \001(" +
+      "\005H\000\022\024\n\nlong_value\030\002 \001(\003H\000\022\026\n\014string_valu" +
+      "e\030\003 \001(\tH\000\022\025\n\013float_value\030\004 \001(\002H\000\022\026\n\014doub" +
+      "le_value\030\005 \001(\001H\000\022\024\n\nbool_value\030\006 \001(\010H\000\022\025" +
+      "\n\013bytes_value\030\007 \001(\014H\000B\007\n\005value\0329\n\021FileUp" +
+      "loadRequest\022\021\n\tfile_data\030\001 \001(\014\022\021\n\tfile_p" +
+      "ath\030\002 \001(\t\032\363\001\n\023DeletionVectorBatch\022M\n\007ent" +
+      "ries\030\001 \003(\0132<.io.olake.iceberg.rpc.ArrowP" +
+      "ayload.DeletionVectorBatch.Entry\032\214\001\n\005Ent" +
+      "ry\022\026\n\016data_file_path\030\001 \001(\t\022\021\n\tpositions\030" +
+      "\002 \003(\003\022X\n\020partition_values\030\003 \003(\0132>.io.ola" +
+      "ke.iceberg.rpc.ArrowPayload.FileMetadata" +
+      ".PartitionValue\032\217\003\n\010Metadata\022\027\n\017dest_tab" +
+      "le_name\030\001 \001(\t\022\021\n\tthread_id\030\002 \001(\t\022F\n\rfile" +
+      "_metadata\030\003 \003(\0132/.io.olake.iceberg.rpc.A" +
+      "rrowPayload.FileMetadata\022N\n\013file_upload\030" +
+      "\004 \001(\01324.io.olake.iceberg.rpc.ArrowPayloa" +
+      "d.FileUploadRequestH\000\210\001\001\022\017\n\007payload\030\006 \001(" +
+      "\t\022\035\n\020base_snapshot_id\030\007 \001(\003H\001\210\001\001\022U\n\020dele" +
+      "tion_vectors\030\010 \001(\01326.io.olake.iceberg.rp" +
+      "c.ArrowPayload.DeletionVectorBatchH\002\210\001\001B" +
+      "\016\n\014_file_uploadB\023\n\021_base_snapshot_idB\023\n\021" +
+      "_deletion_vectors\"k\n\013PayloadType\022\017\n\013UPLO" +
+      "AD_FILE\020\000\022\027\n\023REGISTER_AND_COMMIT\020\001\022\016\n\nJS" +
+      "ONSCHEMA\020\002\022\014\n\010FILEPATH\020\003\022\024\n\020DELETION_VEC" +
+      "TORS\020\004\"\335\001\n\023ArrowIngestResponse\022\016\n\006result" +
+      "\030\001 \001(\t\022U\n\016icebergSchemas\030\002 \003(\0132=.io.olak" +
+      "e.iceberg.rpc.ArrowIngestResponse.Iceber" +
+      "gSchemasEntry\022\030\n\013snapshot_id\030\003 \001(\003H\000\210\001\001\032" +
+      "5\n\023IcebergSchemasEntry\022\013\n\003key\030\001 \001(\t\022\r\n\005v" +
+      "alue\030\002 \001(\t:\0028\001B\016\n\014_snapshot_id\"^\n\025TableI" +
+      "ndexScanRequest\022\021\n\tthread_id\030\001 \001(\t\022\035\n\020fr" +
+      "om_snapshot_id\030\002 \001(\003H\000\210\001\001B\023\n\021_from_snaps" +
+      "hot_id\"\254\001\n\023TableIndexScanBatch\022@\n\007entrie" +
+      "s\030\001 \003(\0132/.io.olake.iceberg.rpc.TableInde" +
+      "xScanBatch.Entry\022\023\n\013snapshot_id\030\002 \001(\003\032>\n" +
+      "\005Entry\022\020\n\010olake_id\030\001 \001(\t\022\021\n\tfile_path\030\002 " +
+      "\001(\t\022\020\n\010position\030\003 \001(\003\"x\n\035MigrateEquality" +
+      "DeletesRequest\022\021\n\tthread_id\030\001 \001(\t\022D\n\013tar" +
+      "get_mode\030\002 \001(\0162/.io.olake.iceberg.rpc.Ic" +
+      "ebergPayload.DeleteMode\"y\n\036MigrateEquali" +
+      "tyDeletesResponse\022\023\n\013snapshot_id\030\001 \001(\003\022\036" +
+      "\n\026rewritten_delete_files\030\002 \001(\003\022\"\n\032positi" +
+      "onal_deletes_written\030\003 \001(\003\"\345\001\n\017ReadRowsR" +
+      "equest\022\021\n\tthread_id\030\001 \001(\t\022=\n\005files\030\002 \003(\013" +
+      "2..io.olake.iceberg.rpc.ReadRowsRequest." +
+      "FileRows\032(\n\003Row\022\020\n\010position\030\001 \001(\003\022\017\n\007col" +
+      "umns\030\002 \003(\t\032V\n\010FileRows\022\021\n\tfile_path\030\001 \001(" +
+      "\t\0227\n\004rows\030\002 \003(\0132).io.olake.iceberg.rpc.R" +
+      "eadRowsRequest.Row\"\242\002\n\rReadRowsBatch\0225\n\004" +
+      "rows\030\001 \003(\0132\'.io.olake.iceberg.rpc.ReadRo" +
+      "wsBatch.Row\032\331\001\n\003Row\022\021\n\tfile_path\030\001 \001(\t\022\020" +
+      "\n\010position\030\002 \001(\003\022C\n\006values\030\003 \003(\01323.io.ol" +
+      "ake.iceberg.rpc.ReadRowsBatch.Row.Values" +
+      "Entry\032h\n\013ValuesEntry\022\013\n\003key\030\001 \001(\t\022H\n\005val" +
+      "ue\030\002 \001(\01329.io.olake.iceberg.rpc.IcebergP" +
+      "ayload.IceRecord.FieldValue:\0028\0012v\n\023Recor" +
+      "dIngestService\022_\n\013SendRecords\022$.io.olake" +
+      ".iceberg.rpc.IcebergPayload\032*.io.olake.i" +
+      "ceberg.rpc.RecordIngestResponse2q\n\022Arrow" +
+      "IngestService\022[\n\nIcebergAPI\022\".io.olake.i" +
+      "ceberg.rpc.ArrowPayload\032).io.olake.icebe" +
+      "rg.rpc.ArrowIngestResponse2\345\002\n\021TableInde" +
+      "xService\022p\n\024ScanTableForIndexing\022+.io.ol" +
+      "ake.iceberg.rpc.TableIndexScanRequest\032)." +
+      "io.olake.iceberg.rpc.TableIndexScanBatch" +
+      "0\001\022\203\001\n\026MigrateEqualityDeletes\0223.io.olake" +
+      ".iceberg.rpc.MigrateEqualityDeletesReque" +
+      "st\0324.io.olake.iceberg.rpc.MigrateEqualit" +
+      "yDeletesResponse\022X\n\010ReadRows\022%.io.olake." +
+      "iceberg.rpc.ReadRowsRequest\032#.io.olake.i" +
+      "ceberg.rpc.ReadRowsBatch0\001B\035B\014RecordInge" +
+      "stZ\riceberg/protob\006proto3"
     };
     descriptor = com.google.protobuf.Descriptors.FileDescriptor
       .internalBuildGeneratedFileFrom(descriptorData,

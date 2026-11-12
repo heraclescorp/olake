@@ -24,6 +24,10 @@ message IcebergPayload {
     PUBLISH_RESYNC = 9;
     ABORT_RESYNC = 10;
     RESYNC_STATUS = 11;
+    // Read-only startup handshake; old writers reject this unknown type before any table mutation.
+    EXECUTION_CAPABILITY = 12;
+    // Terminal local admission seal and catalog-dispatch outcome, never a data publication.
+    EXECUTION_RETIRE = 13;
   }
   
   PayloadType type = 1;

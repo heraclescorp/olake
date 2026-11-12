@@ -3,12 +3,15 @@ package abstract
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/datazip-inc/olake/destination"
 	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -308,4 +311,59 @@ func TestResyncReadFinalizesFullAndIncrementalTargets(t *testing.T) {
 			require.True(t, state.SuppressPersistence)
 		})
 	}
+}
+
+func TestOrdinaryReadDrainsWritersAndKeepsParsedRuntimeContextOnLocalFailure(t *testing.T) {
+	fence := filepath.Join(t.TempDir(), "execution-fence.json")
+	require.NoError(t, os.WriteFile(fence, []byte(`{"version":1,"execution_id":"runtime","state":"open"}`), 0600))
+	ctx := utils.WithExecution(context.Background(), &utils.ExecutionOptions{ID: "runtime", Fence: fence})
+	utils.BeginOrdinaryExecution(ctx, "sync")
+	retireDestination := utils.BeginExecutionParticipant(ctx)
+	target := types.NewStream("target", "public", nil).Wrap(0)
+	other := types.NewStream("other", "public", nil).Wrap(0)
+	checkpoint := &types.State{RWMutex: &sync.RWMutex{}, Type: types.GlobalType, SuppressPersistence: true}
+	checkpoint.SetGlobal(map[string]any{"lsn": "0/100"}, other.ID())
+	closeEntered, releaseClose := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(releaseClose) }) }
+	t.Cleanup(unblock)
+	driver := &resyncTestDriver{stubDriver: stubDriver{typ: "postgres", cdcSupported: true}, post: func() error { return nil },
+		chunks: func(types.StreamInterface) (*types.Set[types.Chunk], error) {
+			<-closeEntered
+			return nil, errors.New("local target planning failed")
+		}}
+	pool := newMetadataWriterPool(t, []types.StreamInterface{target, other}, metadataWriterHooks{
+		Setup: func(workerCtx context.Context, _ types.StreamInterface, _ *destination.Options) (*types.MetadataState, error) {
+			execution, ok := utils.ExecutionFromContext(workerCtx)
+			require.True(t, ok, "worker inherited pre-flags root context instead of runtime fence")
+			require.Equal(t, "runtime", execution.ID)
+			return nil, nil
+		},
+		Close: func(workerCtx context.Context, _ types.StreamInterface, _ *destination.Options, _ any) error {
+			close(closeEntered)
+			<-releaseClose
+			return workerCtx.Err()
+		},
+	})
+	// Driver construction happens before Cobra parses controlled runtime flags.
+	a := NewAbstractDriver(context.Background(), driver)
+	a.SetupState(checkpoint)
+	result := make(chan error, 1)
+	go func() {
+		result <- a.Read(ctx, pool, []types.StreamInterface{target}, []types.StreamInterface{other}, nil)
+	}()
+	waitCleanupEvent(t, closeEntered)
+	select {
+	case <-result:
+		t.Fatal("ordinary Read returned before its CDC writer drained")
+	default:
+	}
+	proof, ok := utils.OrdinaryExecutionResult(ctx)
+	require.True(t, ok)
+	require.Equal(t, "unknown", proof.Outcome)
+	unblock()
+	require.Error(t, waitCleanupResult(t, result))
+	retireDestination(true)
+	proof, _ = utils.OrdinaryExecutionResult(ctx)
+	require.Equal(t, "settled", proof.Outcome, "local failure is not unresolved work after all joins and terminal retirement")
 }

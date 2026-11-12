@@ -103,12 +103,18 @@ func WithKeepDeletesThroughFilter(keep bool) ThreadOptions {
 // NewWriterPool manages a destination's shared resources (e.g., Iceberg JVM) and connection health.
 // It initializes global state, runs checks, and provides thread-level writers. Call Close() to clean up.
 func NewWriterPool(ctx context.Context, config *types.WriterConfig, syncStreams []types.StreamInterface, batchSize int64) (*WriterPool, error) {
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return nil, err
+	}
 	initWriter, found := RegisteredWriters[config.Type]
 	if !found {
 		return nil, errs.Precondition(errs.ConfigInvalid, codeDestinationTypeInvalid,
 			fmt.Errorf("invalid destination type has been passed [%s]", config.Type))
 	}
 
+	if config.Type != types.Iceberg {
+		utils.BeginExecutionParticipant(ctx)(false)
+	}
 	adapter, shutdown, err := initWriter(ctx, config.WriterConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize destination: %w", err)
@@ -127,9 +133,14 @@ func NewWriterPool(ctx context.Context, config *types.WriterConfig, syncStreams 
 	pool.resync, _ = adapter.(resyncDestination)
 
 	stopCheck := logger.TrackTiming("destination", "check")
-	err = adapter.Check(ctx)
+	// Recovery-only must not run the ordinary connection test: it creates a test
+	// table and writes a row, while recovery is strictly read-only at destination.
+	if options, ok := types.ResyncFromContext(ctx); !ok || !options.RecoverOnly {
+		err = adapter.Check(ctx)
+	}
 	stopCheck()
 	if err != nil {
+		pool.Shutdown(ctx)
 		return nil, fmt.Errorf("failed to test destination: %w", err)
 	}
 
@@ -169,6 +180,12 @@ func (w *WriterPool) GetStats() *Stats {
 }
 
 func (w *WriterPool) NewWriter(ctx context.Context, stream types.StreamInterface, options ...ThreadOptions) (*WriterThread, *types.MetadataState, error) {
+	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
+		return nil, nil, fmt.Errorf("recovery-only resync cannot open a data writer")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return nil, nil, err
+	}
 	ctx = observability.WithTable(ctx, stream.Namespace(), stream.Name())
 	w.stats.ThreadCount.Add(1)
 
@@ -456,14 +473,26 @@ func (wt *WriterThread) Close(closeCtx context.Context, finalMetadataState any) 
 }
 
 func DropStreams(ctx context.Context, config *types.WriterConfig, dropStreams []types.StreamInterface) error {
+	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
+		return fmt.Errorf("recovery-only resync cannot drop destination streams")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
 	if len(dropStreams) == 0 {
 		return nil
+	}
+	if config.Type != types.Iceberg {
+		utils.BeginExecutionParticipant(ctx)(false)
 	}
 
 	// Always drop the stream index: dropStreams carry the new update type, not the one the
 	// index was built under, so a dv/pos -> eq clear would otherwise leave a stale index
 	// that outlives the recreated table. Dropping a missing index is a no-op.
 	for _, stream := range dropStreams {
+		if err := utils.CheckExecutionFence(ctx); err != nil {
+			return err
+		}
 		if err := indexdb.Drop(stream); err != nil {
 			return err
 		}

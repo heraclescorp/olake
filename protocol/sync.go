@@ -92,6 +92,12 @@ var syncCmd = &cobra.Command{
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, _ []string) (err error) {
+		sourceReading := false
+		defer func() {
+			if !sourceReading {
+				utils.SourceDrained(cmd.Context(), nil)
+			}
+		}()
 		// setup conector first
 		err = connector.Setup(cmd.Context())
 		if err != nil {
@@ -175,6 +181,7 @@ var syncCmd = &cobra.Command{
 		defer recoverToError(&err)
 
 		stopRead := logger.TrackTiming("sync", "read records")
+		sourceReading = true
 		err = connector.Read(cmd.Context(), pool, selectedStreamsMetadata.FullLoadStreams, selectedStreamsMetadata.CDCStreams, selectedStreamsMetadata.IncrementalStreams)
 		stopRead()
 		if err != nil {

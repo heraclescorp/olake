@@ -4,9 +4,11 @@ import "context"
 
 // ResyncOptions identifies one atomic replacement within the full saved catalog.
 type ResyncOptions struct {
-	Namespace string
-	Table     string
-	ID        string
+	Namespace   string
+	Table       string
+	ID          string
+	LaunchID    string
+	RecoverOnly bool
 }
 
 type resyncContextKey struct{}

@@ -17,6 +17,7 @@ import org.apache.iceberg.types.Types.NestedField;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.olake.iceberg.ExecutionFence;
 import io.olake.iceberg.RuntimeTelemetry;
 import io.olake.iceberg.RuntimeTelemetry.Stage;
 import io.olake.iceberg.rpc.RecordIngest.ArrowPayload;
@@ -56,6 +57,7 @@ public class OlakeArrowIngester extends ArrowIngestServiceGrpc.ArrowIngestServic
         IcebergSession session = null;
 
         try {
+            ExecutionFence.requireMutation();
             ArrowPayload.Metadata metadata = request.getMetadata();
             String threadId = metadata.getThreadId();
 

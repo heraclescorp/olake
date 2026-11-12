@@ -10,6 +10,16 @@ import org.junit.jupiter.api.Test;
 
 class OlakeRpcServerTest {
     @Test
+    void fencedRuntimeNeverPassesUnsupportedZeroRetriesToStockClient() {
+        for (boolean resync : new boolean[] {false, true}) {
+            Map<String, String> properties = new HashMap<>(Map.of("execution-id", "runtime",
+                    "atomic-resync-enabled", Boolean.toString(resync), "rest.client.max-retries", "100"));
+            OlakeRpcServer.configureResyncCatalog(properties);
+            assertEquals(resync ? "5" : "100", properties.get("rest.client.max-retries"));
+        }
+    }
+
+    @Test
     void ordinarySyncCatalogTransportIsUnchanged() {
         Map<String, String> properties = new HashMap<>(Map.of("rest.client.socket-timeout-ms", "0"));
         OlakeRpcServer.configureResyncCatalog(properties);

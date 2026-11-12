@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"github.com/datazip-inc/olake/destination"
 	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 )
@@ -351,4 +354,41 @@ func TestPrepareAndPublishSendSameCanonicalStreamCheckpoint(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, adapter.PublishResync(ctx, checkpoint))
 	require.Len(t, client.requests, 2)
+}
+
+func TestRecoveryOnlyAbsentMarkerCannotPublish(t *testing.T) {
+	client := &resyncControlClient{send: func(_ context.Context, request *proto.IcebergPayload) (*proto.RecordIngestResponse, error) {
+		require.Equal(t, proto.IcebergPayload_PREPARE_RESYNC, request.GetType())
+		return &proto.RecordIngestResponse{Success: true}, nil
+	}}
+	adapter := resyncTestAdapter(client)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	ctx = types.WithResync(ctx, &types.ResyncOptions{ID: "operation-1", LaunchID: "original-launch", RecoverOnly: true})
+	checkpoint, err := adapter.PrepareResync(ctx, types.NewStream("events", "public", nil).Wrap(0), "operation-1", resyncTestState())
+	require.ErrorContains(t, err, "UNKNOWN")
+	require.Nil(t, checkpoint)
+	require.ErrorContains(t, adapter.PublishResync(ctx, resyncTestState()), "cannot publish")
+	require.Len(t, client.requests, 1)
+}
+
+func TestRuntimeClosureBeforePublishNeverDispatchesMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "execution-fence.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"version":1,"execution_id":"runtime","state":"open"}`), 0600))
+	client := &resyncControlClient{send: func(_ context.Context, request *proto.IcebergPayload) (*proto.RecordIngestResponse, error) {
+		require.NotEqual(t, proto.IcebergPayload_PUBLISH_RESYNC, request.GetType(), "closed fence must block publication dispatch")
+		return &proto.RecordIngestResponse{Success: true}, nil
+	}}
+	adapter := resyncTestAdapter(client)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	ctx = utils.WithExecution(ctx, &utils.ExecutionOptions{ID: "runtime", Fence: path})
+	_, err := adapter.PrepareResync(ctx, types.NewStream("events", "public", nil).Wrap(0), "operation-1", resyncTestState())
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, []byte(`{"version":1,"execution_id":"runtime","state":"closed"}`), 0600))
+	require.ErrorContains(t, adapter.PublishResync(ctx, resyncTestState()), "unconfirmed")
+	require.False(t, adapter.ResyncPublished())
+	for _, request := range client.requests {
+		require.NotEqual(t, proto.IcebergPayload_PUBLISH_RESYNC, request.GetType())
+	}
 }

@@ -111,6 +111,9 @@ func (p *Postgres) Setup(ctx context.Context) error {
 }
 
 func (p *Postgres) setup(ctx context.Context, requireCDCPrerequisites bool) error {
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
 	err := p.config.Validate()
 	if err != nil {
 		return fmt.Errorf("failed to validate config: %w", err)

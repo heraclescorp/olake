@@ -39,6 +39,7 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import io.olake.iceberg.ExecutionFence;
 import io.olake.iceberg.rpc.RecordIngest.IcebergPayload;
 import io.olake.iceberg.rpc.RecordIngest.RecordIngestResponse;
 
@@ -49,6 +50,7 @@ public final class ResyncCoordinator {
     public static final String BASELINE_SHA256_PROPERTY = "olake.resync.baseline-sha256";
     public static final String GENERATION_PROPERTY = "olake.resync.generation";
     public static final String SNAPSHOT_PROPERTY = "olake.resync.snapshot-id";
+    public static final String LAUNCH_PROPERTY = "olake.resync.launch-id";
     public static final long MAX_ATTEMPT_MILLIS = Duration.ofHours(12).toMillis();
     private static final ObjectMapper JSON = new ObjectMapper().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
 
@@ -69,6 +71,16 @@ public final class ResyncCoordinator {
 
     public synchronized RecordIngestResponse control(IcebergPayload.PayloadType type, IcebergPayload.Metadata request)
             throws Exception {
+        if (type == IcebergPayload.PayloadType.ABORT_RESYNC || type == IcebergPayload.PayloadType.RESYNC_STATUS) {
+            ExecutionFence.runtime().checkReconciliation();
+        } else {
+            ExecutionFence.runtime().check();
+        }
+        if (ExecutionFence.runtime().recoveryOnly()
+                && type != IcebergPayload.PayloadType.PREPARE_RESYNC
+                && type != IcebergPayload.PayloadType.RESYNC_STATUS) {
+            throw new IllegalStateException("Recovery-only runtime cannot mutate resync state");
+        }
         String id = request.getResyncId();
         if (id.isBlank() || request.getNamespace().isBlank() || request.getDestTableName().isBlank()) {
             throw new IllegalArgumentException("Resync requires a nonblank operation id, namespace and destination table");
@@ -83,7 +95,15 @@ public final class ResyncCoordinator {
             baselineHash = sha256(checkpoint);
         }
         TableIdentifier target = TableIdentifier.of(request.getNamespace(), request.getDestTableName());
-        Table original = catalog.loadTable(target);
+        Table original;
+        try {
+            original = catalog.loadTable(target);
+        } catch (org.apache.iceberg.exceptions.NoSuchTableException missing) {
+            if (ExecutionFence.runtime().recoveryOnly()) {
+                throw new CommitStateUnknownException("UNKNOWN: recovery cannot find the durable publication table", missing);
+            }
+            throw missing;
+        }
         TableOperations originalOps = operations(original);
         TableMetadata current = originalOps.refresh();
         RecordIngestResponse completed = published(current, id);
@@ -106,6 +126,10 @@ public final class ResyncCoordinator {
             return completed;
         }
 
+        if (ExecutionFence.runtime().recoveryOnly()) {
+            throw new CommitStateUnknownException("UNKNOWN: recovery found no matching durable publication marker",
+                    new IllegalStateException("Marker absence is not proof of non-publication"));
+        }
         ShadowOperations attempt = attempts.get(target);
         if (attempt != null && !attempt.id.equals(id)) {
             throw new IllegalStateException("Another resync operation owns " + target);
@@ -146,7 +170,8 @@ public final class ResyncCoordinator {
                 Table stage = new BaseTable(attempt, original.name());
                 empty(stage);
                 stage.updateProperties().remove("olake_2pc").remove(ID_PROPERTY).remove(CHECKPOINT_PROPERTY)
-                        .remove(BASELINE_SHA256_PROPERTY).remove(GENERATION_PROPERTY).remove(SNAPSHOT_PROPERTY).commit();
+                        .remove(BASELINE_SHA256_PROPERTY).remove(GENERATION_PROPERTY).remove(SNAPSHOT_PROPERTY)
+                        .remove(LAUNCH_PROPERTY).commit();
                 attempt.requireActive();
             } catch (Exception failure) {
                 attempt.failed = true;
@@ -173,18 +198,17 @@ public final class ResyncCoordinator {
         Table stage = new BaseTable(attempt, original.name());
         stage.updateProperties().set(ID_PROPERTY, id).set(CHECKPOINT_PROPERTY, checkpoint)
                 .set(BASELINE_SHA256_PROPERTY, attempt.baselineHash)
+                .set(LAUNCH_PROPERTY, ExecutionFence.runtime().launchId())
                 .set(GENERATION_PROPERTY, id).set(SNAPSHOT_PROPERTY, Long.toString(tip.snapshotId())).commit();
         TableMetadata staged = attempt.current();
         TableMetadata publication = ResyncMetadata.forPublication(attempt.base, staged, attempt,
                 Math.max(clock.millis(), staged.lastUpdatedMillis()), attempt::requireActive);
         attempt.requireActive();
+        ExecutionFence.requireMutation();
         try {
             // REST applies the same original-to-final delta as whole-metadata catalogs.
             attempt.original.commit(attempt.base, publication);
             attempt.published = true;
-        } catch (CommitFailedException failure) {
-            attempt.failed = true;
-            throw failure;
         } catch (RuntimeException failure) {
             attempt.unknown = true;
             try {
@@ -236,6 +260,10 @@ public final class ResyncCoordinator {
     private static RecordIngestResponse published(TableMetadata metadata, String id) {
         if (!id.equals(metadata.properties().get(ID_PROPERTY))) {
             return null;
+        }
+        String launch = ExecutionFence.runtime().launchId();
+        if (!launch.isBlank() && !launch.equals(metadata.properties().get(LAUNCH_PROPERTY))) {
+            throw new IllegalStateException("Resync durable marker belongs to a different admitted launch");
         }
         String checkpoint = metadata.properties().get(CHECKPOINT_PROPERTY);
         String generation = metadata.properties().get(GENERATION_PROPERTY);
@@ -369,6 +397,7 @@ public final class ResyncCoordinator {
         }
 
         void requireActive() {
+            ExecutionFence.requireMutation();
             if (failed || aborted || published || unknown) {
                 throw new IllegalStateException("Resync attempt is no longer writable; start a fresh process attempt");
             }

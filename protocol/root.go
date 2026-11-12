@@ -47,6 +47,8 @@ var (
 	connector                      *abstract.AbstractDriver
 	availableQueryEngines          bool
 	targetQueryEngines             []string
+	executionID                    string
+	executionFence                 string
 )
 
 // RootCmd represents the base command when called without any subcommands
@@ -54,6 +56,10 @@ var RootCmd = &cobra.Command{
 	Use:   "olake",
 	Short: "root command",
 	PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+		if executionID != "" || executionFence != "" || cmd.Flags().Changed("execution-id") || cmd.Flags().Changed("execution-fence") || cmd.InheritedFlags().Changed("execution-id") || cmd.InheritedFlags().Changed("execution-fence") {
+			cmd.SetContext(utils.WithExecution(cmd.Context(), &utils.ExecutionOptions{ID: executionID, Fence: executionFence}))
+		}
+		utils.BeginOrdinaryExecution(cmd.Context(), cmd.Name())
 		// Resolve now as configPaths are needed by logger.Init(), but the error is handled later because the logger is not initialized yet.
 		s3Err := utils.ResolveS3Paths(cmd.Context(), []*string{
 			&configPath, &destinationConfigPath, &streamsPath, &statePath, &differencePath,
@@ -115,6 +121,9 @@ var RootCmd = &cobra.Command{
 	// After a successful subcommand (sync/discover/clear). Cobra skips this hook when
 	// RunE failed, which matches FinalizeS3Upload's "do not upload a failed run" rule.
 	PersistentPostRunE: func(cmd *cobra.Command, _ []string) error {
+		if err := utils.CheckExecutionFence(cmd.Context()); err != nil {
+			return err
+		}
 		if cmd.Name() == "discover-new-tables" {
 			return utils.UploadArtifactOutput(cmd.Context(), enrollmentResultPath, enrollmentResultURI, noSave)
 		}
@@ -200,6 +209,8 @@ func init() {
 	RootCmd.PersistentFlags().StringVarP(&availableStreamsPath, "available-streams", "", "", "Path to available_streams file for the connector")
 	RootCmd.PersistentFlags().StringVarP(&selectedStreamsPath, "selected-streams", "", "", "Path to selected_streams file for the connector")
 	RootCmd.PersistentFlags().StringVarP(&statePath, "state", "", "", "(Required) State for connector")
+	RootCmd.PersistentFlags().StringVar(&executionID, "execution-id", "", "Controlled runtime identity; requires --execution-fence")
+	RootCmd.PersistentFlags().StringVar(&executionFence, "execution-fence", "", "Positive runtime fence local path or s3:// URI; must remain OPEN")
 	RootCmd.PersistentFlags().Int64VarP(&batchSize, "destination-buffer-size", "", 10000, "(Optional) Batch size for destination")
 	RootCmd.PersistentFlags().IntVarP(&maxDiscoverThreads, "max-discover-threads", "", 50, "(Optional) Max number of parallel threads for discovery of table in database")
 	RootCmd.PersistentFlags().BoolVar(&discoverSchema, "discover-schema", false, "(Optional) Re-discover source schema during sync and validate sync mode, primary keys, and cursor fields")

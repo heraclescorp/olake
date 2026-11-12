@@ -117,7 +117,16 @@ func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destinatio
 			}
 			return
 		}
-		if postCDCErr := a.driver.PostCDC(cdcCtx, streamIndex); postCDCErr != nil {
+		if _, controlled := utils.ExecutionFromContext(cdcCtx); controlled {
+			if fenceErr := utils.CheckExecutionFence(cdcCtx); fenceErr != nil {
+				err = utils.Ternary(err == nil, fenceErr, fmt.Errorf("%w: source acknowledgement fenced: %w", err, fenceErr)).(error)
+				return
+			}
+		}
+		settled := utils.BeginExecutionParticipant(cdcCtx)
+		postCDCErr := a.driver.PostCDC(cdcCtx, streamIndex)
+		settled(postCDCErr == nil)
+		if postCDCErr != nil {
 			err = utils.Ternary(err == nil, fmt.Errorf("post cdc error: %w", postCDCErr), fmt.Errorf("%w: post cdc error: %w", err, postCDCErr)).(error)
 		}
 	}()

@@ -703,6 +703,9 @@ func init() {
 	var server *serverInstance
 	var icebergConfig *Config
 	destination.RegisteredWriters[types.Iceberg] = func(ctx context.Context, config any) (destination.Writer, func(ctx context.Context), error) {
+		if err := utils.CheckExecutionFence(ctx); err != nil {
+			return nil, nil, err
+		}
 		_, atomicResync := types.ResyncFromContext(ctx)
 		if icebergConfig != nil || server != nil {
 			if atomicResync && (icebergConfig == nil || !icebergConfig.atomicResync) {
@@ -722,6 +725,16 @@ func init() {
 			return nil, nil, fmt.Errorf("failed to unmarshal iceberg config: %w", err)
 		}
 		icebergConfig.atomicResync = atomicResync
+		if execution, ok := utils.ExecutionFromContext(ctx); ok {
+			icebergConfig.executionID = execution.ID
+			icebergConfig.executionFence = execution.Fence
+			icebergConfig.executionCommand = execution.Command
+			icebergConfig.executionContext = ctx
+		}
+		if resync, ok := types.ResyncFromContext(ctx); ok {
+			icebergConfig.resyncLaunchID = resync.LaunchID
+			icebergConfig.resyncRecoverOnly = resync.RecoverOnly
+		}
 
 		server, err = startServer(icebergConfig)
 		if err != nil {

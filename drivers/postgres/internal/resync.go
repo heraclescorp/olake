@@ -41,6 +41,12 @@ func (p *Postgres) ValidateResync(ctx context.Context, target types.StreamInterf
 }
 
 func (p *Postgres) PrepareResync(ctx context.Context, target types.StreamInterface) (err error) {
+	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
+		return fmt.Errorf("recovery-only resync cannot prepare a source snapshot")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
 	if err := p.ValidateResync(ctx, target); err != nil {
 		return err
 	}
@@ -89,6 +95,9 @@ func (p *Postgres) PrepareResync(ctx context.Context, target types.StreamInterfa
 		// The existing job slot remains untouched. The temporary slot exports an exact
 		// snapshot/commit boundary using replication privilege, with no table write lock.
 		name := "olake_resync_" + strings.ToLower(utils.ULID())
+		if err := utils.CheckExecutionFence(ctx); err != nil {
+			return err
+		}
 		created, err := pglogrepl.CreateReplicationSlot(ctx, snapshot.exporter, name, slot.Plugin, pglogrepl.CreateReplicationSlotOptions{
 			Temporary: true, Mode: pglogrepl.LogicalReplication, SnapshotAction: "EXPORT_SNAPSHOT",
 		})
@@ -117,6 +126,9 @@ func (p *Postgres) PrepareResync(ctx context.Context, target types.StreamInterfa
 	snapshot.pool.SetMaxOpenConns(1)
 	snapshot.tx, err = snapshot.pool.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
+		return err
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return err
 	}
 	if err = snapshot.tx.QueryRowContext(ctx, "SELECT pg_export_snapshot()").Scan(&snapshot.name); err != nil {
@@ -240,7 +252,15 @@ func (p *Postgres) ResyncCheckpoint(ctx context.Context, checkpoint *types.State
 }
 
 func (p *Postgres) RecoverResync(ctx context.Context, checkpoint *types.State, _ types.StreamInterface) error {
-	if !p.CDCSupport || checkpoint.Global == nil || checkpoint.Global.State == nil {
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
+	if !p.CDCSupport {
+		return nil
+	}
+	if checkpoint == nil || checkpoint.Global == nil || checkpoint.Global.State == nil {
+		// CDC configuration does not imply this saved catalog selected any CDC streams.
+		// The protocol validates the published marker and full checkpoint before recovery.
 		return nil
 	}
 	var committed waljs.WALState

@@ -9,6 +9,7 @@ import (
 
 	"github.com/datazip-inc/olake/pkg/indexdb"
 	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
 )
 
 const ResyncMaxDuration = 12 * time.Hour
@@ -32,7 +33,7 @@ func (w *WriterPool) PrepareResync(ctx context.Context, stream types.StreamInter
 	if baseline == nil {
 		return nil, fmt.Errorf("atomic resync requires the full baseline checkpoint")
 	}
-	if err := ctx.Err(); err != nil {
+	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return nil, err
 	}
 	deadline, ok := ctx.Deadline()
@@ -53,6 +54,9 @@ func (w *WriterPool) PrepareResync(ctx context.Context, stream types.StreamInter
 	if err != nil || checkpoint != nil {
 		return checkpoint, err
 	}
+	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
+		return nil, fmt.Errorf("UNKNOWN: recovery-only resync has no confirmed durable publication checkpoint")
+	}
 	if artifact.needsIndex {
 		artifact.streamIndex, err = indexdb.OpenAttempt(stream)
 		if err != nil {
@@ -67,6 +71,12 @@ func (w *WriterPool) PrepareResync(ctx context.Context, stream types.StreamInter
 func (w *WriterPool) PublishResync(ctx context.Context, checkpoint *types.State) error {
 	if w.resync == nil {
 		return fmt.Errorf("destination does not support atomic table resync")
+	}
+	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
+		return fmt.Errorf("recovery-only resync cannot publish replacement data")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
 	}
 	return w.resync.PublishResync(ctx, checkpoint)
 }

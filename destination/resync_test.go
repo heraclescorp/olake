@@ -3,6 +3,7 @@ package destination
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/pkg/indexdb"
 	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -189,4 +191,56 @@ func TestWriterFactoriesReceiveResyncContextBeforeSharedStartup(t *testing.T) {
 	_, _, err = pool.NewWriter(ctx, stream)
 	require.NoError(t, err)
 	require.Len(t, contexts, 2)
+}
+
+func TestRecoveryOnlyAbsentMarkerNeverAllocatesIndexOrOpensWriter(t *testing.T) {
+	stream := types.NewStream("events", "public", nil).Wrap(0)
+	adapter := &poolResyncAdapter{}
+	pool := &WriterPool{resync: adapter}
+	artifact := &writerSchema{needsIndex: true}
+	pool.writerSchema.Store(stream.ID(), artifact)
+	t.Setenv(constants.IndexDBDir, "/dev/null/forbidden-recovery-index")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	ctx = types.WithResync(ctx, &types.ResyncOptions{ID: "operation", RecoverOnly: true, LaunchID: "launch"})
+	checkpoint, err := pool.PrepareResync(ctx, stream, "operation", &types.State{Type: types.StreamType})
+	require.ErrorContains(t, err, "UNKNOWN")
+	require.Nil(t, checkpoint)
+	require.Nil(t, artifact.streamIndex)
+	_, _, err = pool.NewWriter(ctx, stream)
+	require.ErrorContains(t, err, "cannot open a data writer")
+	require.ErrorContains(t, pool.PublishResync(ctx, &types.State{}), "cannot publish")
+	require.ErrorContains(t, DropStreams(ctx, nil, []types.StreamInterface{stream}), "cannot drop")
+	require.False(t, adapter.published)
+}
+
+type recoveryOnlyCheckWriter struct{ resyncContextWriter }
+
+func (*recoveryOnlyCheckWriter) Check(context.Context) error {
+	return errors.New("recovery must never run mutating adapter.Check")
+}
+
+func TestRecoveryOnlyWriterPoolSkipsMutatingConnectionCheck(t *testing.T) {
+	writerType := types.DestinationType("recovery-only-connection-test")
+	RegisteredWriters[writerType] = func(context.Context, any) (Writer, func(context.Context), error) {
+		return &recoveryOnlyCheckWriter{}, nil, nil
+	}
+	t.Cleanup(func() { delete(RegisteredWriters, writerType) })
+	ctx := types.WithResync(context.Background(), &types.ResyncOptions{RecoverOnly: true})
+	pool, err := NewWriterPool(ctx, &types.WriterConfig{Type: writerType}, nil, 1)
+	require.NoError(t, err)
+	pool.Shutdown(context.Background())
+}
+
+func TestMissingRuntimeFenceRejectsBeforeDestinationStartup(t *testing.T) {
+	writerType := types.DestinationType("missing-fence-startup-test")
+	RegisteredWriters[writerType] = func(context.Context, any) (Writer, func(context.Context), error) {
+		t.Fatal("missing fence reached destination startup")
+		return nil, nil, nil
+	}
+	t.Cleanup(func() { delete(RegisteredWriters, writerType) })
+	ctx := utils.WithExecution(context.Background(), &utils.ExecutionOptions{ID: "runtime", Fence: filepath.Join(t.TempDir(), "missing.json")})
+	_, err := NewWriterPool(ctx, &types.WriterConfig{Type: writerType}, nil, 1)
+	require.ErrorContains(t, err, "unreadable")
+	require.ErrorContains(t, DropStreams(ctx, nil, []types.StreamInterface{types.NewStream("target", "public", nil).Wrap(0)}), "unreadable")
 }
