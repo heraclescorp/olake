@@ -1090,18 +1090,32 @@ func (w *nativeWriter) logConflict(operation string, attempt int, tbl *table.Tab
 	logger.Warnf("Thread[%s]: native Iceberg %s attempt=%d base_snapshot=%d classification=%s", w.options.ThreadID, operation, attempt, nativeSnapshotID(tbl), nativeConflictClass(err))
 }
 
+// S3 Tables reserves the --table-s3 bucket suffix and removes unreferenced
+// objects through managed maintenance; its object API does not support DELETE.
+// Only writer-owned, uncommitted files may be handed off to that cleanup.
+func (w *nativeWriter) discardStagedFile(fs iceio.IO, path string) error {
+	if _, ours := w.paths[path]; !ours {
+		return errors.New("refusing to discard a file not staged by this writer")
+	}
+	scheme, object, hasScheme := strings.Cut(path, "://")
+	bucket, _, _ := strings.Cut(object, "/")
+	managed := hasScheme && (scheme == "s3" || scheme == "s3a" || scheme == "s3n") && strings.HasSuffix(bucket, "--table-s3")
+	if !managed {
+		if err := fs.Remove(path); err != nil {
+			return err
+		}
+	}
+	delete(w.paths, path)
+	return nil
+}
+
 func (w *nativeWriter) removeFiles(ctx context.Context, files []apacheiceberg.DataFile) {
 	fs, err := w.table.FS(nativeCatalogContext(ctx, w.cat))
 	if err != nil {
 		return
 	}
 	for _, file := range files {
-		path := file.FilePath()
-		if _, ours := w.paths[path]; ours {
-			if fs.Remove(path) == nil {
-				delete(w.paths, path)
-			}
-		}
+		_ = w.discardStagedFile(fs, file.FilePath())
 	}
 }
 
@@ -1119,9 +1133,7 @@ func (w *nativeWriter) Abort() {
 		return
 	}
 	for path := range w.paths {
-		if err := fs.Remove(path); err == nil {
-			delete(w.paths, path)
-		}
+		_ = w.discardStagedFile(fs, path)
 	}
 }
 

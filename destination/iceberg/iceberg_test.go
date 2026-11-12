@@ -1788,10 +1788,15 @@ type nativeCommitFaultCatalog struct {
 	fault func(context.Context, table.Identifier, []table.Requirement, []table.Update) (bool, error)
 	calls int
 	loads int
+	fs    iceio.IO
 }
 
 func (c *nativeCommitFaultCatalog) bind(tbl *table.Table) *table.Table {
-	return table.New(tbl.Identifier(), tbl.Metadata(), tbl.MetadataLocation(), tbl.FS, c)
+	factory := tbl.FS
+	if c.fs != nil {
+		factory = func(context.Context) (iceio.IO, error) { return c.fs, nil }
+	}
+	return table.New(tbl.Identifier(), tbl.Metadata(), tbl.MetadataLocation(), factory, c)
 }
 func (c *nativeCommitFaultCatalog) LoadTable(ctx context.Context, id table.Identifier) (*table.Table, error) {
 	c.loads++
@@ -2279,4 +2284,127 @@ func TestNativeStagedRewriteUnknownCommitKeepsPublishedReplacements(t *testing.T
 	require.Equal(t, nativeSnapshotID(recovered.table), index.snapshot)
 	require.Contains(t, recovered.table.Properties()[nativeRecoveryProperty], "published")
 	recovered.Abort()
+}
+
+type nativeDeleteDeniedFS struct {
+	iceio.WriteFileIO
+	prefix  string
+	root    string
+	deletes atomic.Int32
+}
+
+func (fs *nativeDeleteDeniedFS) local(path string) string {
+	if relative, found := strings.CutPrefix(path, fs.prefix+"/"); found {
+		return filepath.Join(fs.root, relative)
+	}
+	return path
+}
+
+func (fs *nativeDeleteDeniedFS) Open(path string) (iceio.File, error) {
+	return fs.WriteFileIO.Open(fs.local(path))
+}
+
+func (fs *nativeDeleteDeniedFS) Create(path string) (iceio.FileWriter, error) {
+	return fs.WriteFileIO.Create(fs.local(path))
+}
+
+func (fs *nativeDeleteDeniedFS) WriteFile(path string, data []byte) error {
+	return fs.WriteFileIO.WriteFile(fs.local(path), data)
+}
+
+func (fs *nativeDeleteDeniedFS) Remove(path string) error {
+	if !strings.HasPrefix(path, fs.prefix+"/") {
+		return fs.WriteFileIO.Remove(path)
+	}
+	fs.deletes.Add(1)
+	return &os.PathError{Op: "remove", Path: path, Err: os.ErrPermission}
+}
+
+func nativeDeleteDeniedStorage(ctx context.Context, t *testing.T, mode types.UpdateType, bucket string) (*Config, *types.ConfiguredStream, *nativeCommitFaultCatalog, *nativeDeleteDeniedFS) {
+	t.Helper()
+	cfg, stream, base := nativeWriterFixture(t, mode, true, "/{part, identity}")
+	initial := openNativeTestWriter(ctx, t, cfg, stream, base, nil, "initialize-cleanup", true)
+	tx := initial.table.NewTransaction()
+	prefix := "s3://" + bucket
+	require.NoError(t, tx.SetProperties(apacheiceberg.Properties{
+		table.WriteDataPathKey:     prefix + "/data",
+		table.WriteMetadataPathKey: prefix + "/metadata",
+	}))
+	_, err := tx.Commit(ctx)
+	require.NoError(t, err)
+	initial.Abort()
+	storage := &nativeDeleteDeniedFS{WriteFileIO: iceio.LocalFS{}, prefix: prefix, root: t.TempDir()}
+	return cfg, stream, &nativeCommitFaultCatalog{Catalog: base, fs: storage}, storage
+}
+
+func TestNativeManagedStorageRewriteRetryAndAbort(t *testing.T) {
+	for _, mode := range []types.UpdateType{types.UpdateTypeEquality, types.UpdateTypePosition, types.UpdateTypeDeletionVector} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, cat, storage := nativeDeleteDeniedStorage(ctx, t, mode, "example--table-s3")
+			var index *nativeMemoryIndex
+			if mode != types.UpdateTypeEquality {
+				index = &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
+			}
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "managed-rewrite", false)
+			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 1, "one"), nativeTestRecord("b", "u", 2, "one")}))
+			originalB := nativePendingLocation(t, writer, "b")
+			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 3, "two"), nativeTestRecord("a", "d", 4, "two"), nativeTestRecord("c", "c", 5, "one")}))
+			require.NoError(t, writer.Close(ctx, map[string]any{"state": "managed-committed"}))
+			require.Equal(t, map[string]int64{"a": 4, "b": 2, "c": 5}, nativeVisibleValues(t, writer.table))
+			require.Contains(t, writer.table.Properties()[nativeRecoveryProperty], "managed-committed")
+			_, err := os.Stat(storage.local(originalB.FilePath))
+			require.NoError(t, err, "obsolete bytes are retained for managed maintenance")
+			entries, err := nativeLiveEntries(ctx, writer.table)
+			require.NoError(t, err)
+			for _, entry := range entries {
+				require.NotEqual(t, originalB.FilePath, entry.DataFile().FilePath(), "obsolete staged files must not be committed")
+			}
+			if index != nil {
+				location := index.rows["b"]
+				require.NotEqual(t, originalB.FilePath, location.FilePath)
+				require.Zero(t, location.Position)
+				rows, err := writer.ReadRows(ctx, location.FilePath, []int64{location.Position}, []string{"value"})
+				require.NoError(t, err)
+				require.Equal(t, int64(2), rows[location.Position]["value"])
+				require.Equal(t, nativeSnapshotID(writer.table), index.snapshot)
+			}
+			updater := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "managed-conflict", false)
+			require.NoError(t, updater.Write(ctx, []types.RawRecord{nativeTestRecord("b", "u", 6, "two")}))
+			cat.fault = func(context.Context, table.Identifier, []table.Requirement, []table.Update) (bool, error) {
+				cat.fault = nil
+				return true, table.ErrCommitFailed
+			}
+			require.NoError(t, updater.Close(ctx, map[string]any{"state": "managed-retried"}))
+			require.Equal(t, map[string]int64{"a": 4, "b": 6, "c": 5}, nativeVisibleValues(t, updater.table))
+			require.Contains(t, updater.table.Properties()[nativeRecoveryProperty], "managed-retried")
+			aborted := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "managed-abort", false)
+			require.NoError(t, aborted.Write(ctx, []types.RawRecord{nativeTestRecord("unpublished", "c", 7, "one")}))
+			unpublished := nativePendingLocation(t, aborted, "unpublished")
+			aborted.Abort()
+			_, err = os.Stat(storage.local(unpublished.FilePath))
+			require.NoError(t, err)
+			fresh, err := cat.LoadTable(ctx, updater.table.Identifier())
+			require.NoError(t, err)
+			require.Equal(t, map[string]int64{"a": 4, "b": 6, "c": 5}, nativeVisibleValues(t, fresh))
+			require.Zero(t, storage.deletes.Load(), "S3 Tables must never receive object DELETE requests")
+		})
+	}
+}
+
+func TestNativeOrdinaryStorageDeleteFailurePreventsCommit(t *testing.T) {
+	ctx := context.Background()
+	cfg, stream, cat, storage := nativeDeleteDeniedStorage(ctx, t, types.UpdateTypePosition, "ordinary-bucket")
+	index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "ordinary-denied", false)
+	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 1, "one"), nativeTestRecord("a", "u", 2, "one")}))
+	err := writer.Close(ctx, map[string]any{"state": "must-not-commit"})
+	require.ErrorIs(t, err, os.ErrPermission)
+	require.Positive(t, storage.deletes.Load())
+	fresh, err := cat.LoadTable(ctx, writer.table.Identifier())
+	require.NoError(t, err)
+	require.Nil(t, fresh.CurrentSnapshot())
+	require.NotContains(t, fresh.Properties()[nativeRecoveryProperty], "must-not-commit")
+	require.Empty(t, index.rows)
+	require.Zero(t, index.snapshot)
 }

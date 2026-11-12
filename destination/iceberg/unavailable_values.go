@@ -1407,10 +1407,9 @@ func (w *nativeWriter) compactStagedDataFiles(ctx context.Context) error {
 		if _, rewritten := rewrites[path]; !rewritten {
 			continue
 		}
-		if err := fs.Remove(path); err != nil {
+		if err := w.discardStagedFile(fs, path); err != nil {
 			return fmt.Errorf("remove superseded staged data file: %w", err)
 		}
-		delete(w.paths, path)
 	}
 	for _, change := range pending {
 		w.indexThread.Put(change.key, change.location)
