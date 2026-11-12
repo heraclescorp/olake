@@ -333,7 +333,7 @@ func (i *Iceberg) FlattenAndCleanData(ctx context.Context, records []types.RawRe
 	return schemaDifference, records, recordsSchema, nil
 }
 
-// EvolveSchema reloads the current table and applies compatible source schema changes.
+// EvolveSchema applies compatible source changes to the coordinated table view.
 func (i *Iceberg) EvolveSchema(ctx context.Context, globalSchema, recordsRawSchema any) (any, error) {
 	if !i.stream.NormalizationEnabled() {
 		return i.schema, nil
@@ -489,14 +489,107 @@ func init() {
 const nativeCommitAttempts = 4
 const nativeRecoveryProperty = "olake_2pc"
 
-// A table's chunks share a recovery document, even when their files were
-// produced concurrently. Serialize the final refresh/merge/commit in-process;
-// catalog branch assertions remain the cross-process correctness boundary.
-var nativeCommitLocks sync.Map
+// The coordinator belongs to one catalog lifetime, never a process-global cache.
+// OLake must be the sole OLake process owning a destination table: this mutex
+// serializes local recovery-property merges, not distributed property writers.
+// Ref and default-shape assertions remain enabled; schema mutations retain the
+// SDK's schema requirements. None is a CAS on arbitrary table properties.
+type nativeTableCoordinator struct {
+	mu     sync.Mutex
+	tables map[string]*nativeTableState
+	closed bool
+}
 
-func nativeCommitLock(tbl *table.Table) *sync.Mutex {
-	lock, _ := nativeCommitLocks.LoadOrStore(tbl.Location(), &sync.Mutex{})
-	return lock.(*sync.Mutex)
+type nativeTableState struct {
+	mu         sync.Mutex
+	latest     *table.Table
+	unknown    bool
+	closed     bool
+	generation uint64
+}
+
+type nativeTableLockKey struct{}
+
+func (c *nativeTableCoordinator) entry(identifier table.Identifier) *nativeTableState {
+	// Length-prefixed components distinguish identifiers containing separators.
+	var key strings.Builder
+	for _, component := range identifier {
+		key.WriteString(strconv.Itoa(len(component)))
+		key.WriteByte(':')
+		key.WriteString(component)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tables == nil {
+		c.tables = make(map[string]*nativeTableState)
+	}
+	state := c.tables[key.String()]
+	if state == nil {
+		state = &nativeTableState{closed: c.closed}
+		c.tables[key.String()] = state
+	}
+	return state
+}
+
+func nativeTableEntry(cat catalog.Catalog, identifier table.Identifier) *nativeTableState {
+	if native, ok := cat.(*nativeCatalog); ok {
+		return native.tables.entry(identifier)
+	}
+	// Callers supplying their own catalog can opt into sharing by wrapping it in
+	// nativeCatalog. Never retain arbitrary catalog instances in a global map.
+	return &nativeTableState{}
+}
+
+func (s *nativeTableState) usable() error {
+	if s.closed {
+		return errors.New("Iceberg catalog is closed")
+	}
+	if s.unknown {
+		return errors.New("Iceberg table commit outcome is unknown; reopen the catalog before recovery")
+	}
+	return nil
+}
+
+func (s *nativeTableState) invalidate(unknown bool) {
+	s.latest = nil
+	s.unknown = s.unknown || unknown
+}
+
+func (w *nativeWriter) lockTable(ctx context.Context) (context.Context, *nativeTableState, error) {
+	state := w.coordinator
+	if state == nil {
+		state = nativeTableEntry(w.cat, w.table.Identifier())
+		w.coordinator = state
+	}
+	state.mu.Lock()
+	if err := state.usable(); err != nil {
+		if state.unknown {
+			w.uncertain = true
+		}
+		state.mu.Unlock()
+		return ctx, nil, err
+	}
+	if state.generation != w.generation {
+		state.mu.Unlock()
+		return ctx, nil, errors.New("Iceberg table was replaced or removed while this writer was active")
+	}
+	return context.WithValue(ctx, nativeTableLockKey{}, state), state, nil
+}
+
+func (w *nativeWriter) currentTable(ctx context.Context, state *nativeTableState) (*table.Table, error) {
+	if state.latest == nil {
+		fresh, err := w.cat.LoadTable(ctx, w.table.Identifier())
+		if err != nil {
+			return nil, err
+		}
+		if fresh.Metadata().TableUUID() != w.table.Metadata().TableUUID() {
+			state.generation++
+			state.latest = fresh
+			return nil, errors.New("Iceberg table identity changed while this writer was active")
+		}
+		state.latest = fresh
+	}
+	return state.latest, nil
 }
 
 type nativeIndexRead struct {
@@ -507,6 +600,8 @@ type nativeIndexRead struct {
 type nativeWriter struct {
 	table        *table.Table
 	cat          catalog.Catalog
+	coordinator  *nativeTableState
+	generation   uint64
 	config       *Config
 	stream       types.StreamInterface
 	options      *destination.Options
@@ -527,11 +622,28 @@ type nativeWriter struct {
 
 func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInterface, options *destination.Options, cat catalog.Catalog, indexThread *types.StreamIndexThread) (_ *nativeWriter, _ *types.MetadataState, err error) {
 	ctx = nativeCatalogContext(ctx, cat)
-	tbl, err := loadOrCreateNativeTable(ctx, config, stream, cat)
-	if err != nil {
-		return nil, nil, fmt.Errorf("load or create Iceberg table: %w", err)
+	identifier := catalog.ToIdentifier(stream.GetDestinationDatabase(&config.IcebergDatabase), stream.GetDestinationTable())
+	state := nativeTableEntry(cat, identifier)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if err := state.usable(); err != nil {
+		return nil, nil, err
 	}
-	w := &nativeWriter{table: tbl, cat: cat, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), positions: make(map[string][]int64), latest: make(map[string]types.RowLocation), paths: make(map[string]struct{})}
+	ctx = context.WithValue(ctx, nativeTableLockKey{}, state)
+	tbl := state.latest
+	// REST response-config credentials are not exposed by Table. Keep a fresh
+	// load at each writer setup for servers vending config-only temporary creds;
+	// the SDK refreshes storage-credentials itself through its original FS closure.
+	// Holding the entry lock across this load prevents an older local load from
+	// being published after a newer local commit. Close never refreshes routinely.
+	if tbl == nil || cat.CatalogType() == catalog.REST {
+		tbl, err = loadOrCreateNativeTable(ctx, config, stream, cat)
+		if err != nil {
+			return nil, nil, fmt.Errorf("load or create Iceberg table: %w", err)
+		}
+		state.latest = tbl
+	}
+	w := &nativeWriter{table: tbl, cat: cat, coordinator: state, generation: state.generation, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), positions: make(map[string][]int64), latest: make(map[string]types.RowLocation), paths: make(map[string]struct{})}
 	defer func() {
 		if err != nil {
 			w.Abort()
@@ -554,14 +666,14 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 	if err := reconcileNativeTableIndex(ctx, options.TableIndex, w.table, constants.OlakeID); err != nil {
 		return nil, nil, err
 	}
-	state := &types.MetadataState{}
+	metadataState := &types.MetadataState{}
 	if value := w.table.Properties()[nativeRecoveryProperty]; value != "" {
-		if err := json.Unmarshal([]byte(value), state); err != nil {
+		if err := json.Unmarshal([]byte(value), metadataState); err != nil {
 			return nil, nil, fmt.Errorf("decode Iceberg recovery state: %w", err)
 		}
 	}
 	indexThread.SetObservabilityContext(ctx)
-	return w, state, nil
+	return w, metadataState, nil
 }
 
 func (w *nativeWriter) writable() error {
@@ -578,6 +690,9 @@ func (w *nativeWriter) writable() error {
 }
 
 func (w *nativeWriter) validateFormat(ctx context.Context) error {
+	// Initialization holds the entry lock through format changes, equality
+	// migration, index reconciliation and recovery-state publication.
+	state := w.coordinator
 	version := w.table.Metadata().Version()
 	if version > 3 {
 		return fmt.Errorf("unsupported Iceberg format version %d", version)
@@ -595,13 +710,9 @@ func (w *nativeWriter) validateFormat(ctx context.Context) error {
 		return nil
 	}
 	for attempt := range nativeCommitAttempts {
-		fresh := w.table
-		if attempt > 0 {
-			var err error
-			fresh, err = w.cat.LoadTable(ctx, w.table.Identifier())
-			if err != nil {
-				return err
-			}
+		fresh, err := w.currentTable(ctx, state)
+		if err != nil {
+			return err
 		}
 		tx := fresh.NewTransaction()
 		if err := tx.AssertRefSnapshotID(table.MainBranch); err != nil {
@@ -612,11 +723,12 @@ func (w *nativeWriter) validateFormat(ctx context.Context) error {
 		}
 		updated, err := tx.Commit(ctx)
 		if err == nil {
-			w.table = updated
+			w.table, state.latest = updated, updated
 			return nil
 		}
 		err = nativeCatalogError("upgrade Iceberg format", err)
 		w.logConflict("format-upgrade", attempt+1, fresh, err)
+		state.invalidate(!errors.Is(err, table.ErrCommitFailed))
 		if !errors.Is(err, table.ErrCommitFailed) {
 			w.uncertain = true
 			return fmt.Errorf("Iceberg format upgrade outcome is unknown: %w", err)
@@ -880,19 +992,21 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		}
 	}()
 	ctx = nativeCatalogContext(ctx, w.cat)
-	lock := nativeCommitLock(w.table)
-	lock.Lock()
-	defer lock.Unlock()
 	if err := w.compactStagedDataFiles(ctx); err != nil {
 		return fmt.Errorf("compact superseded staged Iceberg rows: %w", err)
 	}
+	ctx, coordinated, err := w.lockTable(ctx)
+	if err != nil {
+		return err
+	}
+	defer coordinated.mu.Unlock()
 	hasFiles := len(w.dataFiles) > 0 || len(w.positions) > 0
 	var lastConflict error
 	for attempt := range nativeCommitAttempts {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		fresh, err := w.cat.LoadTable(ctx, w.table.Identifier())
+		fresh, err := w.currentTable(ctx, coordinated)
 		if err != nil {
 			return err
 		}
@@ -922,6 +1036,7 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 			return err
 		}
 		if !hasFiles && !changed {
+			w.table = fresh
 			w.closed = true
 			return nil
 		}
@@ -960,6 +1075,7 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 			commitErr = nativeCatalogError("commit Iceberg table", commitErr)
 			lastConflict = commitErr
 			w.logConflict("commit", attempt+1, fresh, commitErr)
+			coordinated.invalidate(!errors.Is(commitErr, table.ErrCommitFailed))
 			if !errors.Is(commitErr, table.ErrCommitFailed) {
 				w.uncertain = true
 				return fmt.Errorf("Iceberg commit outcome is unknown; staged files retained for recovery: %w", commitErr)
@@ -971,6 +1087,7 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 			continue
 		}
 		w.table, w.closed = committed, true
+		coordinated.latest = committed
 		// A successful metadata commit owns all staged files from now on.
 		// Never delete them, including when the local index checkpoint fails.
 		clear(w.paths)
@@ -1010,19 +1127,14 @@ func nativeMayHaveEqualityDeletes(tbl *table.Table) bool {
 }
 
 func (w *nativeWriter) migrateEqualityDeletes(ctx context.Context) error {
-	lock := nativeCommitLock(w.table)
-	lock.Lock()
-	defer lock.Unlock()
+	// Called only during initialization, with the coordinator entry locked.
+	state := w.coordinator
 	for attempt := range nativeCommitAttempts {
-		fresh := w.table
-		if attempt > 0 {
-			var err error
-			fresh, err = w.cat.LoadTable(ctx, w.table.Identifier())
-			if err != nil {
-				return err
-			}
-			w.table = fresh
+		fresh, err := w.currentTable(ctx, state)
+		if err != nil {
+			return err
 		}
+		w.table = fresh
 		if !nativeMayHaveEqualityDeletes(fresh) {
 			return nil
 		}
@@ -1054,12 +1166,13 @@ func (w *nativeWriter) migrateEqualityDeletes(ctx context.Context) error {
 		}
 		updated, commitErr := tx.Commit(ctx)
 		if commitErr == nil {
-			w.table = updated
+			w.table, state.latest = updated, updated
 			clear(w.paths)
 			return nil
 		}
 		commitErr = nativeCatalogError("migrate Iceberg equality deletes", commitErr)
 		w.logConflict("equality-migration", attempt+1, fresh, commitErr)
+		state.invalidate(!errors.Is(commitErr, table.ErrCommitFailed))
 		if !errors.Is(commitErr, table.ErrCommitFailed) {
 			w.uncertain = true
 			return fmt.Errorf("Iceberg equality migration outcome is unknown: %w", commitErr)

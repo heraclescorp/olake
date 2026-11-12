@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -687,6 +688,115 @@ func TestNativeSourceChangesInvalidateSameThreadTOASTCarry(t *testing.T) {
 			require.Equal(t, placeholder, resurrect.Data["new_toast"])
 			require.Equal(t, beforeReads, resolver.fromTable)
 			require.Same(t, tombstone, resolver.carry["deleted"])
+		})
+	}
+}
+
+func TestNativeRESTCoordinatorRejectsDeletesAfterExternalCompaction(t *testing.T) {
+	for _, mode := range []types.UpdateType{types.UpdateTypePosition, types.UpdateTypeDeletionVector} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, cat, boundary := nativeRESTWriterFixture(t, mode,
+				nativeTestRecord("a", "r", 1, "one"))
+			// Seed separate files so the external rewrite really compacts them
+			// into one file, rather than merely replacing an identical layout.
+			seedB := openNativeTestWriter(ctx, t, cfg, stream, boundary.cat, nil, "second-input", true)
+			require.NoError(t, seedB.Write(ctx, []types.RawRecord{nativeTestRecord("b", "r", 2, "one")}))
+			require.NoError(t, seedB.Close(ctx, nil))
+			index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
+			stale := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "stale-delete", false)
+			checkpoint, originalA := index.snapshot, index.rows["a"]
+			require.NoError(t, stale.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 3, "one")}))
+			staged := stale.dataFiles[0].FilePath()
+
+			// A separate catalog owner compacts files, reordering rows on v2.
+			// This intentionally bypasses the REST client's in-process coordinator.
+			compactor := openNativeTestWriter(ctx, t, cfg, stream, boundary.cat, nil, "external-compactor", true)
+			rows := []types.RawRecord{nativeTestRecord("b", "r", 2, "one"), nativeTestRecord("a", "r", 1, "one")}
+			if mode == types.UpdateTypeDeletionVector {
+				// Preserve the implicit v3 row IDs: a and b were assigned
+				// consecutive IDs in separate files and now share one file.
+				rows[0], rows[1] = rows[1], rows[0]
+			}
+			require.NoError(t, compactor.Write(ctx, rows))
+			entries, err := nativeLiveEntries(ctx, compactor.table)
+			require.NoError(t, err)
+			var removed []apacheiceberg.DataFile
+			for _, entry := range entries {
+				if entry.DataFile().ContentType() == apacheiceberg.EntryContentData {
+					removed = append(removed, entry.DataFile())
+				}
+			}
+			require.Len(t, removed, 2)
+			require.Len(t, compactor.dataFiles, 1)
+			if mode == types.UpdateTypeDeletionVector {
+				var firstA, firstB *int64
+				for _, file := range removed {
+					switch file.FilePath() {
+					case index.rows["a"].FilePath:
+						firstA = file.FirstRowID()
+					case index.rows["b"].FilePath:
+						firstB = file.FirstRowID()
+					}
+				}
+				require.NotNil(t, firstA)
+				require.NotNil(t, firstB)
+				require.Equal(t, *firstA+1, *firstB)
+				replacement := compactor.dataFiles[0]
+				builder, err := apacheiceberg.NewDataFileBuilder(compactor.table.Spec(), replacement.ContentType(), replacement.FilePath(), replacement.FileFormat(), replacement.Partition(), nil, nil, replacement.Count(), replacement.FileSizeBytes())
+				require.NoError(t, err)
+				builder.ColumnSizes(replacement.ColumnSizes()).ValueCounts(replacement.ValueCounts()).
+					NullValueCounts(replacement.NullValueCounts()).NaNValueCounts(replacement.NaNValueCounts()).
+					LowerBoundValues(replacement.LowerBoundValues()).UpperBoundValues(replacement.UpperBoundValues()).
+					SplitOffsets(replacement.SplitOffsets()).FirstRowID(*firstA)
+				if order := replacement.SortOrderID(); order != nil {
+					builder.SortOrderID(*order)
+				}
+				compactor.dataFiles[0] = builder.Build()
+			}
+			tx := compactor.table.NewTransaction()
+			require.NoError(t, tx.ReplaceFiles(ctx, removed, compactor.dataFiles, nil, nil))
+			compacted, err := tx.Commit(ctx)
+			require.NoError(t, err)
+			clear(compactor.paths)
+			compactor.Abort()
+			require.NotEqual(t, checkpoint, nativeSnapshotID(compacted))
+			require.Equal(t, map[string]int64{"a": 1, "b": 2}, nativeVisibleValues(t, compacted))
+			if mode == types.UpdateTypeDeletionVector {
+				compactedEntries, err := nativeLiveEntries(ctx, compacted)
+				require.NoError(t, err)
+				require.Len(t, compactedEntries, 1)
+				require.Equal(t, compactor.dataFiles[0].FirstRowID(), compactedEntries[0].DataFile().FirstRowID(), "compaction must preserve the original v3 row ID range")
+			}
+
+			require.ErrorIs(t, stale.Close(ctx, map[string]any{"state": `{"unsafe":3}`}), table.ErrCommitFailed)
+			require.Equal(t, []string{http.MethodGet, http.MethodPost, http.MethodGet}, boundary.tableRequests(), "definite server conflict must refresh once, then refuse stale positional deletes without another POST")
+			require.False(t, stale.uncertain, "a rejected stale snapshot is not an ambiguous publication")
+			require.Equal(t, checkpoint, index.snapshot)
+			require.Equal(t, originalA, index.rows["a"])
+			persisted, err := boundary.cat.LoadTable(ctx, compacted.Identifier())
+			require.NoError(t, err)
+			require.Equal(t, nativeSnapshotID(compacted), nativeSnapshotID(persisted))
+			require.Equal(t, map[string]int64{"a": 1, "b": 2}, nativeVisibleValues(t, persisted))
+			require.NotContains(t, persisted.Properties()[nativeRecoveryProperty], "unsafe")
+			_, err = os.Stat(staged)
+			require.ErrorIs(t, err, os.ErrNotExist, "definitively unpublished staged data can be cleaned up")
+
+			recovered := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "after-compaction", false)
+			require.Equal(t, []string{http.MethodGet, http.MethodPost, http.MethodGet, http.MethodGet}, boundary.tableRequests())
+			require.Equal(t, nativeSnapshotID(compacted), index.snapshot)
+			require.NotEqual(t, originalA.FilePath, index.rows["a"].FilePath)
+			if mode == types.UpdateTypeDeletionVector {
+				require.Equal(t, int64(0), index.rows["a"].Position)
+				require.Equal(t, int64(1), index.rows["b"].Position)
+			} else {
+				require.Equal(t, int64(1), index.rows["a"].Position)
+				require.Equal(t, int64(0), index.rows["b"].Position)
+			}
+			require.NoError(t, recovered.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 4, "one")}))
+			require.NoError(t, recovered.Close(ctx, map[string]any{"state": `{"safe":4}`}))
+			require.Equal(t, []string{http.MethodGet, http.MethodPost, http.MethodGet, http.MethodGet, http.MethodPost}, boundary.tableRequests())
+			require.Equal(t, map[string]int64{"a": 4, "b": 2}, nativeVisibleValues(t, recovered.table))
 		})
 	}
 }

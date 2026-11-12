@@ -351,12 +351,23 @@ func (w *nativeWriter) AlterSourceColumns(ctx context.Context, added []*nativeSo
 		return nil
 	}
 	ctx = nativeCatalogContext(ctx, w.cat)
+	ctx, state, err := w.lockTable(ctx)
+	if err != nil {
+		return err
+	}
+	defer state.mu.Unlock()
 	for attempt := range nativeCommitAttempts {
-		fresh, err := w.cat.LoadTable(ctx, w.table.Identifier())
+		fresh, err := w.currentTable(ctx, state)
 		if err != nil {
 			return err
 		}
 		tx := fresh.NewTransaction()
+		if err := tx.AssertRefSnapshotID(table.MainBranch); err != nil {
+			return err
+		}
+		if err := tx.AssertDefaultShape(); err != nil {
+			return err
+		}
 		update := tx.UpdateSchema(true, false)
 		changed := false
 		var additions []apacheiceberg.NestedField
@@ -429,11 +440,12 @@ func (w *nativeWriter) AlterSourceColumns(ctx context.Context, added []*nativeSo
 		}
 		updated, err := tx.Commit(ctx)
 		if err == nil {
-			w.table = updated
+			w.table, state.latest = updated, updated
 			return nil
 		}
 		err = nativeCatalogError("alter Iceberg source columns", err)
 		w.logConflict("source columns", attempt+1, fresh, err)
+		state.invalidate(!errors.Is(err, table.ErrCommitFailed))
 		if !errors.Is(err, table.ErrCommitFailed) {
 			w.uncertain = true
 			return fmt.Errorf("source schema commit outcome is unknown; refresh before recovery: %w", err)
@@ -447,8 +459,13 @@ func (w *nativeWriter) EvolveSchema(ctx context.Context, columns map[string]stri
 		return err
 	}
 	ctx = nativeCatalogContext(ctx, w.cat)
+	ctx, state, err := w.lockTable(ctx)
+	if err != nil {
+		return err
+	}
+	defer state.mu.Unlock()
 	for attempt := range nativeCommitAttempts {
-		fresh, err := w.cat.LoadTable(ctx, w.table.Identifier())
+		fresh, err := w.currentTable(ctx, state)
 		if err != nil {
 			return err
 		}
@@ -468,6 +485,12 @@ func (w *nativeWriter) EvolveSchema(ctx context.Context, columns map[string]stri
 		}
 		incoming = apacheiceberg.NewSchema(0, fields...)
 		tx := fresh.NewTransaction()
+		if err := tx.AssertRefSnapshotID(table.MainBranch); err != nil {
+			return err
+		}
+		if err := tx.AssertDefaultShape(); err != nil {
+			return err
+		}
 		update := tx.UpdateSchema(true, false).UnionByNameWith(incoming)
 		if !w.config.NoIdentifierFields {
 			identifiers := make([][]string, 0, len(fresh.Schema().IdentifierFieldIDs)+1)
@@ -484,11 +507,12 @@ func (w *nativeWriter) EvolveSchema(ctx context.Context, columns map[string]stri
 		}
 		updated, err := tx.Commit(ctx)
 		if err == nil {
-			w.table = updated
+			w.table, state.latest = updated, updated
 			return nil
 		}
 		err = nativeCatalogError("evolve Iceberg schema", err)
 		w.logConflict("schema", attempt+1, fresh, err)
+		state.invalidate(!errors.Is(err, table.ErrCommitFailed))
 		if !errors.Is(err, table.ErrCommitFailed) {
 			w.uncertain = true
 			return fmt.Errorf("schema commit outcome is unknown; refresh before recovery: %w", err)

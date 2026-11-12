@@ -2,6 +2,7 @@ package iceberg
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -510,4 +511,46 @@ func TestNativeSourcePrimitiveDefaultsPersistAndReadOldRows(t *testing.T) {
 			require.Equal(t, 1, count)
 		})
 	}
+}
+
+func TestNativeRESTCoordinatorSchemaMutationsPublishLatestView(t *testing.T) {
+	ctx := context.Background()
+	cfg, stream, cat, boundary := nativeRESTWriterFixture(t, types.UpdateTypeDeletionVector, nativeTestRecord("old", "r", 1, "one"))
+	discoverer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "record-schema", true)
+	source := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "source-schema", true)
+	initialSchema := source.table.Schema().ID
+	columns := discoverer.schemaMap()
+	columns["discovered"] = "string"
+	require.NoError(t, discoverer.EvolveSchema(ctx, columns))
+	require.Equal(t, []string{http.MethodGet, http.MethodGet, http.MethodPost}, boundary.tableRequests())
+	discovered, found := discoverer.table.Schema().FindFieldByName("discovered")
+	require.True(t, found)
+	initial, err := nativeSourceColumnDefault("long", 42)
+	require.NoError(t, err)
+	// This writer predates discovery; its mutation must use the shared result,
+	// not replace it with its own older table view or issue a second metadata GET.
+	require.Equal(t, initialSchema, source.table.Schema().ID)
+	require.NoError(t, source.AlterSourceColumns(ctx, []*nativeSourceColumn{{Key: "source_added", IceType: "long", InitialDefault: initial.Val}}, nil))
+	require.Equal(t, []string{http.MethodGet, http.MethodGet, http.MethodPost, http.MethodPost}, boundary.tableRequests())
+	current, found := source.table.Schema().FindFieldByName("discovered")
+	require.True(t, found)
+	require.Equal(t, discovered.ID, current.ID)
+	added, found := source.table.Schema().FindFieldByName("source_added")
+	require.True(t, found)
+	require.Greater(t, added.ID, discovered.ID)
+	require.Nil(t, added.WriteDefault)
+	require.Equal(t, map[string]any{"old": int64(42)}, nativeSourceValues(t, source.table, "source_added"))
+
+	reader := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "after-schema", true)
+	defer reader.Abort()
+	require.Equal(t, source.table.MetadataLocation(), reader.table.MetadataLocation())
+	require.Equal(t, source.table.Schema().ID, reader.table.Schema().ID)
+	require.Equal(t, []string{http.MethodGet, http.MethodGet, http.MethodPost, http.MethodPost, http.MethodGet}, boundary.tableRequests())
+	require.Equal(t, "string", reader.schemaMap()["discovered"])
+	require.Equal(t, "long", reader.schemaMap()["source_added"])
+	require.NoError(t, discoverer.Close(ctx, map[string]any{"state": `{"schema_seen":1}`}))
+	require.Equal(t, source.table.Schema().ID, discoverer.table.Schema().ID, "state-only commit must not roll back a later schema mutation")
+	require.Equal(t, []string{http.MethodGet, http.MethodGet, http.MethodPost, http.MethodPost, http.MethodGet, http.MethodPost}, boundary.tableRequests())
+	require.Equal(t, map[string]any{"old": int64(42)}, nativeSourceValues(t, discoverer.table, "source_added"))
+	source.Abort()
 }

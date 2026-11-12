@@ -1602,11 +1602,17 @@ func nativeWriterFixture(t *testing.T, mode types.UpdateType, normalized bool, p
 	stream.UpsertField("blob", types.FixedBinaryOf(4), true, false)
 	updateMode := string(mode)
 	configured := &types.ConfiguredStream{Stream: stream, StreamMetadata: types.StreamMetadata{Normalization: &normalized, UpdateType: &updateMode, PartitionRegex: partition, UseSourceColumnNames: true}}
-	return &Config{IcebergS3Path: root, IcebergDatabase: "db"}, configured, cat
+	return &Config{IcebergS3Path: root, IcebergDatabase: "db"}, configured, &nativeCatalog{Catalog: cat}
 }
 
 func openNativeTestWriter(ctx context.Context, t *testing.T, cfg *Config, stream *types.ConfiguredStream, cat catalog.Catalog, index *nativeMemoryIndex, thread string, backfill bool) *nativeWriter {
 	t.Helper()
+	if fault, ok := cat.(*nativeCommitFaultCatalog); ok {
+		if fault.coordinated == nil {
+			fault.coordinated = &nativeCatalog{Catalog: fault}
+		}
+		cat = fault.coordinated
+	}
 	opts := &destination.Options{ThreadID: thread, Backfill: backfill}
 	if index != nil {
 		opts.TableIndex = index
@@ -1785,10 +1791,11 @@ func TestNativeWriterRawAppendAndAbort(t *testing.T) {
 
 type nativeCommitFaultCatalog struct {
 	catalog.Catalog
-	fault func(context.Context, table.Identifier, []table.Requirement, []table.Update) (bool, error)
-	calls int
-	loads int
-	fs    iceio.IO
+	fault       func(context.Context, table.Identifier, []table.Requirement, []table.Update) (bool, error)
+	calls       int
+	loads       int
+	fs          iceio.IO
+	coordinated *nativeCatalog
 }
 
 func (c *nativeCommitFaultCatalog) bind(tbl *table.Table) *table.Table {
@@ -1834,6 +1841,9 @@ func TestNativeWriterRetriesMergeFreshRecoveryState(t *testing.T) {
 		require.NoError(t, tx.SetProperties(apacheiceberg.Properties{nativeRecoveryProperty: `{"state":"{\"other_partition\":17}"}`}))
 		_, err = tx.Commit(ctx)
 		require.NoError(t, err)
+		// This injects a definite catalog rejection; snapshot assertions alone
+		// do not detect an external property-only update. Single-process table
+		// ownership is still required, rather than a distributed merge guarantee.
 		return true, table.ErrCommitFailed
 	}
 	require.NoError(t, writer.Close(ctx, map[string]any{"state": `{"this_partition":18}`}))
@@ -2026,7 +2036,12 @@ func TestNativeWriterConstructorReusesLoadedMetadata(t *testing.T) {
 			require.Equal(t, 1, cat.loads, "unchanged setup must use its initial catalog load")
 			require.Zero(t, cat.calls, "unchanged setup must not commit metadata")
 			require.NoError(t, writer.EvolveSchema(ctx, writer.schemaMap()))
-			require.Equal(t, 2, cat.loads, "explicit schema evolution must refresh even when unchanged")
+			require.Equal(t, 1, cat.loads, "unchanged schema must reuse the coordinated metadata")
+			next := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "same-lifetime", false)
+			require.Equal(t, 1, cat.loads, "non-REST writer setup reuses the catalog-lifetime view")
+			require.Zero(t, cat.calls)
+			require.Equal(t, writer.table.MetadataLocation(), next.table.MetadataLocation())
+			next.Abort()
 			writer.Abort()
 		})
 	}
@@ -2407,4 +2422,443 @@ func TestNativeOrdinaryStorageDeleteFailurePreventsCommit(t *testing.T) {
 	require.NotContains(t, fresh.Properties()[nativeRecoveryProperty], "must-not-commit")
 	require.Empty(t, index.rows)
 	require.Zero(t, index.snapshot)
+}
+
+// This boundary executes real REST requests and real Hadoop metadata commits.
+// The coordinator protects one catalog lifetime in one OLake process; it is not
+// distributed ownership or a fence against another property-only writer.
+type nativeRESTCommitBoundary struct {
+	cat                catalog.Catalog
+	mu                 sync.Mutex
+	requests           []string
+	requirements       [][]table.Requirement
+	failAfterCommit    bool
+	initialCredentials []rest.StorageCredential
+	freshCredentials   []rest.StorageCredential
+	credentialRequests int
+}
+
+func (b *nativeRESTCommitBoundary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodGet && r.URL.Path == "/v1/config" {
+		_, _ = w.Write([]byte(`{"defaults":{},"overrides":{},"endpoints":["GET /v1/{prefix}/namespaces/{namespace}/tables/{table}","POST /v1/{prefix}/namespaces/{namespace}/tables/{table}","GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials"]}`))
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if r.Method == http.MethodGet && r.URL.Path == "/v1/namespaces/db/tables/records/credentials" {
+		b.credentialRequests++
+		_ = json.NewEncoder(w).Encode(map[string]any{"storage-credentials": b.freshCredentials})
+		return
+	}
+	if r.URL.Path != "/v1/namespaces/db/tables/records" {
+		http.Error(w, "unexpected catalog path", http.StatusNotFound)
+		return
+	}
+	b.requests = append(b.requests, r.Method)
+	ident := table.Identifier{"db", "records"}
+	current, err := b.cat.LoadTable(r.Context(), ident)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	metadata, location := current.Metadata(), current.MetadataLocation()
+	switch r.Method {
+	case http.MethodGet:
+	case http.MethodPost:
+		var request struct {
+			Requirements table.Requirements `json:"requirements"`
+			Updates      table.Updates      `json:"updates"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		b.requirements = append(b.requirements, request.Requirements)
+		for _, requirement := range request.Requirements {
+			if err := requirement.Validate(metadata); err != nil {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": err.Error(), "type": "CommitFailedException", "code": http.StatusConflict}})
+				return
+			}
+		}
+		metadata, location, err = b.cat.CommitTable(r.Context(), ident, request.Requirements, request.Updates)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if b.failAfterCommit {
+			b.failAfterCommit = false
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"message":"response lost after publication","type":"CommitStateUnknownException","code":503}}`))
+			return
+		}
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"metadata": metadata, "metadata-location": location, "config": map[string]string{}, "storage-credentials": b.initialCredentials})
+}
+
+func (b *nativeRESTCommitBoundary) tableRequests() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.requests)
+}
+
+func nativeRESTWriterFixture(t *testing.T, mode types.UpdateType, rows ...types.RawRecord) (*Config, *types.ConfiguredStream, catalog.Catalog, *nativeRESTCommitBoundary) {
+	t.Helper()
+	ctx := context.Background()
+	cfg, stream, base := nativeWriterFixture(t, mode, true, "")
+	seed := openNativeTestWriter(ctx, t, cfg, stream, base, nil, "bootstrap", true)
+	if len(rows) > 0 {
+		require.NoError(t, seed.Write(ctx, rows))
+		require.NoError(t, seed.Close(ctx, nil))
+	} else {
+		seed.Abort()
+	}
+	boundary := &nativeRESTCommitBoundary{cat: base}
+	server := httptest.NewServer(boundary)
+	t.Cleanup(server.Close)
+	cfg.CatalogType, cfg.CatalogName, cfg.RestCatalogURL = RestCatalog, "coordinator-boundary", server.URL
+	cfg.Region, cfg.AccessKey, cfg.SecretKey = "us-east-1", "test-access", "test-secret"
+	cat, cleanup, err := openNativeCatalog(ctx, cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { cleanup(context.Background()) })
+	return cfg, stream, cat, boundary
+}
+
+func nativeRecoveryOffsets(t *testing.T, tbl *table.Table) (map[string]int, []string) {
+	t.Helper()
+	var recovery struct {
+		State  string   `json:"state"`
+		Chunks []string `json:"full_refresh_committed_ids"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(tbl.Properties()[nativeRecoveryProperty]), &recovery))
+	var offsets map[string]int
+	require.NoError(t, json.Unmarshal([]byte(recovery.State), &offsets))
+	return offsets, recovery.Chunks
+}
+
+func TestNativeRESTCoordinatorCDCUsesReturnedMetadata(t *testing.T) {
+	for _, mode := range []types.UpdateType{types.UpdateTypeEquality, types.UpdateTypePosition, types.UpdateTypeDeletionVector} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, cat, boundary := nativeRESTWriterFixture(t, mode, nativeTestRecord("a", "r", 1, "one"))
+			var index *nativeMemoryIndex
+			if mode != types.UpdateTypeEquality {
+				index = &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
+			}
+			first := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "cdc-first", false)
+			require.Equal(t, []string{http.MethodGet}, boundary.tableRequests())
+			require.NoError(t, first.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 2, "one")}))
+			require.NoError(t, first.Close(ctx, map[string]any{"state": `{"first":2}`}))
+			require.Equal(t, []string{http.MethodGet, http.MethodPost}, boundary.tableRequests(), "normal CDC must not issue a precommit metadata GET")
+			second := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "cdc-second", false)
+			require.Equal(t, first.table.MetadataLocation(), second.table.MetadataLocation())
+			require.Equal(t, []string{http.MethodGet, http.MethodPost, http.MethodGet}, boundary.tableRequests(), "REST writer setup retains its credential-refresh GET")
+			require.NoError(t, second.EvolveSchema(ctx, second.schemaMap()))
+			require.Equal(t, []string{http.MethodGet, http.MethodPost, http.MethodGet}, boundary.tableRequests(), "unchanged schema evolution must not reload or recommit")
+			require.NoError(t, second.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 3, "one")}))
+			require.NoError(t, second.Close(ctx, map[string]any{"state": `{"second":3}`}))
+			require.Equal(t, []string{http.MethodGet, http.MethodPost, http.MethodGet, http.MethodPost}, boundary.tableRequests())
+			require.Equal(t, map[string]int64{"a": 3}, nativeVisibleValues(t, second.table))
+			offsets, _ := nativeRecoveryOffsets(t, second.table)
+			require.Equal(t, map[string]int{"first": 2, "second": 3}, offsets)
+			if index != nil {
+				require.Equal(t, nativeSnapshotID(second.table), index.snapshot)
+				require.Equal(t, second.dataFiles[0].FilePath(), index.rows["a"].FilePath)
+			}
+			boundary.mu.Lock()
+			requirements := slices.Clone(boundary.requirements)
+			boundary.mu.Unlock()
+			for _, commit := range requirements {
+				var kinds []string
+				for _, requirement := range commit {
+					kinds = append(kinds, requirement.GetType())
+				}
+				require.Subset(t, kinds, []string{"assert-table-uuid", "assert-ref-snapshot-id", "assert-default-spec-id", "assert-default-sort-order-id"})
+			}
+		})
+	}
+}
+
+func TestNativeRESTCoordinatorConcurrentFullRefreshChunks(t *testing.T) {
+	for _, mode := range []types.UpdateType{types.UpdateTypeEquality, types.UpdateTypePosition, types.UpdateTypeDeletionVector} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, cat, boundary := nativeRESTWriterFixture(t, mode)
+			initial, err := boundary.cat.LoadTable(ctx, table.Identifier{"db", "records"})
+			require.NoError(t, err)
+			tx := initial.NewTransaction()
+			require.NoError(t, tx.SetProperties(apacheiceberg.Properties{nativeRecoveryProperty: `{"state":"{\"before_chunks\":17}","dedup_inserts":false,"retained":"keep"}`}))
+			_, err = tx.Commit(ctx)
+			require.NoError(t, err)
+			var index *nativeMemoryIndex
+			if mode != types.UpdateTypeEquality {
+				index = &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
+			}
+			const chunks = 6
+			writers := make([]*nativeWriter, chunks)
+			expectedRows := make(map[string]int64)
+			var expectedChunks []string
+			for chunk := range chunks {
+				id := fmt.Sprintf("chunk-%d", chunk)
+				writers[chunk] = openNativeTestWriter(ctx, t, cfg, stream, cat, index, id, true)
+				require.NoError(t, writers[chunk].Write(ctx, []types.RawRecord{nativeTestRecord(id, "r", int64(chunk), "one")}))
+				expectedRows[id] = int64(chunk)
+				expectedChunks = append(expectedChunks, id)
+			}
+			var expectedRequests []string
+			for range chunks {
+				expectedRequests = append(expectedRequests, http.MethodGet)
+			}
+			require.Equal(t, expectedRequests, boundary.tableRequests(), "REST chunk setup keeps one credential-refresh GET per writer")
+			start := make(chan struct{})
+			errors := make(chan error, chunks)
+			for _, writer := range writers {
+				go func() {
+					<-start
+					errors <- writer.Close(ctx, nil)
+				}()
+			}
+			close(start)
+			for range chunks {
+				require.NoError(t, <-errors)
+			}
+			for range chunks {
+				expectedRequests = append(expectedRequests, http.MethodPost)
+			}
+			require.Equal(t, expectedRequests, boundary.tableRequests())
+			if index != nil {
+				require.Len(t, index.rows, chunks, "serialized commits must publish every chunk to the shared index")
+				for chunk, writer := range writers {
+					id := fmt.Sprintf("chunk-%d", chunk)
+					require.Equal(t, writer.dataFiles[0].FilePath(), index.rows[id].FilePath)
+				}
+			}
+			reader := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "after-chunks", true)
+			defer reader.Abort()
+			expectedRequests = append(expectedRequests, http.MethodGet)
+			require.Equal(t, expectedRequests, boundary.tableRequests())
+			require.Equal(t, expectedRows, nativeVisibleValues(t, reader.table))
+			if index != nil {
+				require.Equal(t, nativeSnapshotID(reader.table), index.snapshot)
+			}
+			offsets, committedChunks := nativeRecoveryOffsets(t, reader.table)
+			require.Equal(t, map[string]int{"before_chunks": 17}, offsets)
+			require.ElementsMatch(t, expectedChunks, committedChunks)
+			var recovery struct {
+				DedupInserts *bool  `json:"dedup_inserts"`
+				Retained     string `json:"retained"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(reader.table.Properties()[nativeRecoveryProperty]), &recovery))
+			require.NotNil(t, recovery.DedupInserts)
+			require.True(t, *recovery.DedupInserts)
+			require.Equal(t, "keep", recovery.Retained, "chunk commits preserve unrelated recovery properties")
+		})
+	}
+}
+
+func TestNativeRESTCoordinatorPropertyOnlyCommitsMergeLocally(t *testing.T) {
+	ctx := context.Background()
+	cfg, stream, cat, boundary := nativeRESTWriterFixture(t, types.UpdateTypeEquality, nativeTestRecord("a", "r", 1, "one"))
+	first := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "state-first", false)
+	second := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "state-second", false)
+	snapshot := nativeSnapshotID(first.table)
+	start, results := make(chan struct{}), make(chan error, 2)
+	go func() { <-start; results <- first.Close(ctx, map[string]any{"state": `{"partition_a":17}`}) }()
+	go func() { <-start; results <- second.Close(ctx, map[string]any{"state": `{"partition_b":18}`}) }()
+	close(start)
+	for range 2 {
+		require.NoError(t, <-results)
+	}
+	reader := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "read-state", false)
+	defer reader.Abort()
+	require.Equal(t, []string{http.MethodGet, http.MethodGet, http.MethodPost, http.MethodPost, http.MethodGet}, boundary.tableRequests())
+	require.Equal(t, snapshot, nativeSnapshotID(reader.table))
+	offsets, _ := nativeRecoveryOffsets(t, reader.table)
+	require.Equal(t, map[string]int{"partition_a": 17, "partition_b": 18}, offsets)
+	require.Equal(t, map[string]int64{"a": 1}, nativeVisibleValues(t, reader.table))
+}
+
+func TestNativeRESTCoordinatorUnknownCommitRequiresCatalogRecovery(t *testing.T) {
+	for _, mode := range []types.UpdateType{types.UpdateTypeEquality, types.UpdateTypePosition, types.UpdateTypeDeletionVector} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, cat, boundary := nativeRESTWriterFixture(t, mode, nativeTestRecord("a", "r", 1, "one"))
+			var index *nativeMemoryIndex
+			if mode != types.UpdateTypeEquality {
+				index = &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
+			}
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "unknown", false)
+			peer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "pending-peer", false)
+			beforeMetadata := writer.table.MetadataLocation()
+			beforeRecovery := writer.table.Properties()[nativeRecoveryProperty]
+			var beforeRows map[string]types.RowLocation
+			var beforeCheckpoint int64
+			if index != nil {
+				beforeRows, beforeCheckpoint = maps.Clone(index.rows), index.snapshot
+			}
+			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 2, "one")}))
+			paths := slices.Collect(maps.Keys(writer.paths))
+			boundary.mu.Lock()
+			boundary.failAfterCommit = true
+			boundary.mu.Unlock()
+			require.Error(t, writer.Close(ctx, map[string]any{"state": `{"published":2}`}))
+			require.True(t, writer.uncertain)
+			require.Equal(t, beforeMetadata, writer.table.MetadataLocation(), "unacknowledged response must not become the writer view")
+			require.Equal(t, beforeRecovery, writer.table.Properties()[nativeRecoveryProperty])
+			require.Error(t, writer.Close(ctx, map[string]any{"state": `{"retry":3}`}))
+			require.Error(t, peer.Close(ctx, map[string]any{"state": `{"unsafe_peer":4}`}))
+			opts := &destination.Options{ThreadID: "unsafe-new"}
+			if index != nil {
+				opts.TableIndex = index
+			}
+			_, _, err := newNativeWriter(ctx, cfg, stream, opts, cat, types.NewStreamIndexThread(opts.TableIndex))
+			require.Error(t, err, "new setup cannot clear an unknown catalog outcome")
+			require.Equal(t, []string{http.MethodGet, http.MethodGet, http.MethodPost}, boundary.tableRequests(), "unknown outcome must not be retried or probed into success")
+			writer.Abort()
+			fs, err := writer.table.FS(ctx)
+			require.NoError(t, err)
+			for _, path := range paths {
+				input, err := fs.Open(path)
+				require.NoError(t, err, "possibly published staged data must survive abort")
+				require.NoError(t, input.Close())
+			}
+			if index != nil {
+				require.Equal(t, beforeRows, index.rows)
+				require.Equal(t, beforeCheckpoint, index.snapshot)
+			}
+			// Reopen a catalog lifetime, then rebuild the index from authoritative
+			// metadata before accepting more CDC. A GET alone is not recovery.
+			reopened, cleanup, err := openNativeCatalog(ctx, cfg)
+			require.NoError(t, err)
+			defer cleanup(context.Background())
+			recovered := openNativeTestWriter(ctx, t, cfg, stream, reopened, index, "recovery", false)
+			defer recovered.Abort()
+			require.Equal(t, []string{http.MethodGet, http.MethodGet, http.MethodPost, http.MethodGet}, boundary.tableRequests())
+			require.Equal(t, map[string]int64{"a": 2}, nativeVisibleValues(t, recovered.table))
+			offsets, _ := nativeRecoveryOffsets(t, recovered.table)
+			require.Equal(t, map[string]int{"published": 2}, offsets)
+			if index != nil {
+				require.Equal(t, nativeSnapshotID(recovered.table), index.snapshot)
+			}
+		})
+	}
+}
+
+func TestNativeCoordinatorTableLifecycleRejectsOldWriters(t *testing.T) {
+	for _, purge := range []bool{false, true} {
+		t.Run(fmt.Sprintf("purge=%t", purge), func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
+			seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "original", true)
+			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("old", "r", 1, "one")}))
+			require.NoError(t, seed.Close(ctx, nil))
+			oldUUID := seed.table.Metadata().TableUUID()
+			stale := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "old-writer", false)
+			require.NoError(t, stale.Write(ctx, []types.RawRecord{nativeTestRecord("old", "u", 2, "one")}))
+			if purge {
+				require.NoError(t, cat.(catalog.PurgeableTable).PurgeTable(ctx, stale.table.Identifier()))
+			} else {
+				require.NoError(t, cat.DropTable(ctx, stale.table.Identifier()))
+			}
+			replacement := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "replacement", true)
+			require.NotEqual(t, oldUUID, replacement.table.Metadata().TableUUID())
+			require.NoError(t, replacement.Write(ctx, []types.RawRecord{nativeTestRecord("new", "r", 3, "one")}))
+			require.NoError(t, replacement.Close(ctx, map[string]any{"state": "replacement"}))
+			require.Error(t, stale.Close(ctx, map[string]any{"state": "must-not-resurrect"}), "a writer from an old table generation cannot mutate its replacement")
+			persisted, err := cat.LoadTable(ctx, replacement.table.Identifier())
+			require.NoError(t, err)
+			require.Equal(t, map[string]int64{"new": 3}, nativeVisibleValues(t, persisted))
+			require.NotContains(t, persisted.Properties()[nativeRecoveryProperty], "must-not-resurrect")
+		})
+	}
+}
+
+func TestNativeRESTCoordinatorCatalogLifetimesStayIsolated(t *testing.T) {
+	ctx := context.Background()
+	firstCfg, firstStream, firstCat, firstBoundary := nativeRESTWriterFixture(t, types.UpdateTypeEquality, nativeTestRecord("first", "r", 1, "one"))
+	secondCfg, secondStream, secondCat, secondBoundary := nativeRESTWriterFixture(t, types.UpdateTypeEquality, nativeTestRecord("second", "r", 2, "one"))
+	first := openNativeTestWriter(ctx, t, firstCfg, firstStream, firstCat, nil, "first-owner", false)
+	second := openNativeTestWriter(ctx, t, secondCfg, secondStream, secondCat, nil, "second-owner", false)
+	require.NoError(t, first.Close(ctx, map[string]any{"state": `{"first_catalog":1}`}))
+	require.NoError(t, second.Close(ctx, map[string]any{"state": `{"second_catalog":2}`}))
+	require.Equal(t, []string{http.MethodGet, http.MethodPost}, firstBoundary.tableRequests())
+	require.Equal(t, []string{http.MethodGet, http.MethodPost}, secondBoundary.tableRequests())
+	require.Equal(t, map[string]int64{"first": 1}, nativeVisibleValues(t, first.table))
+	require.Equal(t, map[string]int64{"second": 2}, nativeVisibleValues(t, second.table))
+	firstOffsets, _ := nativeRecoveryOffsets(t, first.table)
+	secondOffsets, _ := nativeRecoveryOffsets(t, second.table)
+	require.Equal(t, map[string]int{"first_catalog": 1}, firstOffsets)
+	require.Equal(t, map[string]int{"second_catalog": 2}, secondOffsets)
+}
+
+func TestNativeRESTCoordinatorSnapshotConflictRefreshesRecovery(t *testing.T) {
+	ctx := context.Background()
+	cfg, stream, cat, boundary := nativeRESTWriterFixture(t, types.UpdateTypeEquality, nativeTestRecord("a", "r", 1, "one"))
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "retry-after-snapshot", false)
+	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 2, "one")}))
+	external := openNativeTestWriter(ctx, t, cfg, stream, boundary.cat, nil, "external-chunk", true)
+	require.NoError(t, external.Write(ctx, []types.RawRecord{nativeTestRecord("b", "r", 3, "one")}))
+	require.NoError(t, external.Close(ctx, map[string]any{"state": `{"external_partition":17}`}))
+	require.Equal(t, []string{http.MethodGet}, boundary.tableRequests())
+	require.NoError(t, writer.Close(ctx, map[string]any{"state": `{"local_partition":18}`}))
+	require.Equal(t, []string{http.MethodGet, http.MethodPost, http.MethodGet, http.MethodPost}, boundary.tableRequests())
+	require.Equal(t, map[string]int64{"a": 2, "b": 3}, nativeVisibleValues(t, writer.table))
+	offsets, chunks := nativeRecoveryOffsets(t, writer.table)
+	require.Equal(t, map[string]int{"external_partition": 17, "local_partition": 18}, offsets)
+	require.ElementsMatch(t, []string{"bootstrap"}, chunks)
+}
+
+func TestNativeRESTCoordinatorSerialCDCCommitsShareLatestResponse(t *testing.T) {
+	for _, mode := range []types.UpdateType{types.UpdateTypeEquality, types.UpdateTypePosition, types.UpdateTypeDeletionVector} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, cat, boundary := nativeRESTWriterFixture(t, mode, nativeTestRecord("a", "r", 1, "one"), nativeTestRecord("b", "r", 2, "one"))
+			var index *nativeMemoryIndex
+			if mode != types.UpdateTypeEquality {
+				index = &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
+			}
+			first := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "first-staged", false)
+			second := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "second-staged", false)
+			require.NoError(t, first.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 3, "one")}))
+			require.NoError(t, second.Write(ctx, []types.RawRecord{nativeTestRecord("b", "u", 4, "one")}))
+			require.NoError(t, first.Close(ctx, map[string]any{"state": `{"first":3}`}))
+			require.NotEqual(t, first.table.MetadataLocation(), second.table.MetadataLocation())
+			require.NoError(t, second.Close(ctx, map[string]any{"state": `{"second":4}`}))
+			require.Equal(t, []string{http.MethodGet, http.MethodGet, http.MethodPost, http.MethodPost}, boundary.tableRequests(), "a writer staged before its peer committed must consume the latest successful POST response")
+			require.Equal(t, map[string]int64{"a": 3, "b": 4}, nativeVisibleValues(t, second.table))
+			offsets, _ := nativeRecoveryOffsets(t, second.table)
+			require.Equal(t, map[string]int{"first": 3, "second": 4}, offsets)
+			if index != nil {
+				require.Equal(t, nativeSnapshotID(second.table), index.snapshot)
+				require.Equal(t, first.dataFiles[0].FilePath(), index.rows["a"].FilePath)
+				require.Equal(t, second.dataFiles[0].FilePath(), index.rows["b"].FilePath)
+			}
+		})
+	}
+}
+
+func TestNativeRESTCoordinatorPreservesVendedCredentialRefresher(t *testing.T) {
+	ctx := context.Background()
+	cfg, stream, cat, boundary := nativeRESTWriterFixture(t, types.UpdateTypeEquality)
+	boundary.mu.Lock()
+	boundary.initialCredentials = []rest.StorageCredential{{Prefix: cfg.IcebergS3Path, Config: apacheiceberg.Properties{"s3.session-token-expires-at-ms": strconv.FormatInt(time.Now().Add(-time.Hour).UnixMilli(), 10)}}}
+	boundary.freshCredentials = []rest.StorageCredential{{Prefix: cfg.IcebergS3Path, Config: apacheiceberg.Properties{"s3.session-token-expires-at-ms": strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)}}}
+	boundary.mu.Unlock()
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "credential-refresh", false)
+	// Commit without opening FileIO, then use the returned table twice: the
+	// first access initializes the SDK closure and the second renews its expiry.
+	require.NoError(t, writer.Close(ctx, map[string]any{"state": `{"before_io":1}`}))
+	_, err := writer.table.FS(ctx)
+	require.NoError(t, err)
+	_, err = writer.table.FS(ctx)
+	require.NoError(t, err)
+	boundary.mu.Lock()
+	credentialRequests := boundary.credentialRequests
+	boundary.mu.Unlock()
+	require.Equal(t, 1, credentialRequests, "successful commit metadata must retain the original SDK /credentials refresher")
+	require.Equal(t, []string{http.MethodGet, http.MethodPost}, boundary.tableRequests(), "credential renewal must not require a metadata GET")
 }

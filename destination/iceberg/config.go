@@ -620,6 +620,7 @@ func nativeSQLConnection(config *Config) (string, string, icesql.SupportedDialec
 // FileIO honors explicit/vended table properties ahead of these ambient defaults.
 type nativeCatalog struct {
 	catalog.Catalog
+	tables     nativeTableCoordinator
 	storageAWS aws.Config
 	closeOnce  sync.Once
 	closeOwned func() error
@@ -637,6 +638,17 @@ func (c *nativeCatalog) ctx(ctx context.Context) context.Context {
 	return iceutils.WithAwsConfig(ctx, &c.storageAWS)
 }
 
+// A writer marks an already-held entry in its context so local catalog
+// adapters participate without recursively locking the same table.
+func (c *nativeCatalog) lockTable(ctx context.Context, ident table.Identifier) (context.Context, *nativeTableState, func()) {
+	state := c.tables.entry(ident)
+	if ctx.Value(nativeTableLockKey{}) == state {
+		return ctx, state, func() {}
+	}
+	state.mu.Lock()
+	return context.WithValue(ctx, nativeTableLockKey{}, state), state, state.mu.Unlock
+}
+
 // Every catalog produced by this factory implements PurgeableTable. Never fall
 // back to metadata-only DropTable if a different catalog is supplied: that would
 // report success while retaining the table's data.
@@ -645,13 +657,37 @@ func (c *nativeCatalog) PurgeTable(ctx context.Context, ident table.Identifier) 
 	if !ok {
 		return errors.New("Iceberg catalog cannot purge tables; the table was not dropped")
 	}
-	return nativeCatalogError("purge Iceberg table", purger.PurgeTable(c.ctx(ctx), ident))
+	ctx, state, unlock := c.lockTable(ctx, ident)
+	defer unlock()
+	if err := state.usable(); err != nil {
+		return err
+	}
+	err := nativeCatalogError("purge Iceberg table", purger.PurgeTable(c.ctx(ctx), ident))
+	state.invalidate(err != nil && !errors.Is(err, catalog.ErrNoSuchTable))
+	if err == nil || errors.Is(err, catalog.ErrNoSuchTable) {
+		state.generation++
+	}
+	return err
 }
 
 // Close and the factory cleanup callback share ownership, so callers may use
 // either public lifecycle API without double-closing pools or HTTP transports.
 func (c *nativeCatalog) Close() error {
 	c.closeOnce.Do(func() {
+		c.tables.mu.Lock()
+		c.tables.closed = true
+		states := make([]*nativeTableState, 0, len(c.tables.tables))
+		for _, state := range c.tables.tables {
+			states = append(states, state)
+		}
+		c.tables.tables = nil
+		c.tables.mu.Unlock()
+		for _, state := range states {
+			state.mu.Lock()
+			state.closed = true
+			state.latest = nil
+			state.mu.Unlock()
+		}
 		if c.closeOwned != nil {
 			c.closeErr = c.closeOwned()
 		} else if closer, ok := c.Catalog.(catalog.Closer); ok {
@@ -681,22 +717,42 @@ func (r nativeValidatedRequirement) Validate(metadata table.Metadata) error {
 }
 
 func (c *nativeCatalog) bindLocalTable(original *table.Table) *table.Table {
-	if original == nil || !nativeLocalRequirementValidation(c.Catalog.CatalogType()) {
+	if original == nil || c.Catalog.CatalogType() == catalog.REST {
 		return original
 	}
-	// Transactions retain the table's catalog. Rebind local catalogs so their
-	// later commits pass through the pre-write requirement adapter too. REST
-	// tables retain their original scan-planning and vended-credential state.
+	// Transactions retain the table's catalog. Local transactions also invalidate
+	// the coordinator when invoked outside a writer. REST tables must retain the
+	// SDK's original scan planner, response IO config and credential refresher.
 	return table.New(original.Identifier(), original.Metadata(), original.MetadataLocation(),
 		func(ctx context.Context) (iceio.IO, error) { return original.FS(c.ctx(ctx)) }, c,
 		table.WithMetricsReporter(original.MetricsReporter()))
 }
 
 func (c *nativeCatalog) CreateTable(ctx context.Context, ident table.Identifier, schema *apacheiceberg.Schema, opts ...catalog.CreateTableOpt) (*table.Table, error) {
+	ctx, state, unlock := c.lockTable(ctx, ident)
+	defer unlock()
+	if err := state.usable(); err != nil {
+		return nil, err
+	}
 	tbl, err := c.Catalog.CreateTable(c.ctx(ctx), ident, schema, opts...)
-	return c.bindLocalTable(tbl), nativeCatalogError("create Iceberg table", err)
+	err = nativeCatalogError("create Iceberg table", err)
+	if err != nil {
+		state.invalidate(!errors.Is(err, catalog.ErrTableAlreadyExists))
+		return nil, err
+	}
+	tbl = c.bindLocalTable(tbl)
+	state.generation++
+	state.latest = tbl
+	return tbl, nil
 }
 func (c *nativeCatalog) CommitTable(ctx context.Context, ident table.Identifier, requirements []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	state := c.tables.entry(ident)
+	writerOwned := ctx.Value(nativeTableLockKey{}) == state
+	ctx, state, unlock := c.lockTable(ctx, ident)
+	defer unlock()
+	if err := state.usable(); err != nil {
+		return nil, "", err
+	}
 	if nativeLocalRequirementValidation(c.Catalog.CatalogType()) && len(requirements) > 0 {
 		validated := make([]table.Requirement, len(requirements))
 		for index, requirement := range requirements {
@@ -705,11 +761,34 @@ func (c *nativeCatalog) CommitTable(ctx context.Context, ident table.Identifier,
 		requirements = validated
 	}
 	metadata, location, err := c.Catalog.CommitTable(c.ctx(ctx), ident, requirements, updates)
-	return metadata, location, nativeCatalogError("commit Iceberg table", err)
+	err = nativeCatalogError("commit Iceberg table", err)
+	if !writerOwned || err != nil {
+		// Only the SDK's returned Table preserves all catalog-specific state.
+		// Writer-owned commits publish that Table after tx.Commit returns.
+		state.invalidate(err != nil && !errors.Is(err, table.ErrCommitFailed))
+	}
+	return metadata, location, err
 }
 func (c *nativeCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	ctx, state, unlock := c.lockTable(ctx, ident)
+	defer unlock()
+	if state.closed {
+		return nil, errors.New("Iceberg catalog is closed")
+	}
 	tbl, err := c.Catalog.LoadTable(c.ctx(ctx), ident)
-	return c.bindLocalTable(tbl), nativeCatalogError("load Iceberg table", err)
+	err = nativeCatalogError("load Iceberg table", err)
+	if err != nil {
+		state.invalidate(false)
+		return nil, err
+	}
+	tbl = c.bindLocalTable(tbl)
+	if !state.unknown {
+		if state.latest != nil && state.latest.Metadata().TableUUID() != tbl.Metadata().TableUUID() {
+			state.generation++
+		}
+		state.latest = tbl
+	}
+	return tbl, nil
 }
 func (c *nativeCatalog) ListTables(ctx context.Context, namespace table.Identifier) iter.Seq2[table.Identifier, error] {
 	return func(yield func(table.Identifier, error) bool) {
@@ -721,11 +800,51 @@ func (c *nativeCatalog) ListTables(ctx context.Context, namespace table.Identifi
 	}
 }
 func (c *nativeCatalog) DropTable(ctx context.Context, ident table.Identifier) error {
-	return nativeCatalogError("drop Iceberg table", c.Catalog.DropTable(c.ctx(ctx), ident))
+	ctx, state, unlock := c.lockTable(ctx, ident)
+	defer unlock()
+	if err := state.usable(); err != nil {
+		return err
+	}
+	err := nativeCatalogError("drop Iceberg table", c.Catalog.DropTable(c.ctx(ctx), ident))
+	state.invalidate(err != nil && !errors.Is(err, catalog.ErrNoSuchTable))
+	if err == nil || errors.Is(err, catalog.ErrNoSuchTable) {
+		state.generation++
+	}
+	return err
 }
 func (c *nativeCatalog) RenameTable(ctx context.Context, from, to table.Identifier) (*table.Table, error) {
+	fromState, toState := c.tables.entry(from), c.tables.entry(to)
+	first, second := fromState, toState
+	if slices.Compare(from, to) > 0 {
+		first, second = second, first
+	}
+	first.mu.Lock()
+	defer first.mu.Unlock()
+	if second != first {
+		second.mu.Lock()
+		defer second.mu.Unlock()
+	}
+	if err := fromState.usable(); err != nil {
+		return nil, err
+	}
+	if err := toState.usable(); err != nil {
+		return nil, err
+	}
 	tbl, err := c.Catalog.RenameTable(c.ctx(ctx), from, to)
-	return c.bindLocalTable(tbl), nativeCatalogError("rename Iceberg table", err)
+	err = nativeCatalogError("rename Iceberg table", err)
+	unknown := err != nil && !errors.Is(err, catalog.ErrNoSuchTable) && !errors.Is(err, catalog.ErrTableAlreadyExists)
+	fromState.invalidate(unknown)
+	toState.invalidate(unknown)
+	if err != nil {
+		return nil, err
+	}
+	fromState.generation++
+	if toState != fromState {
+		toState.generation++
+	}
+	tbl = c.bindLocalTable(tbl)
+	toState.latest = tbl
+	return tbl, nil
 }
 func (c *nativeCatalog) CheckTableExists(ctx context.Context, ident table.Identifier) (bool, error) {
 	exists, err := c.Catalog.CheckTableExists(c.ctx(ctx), ident)
