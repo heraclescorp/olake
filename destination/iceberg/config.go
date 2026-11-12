@@ -2,9 +2,24 @@ package iceberg
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"iter"
+	"net"
+	"net/http"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
 	apacheiceberg "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/glue"
@@ -12,7 +27,7 @@ import (
 	"github.com/apache/iceberg-go/catalog/rest"
 	icesql "github.com/apache/iceberg-go/catalog/sql"
 	iceio "github.com/apache/iceberg-go/io"
-	_ "github.com/apache/iceberg-go/io/gocloud"
+	_ "github.com/apache/iceberg-go/io/gocloud" // Register cloud-backed FileIO schemes.
 	"github.com/apache/iceberg-go/table"
 	iceutils "github.com/apache/iceberg-go/utils"
 	"github.com/apache/thrift/lib/go/thrift"
@@ -28,22 +43,9 @@ import (
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/errs"
 	"github.com/datazip-inc/olake/utils/logger"
-	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "github.com/jackc/pgx/v5/stdlib" // Register the pgx database/sql driver for SQL catalogs.
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	"io"
-	"iter"
-	"math/rand/v2"
-	"net"
-	"net/http"
-	"net/url"
-	"slices"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"syscall"
-	"time"
 )
 
 // CatalogType represents supported Iceberg catalog implementations
@@ -834,7 +836,7 @@ func newNativeHiveClient(ctx context.Context, uri string, sasl bool) (*nativeHiv
 			return nil, err
 		}
 	}
-	factory := thrift.NewTBinaryProtocolFactoryDefault()
+	factory := thrift.NewTBinaryProtocolFactoryConf(nil)
 	client := hive_metastore.NewThriftHiveMetastoreClient(thrift.NewTStandardClient(factory.GetProtocol(transport), factory.GetProtocol(transport)))
 	return &nativeHiveClient{ThriftHiveMetastoreClient: client, transport: transport}, nil
 }
@@ -863,7 +865,7 @@ func nativeHiveCall[T any](ctx context.Context, p *nativeHivePool, call func(*na
 	case <-ctx.Done():
 		return zero, ctx.Err()
 	case <-p.done:
-		return zero, errors.New("Hive catalog is closed")
+		return zero, errors.New("hive catalog is closed")
 	case client := <-p.clients:
 		defer func() {
 			select {
@@ -895,7 +897,7 @@ func (p *nativeHivePool) ensureConnected(ctx context.Context, client *nativeHive
 	select {
 	case <-p.done:
 		p.mu.Unlock()
-		return errors.New("Hive catalog is closed")
+		return errors.New("hive catalog is closed")
 	default:
 	}
 	connected := client.transport != nil
@@ -912,7 +914,7 @@ func (p *nativeHivePool) ensureConnected(ctx context.Context, client *nativeHive
 	select {
 	case <-p.done:
 		_ = replacement.transport.Close()
-		return errors.New("Hive catalog is closed")
+		return errors.New("hive catalog is closed")
 	default:
 		client.transport, client.ThriftHiveMetastoreClient = replacement.transport, replacement.ThriftHiveMetastoreClient
 		return nil
@@ -1183,8 +1185,14 @@ func nativeHTTPThrottleDelay(header string, attempt int, now time.Time) time.Dur
 		}
 	}
 	// Match the former client's exponential backoff and sub-10% jitter.
-	delay := time.Second << min(max(attempt-1, 0), 6)
-	return delay + time.Duration(rand.Int64N(int64(delay/10)))
+	backoff := min(max(attempt-1, 0), 6)
+	delay := time.Second << backoff
+	var jitter [4]byte
+	if _, err := rand.Read(jitter[:]); err != nil {
+		panic(err)
+	}
+	jitterNanos := binary.LittleEndian.Uint32(jitter[:]) % uint32(time.Second/10)
+	return delay + (time.Duration(jitterNanos) << backoff)
 }
 
 // Only fixed application-authored messages may use this type, never server

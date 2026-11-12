@@ -350,7 +350,11 @@ func TestFailureLabelsAreBoundedAndJobLevel(t *testing.T) {
 func TestRuntimeMetricsHaveStableAttributes(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	defer provider.Shutdown(context.Background())
+	defer func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Errorf("shutting down runtime meter provider: %v", err)
+		}
+	}()
 	if err := registerRuntime(provider.Meter("runtime-test"), []attribute.KeyValue{
 		attribute.String("job_id", "job-test"), attribute.String("component", "go"), attribute.String("operation", "sync"),
 	}); err != nil {

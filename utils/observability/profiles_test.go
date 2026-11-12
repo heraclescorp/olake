@@ -135,7 +135,12 @@ func assertLocalProfile(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	if _, err := io.Copy(io.Discard, reader); err != nil {
+	// Read one byte past the bound so an oversized profile cannot pass by truncation.
+	n, err := io.Copy(io.Discard, io.LimitReader(reader, maxProfileBytes+1))
+	if err != nil {
 		t.Fatalf("invalid compressed profile: %v", err)
+	}
+	if n == 0 || n > maxProfileBytes {
+		t.Fatalf("decompressed profile bytes=%d, want 1..%d", n, maxProfileBytes)
 	}
 }

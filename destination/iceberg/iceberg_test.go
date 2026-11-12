@@ -9,6 +9,22 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -34,22 +50,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
-	"io"
-	"maps"
-	"net"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
-	"os"
-	"path/filepath"
-	"slices"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"syscall"
-	"testing"
-	"time"
 )
 
 func TestIsValidTypeForColumn(t *testing.T) {
@@ -569,7 +569,7 @@ func TestNativeRESTSigV4SigningConfiguration(t *testing.T) {
 }
 
 func TestNativeGoogleAuthRefreshAndCancellation(t *testing.T) {
-	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -683,7 +683,7 @@ func TestNativeSQLCatalogFactoryPostgres(t *testing.T) {
 
 func TestNativeGlueSDKRetriesRemainVisible(t *testing.T) {
 	attempts := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attempts++
 		w.Header().Set("Content-Type", "application/x-amz-json-1.1")
 		w.Header().Set("X-Amzn-Requestid", "request-id")
@@ -747,7 +747,7 @@ func TestNativeHiveFactoryUsesThriftAndConfiguredPool(t *testing.T) {
 				defer connections.Done()
 				socket := thrift.NewTSocketFromConnConf(conn, &thrift.TConfiguration{SocketTimeout: 5 * time.Second})
 				defer socket.Close()
-				factory := thrift.NewTBinaryProtocolFactoryDefault()
+				factory := thrift.NewTBinaryProtocolFactoryConf(nil)
 				input, output := factory.GetProtocol(socket), factory.GetProtocol(socket)
 				processor := hive_metastore.NewThriftHiveMetastoreProcessor(&nativeTestHiveHandler{})
 				for {
@@ -994,7 +994,7 @@ func TestNativeHivePoolRetainsDecodedApplicationExceptions(t *testing.T) {
 		transport := &nativeHiveTrackedTransport{TTransport: thrift.NewTMemoryBuffer()}
 		client := &nativeHiveClient{transport: transport, reconnect: func(context.Context) (*nativeHiveClient, error) {
 			t.Fatal("decoded application exception discarded a healthy transport")
-			return nil, nil
+			return nil, errors.New("unexpected reconnect after decoded application exception")
 		}}
 		pool := &nativeHivePool{clients: make(chan *nativeHiveClient, 1), all: []*nativeHiveClient{client}, done: make(chan struct{})}
 		pool.clients <- client
@@ -1167,6 +1167,9 @@ func TestNativeHTTPDiagnosticsPreserveBodiesAndRedactSecrets(t *testing.T) {
 		return &http.Response{StatusCode: 409, Header: http.Header{"X-Amz-Request-Id": {"aws-request"}, "X-Amz-Id-2": {"aws-extended"}, "Set-Cookie": {"response-secret"}}, Body: responseBody}, nil
 	}), func(a nativeHTTPAttempt) { events = append(events, a) })
 	response, err := transport.RoundTrip(request)
+	if response != nil {
+		defer func() { _ = response.Body.Close() }()
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1199,7 +1202,13 @@ func TestNativeHTTPDiagnosticsRecordRecoveredAttempts(t *testing.T) {
 		return &http.Response{StatusCode: status, Header: http.Header{"X-Amzn-Requestid": {"request"}}, Body: http.NoBody}, nil
 	}), func(a nativeHTTPAttempt) { events = append(events, a) })
 	for range statuses {
-		if _, err := transport.RoundTrip(request); err != nil {
+		response, err := transport.RoundTrip(request)
+		if response != nil {
+			if closeErr := response.Body.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+		}
+		if err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1221,7 +1230,10 @@ func TestNativeHTTPDiagnosticsDoNotLogTransportErrors(t *testing.T) {
 	cause := errors.New("https://catalog.example/?secret=transport-secret")
 	var event nativeHTTPAttempt
 	transport := newNativeHTTPTransport(nativeRoundTripFunc(func(*http.Request) (*http.Response, error) { return nil, cause }), func(a nativeHTTPAttempt) { event = a })
-	_, err := transport.RoundTrip(request)
+	response, err := transport.RoundTrip(request)
+	if response != nil {
+		defer func() { _ = response.Body.Close() }()
+	}
 	if !errors.Is(err, cause) || !event.TransportError || event.Status != 0 {
 		t.Fatal("transport error changed or missing")
 	}
@@ -1375,10 +1387,12 @@ func TestNativeRESTThrottleHonorsRetryAfterAndWaitBudget(t *testing.T) {
 	}
 	request, _ := http.NewRequest(http.MethodGet, "https://catalog.example/v1/config", nil)
 	response, err := transport.RoundTrip(request)
+	if response != nil {
+		defer func() { _ = response.Body.Close() }()
+	}
 	if err != nil || response.StatusCode != 429 || calls != 2 || waits != 1 || finalBody.closes != 0 {
 		t.Fatal("wait budget did not stop retries while retaining the final response")
 	}
-	_ = response.Body.Close()
 }
 
 func TestNativeRESTThrottleCancellationInterruptsWait(t *testing.T) {
@@ -1397,7 +1411,13 @@ func TestNativeRESTThrottleCancellationInterruptsWait(t *testing.T) {
 	}
 	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://catalog.example/v1/config", nil)
 	finished := make(chan error, 1)
-	go func() { _, err := transport.RoundTrip(request); finished <- err }()
+	go func() {
+		response, err := transport.RoundTrip(request)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		finished <- err
+	}()
 	<-waiting
 	cancel()
 	select {
@@ -1430,6 +1450,9 @@ func TestNativeRESTThrottleReplaysPOSTOnlyThroughGetBody(t *testing.T) {
 		return &http.Response{StatusCode: status, Header: http.Header{"Retry-After": {"0"}}, Body: http.NoBody}, nil
 	}))
 	response, err := transport.RoundTrip(request)
+	if response != nil {
+		defer func() { _ = response.Body.Close() }()
+	}
 	if err != nil || response.StatusCode != 200 || calls != 2 || replays != 1 {
 		t.Fatal("POST was not replayed via GetBody")
 	}
@@ -1449,10 +1472,12 @@ func TestNativeRESTThrottleLeavesUnreplayablePOSTResponseIntact(t *testing.T) {
 			return &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"0"}}, Body: body}, nil
 		}))
 		response, err := transport.RoundTrip(request)
+		if response != nil {
+			defer func() { _ = response.Body.Close() }()
+		}
 		if err != nil || response.StatusCode != 429 || calls != 1 || body.closes != 0 || body.reads != 0 {
 			t.Fatal("unreplayable POST was retried or its final response was discarded")
 		}
-		_ = response.Body.Close()
 	}
 }
 
@@ -1469,6 +1494,9 @@ func TestNativeRESTThrottleDoesNotRetryConflictsOrAmbiguousFailures(t *testing.T
 			}))
 			request, _ := http.NewRequest(method, "https://catalog.example/v1/commit", strings.NewReader("payload"))
 			response, err := transport.RoundTrip(request)
+			if response != nil {
+				_ = response.Body.Close()
+			}
 			if err != nil || response.StatusCode != status || calls != 1 {
 				t.Fatalf("retried %s HTTP %d", method, status)
 			}
@@ -1479,6 +1507,9 @@ func TestNativeRESTThrottleDoesNotRetryConflictsOrAmbiguousFailures(t *testing.T
 	transport := nativeThrottleTestTransport(nativeRoundTripFunc(func(*http.Request) (*http.Response, error) { calls++; return nil, cause }))
 	request, _ := http.NewRequest(http.MethodPost, "https://catalog.example/v1/commit", nil)
 	response, err := transport.RoundTrip(request)
+	if response != nil {
+		defer func() { _ = response.Body.Close() }()
+	}
 	if response != nil || !errors.Is(err, cause) || calls != 1 {
 		t.Fatal("retried an ambiguous transport failure")
 	}
@@ -1522,6 +1553,9 @@ func TestNativeRESTThrottleCancellationClosesPendingPOSTReplay(t *testing.T) {
 	}))
 	transport.wait = func(context.Context, time.Duration) error { return context.Canceled }
 	response, err := transport.RoundTrip(request)
+	if response != nil && response.Body != nil {
+		defer func() { require.NoError(t, response.Body.Close()) }()
+	}
 	if response != nil || !errors.Is(err, context.Canceled) || calls != 1 || replayBody.closes != 1 || replayBody.reads != 0 || responseBody.closes != 1 {
 		t.Fatal("canceled POST retry leaked a replay or discarded response body")
 	}
@@ -1571,7 +1605,7 @@ func nativeWriterFixture(t *testing.T, mode types.UpdateType, normalized bool, p
 	return &Config{IcebergS3Path: root, IcebergDatabase: "db"}, configured, cat
 }
 
-func openNativeTestWriter(t *testing.T, ctx context.Context, cfg *Config, stream *types.ConfiguredStream, cat catalog.Catalog, index *nativeMemoryIndex, thread string, backfill bool) *nativeWriter {
+func openNativeTestWriter(ctx context.Context, t *testing.T, cfg *Config, stream *types.ConfiguredStream, cat catalog.Catalog, index *nativeMemoryIndex, thread string, backfill bool) *nativeWriter {
 	t.Helper()
 	opts := &destination.Options{ThreadID: thread, Backfill: backfill}
 	if index != nil {
@@ -1612,10 +1646,10 @@ func nativeVisibleValues(t *testing.T, tbl *table.Table) map[string]int64 {
 func TestNativeWriterEqualityRepeatsAndSoftDelete(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "/{part, identity}")
-	seed := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "snapshot-1", true)
+	seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "snapshot-1", true)
 	require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("a", "r", 1, "one"), nativeTestRecord("b", "r", 7, "one")}))
 	require.NoError(t, seed.Close(ctx, nil))
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "cdc-1", false)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "cdc-1", false)
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 2, "one"), nativeTestRecord("a", "u", 3, "two")}))
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "d", 4, "two")}))
 	require.NoError(t, writer.Close(ctx, map[string]any{"state": `{"captured_cdc_pos":"0/ABC"}`, "dedup_inserts": false}))
@@ -1634,11 +1668,11 @@ func TestNativeWriterIndexedDeletesAndRecoveryReads(t *testing.T) {
 			ctx := context.Background()
 			cfg, stream, cat := nativeWriterFixture(t, mode, true, "/{part, identity}")
 			index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-			seed := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "snapshot", true)
+			seed := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "snapshot", true)
 			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("a", "r", 1, "one"), nativeTestRecord("b", "r", 2, "one")}))
 			original := seed.dataFiles[0].FilePath()
 			require.NoError(t, seed.Close(ctx, nil))
-			writer := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "cdc-a", false)
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "cdc-a", false)
 			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 3, "two"), nativeTestRecord("a", "u", 4, "one")}))
 			loc, found, err := writer.indexThread.Lookup("a")
 			require.NoError(t, err)
@@ -1649,7 +1683,7 @@ func TestNativeWriterIndexedDeletesAndRecoveryReads(t *testing.T) {
 			require.Equal(t, int64(4), rows[loc.Position]["value"])
 			require.Equal(t, []byte{0, 1, 2, 3}, rows[loc.Position]["blob"])
 			require.NoError(t, writer.Close(ctx, map[string]any{"state": "a"}))
-			next := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "cdc-b", false)
+			next := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "cdc-b", false)
 			require.NoError(t, next.Write(ctx, []types.RawRecord{nativeTestRecord("b", "d", 5, "two")}))
 			require.NoError(t, next.Close(ctx, map[string]any{"state": "b"}))
 			require.Equal(t, map[string]int64{"a": 4, "b": 5}, nativeVisibleValues(t, next.table))
@@ -1671,16 +1705,16 @@ func TestNativeWriterEqualityMigration(t *testing.T) {
 		t.Run(string(mode), func(t *testing.T) {
 			ctx := context.Background()
 			cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
-			seed := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "snapshot", true)
+			seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "snapshot", true)
 			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("a", "r", 1, "one"), nativeTestRecord("b", "r", 2, "one")}))
 			require.NoError(t, seed.Close(ctx, nil))
-			cdc := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "eq-cdc", false)
+			cdc := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "eq-cdc", false)
 			require.NoError(t, cdc.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 3, "one")}))
 			require.NoError(t, cdc.Close(ctx, map[string]any{"state": "checkpoint"}))
 			update := string(mode)
 			stream.StreamMetadata.UpdateType = &update
 			index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-			migrated := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "migrate", false)
+			migrated := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "migrate", false)
 			entries, err := nativeLiveEntries(ctx, migrated.table)
 			require.NoError(t, err)
 			for _, entry := range entries {
@@ -1697,7 +1731,7 @@ func TestNativeWriterEqualityMigration(t *testing.T) {
 func TestNativeWriterSchemaEvolutionKeepsFieldIDs(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "schema", true)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "schema", true)
 	before := make(map[string]int)
 	for _, field := range writer.table.Schema().Fields() {
 		before[field.Name] = field.ID
@@ -1723,7 +1757,7 @@ func TestNativeWriterRawAppendAndAbort(t *testing.T) {
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, false, "/{part, identity}")
 	appendMode := true
 	stream.StreamMetadata.AppendMode = &appendMode
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "raw", false)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "raw", false)
 	row := nativeTestRecord("a", "u", 1, "null")
 	row.Data[constants.StringifiedData] = `{"nested":{"text":"raw"}}`
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{row}))
@@ -1733,7 +1767,7 @@ func TestNativeWriterRawAppendAndAbort(t *testing.T) {
 	require.Equal(t, "string", field.Type.String())
 	_, hasSourceColumn := writer.table.Schema().FindFieldByName("value")
 	require.False(t, hasSourceColumn)
-	abort := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "abort", false)
+	abort := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "abort", false)
 	require.NoError(t, abort.Write(ctx, []types.RawRecord{row}))
 	paths := slices.Collect(maps.Keys(abort.paths))
 	require.NotEmpty(t, paths)
@@ -1781,11 +1815,11 @@ func (c *nativeCommitFaultCatalog) CommitTable(ctx context.Context, id table.Ide
 func TestNativeWriterRetriesMergeFreshRecoveryState(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, realCatalog := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
-	seed := openNativeTestWriter(t, ctx, cfg, stream, realCatalog, nil, "snapshot", true)
+	seed := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, nil, "snapshot", true)
 	require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("a", "r", 1, "one")}))
 	require.NoError(t, seed.Close(ctx, nil))
 	cat := &nativeCommitFaultCatalog{Catalog: realCatalog}
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "retry", false)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "retry", false)
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 2, "one")}))
 	cat.fault = func(ctx context.Context, id table.Identifier, _ []table.Requirement, _ []table.Update) (bool, error) {
 		cat.fault = nil
@@ -1811,10 +1845,10 @@ func TestNativeWriterRetriesMergeFreshRecoveryState(t *testing.T) {
 func TestNativeWriterUnknownCommitRetainsFilesAndRecovery(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, realCatalog := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
-	seed := openNativeTestWriter(t, ctx, cfg, stream, realCatalog, nil, "create", true)
+	seed := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, nil, "create", true)
 	seed.Abort()
 	cat := &nativeCommitFaultCatalog{Catalog: realCatalog}
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "unknown", false)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "unknown", false)
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "i", 1, "one")}))
 	paths := slices.Collect(maps.Keys(writer.paths))
 	cat.fault = func(ctx context.Context, id table.Identifier, reqs []table.Requirement, updates []table.Update) (bool, error) {
@@ -1845,12 +1879,12 @@ func TestNativeWriterRejectsStaleIndexWithoutPublishing(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypePosition, true, "")
 	index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-	seed := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "snapshot", true)
+	seed := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "snapshot", true)
 	require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("a", "r", 1, "one")}))
 	require.NoError(t, seed.Close(ctx, nil))
-	stale := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "stale", false)
+	stale := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "stale", false)
 	require.NoError(t, stale.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 2, "one")}))
-	external := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "external", true)
+	external := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "external", true)
 	require.NoError(t, external.Write(ctx, []types.RawRecord{nativeTestRecord("b", "r", 3, "one")}))
 	require.NoError(t, external.Close(ctx, nil))
 	err := stale.Close(ctx, map[string]any{"state": "unsafe"})
@@ -1896,11 +1930,11 @@ func TestNativePartitionGroupingDistinguishesNullString(t *testing.T) {
 func TestNativeWriterStateOnlyCommitPreservesSnapshot(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
-	seed := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "snapshot", true)
+	seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "snapshot", true)
 	require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("a", "r", 1, "one")}))
 	require.NoError(t, seed.Close(ctx, nil))
 	snapshot := nativeSnapshotID(seed.table)
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "heartbeat", false)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "heartbeat", false)
 	require.NoError(t, writer.Close(ctx, map[string]any{"state": `{"captured_cdc_pos":"0/123"}`}))
 	require.Equal(t, snapshot, nativeSnapshotID(writer.table))
 	require.Contains(t, writer.table.Properties()[nativeRecoveryProperty], "0/123")
@@ -1911,12 +1945,12 @@ func TestNativeWriterConcurrentIndexKeyFence(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypePosition, true, "")
 	index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-	seed := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "snapshot", true)
+	seed := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "snapshot", true)
 	require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("a", "r", 1, "one"), nativeTestRecord("b", "r", 2, "one")}))
 	require.NoError(t, seed.Close(ctx, nil))
-	first := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "first", false)
-	stale := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "same-key", false)
-	disjoint := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "different-key", false)
+	first := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "first", false)
+	stale := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "same-key", false)
+	disjoint := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "different-key", false)
 	require.NoError(t, first.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 3, "one")}))
 	require.NoError(t, stale.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 4, "one")}))
 	require.NoError(t, disjoint.Write(ctx, []types.RawRecord{nativeTestRecord("b", "u", 5, "one")}))
@@ -1930,7 +1964,7 @@ func TestNativeWriterTimestampPartitionAndPromotion(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "/{_olake_timestamp, day}/{blob, bucket[8]}")
 	stream.Stream.UpsertField("promoted", types.Int32, true, false)
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "partitioned", false)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "partitioned", false)
 	before, ok := writer.table.Schema().FindFieldByName("promoted")
 	require.True(t, ok)
 	columns := writer.schemaMap()
@@ -1956,7 +1990,7 @@ func TestNativeWriterTimestampPartitionAndPromotion(t *testing.T) {
 func TestNativeWriterPartialWriteFailureCleansFiles(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "/{part, identity}")
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "bad", true)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "bad", true)
 	bad := nativeTestRecord("b", "r", 2, "two")
 	bad.Data["blob"] = []byte{1}
 	require.Error(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "r", 1, "one"), bad}))
@@ -1979,11 +2013,11 @@ func TestNativeWriterConstructorReusesLoadedMetadata(t *testing.T) {
 			if mode != types.UpdateTypeEquality {
 				index = &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
 			}
-			seed := openNativeTestWriter(t, ctx, cfg, stream, realCatalog, index, "seed", true)
+			seed := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, index, "seed", true)
 			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("a", "r", 1, "one")}))
 			require.NoError(t, seed.Close(ctx, nil))
 			cat := &nativeCommitFaultCatalog{Catalog: realCatalog}
-			writer := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "no-change", false)
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "no-change", false)
 			require.Equal(t, 1, cat.loads, "unchanged setup must use its initial catalog load")
 			require.Zero(t, cat.calls, "unchanged setup must not commit metadata")
 			require.NoError(t, writer.EvolveSchema(ctx, writer.schemaMap()))
@@ -2001,7 +2035,7 @@ func TestNativeWriterCreationKeepsCatalogLocationAndCredentialsPrivate(t *testin
 	cfg.IcebergS3Path = "arn:aws:s3tables:us-east-2:123456789012:bucket/example"
 	cfg.AccessKey, cfg.SecretKey, cfg.SessionToken = "private-access", "private-secret", "private-session"
 	cfg.GCPServiceAccountJSON = "private-google-key"
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "creation", true)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "creation", true)
 	defer writer.Abort()
 	persisted, err := cat.LoadTable(ctx, writer.table.Identifier())
 	require.NoError(t, err)
@@ -2036,7 +2070,7 @@ func TestNativeStagedRewritePreservesSchemaPartitionAndIndex(t *testing.T) {
 			if mode != types.UpdateTypeEquality {
 				index = &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
 			}
-			writer := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "staged-rewrite", false)
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "staged-rewrite", false)
 			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 1, "one"), nativeTestRecord("b", "u", 2, "one"), nativeTestRecord("c", "u", 3, "two")}))
 			originalB := nativePendingLocation(t, writer, "b")
 			originalC := nativePendingLocation(t, writer, "c")
@@ -2107,7 +2141,7 @@ func TestNativeStagedRewriteFailureKeepsPendingIndexAtomic(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypePosition, true, "/{part, identity}")
 	index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "rewrite-fails", false)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "rewrite-fails", false)
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 1, "one"), nativeTestRecord("x", "u", 2, "one"), nativeTestRecord("b", "u", 3, "two"), nativeTestRecord("y", "u", 4, "two")}))
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 5, "three"), nativeTestRecord("b", "u", 6, "three")}))
 	pending := writer.indexThread
@@ -2147,7 +2181,7 @@ func TestNativeStagedRewriteAbortCleansReplacementFiles(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypePosition, true, "")
 	index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "rewrite-abort", false)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "rewrite-abort", false)
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 1, "one"), nativeTestRecord("b", "u", 2, "one"), nativeTestRecord("a", "u", 3, "one")}))
 	original := nativePendingLocation(t, writer, "b")
 	require.NoError(t, writer.compactStagedDataFiles(ctx))
@@ -2171,7 +2205,7 @@ func TestNativeStagedRewriteStreamsAcrossPhysicalBatches(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypePosition, true, "")
 	index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "rewrite-batches", false)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "rewrite-batches", false)
 	const count = 9000
 	records := make([]types.RawRecord, count)
 	for row := range records {
@@ -2215,10 +2249,10 @@ func TestNativeStagedRewriteUnknownCommitKeepsPublishedReplacements(t *testing.T
 	ctx := context.Background()
 	cfg, stream, realCatalog := nativeWriterFixture(t, types.UpdateTypeDeletionVector, true, "")
 	index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-	seed := openNativeTestWriter(t, ctx, cfg, stream, realCatalog, index, "create", true)
+	seed := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, index, "create", true)
 	seed.Abort()
 	cat := &nativeCommitFaultCatalog{Catalog: realCatalog}
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "rewrite-unknown", false)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "rewrite-unknown", false)
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 1, "one"), nativeTestRecord("b", "u", 2, "one"), nativeTestRecord("a", "u", 3, "one")}))
 	original := nativePendingLocation(t, writer, "b")
 	cat.fault = func(ctx context.Context, id table.Identifier, reqs []table.Requirement, updates []table.Update) (bool, error) {
@@ -2239,7 +2273,7 @@ func TestNativeStagedRewriteUnknownCommitKeepsPublishedReplacements(t *testing.T
 	}
 	require.Empty(t, index.rows)
 	require.Zero(t, index.snapshot, "unknown outcomes must not checkpoint the local index")
-	recovered := openNativeTestWriter(t, ctx, cfg, stream, realCatalog, index, "recover", false)
+	recovered := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, index, "recover", false)
 	require.Equal(t, map[string]int64{"a": 3, "b": 2}, nativeVisibleValues(t, recovered.table))
 	require.Equal(t, int64(0), index.rows["b"].Position)
 	require.Equal(t, nativeSnapshotID(recovered.table), index.snapshot)

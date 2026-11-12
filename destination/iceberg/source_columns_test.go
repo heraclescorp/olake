@@ -2,6 +2,8 @@ package iceberg
 
 import (
 	"context"
+	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
 	apacheiceberg "github.com/apache/iceberg-go"
@@ -10,8 +12,6 @@ import (
 	"github.com/datazip-inc/olake/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"testing"
-	"time"
 )
 
 func sourceColumnsStream(dropRemoved bool, selected ...string) *types.ConfiguredStream {
@@ -165,7 +165,7 @@ func TestNativeSourceColumnsInitialDefaultsAndMissingValues(t *testing.T) {
 		t.Run(string(mode), func(t *testing.T) {
 			ctx := context.Background()
 			cfg, stream, cat := nativeWriterFixture(t, mode, true, "")
-			seed := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "seed", true)
+			seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "seed", true)
 			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("old", "r", 1, "one")}))
 			oldPath := seed.dataFiles[0].FilePath()
 			require.NoError(t, seed.Close(ctx, map[string]any{"state": "preserve-recovery"}))
@@ -180,13 +180,13 @@ func TestNativeSourceColumnsInitialDefaultsAndMissingValues(t *testing.T) {
 			// Discovery before SyncStart must not add the field and consume the
 			// opportunity to attach PostgreSQL's authoritative initial default.
 			stream.Stream.UpsertField("added", types.Int32, true, false)
-			writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "alter", true)
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "alter", true)
 			_, exists := writer.table.Schema().FindFieldByName("added")
 			require.False(t, exists)
 			initial, err := nativeSourceColumnDefault("int", "42")
 			require.NoError(t, err)
 			require.NoError(t, writer.AlterSourceColumns(ctx, []*nativeSourceColumn{
-				{Key: "added", IceType: "int", InitialDefault: initial},
+				{Key: "added", IceType: "int", InitialDefault: initial.Val},
 				{Key: "nullable", IceType: "string"},
 			}, nil))
 			persisted, err := cat.LoadTable(ctx, writer.table.Identifier())
@@ -234,10 +234,10 @@ func TestNativeSourceColumnsInitialDefaultsAndMissingValues(t *testing.T) {
 func TestNativeSourceColumnsDropAndReAddUsesFreshIDs(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeDeletionVector, true, "")
-	seed := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "seed", true)
+	seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "seed", true)
 	require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("old", "r", 7, "one")}))
 	require.NoError(t, seed.Close(ctx, map[string]any{"state": "keep"}))
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "alter", true)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "alter", true)
 	defer writer.Abort()
 	old, found := writer.table.Schema().FindFieldByName("value")
 	require.True(t, found)
@@ -253,7 +253,7 @@ func TestNativeSourceColumnsDropAndReAddUsesFreshIDs(t *testing.T) {
 	require.False(t, found)
 	initial, err := nativeSourceColumnDefault("long", 99)
 	require.NoError(t, err)
-	require.NoError(t, writer.AlterSourceColumns(ctx, []*nativeSourceColumn{{Key: "value", IceType: "long", InitialDefault: initial}}, nil))
+	require.NoError(t, writer.AlterSourceColumns(ctx, []*nativeSourceColumn{{Key: "value", IceType: "long", InitialDefault: initial.Val}}, nil))
 	persisted, err = cat.LoadTable(ctx, writer.table.Identifier())
 	require.NoError(t, err)
 	readded, found := persisted.Schema().FindFieldByName("value")
@@ -268,7 +268,7 @@ func TestNativeSourceColumnsDropAndReAddUsesFreshIDs(t *testing.T) {
 func TestNativeSourceColumnsKeepIdentifiersHistoricalPartitionsAndSortSources(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "/{part, identity}")
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "protected", true)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "protected", true)
 	defer writer.Abort()
 	original := writer.table.Schema()
 	value, found := original.FindFieldByName("value")
@@ -315,10 +315,11 @@ func TestNativeSourceColumnDefaultConversions(t *testing.T) {
 		t.Run(tc.iceType, func(t *testing.T) {
 			literal, err := nativeSourceColumnDefault(tc.iceType, tc.value)
 			require.NoError(t, err)
-			require.Equal(t, tc.want, literal.Any())
+			require.True(t, literal.Valid)
+			require.Equal(t, tc.want, literal.Val.Any())
 			schema, err := nativeSchema(map[string]string{"default": tc.iceType}, false)
 			require.NoError(t, err)
-			require.True(t, literal.Type().Equals(schema.Field(0).Type))
+			require.True(t, literal.Val.Type().Equals(schema.Field(0).Type))
 		})
 	}
 	for _, tc := range []struct {
@@ -339,15 +340,20 @@ func TestNativeSourceColumnDefaultConversions(t *testing.T) {
 		_, err := nativeSourceColumnDefault(tc.iceType, tc.value)
 		require.Error(t, err)
 	}
-	literal, err := nativeSourceColumnDefault("long", nil)
-	require.NoError(t, err)
-	require.Nil(t, literal)
+	var nilPointer *any
+	var null any
+	for _, value := range []any{nil, nilPointer, &null} {
+		literal, err := nativeSourceColumnDefault("long", value)
+		require.NoError(t, err)
+		require.False(t, literal.Valid)
+		require.Nil(t, literal.Val)
+	}
 }
 
 func TestNativeSchemaEvolutionPreservesExistingDefaultsAndIdentifiers(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeDeletionVector, true, "")
-	seed := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "seed", true)
+	seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "seed", true)
 	require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("old", "r", 7, "one")}))
 	require.NoError(t, seed.Close(ctx, map[string]any{"state": "keep-existing"}))
 	tx := seed.table.NewTransaction()
@@ -360,7 +366,7 @@ func TestNativeSchemaEvolutionPreservesExistingDefaultsAndIdentifiers(t *testing
 	original, found := committed.Schema().FindFieldByName("external_default")
 	require.True(t, found)
 	recovery := committed.Properties()[nativeRecoveryProperty]
-	writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "evolve", true)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "evolve", true)
 	defer writer.Abort()
 	columns := writer.schemaMap()
 	columns["record_discovered"] = "string"
@@ -389,11 +395,11 @@ func TestNativeSourceColumnsCommitRecovery(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
 			cfg, stream, realCatalog := nativeWriterFixture(t, types.UpdateTypeDeletionVector, true, "")
-			seed := openNativeTestWriter(t, ctx, cfg, stream, realCatalog, nil, "seed", true)
+			seed := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, nil, "seed", true)
 			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("old", "r", 1, "one")}))
 			require.NoError(t, seed.Close(ctx, map[string]any{"state": "original"}))
 			cat := &nativeCommitFaultCatalog{Catalog: realCatalog}
-			writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "alter", true)
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "alter", true)
 			defer writer.Abort()
 			cat.fault = func(ctx context.Context, id table.Identifier, reqs []table.Requirement, updates []table.Update) (bool, error) {
 				cat.fault = nil
@@ -414,7 +420,7 @@ func TestNativeSourceColumnsCommitRecovery(t *testing.T) {
 			}
 			initial, err := nativeSourceColumnDefault("long", 42)
 			require.NoError(t, err)
-			err = writer.AlterSourceColumns(ctx, []*nativeSourceColumn{{Key: "added", IceType: "long", InitialDefault: initial}}, nil)
+			err = writer.AlterSourceColumns(ctx, []*nativeSourceColumn{{Key: "added", IceType: "long", InitialDefault: initial.Val}}, nil)
 			if unknown {
 				require.ErrorContains(t, err, "outcome is unknown")
 				require.ErrorContains(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("unsafe", "r", 2, "one")}), "outcome is unknown")
@@ -444,7 +450,7 @@ func TestNativeSourcePrimitiveDefaultsPersistAndReadOldRows(t *testing.T) {
 		t.Run(string(mode), func(t *testing.T) {
 			ctx := context.Background()
 			cfg, stream, cat := nativeWriterFixture(t, mode, true, "")
-			seed := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "seed", true)
+			seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "seed", true)
 			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("old", "r", 1, "one")}))
 			oldPath := seed.dataFiles[0].FilePath()
 			require.NoError(t, seed.Close(ctx, nil))
@@ -469,14 +475,14 @@ func TestNativeSourcePrimitiveDefaultsPersistAndReadOldRows(t *testing.T) {
 			for _, column := range defaults {
 				initial, err := nativeSourceColumnDefault(column.iceType, column.value)
 				require.NoError(t, err)
-				added = append(added, &nativeSourceColumn{Key: column.name, IceType: column.iceType, InitialDefault: initial})
+				added = append(added, &nativeSourceColumn{Key: column.name, IceType: column.iceType, InitialDefault: initial.Val})
 				names = append(names, column.name)
 			}
-			writer := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "alter", true)
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "alter", true)
 			require.NoError(t, writer.AlterSourceColumns(ctx, added, nil))
 			writer.Abort()
 			// Reopen from catalog JSON rather than retaining transaction metadata.
-			reader := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "read", true)
+			reader := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "read", true)
 			defer reader.Abort()
 			rows, err := reader.ReadRows(ctx, oldPath, []int64{0}, names)
 			require.NoError(t, err)

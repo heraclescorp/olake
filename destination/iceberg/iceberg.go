@@ -5,6 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
+	"math"
+	"regexp"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
@@ -26,16 +38,6 @@ import (
 	"github.com/datazip-inc/olake/utils/typeutils"
 	"github.com/google/uuid"
 	"github.com/spf13/viper"
-	"io"
-	"maps"
-	"regexp"
-	"runtime"
-	"slices"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 type Iceberg struct {
@@ -1240,57 +1242,58 @@ func appendNativeValue(builder array.Builder, value any) error {
 	return nil
 }
 
-func nativePartitionLiteral(field apacheiceberg.NestedField, value any) (apacheiceberg.Literal, error) {
+// nativePartitionLiteral represents SQL NULL as an invalid optional, not an error.
+func nativePartitionLiteral(field apacheiceberg.NestedField, value any) (apacheiceberg.Optional[apacheiceberg.Literal], error) {
 	if value == nil {
-		return nil, nil
+		return apacheiceberg.Optional[apacheiceberg.Literal]{}, nil
 	}
 	switch field.Type.(type) {
 	case apacheiceberg.BooleanType:
 		v, err := typeutils.ReformatBool(value)
 		if err != nil {
-			return nil, err
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 		}
-		return apacheiceberg.NewLiteral(v), nil
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
 	case apacheiceberg.Int32Type:
 		v, err := typeutils.ReformatInt32(value)
 		if err != nil {
-			return nil, err
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 		}
-		return apacheiceberg.NewLiteral(v), nil
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
 	case apacheiceberg.Int64Type:
 		v, err := typeutils.ReformatInt64(value)
 		if err != nil {
-			return nil, err
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 		}
-		return apacheiceberg.NewLiteral(v), nil
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
 	case apacheiceberg.Float32Type:
 		v, err := typeutils.ReformatFloat32(value)
 		if err != nil {
-			return nil, err
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 		}
-		return apacheiceberg.NewLiteral(v), nil
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
 	case apacheiceberg.Float64Type:
 		v, err := typeutils.ReformatFloat64(value)
 		if err != nil {
-			return nil, err
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 		}
-		return apacheiceberg.NewLiteral(v), nil
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
 	case apacheiceberg.TimestampType, apacheiceberg.TimestampTzType:
 		v, err := typeutils.ReformatDate(value, true)
 		if err != nil {
-			return nil, err
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 		}
-		return apacheiceberg.NewLiteral(apacheiceberg.Timestamp(v.UnixMicro())), nil
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(apacheiceberg.Timestamp(v.UnixMicro())), Valid: true}, nil
 	case apacheiceberg.BinaryType, apacheiceberg.FixedType:
 		v, err := typeutils.ReformatBytes(value)
 		if err != nil {
-			return nil, err
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 		}
-		return apacheiceberg.NewLiteral(v), nil
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
 	case apacheiceberg.StringType:
-		return apacheiceberg.NewLiteral(utils.ConvertToString(value)), nil
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(utils.ConvertToString(value)), Valid: true}, nil
 	default:
-		return nil, fmt.Errorf("unsupported partition source type %s", field.Type)
+		return apacheiceberg.Optional[apacheiceberg.Literal]{}, fmt.Errorf("unsupported partition source type %s", field.Type)
 	}
 }
 
@@ -1309,7 +1312,7 @@ func nativeRecordPartition(schema *apacheiceberg.Schema, spec apacheiceberg.Part
 		if err != nil {
 			return "", nil, fmt.Errorf("partition column %q: %w", field.Name, err)
 		}
-		transformed := part.Transform.Apply(apacheiceberg.Optional[apacheiceberg.Literal]{Val: lit, Valid: lit != nil})
+		transformed := part.Transform.Apply(lit)
 		if transformed.Valid {
 			partition[idx] = transformed.Val.Any()
 		}
@@ -1422,11 +1425,12 @@ func nativeLiveEntries(ctx context.Context, tbl *table.Table) ([]apacheiceberg.M
 	}
 	var entries []apacheiceberg.ManifestEntry
 	for _, manifest := range manifests {
-		files, err := manifest.FetchEntries(fs, true)
-		if err != nil {
-			return nil, err
+		for entry, err := range manifest.Entries(fs, true) {
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, entry)
 		}
-		entries = append(entries, files...)
 	}
 	return entries, nil
 }
@@ -1445,6 +1449,9 @@ func nativeDeletedPositions(ctx context.Context, tbl *table.Table, path string) 
 	var result []int64
 	if bitmap := bitmaps[path]; bitmap != nil {
 		for position := range bitmap.Positions() {
+			if position > math.MaxInt64 {
+				return nil, nil, errors.New("native delete position exceeds signed row position range")
+			}
 			result = append(result, int64(position))
 		}
 	}

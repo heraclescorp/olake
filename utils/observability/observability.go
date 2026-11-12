@@ -115,7 +115,7 @@ func Start(ctx context.Context) (func(context.Context) error, error) {
 	lifecycleMu.Lock()
 	defer lifecycleMu.Unlock()
 	if active.Load() != nil {
-		return func(context.Context) error { return nil }, errors.New("Go metrics already started")
+		return func(context.Context) error { return nil }, errors.New("go metrics already started")
 	}
 	logger.Infof("runtime budget: Go effective memory limit=%d bytes, GOMEMLIMIT configured=%t", debug.SetMemoryLimit(-1), os.Getenv("GOMEMLIMIT") != "")
 	profiles := startProfiles()
@@ -450,7 +450,7 @@ func diagnosticError(err error) error {
 	if err == nil {
 		return nil
 	}
-	return errors.New("Go diagnostic metrics export/shutdown failed")
+	return errors.New("go diagnostic metrics export/shutdown failed")
 }
 
 // RecordReaderBarrier records visibility-barrier retry attempts and elapsed

@@ -6,6 +6,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
+	"math"
+	"slices"
+	"strings"
+	"sync/atomic"
+
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
@@ -20,11 +26,6 @@ import (
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/goccy/go-json"
-	"maps"
-	"math"
-	"slices"
-	"strings"
-	"sync/atomic"
 )
 
 // unavailableValuesResolver fills columns the source could not send (Postgres unchanged TOAST)
@@ -552,14 +553,13 @@ func reconcileNativeTableIndex(ctx context.Context, index types.StreamIndex, tbl
 		err = readNativePhysicalBatches(ctx, fs, tbl, task.File.FilePath(), projection, nil, func(base int64, batch arrow.RecordBatch) (bool, error) {
 			for row := range int(batch.NumRows()) {
 				position := base + int64(row)
+				if position < 0 {
+					return false, errors.New("native index row position is negative or overflows int64")
+				}
 				if deleted.Contains(uint64(position)) || batch.Column(0).IsNull(row) {
 					continue
 				}
-				identifier, err := nativeIndexValue(batch.Column(0), row)
-				if err != nil {
-					return false, err
-				}
-				key, ok := identifier.(string)
+				key, ok := nativeIndexValue(batch.Column(0), row).(string)
 				if !ok {
 					return false, errors.New("native stream index identifier must be a string")
 				}
@@ -703,11 +703,7 @@ func readNativeRows(ctx context.Context, tbl *table.Table, path string, position
 			}
 			row := make(map[string]any, len(selected))
 			for col, field := range batch.Schema().Fields() {
-				value, err := nativeIndexValue(batch.Column(col), int(position-base))
-				if err != nil {
-					return false, err
-				}
-				row[field.Name] = value
+				row[field.Name] = nativeIndexValue(batch.Column(col), int(position-base))
 			}
 			result[position] = row
 			next++
@@ -851,41 +847,42 @@ func readNativePhysicalBatches(ctx context.Context, fs iceio.IO, tbl *table.Tabl
 	return nil
 }
 
-func nativeIndexValue(column arrow.Array, row int) (any, error) {
+// nativeIndexValue returns nil for SQL NULL; Arrow conversions cannot fail.
+func nativeIndexValue(column arrow.Array, row int) any {
 	if column.IsNull(row) {
-		return nil, nil
+		return nil
 	}
 	switch value := column.(type) {
 	case *array.String:
-		return strings.Clone(value.Value(row)), nil
+		return strings.Clone(value.Value(row))
 	case *array.LargeString:
-		return strings.Clone(value.Value(row)), nil
+		return strings.Clone(value.Value(row))
 	case *array.StringView:
-		return strings.Clone(value.Value(row)), nil
+		return strings.Clone(value.Value(row))
 	case *array.Binary:
-		return slices.Clone(value.Value(row)), nil
+		return slices.Clone(value.Value(row))
 	case *array.LargeBinary:
-		return slices.Clone(value.Value(row)), nil
+		return slices.Clone(value.Value(row))
 	case *array.FixedSizeBinary:
-		return slices.Clone(value.Value(row)), nil
+		return slices.Clone(value.Value(row))
 	case *array.BinaryView:
-		return slices.Clone(value.Value(row)), nil
+		return slices.Clone(value.Value(row))
 	case *array.Boolean:
-		return value.Value(row), nil
+		return value.Value(row)
 	case *array.Int32:
-		return value.Value(row), nil
+		return value.Value(row)
 	case *array.Int64:
-		return value.Value(row), nil
+		return value.Value(row)
 	case *array.Float32:
-		return value.Value(row), nil
+		return value.Value(row)
 	case *array.Float64:
-		return value.Value(row), nil
+		return value.Value(row)
 	case *array.Dictionary:
 		return nativeIndexValue(value.Dictionary(), value.GetValueIndex(row))
 	default:
 		// TOAST-bearing source values (text, JSON, arrays) are stored as strings;
 		// the other primitive values retain their Arrow logical representation.
-		return column.GetOneForMarshal(row), nil
+		return column.GetOneForMarshal(row)
 	}
 }
 
@@ -936,7 +933,11 @@ func (cache *nativeDeleteCache) positions(ctx context.Context, fs iceio.IO, tbl 
 				for row := range int(batch.NumRows()) {
 					key = nativeEqualityKey(key[:0], columns, row)
 					if _, matches := set.keys[string(key)]; matches {
-						deleted.Set(uint64(base + int64(row)))
+						position := base + int64(row)
+						if position < 0 {
+							return false, errors.New("native equality delete row position is negative or overflows int64")
+						}
+						deleted.Set(uint64(position))
 					}
 				}
 				return true, nil
@@ -956,16 +957,16 @@ func (cache *nativeDeleteCache) positional(ctx context.Context, fs iceio.IO, tbl
 	}
 	err := readNativePhysicalBatches(ctx, fs, tbl, deleteFile.FilePath(), apacheiceberg.PositionalDeleteSchema, nil, func(_ int64, batch arrow.RecordBatch) (bool, error) {
 		for row := range int(batch.NumRows()) {
-			path, err := nativeIndexValue(batch.Column(0), row)
-			if err != nil {
-				return false, err
-			}
-			filePath, ok := path.(string)
+			filePath, ok := nativeIndexValue(batch.Column(0), row).(string)
 			if !ok {
 				return false, errors.New("native positional delete has a null or invalid file path")
 			}
 			position, ok := batch.Column(1).(*array.Int64)
-			if !ok || position.IsNull(row) || position.Value(row) < 0 {
+			if !ok || position.IsNull(row) {
+				return false, errors.New("invalid native positional delete row")
+			}
+			signedPosition := position.Value(row)
+			if signedPosition < 0 {
 				return false, errors.New("invalid native positional delete row")
 			}
 			fileKey := deleteFile.FilePath() + "\x00" + filePath
@@ -974,7 +975,7 @@ func (cache *nativeDeleteCache) positional(ctx context.Context, fs iceio.IO, tbl
 				bitmap = dv.NewRoaringPositionBitmap()
 				cache.positionsByFile[fileKey] = bitmap
 			}
-			bitmap.Set(uint64(position.Value(row)))
+			bitmap.Set(uint64(signedPosition))
 		}
 		return true, nil
 	})
@@ -1198,12 +1199,20 @@ func collectNativeEqualityDeletePositions(ctx context.Context, tbl *table.Table)
 		if err != nil {
 			return nil, nil, err
 		}
+		count := task.File.Count()
+		if count < 0 {
+			return nil, nil, errors.New("native data file has a negative row count")
+		}
 		for position := range after.Positions() {
-			if position >= uint64(task.File.Count()) {
+			if position > math.MaxInt64 {
+				return nil, nil, errors.New("native equality delete position exceeds signed row position range")
+			}
+			rowPosition := int64(position)
+			if rowPosition >= count {
 				return nil, nil, errors.New("native equality delete position exceeds data file row count")
 			}
 			if !before.Contains(position) {
-				positions[task.File.FilePath()] = append(positions[task.File.FilePath()], int64(position))
+				positions[task.File.FilePath()] = append(positions[task.File.FilePath()], rowPosition)
 			}
 		}
 	}
@@ -1219,11 +1228,7 @@ func readNativePositionDeletes(ctx context.Context, tbl *table.Table, path strin
 	positions := make(map[string][]int64)
 	err = readNativePhysicalBatches(ctx, fs, tbl, path, apacheiceberg.PositionalDeleteSchema, nil, func(_ int64, batch arrow.RecordBatch) (bool, error) {
 		for row := range int(batch.NumRows()) {
-			path, err := nativeIndexValue(batch.Column(0), row)
-			if err != nil {
-				return false, err
-			}
-			filePath, ok := path.(string)
+			filePath, ok := nativeIndexValue(batch.Column(0), row).(string)
 			if !ok {
 				return false, errors.New("native positional delete has a null or invalid file path")
 			}

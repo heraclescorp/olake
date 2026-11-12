@@ -2,6 +2,7 @@ package observability
 
 import (
 	"context"
+	"math"
 	"os"
 	"runtime/metrics"
 	"strconv"
@@ -81,7 +82,10 @@ func registerRuntime(meter metric.Meter, base []attribute.KeyValue) error {
 			pauseOptions[n] = []metric.ObserveOption{measurement(base, attribute.String("le", strconv.FormatFloat(h.Buckets[n+1], 'g', -1, 64)))}
 		}
 	}
-	proc, _ := process.NewProcess(int32(os.Getpid()))
+	var proc *process.Process
+	if pid := os.Getpid(); pid > 0 && pid <= math.MaxInt32 {
+		proc, _ = process.NewProcess(int32(pid))
+	}
 	var mu sync.Mutex
 	_, err = meter.RegisterCallback(func(ctx context.Context, observer metric.Observer) error {
 		mu.Lock()

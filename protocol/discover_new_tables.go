@@ -166,8 +166,8 @@ func discoverNewTables(ctx context.Context, source abstract.TableEnrollmentSourc
 			id := types.StreamID{Namespace: configured.Namespace(), Name: configured.Name()}
 			known[id] = true
 			knownCanonical[id.String()] = true
-			copy := &types.ConfiguredStream{Stream: configured.Stream, StreamMetadata: metadata[id]}
-			occupied[copy.GetDestinationDatabase(&writer.IcebergDatabase)+"\x00"+copy.GetDestinationTable()] = true
+			configuredCopy := &types.ConfiguredStream{Stream: configured.Stream, StreamMetadata: metadata[id]}
+			occupied[configuredCopy.GetDestinationDatabase(&writer.IcebergDatabase)+"\x00"+configuredCopy.GetDestinationTable()] = true
 		}
 		approved := make(map[string]string)
 		for _, schema := range policy.Schemas {

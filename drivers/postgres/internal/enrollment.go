@@ -32,11 +32,17 @@ func (p *Postgres) SetupTableEnrollment(ctx context.Context) error {
 	checks := abstract.RunPrerequisites(ctx, prerequisites)
 	for _, check := range checks {
 		if check.Required && (!check.Passed || check.Err != nil) {
-			p.enrollmentIssue = fmt.Errorf("CDC prerequisite %s is unavailable", check.Name)
-			return nil
+			if check.Err != nil {
+				p.enrollmentIssue = fmt.Errorf("CDC prerequisite %s is unavailable: %w", check.Name, check.Err)
+			} else {
+				p.enrollmentIssue = fmt.Errorf("CDC prerequisite %s is unavailable", check.Name)
+			}
+			break
 		}
 	}
-	if p.cdcConfig.Publication != "" {
+	// A prerequisite failure rejects candidates through ValidateTableEnrollment;
+	// it must not prevent discovery from producing their explicit skip results.
+	if p.enrollmentIssue == nil && p.cdcConfig.Publication != "" {
 		var err error
 		p.enrollmentTables, err = fetchPublicationTables(ctx, p.client, p.cdcConfig.Publication)
 		if err != nil {

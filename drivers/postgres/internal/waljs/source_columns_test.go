@@ -1,6 +1,7 @@
 package waljs
 
 import (
+	"math"
 	"testing"
 
 	"github.com/datazip-inc/olake/types"
@@ -8,6 +9,7 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func testSourceColumnsFilter() ChangeFilter {
@@ -73,7 +75,8 @@ func TestRelationSourceColumns(t *testing.T) {
 		{Name: "total", TypeOID: pgtype.Int4OID, Generated: true},
 	}
 
-	change := filter.relationSourceColumns(msg, catalog)
+	change, err := filter.relationSourceColumns(msg, catalog)
+	require.NoError(t, err)
 
 	assert.Equal(t, types.SourceColumnsChange{
 		Columns: []types.SourceColumn{
@@ -87,11 +90,12 @@ func TestRelationSourceColumns(t *testing.T) {
 
 func TestCatalogSourceColumns(t *testing.T) {
 	filter := testSourceColumnsFilter()
-	change := filter.catalogSourceColumns([]catalogColumn{
+	change, err := filter.catalogSourceColumns([]catalogColumn{
 		{Name: "id", TypeOID: pgtype.Int4OID},
 		{Name: "label", TypeOID: pgtype.TextOID, HasMissing: true, HasDefault: true, MissingValue: new(`a "quoted" \ value`)},
 		{Name: "total", TypeOID: pgtype.Int4OID, Generated: true},
 	})
+	require.NoError(t, err)
 
 	assert.Equal(t, types.SourceColumnsChange{
 		SyncStart: true,
@@ -101,4 +105,20 @@ func TestCatalogSourceColumns(t *testing.T) {
 		},
 		KeepColumns: []string{"total"},
 	}, change)
+}
+
+func TestCatalogTypeOIDBounds(t *testing.T) {
+	filter := testSourceColumnsFilter()
+	for _, oid := range []int64{-1, math.MaxUint32 + 1, math.MaxInt64} {
+		catalog := []catalogColumn{{Name: "invalid", TypeOID: oid}}
+		_, err := filter.catalogSourceColumns(catalog)
+		require.ErrorContains(t, err, "outside the PostgreSQL OID range")
+		_, err = filter.relationSourceColumns(&pglogrepl.RelationMessage{}, catalog)
+		require.ErrorContains(t, err, "outside the PostgreSQL OID range")
+	}
+	for _, oid := range []int64{0, math.MaxUint32} {
+		got, err := (&catalogColumn{Name: "boundary", TypeOID: oid}).typeOID()
+		require.NoError(t, err)
+		assert.Equal(t, oid, int64(got))
+	}
 }

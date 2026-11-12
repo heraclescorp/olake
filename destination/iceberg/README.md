@@ -13,7 +13,7 @@ The destination uses upstream `github.com/apache/iceberg-go v0.7.0` without patc
 - Recovery metadata and data/delete files publish in the same catalog transaction. Positional/deletion-vector modes preserve the durable Pebble index, rebuild it from the committed snapshot when necessary, and recover unchanged PostgreSQL TOAST values.
 - Source-column changes honor `drop_removed_columns`, keep identifier/partition/sort source columns, and assign fresh IDs on drop/re-add. Version 3 uses upstream historical-default handling with the limitations above; version 2 logs a warning and leaves historical rows NULL rather than upgrading implicitly. Changed columns invalidate TOAST carry values; unchanged carry and deletion tombstones remain intact.
 - REST (including S3 Tables and Unity), Glue, JDBC PostgreSQL/SQLite, Hive, and Hadoop catalogs use native adapters. S3, GCS, local files, and HDFS use native FileIO. Managed REST catalogs choose physical table locations; `iceberg_s3_path` remains the warehouse identifier for their catalog configuration.
-- HTTP diagnostics emit one `iceberg_http` event per wire attempt with status, latency, request ID, and retry/conflict outcome. Credentials, query strings, headers, and bodies are omitted. REST throttling retries are bounded; ambiguous commit failures are not blindly replayed.
+- HTTP diagnostics emit one `iceberg_http` event per wire attempt with status, latency, request ID, and retry/conflict outcome. Credentials, query strings, headers, and bodies are omitted. REST throttling retries use cryptographically secure sub-10% jitter and remain bounded; ambiguous commit failures are not blindly replayed.
 
 ## Build and Runtime
 

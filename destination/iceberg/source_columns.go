@@ -5,6 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"math"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
 	apacheiceberg "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/table"
@@ -13,12 +20,6 @@ import (
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/datazip-inc/olake/utils/typeutils"
-	"maps"
-	"math"
-	"slices"
-	"strconv"
-	"strings"
-	"time"
 )
 
 type nativeSourceColumn struct {
@@ -99,7 +100,7 @@ func planSourceColumns(stream types.StreamInterface, schema map[string]string, c
 				continue
 			}
 			logger.Infof("stream[%s]: adding column[%s] type[%s], existing rows read [%v]", stream.ID(), key, iceType, column.ExistingRowValue)
-			added = append(added, &nativeSourceColumn{Key: key, IceType: iceType, InitialDefault: initialDefault})
+			added = append(added, &nativeSourceColumn{Key: key, IceType: iceType, InitialDefault: initialDefault.Val})
 		}
 	}
 
@@ -237,19 +238,21 @@ type nativeSourceLiteral struct {
 
 func (l nativeSourceLiteral) Type() apacheiceberg.Type { return l.fieldType }
 
-func nativeSourceColumnDefault(iceType string, value any) (apacheiceberg.Literal, error) {
+// nativeSourceColumnDefault distinguishes a NULL default (invalid optional) from
+// a value that cannot be encoded (error), preserving NULL and typed defaults.
+func nativeSourceColumnDefault(iceType string, value any) (apacheiceberg.Optional[apacheiceberg.Literal], error) {
 	if value == nil {
-		return nil, nil
+		return apacheiceberg.Optional[apacheiceberg.Literal]{}, nil
 	}
 	if pointer, ok := value.(*any); ok {
 		if pointer == nil {
-			return nil, nil
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, nil
 		}
 		return nativeSourceColumnDefault(iceType, *pointer)
 	}
 	schema, err := nativeSchema(map[string]string{"default": iceType}, false)
 	if err != nil {
-		return nil, err
+		return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 	}
 	field := schema.Field(0)
 	// Row conversions deliberately tolerate truncation and timestamp fallback;
@@ -264,20 +267,20 @@ func nativeSourceColumnDefault(iceType string, value any) (apacheiceberg.Literal
 		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, json.Number:
 			parsed, err := strconv.ParseInt(fmt.Sprint(number), 10, bits)
 			if err != nil {
-				return nil, err
+				return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 			}
 			value = parsed
 		case float32, float64:
 			parsed, err := typeutils.ReformatFloat64(number)
 			if err != nil {
-				return nil, err
+				return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 			}
 			outside := parsed < -0x1p63 || parsed >= 0x1p63
 			if bits == 32 {
 				outside = parsed < math.MinInt32 || parsed > math.MaxInt32
 			}
 			if math.IsNaN(parsed) || math.IsInf(parsed, 0) || math.Trunc(parsed) != parsed || outside {
-				return nil, fmt.Errorf("source default %v is not a valid %s", value, iceType)
+				return apacheiceberg.Optional[apacheiceberg.Literal]{}, fmt.Errorf("source default %v is not a valid %s", value, iceType)
 			}
 		}
 	case apacheiceberg.TimestampType, apacheiceberg.TimestampTzType:
@@ -294,12 +297,12 @@ func nativeSourceColumnDefault(iceType string, value any) (apacheiceberg.Literal
 				}
 			}
 			if parseErr != nil {
-				return nil, parseErr
+				return apacheiceberg.Optional[apacheiceberg.Literal]{}, parseErr
 			}
 			value = parsed
 		}
 		if stamp, ok := value.(time.Time); ok && (stamp.Year() < 1 || stamp.Year() > 9999) {
-			return nil, fmt.Errorf("source timestamp default is outside years 1 through 9999")
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, fmt.Errorf("source timestamp default is outside years 1 through 9999")
 		}
 	}
 	if _, ok := field.Type.(apacheiceberg.StringType); ok {
@@ -307,33 +310,34 @@ func nativeSourceColumnDefault(iceType string, value any) (apacheiceberg.Literal
 		case map[string]any, []any:
 			encoded, err := json.Marshal(value)
 			if err != nil {
-				return nil, err
+				return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 			}
 			value = string(encoded)
 		}
 	}
-	literal, err := nativePartitionLiteral(field, value)
+	optional, err := nativePartitionLiteral(field, value)
 	if err != nil {
-		return nil, err
+		return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 	}
+	literal := optional.Val
 	switch number := literal.Any().(type) {
 	case float32:
 		if math.IsInf(float64(number), 0) || math.IsNaN(float64(number)) {
-			return nil, fmt.Errorf("source default %v is not a finite %s", value, iceType)
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, fmt.Errorf("source default %v is not a finite %s", value, iceType)
 		}
 	case float64:
 		if math.IsInf(number, 0) || math.IsNaN(number) {
-			return nil, fmt.Errorf("source default %v is not a finite %s", value, iceType)
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, fmt.Errorf("source default %v is not a finite %s", value, iceType)
 		}
 	}
 	literal, err = literal.To(field.Type)
 	if err != nil {
-		return nil, err
+		return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 	}
 	if !literal.Type().Equals(field.Type) {
 		literal = nativeSourceLiteral{Literal: literal, fieldType: field.Type}
 	}
-	return literal, nil
+	return apacheiceberg.Optional[apacheiceberg.Literal]{Val: literal, Valid: true}, nil
 }
 
 // AlterSourceColumns applies source additions and opt-in drops atomically.

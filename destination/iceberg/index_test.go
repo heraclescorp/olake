@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -19,9 +22,6 @@ import (
 	"github.com/datazip-inc/olake/pkg/indexdb"
 	"github.com/datazip-inc/olake/types"
 	"github.com/stretchr/testify/require"
-	"os"
-	"path/filepath"
-	"testing"
 )
 
 type nativeIndexTestCatalog struct{ metadata table.Metadata }
@@ -95,7 +95,7 @@ func openNativeTestIndex(t *testing.T) types.StreamIndex {
 	return index
 }
 
-func writeNativeIndexDelete(t *testing.T, tbl *table.Table, projection *apacheiceberg.Schema, rows string, equality bool, count int64) apacheiceberg.DataFile {
+func writeNativeIndexDelete(t *testing.T, projection *apacheiceberg.Schema, rows string, equality bool, count int64) apacheiceberg.DataFile {
 	t.Helper()
 	schema, err := table.SchemaToArrowSchema(projection, nil, true, false)
 	require.NoError(t, err)
@@ -175,7 +175,7 @@ func TestNativeIndexRebuildRemovesPositionDeletedRows(t *testing.T) {
 	require.NoError(t, reconcileNativeTableIndex(ctx, index, tbl, constants.OlakeID))
 	location, _, err := index.Lookup("removed")
 	require.NoError(t, err)
-	deleted := writeNativeIndexDelete(t, tbl, apacheiceberg.PositionalDeleteSchema, fmt.Sprintf(`[{"file_path":%q,"pos":1}]`, location.FilePath), false, 1)
+	deleted := writeNativeIndexDelete(t, apacheiceberg.PositionalDeleteSchema, fmt.Sprintf(`[{"file_path":%q,"pos":1}]`, location.FilePath), false, 1)
 	tbl = commitNativeIndexDeletes(t, tbl, deleted)
 	require.NoError(t, reconcileNativeTableIndex(ctx, index, tbl, constants.OlakeID))
 	_, found, err := index.Lookup("removed")
@@ -197,7 +197,7 @@ func TestNativeIndexEqualityMigrationRespectsSequence(t *testing.T) {
 	require.NoError(t, err)
 	projection, err := tbl.Schema().Select(true, constants.OlakeID)
 	require.NoError(t, err)
-	deleted := writeNativeIndexDelete(t, tbl, projection, fmt.Sprintf(`[{%q:"deleted"}]`, constants.OlakeID), true, 1)
+	deleted := writeNativeIndexDelete(t, projection, fmt.Sprintf(`[{%q:"deleted"}]`, constants.OlakeID), true, 1)
 	tbl = commitNativeIndexDeletes(t, tbl, deleted)
 	tbl = appendNativeIndexRows(t, tbl, nativeIndexRows("deleted"))
 	positions, oldDeletes, err := collectNativeEqualityDeletePositions(ctx, tbl)
@@ -370,10 +370,10 @@ func TestNativeIndexedCreateReadSupersedesPendingVersions(t *testing.T) {
 				ctx := context.Background()
 				cfg, stream, cat := nativeWriterFixture(t, mode, true, "/{part, identity}")
 				index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-				seed := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "seed", true)
+				seed := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "seed", true)
 				require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("seed", "r", 0, "seed")}))
 				require.NoError(t, seed.Close(ctx, nil))
-				writer := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "pending-versions", false)
+				writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "pending-versions", false)
 				var records []types.RawRecord
 				for idx, operation := range testCase.operations {
 					records = append(records, nativeTestRecord("a", operation, int64(idx+1), fmt.Sprint(idx)))
@@ -404,12 +404,12 @@ func TestNativeIndexedStateOnlyCommitAllowsAdvancedSnapshot(t *testing.T) {
 			ctx := context.Background()
 			cfg, stream, cat := nativeWriterFixture(t, mode, true, "")
 			index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-			seed := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "seed", true)
+			seed := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "seed", true)
 			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("seed", "r", 1, "one")}))
 			require.NoError(t, seed.Close(ctx, nil))
 			checkpoint := index.snapshot
-			heartbeat := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "heartbeat", false)
-			external := openNativeTestWriter(t, ctx, cfg, stream, cat, nil, "external", true)
+			heartbeat := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "heartbeat", false)
+			external := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "external", true)
 			require.NoError(t, external.Write(ctx, []types.RawRecord{nativeTestRecord("external", "r", 2, "one")}))
 			require.NoError(t, external.Close(ctx, nil))
 			require.NotEqual(t, checkpoint, nativeSnapshotID(external.table))
@@ -419,7 +419,7 @@ func TestNativeIndexedStateOnlyCommitAllowsAdvancedSnapshot(t *testing.T) {
 			require.Equal(t, checkpoint, index.snapshot, "state-only commits cannot checkpoint rows they never indexed")
 			_, indexedExternal := index.rows["external"]
 			require.False(t, indexedExternal)
-			recovered := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "next-sync", false)
+			recovered := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "next-sync", false)
 			require.Equal(t, nativeSnapshotID(external.table), index.snapshot)
 			_, indexedExternal = index.rows["external"]
 			require.True(t, indexedExternal)
@@ -438,7 +438,7 @@ func TestNativeIndexedReadProvenanceBoundedByCommittedDeletes(t *testing.T) {
 			cfg, stream, cat := nativeWriterFixture(t, mode, true, "")
 			index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
 			const count = 256
-			backfill := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "backfill", true)
+			backfill := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "backfill", true)
 			records := make([]types.RawRecord, count)
 			for row := range records {
 				records[row] = nativeTestRecord(fmt.Sprint(row), "r", int64(row), "one")
@@ -447,7 +447,7 @@ func TestNativeIndexedReadProvenanceBoundedByCommittedDeletes(t *testing.T) {
 			require.Nil(t, backfill.indexReads)
 			require.Nil(t, backfill.indexTouched)
 			backfill.Abort()
-			creates := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "creates", false)
+			creates := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "creates", false)
 			for row := range records {
 				records[row] = nativeTestRecord(fmt.Sprint(row), "c", int64(row), "one")
 			}
@@ -495,7 +495,7 @@ func TestNativeInitialDefaultsPreservePhysicalRowsAndIndex(t *testing.T) {
 				require.NoError(t, err)
 				tbl = commitNativeIndexDeletes(t, tbl, deletes...)
 			} else {
-				deleted := writeNativeIndexDelete(t, tbl, apacheiceberg.PositionalDeleteSchema, fmt.Sprintf(`[{"file_path":%q,"pos":1}]`, original.FilePath), false, 1)
+				deleted := writeNativeIndexDelete(t, apacheiceberg.PositionalDeleteSchema, fmt.Sprintf(`[{"file_path":%q,"pos":1}]`, original.FilePath), false, 1)
 				tbl = commitNativeIndexDeletes(t, tbl, deleted)
 			}
 			require.NoError(t, reconcileNativeTableIndex(ctx, index, tbl, constants.OlakeID))
@@ -598,7 +598,7 @@ func TestNativeSourceChangesInvalidateSameThreadTOASTCarry(t *testing.T) {
 			stream.Stream.UpsertField("stable", types.String, true, false)
 			stream.StreamMetadata.DropRemovedColumns = true
 			index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-			seed := openNativeTestWriter(t, ctx, cfg, stream, cat, index, "defaults-seed", true)
+			seed := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "defaults-seed", true)
 			seedRow := nativeTestRecord("row", "r", 1, "table-old")
 			seedRow.Data["stable"] = "table-stable"
 			seedDeleted := nativeTestRecord("deleted", "r", 2, "table-deleted")

@@ -1,10 +1,10 @@
-FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm AS makefiles
+FROM --platform=$BUILDPLATFORM golang:1.26.11-bookworm AS makefiles
 WORKDIR /home/app
 COPY . .
 RUN mkdir /out && cp --parents Makefile $(find drivers -maxdepth 2 -name driver.mk) /out
 
 # Hive's native GSSAPI transport requires a target-platform C compiler and headers.
-FROM golang:1.26.10-bookworm AS builder
+FROM golang:1.26.11-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends libkrb5-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /home/app
 ARG DRIVER_NAME=olake

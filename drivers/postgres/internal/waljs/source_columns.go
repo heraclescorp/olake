@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/datazip-inc/olake/drivers/abstract"
 	"github.com/datazip-inc/olake/types"
@@ -29,6 +30,13 @@ type catalogColumn struct {
 	MissingValue *string `db:"missing_value"`
 	HasDefault   bool    `db:"has_default"`
 	Generated    bool    `db:"generated"`
+}
+
+func (column *catalogColumn) typeOID() (uint32, error) {
+	if column.TypeOID < 0 || column.TypeOID > math.MaxUint32 {
+		return 0, fmt.Errorf("column %q type OID %d is outside the PostgreSQL OID range", column.Name, column.TypeOID)
+	}
+	return uint32(column.TypeOID), nil
 }
 
 func fetchCatalogColumns(ctx context.Context, db *sqlx.DB, relation string, args ...any) ([]catalogColumn, error) {
@@ -83,10 +91,13 @@ func (c ChangeFilter) sourceColumn(name string, typeOID uint32, catalog *catalog
 
 // relationSourceColumns lists the columns of a Relation message. catalog is the table's current
 // catalog, nil when it could not be read.
-func (c ChangeFilter) relationSourceColumns(msg *pglogrepl.RelationMessage, catalog []catalogColumn) types.SourceColumnsChange {
+func (c ChangeFilter) relationSourceColumns(msg *pglogrepl.RelationMessage, catalog []catalogColumn) (types.SourceColumnsChange, error) {
 	byName := make(map[string]*catalogColumn, len(catalog))
 	var change types.SourceColumnsChange
 	for idx := range catalog {
+		if _, err := catalog[idx].typeOID(); err != nil {
+			return types.SourceColumnsChange{}, err
+		}
 		if catalog[idx].Generated {
 			change.KeepColumns = append(change.KeepColumns, catalog[idx].Name)
 			continue
@@ -95,25 +106,29 @@ func (c ChangeFilter) relationSourceColumns(msg *pglogrepl.RelationMessage, cata
 	}
 	for _, column := range msg.Columns {
 		entry := byName[column.Name]
-		if entry != nil && uint32(entry.TypeOID) != column.DataType {
+		if entry != nil && entry.TypeOID != int64(column.DataType) {
 			entry = nil
 		}
 		change.Columns = append(change.Columns, c.sourceColumn(column.Name, column.DataType, entry))
 	}
-	return change
+	return change, nil
 }
 
 // catalogSourceColumns lists the columns of a table's current catalog.
-func (c ChangeFilter) catalogSourceColumns(catalog []catalogColumn) types.SourceColumnsChange {
+func (c ChangeFilter) catalogSourceColumns(catalog []catalogColumn) (types.SourceColumnsChange, error) {
 	change := types.SourceColumnsChange{SyncStart: true}
 	for idx := range catalog {
+		typeOID, err := catalog[idx].typeOID()
+		if err != nil {
+			return types.SourceColumnsChange{}, err
+		}
 		if catalog[idx].Generated {
 			change.KeepColumns = append(change.KeepColumns, catalog[idx].Name)
 			continue
 		}
-		change.Columns = append(change.Columns, c.sourceColumn(catalog[idx].Name, uint32(catalog[idx].TypeOID), &catalog[idx]))
+		change.Columns = append(change.Columns, c.sourceColumn(catalog[idx].Name, typeOID, &catalog[idx]))
 	}
-	return change
+	return change, nil
 }
 
 func (p *pgoutputReplicator) emitRelationColumns(ctx context.Context, msg *pglogrepl.RelationMessage, insertFn abstract.CDCMsgFn) error {
@@ -127,7 +142,11 @@ func (p *pgoutputReplicator) emitRelationColumns(ctx context.Context, msg *pglog
 		logger.Warnf("table[%s.%s]: failed to read column catalog, values of existing rows for added columns are unknown: %s", msg.Namespace, msg.RelationName, err)
 		catalog = nil
 	}
-	return insertFn(ctx, abstract.NewSourceColumnsChange(stream, p.socket.changeFilter.relationSourceColumns(msg, catalog)))
+	change, err := p.socket.changeFilter.relationSourceColumns(msg, catalog)
+	if err != nil {
+		return fmt.Errorf("table[%s.%s] column catalog: %w", msg.Namespace, msg.RelationName, err)
+	}
+	return insertFn(ctx, abstract.NewSourceColumnsChange(stream, change))
 }
 
 // emitSyncStartColumns reports every stream's current columns, so columns added to a table
@@ -139,7 +158,11 @@ func (p *pgoutputReplicator) emitSyncStartColumns(ctx context.Context, insertFn 
 			logger.Warnf("stream[%s]: failed to read column catalog, skipping column check at sync start: %s", stream.ID(), err)
 			continue
 		}
-		if err := insertFn(ctx, abstract.NewSourceColumnsChange(stream, p.socket.changeFilter.catalogSourceColumns(catalog))); err != nil {
+		change, err := p.socket.changeFilter.catalogSourceColumns(catalog)
+		if err != nil {
+			return fmt.Errorf("stream[%s] column catalog: %w", stream.ID(), err)
+		}
+		if err := insertFn(ctx, abstract.NewSourceColumnsChange(stream, change)); err != nil {
 			return err
 		}
 	}
