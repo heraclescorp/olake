@@ -2019,34 +2019,6 @@ func TestNativeWriterPartialWriteFailureCleansFiles(t *testing.T) {
 	require.Error(t, writer.Close(ctx, nil))
 }
 
-func TestNativeWriterConstructorReusesLoadedMetadata(t *testing.T) {
-	for _, mode := range []types.UpdateType{types.UpdateTypeEquality, types.UpdateTypePosition, types.UpdateTypeDeletionVector} {
-		t.Run(string(mode), func(t *testing.T) {
-			ctx := context.Background()
-			cfg, stream, realCatalog := nativeWriterFixture(t, mode, true, "")
-			var index *nativeMemoryIndex
-			if mode != types.UpdateTypeEquality {
-				index = &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-			}
-			seed := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, index, "seed", true)
-			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("a", "r", 1, "one")}))
-			require.NoError(t, seed.Close(ctx, nil))
-			cat := &nativeCommitFaultCatalog{Catalog: realCatalog}
-			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "no-change", false)
-			require.Equal(t, 1, cat.loads, "unchanged setup must use its initial catalog load")
-			require.Zero(t, cat.calls, "unchanged setup must not commit metadata")
-			require.NoError(t, writer.EvolveSchema(ctx, writer.schemaMap()))
-			require.Equal(t, 1, cat.loads, "unchanged schema must reuse the coordinated metadata")
-			next := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "same-lifetime", false)
-			require.Equal(t, 1, cat.loads, "non-REST writer setup reuses the catalog-lifetime view")
-			require.Zero(t, cat.calls)
-			require.Equal(t, writer.table.MetadataLocation(), next.table.MetadataLocation())
-			next.Abort()
-			writer.Abort()
-		})
-	}
-}
-
 func TestNativeWriterCreationKeepsCatalogLocationAndCredentialsPrivate(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
@@ -2433,6 +2405,7 @@ type nativeRESTCommitBoundary struct {
 	requests           []string
 	requirements       [][]table.Requirement
 	failAfterCommit    bool
+	failLoad           bool
 	initialCredentials []rest.StorageCredential
 	freshCredentials   []rest.StorageCredential
 	credentialRequests int
@@ -2446,6 +2419,10 @@ func (b *nativeRESTCommitBoundary) ServeHTTP(w http.ResponseWriter, r *http.Requ
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if r.Method == http.MethodGet && r.URL.Path == "/v1/namespaces/db/tables/records" && b.failLoad {
+		http.Error(w, "injected setup metadata failure", http.StatusServiceUnavailable)
+		return
+	}
 	if r.Method == http.MethodGet && r.URL.Path == "/v1/namespaces/db/tables/records/credentials" {
 		b.credentialRequests++
 		_ = json.NewEncoder(w).Encode(map[string]any{"storage-credentials": b.freshCredentials})
@@ -2861,4 +2838,32 @@ func TestNativeRESTCoordinatorPreservesVendedCredentialRefresher(t *testing.T) {
 	boundary.mu.Unlock()
 	require.Equal(t, 1, credentialRequests, "successful commit metadata must retain the original SDK /credentials refresher")
 	require.Equal(t, []string{http.MethodGet, http.MethodPost}, boundary.tableRequests(), "credential renewal must not require a metadata GET")
+}
+
+func TestNativeRESTCoordinatorRejectsOldIdentityAfterFailedSetup(t *testing.T) {
+	ctx := context.Background()
+	cfg, stream, cat, boundary := nativeRESTWriterFixture(t, types.UpdateTypeEquality)
+	old := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "old-table", false)
+	boundary.mu.Lock()
+	boundary.failLoad = true
+	boundary.mu.Unlock()
+	_, _, err := newNativeWriter(ctx, cfg, stream, &destination.Options{ThreadID: "failed-setup"}, cat, nil)
+	require.Error(t, err)
+	boundary.mu.Lock()
+	boundary.failLoad = false
+	boundary.mu.Unlock()
+	admin := boundary.cat.(*nativeCatalog).Catalog
+	require.NoError(t, admin.DropTable(ctx, old.table.Identifier()))
+	replacement, err := admin.CreateTable(ctx, old.table.Identifier(), old.table.Schema(), catalog.WithProperties(apacheiceberg.Properties{table.PropertyFormatVersion: "2"}))
+	require.NoError(t, err)
+	require.NotEqual(t, old.table.Metadata().TableUUID(), replacement.Metadata().TableUUID())
+	current := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "new-table", false)
+	require.NoError(t, current.Close(ctx, map[string]any{"state": "new-table-checkpoint"}))
+	requests := boundary.tableRequests()
+	require.Error(t, old.Close(ctx, map[string]any{"state": "must-not-resurrect"}))
+	require.Equal(t, requests, boundary.tableRequests(), "old identities must be rejected before any catalog request")
+	fresh, err := admin.LoadTable(ctx, replacement.Identifier())
+	require.NoError(t, err)
+	require.Contains(t, fresh.Properties()[nativeRecoveryProperty], "new-table-checkpoint")
+	require.NotContains(t, fresh.Properties()[nativeRecoveryProperty], "must-not-resurrect")
 }

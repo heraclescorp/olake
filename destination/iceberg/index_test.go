@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -797,6 +798,84 @@ func TestNativeRESTCoordinatorRejectsDeletesAfterExternalCompaction(t *testing.T
 			require.NoError(t, recovered.Close(ctx, map[string]any{"state": `{"safe":4}`}))
 			require.Equal(t, []string{http.MethodGet, http.MethodPost, http.MethodGet, http.MethodGet, http.MethodPost}, boundary.tableRequests())
 			require.Equal(t, map[string]int64{"a": 4, "b": 2}, nativeVisibleValues(t, recovered.table))
+		})
+	}
+}
+
+func TestNativeRESTCoordinatorConcurrentIndexedCDC(t *testing.T) {
+	for _, mode := range []types.UpdateType{types.UpdateTypePosition, types.UpdateTypeDeletionVector} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, cat, _ := nativeRESTWriterFixture(t, mode, nativeTestRecord("a", "r", 1, "one"), nativeTestRecord("b", "r", 2, "one"))
+			index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
+			first := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "parallel-a", false)
+			second := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "parallel-b", false)
+			original := index.rows["a"]
+			require.Equal(t, original.FilePath, index.rows["b"].FilePath)
+			require.NoError(t, first.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 10, "one")}))
+			require.NoError(t, second.Write(ctx, []types.RawRecord{nativeTestRecord("b", "u", 20, "one")}))
+			start := make(chan struct{})
+			errors := make(chan error, 2)
+			var group sync.WaitGroup
+			for _, writer := range []*nativeWriter{first, second} {
+				group.Add(1)
+				go func(writer *nativeWriter) {
+					defer group.Done()
+					<-start
+					errors <- writer.Close(ctx, nil)
+				}(writer)
+			}
+			close(start)
+			group.Wait()
+			close(errors)
+			for err := range errors {
+				require.NoError(t, err)
+			}
+			fresh, err := cat.LoadTable(ctx, first.table.Identifier())
+			require.NoError(t, err)
+			require.Equal(t, map[string]int64{"a": 10, "b": 20}, nativeVisibleValues(t, fresh))
+			deleted, _, err := nativeDeletedPositions(ctx, fresh, original.FilePath)
+			require.NoError(t, err)
+			require.Equal(t, []int64{0, 1}, deleted, "both deletes from the original file must survive vector replacement")
+			require.Equal(t, nativeSnapshotID(fresh), index.snapshot)
+			winner := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "same-key-first", false)
+			stale := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "same-key-stale", false)
+			require.NoError(t, winner.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 30, "one")}))
+			require.NoError(t, stale.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 40, "one")}))
+			require.NoError(t, winner.Close(ctx, nil))
+			require.ErrorIs(t, stale.Close(ctx, nil), table.ErrConflictingDataFiles)
+			fresh, err = cat.LoadTable(ctx, winner.table.Identifier())
+			require.NoError(t, err)
+			require.Equal(t, map[string]int64{"a": 30, "b": 20}, nativeVisibleValues(t, fresh))
+		})
+	}
+}
+
+func TestNativeRESTCoordinatorRecoversAfterCommittedIndexFailure(t *testing.T) {
+	for _, mode := range []types.UpdateType{types.UpdateTypePosition, types.UpdateTypeDeletionVector} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, cat, _ := nativeRESTWriterFixture(t, mode, nativeTestRecord("a", "r", 1, "one"))
+			index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "checkpoint-fails", false)
+			original, checkpoint := index.rows["a"], index.snapshot
+			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 9, "one")}))
+			index.commitErr = errors.New("injected durable index failure")
+			require.ErrorContains(t, writer.Close(ctx, map[string]any{"state": "committed-cursor"}), "local index checkpoint failed")
+			fresh, err := cat.LoadTable(ctx, writer.table.Identifier())
+			require.NoError(t, err)
+			require.Equal(t, map[string]int64{"a": 9}, nativeVisibleValues(t, fresh))
+			require.Contains(t, fresh.Properties()[nativeRecoveryProperty], "committed-cursor")
+			require.Equal(t, checkpoint, index.snapshot)
+			require.Equal(t, original, index.rows["a"])
+			index.commitErr = nil
+			recovered := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "checkpoint-recovery", false)
+			require.Equal(t, nativeSnapshotID(fresh), index.snapshot)
+			require.NotEqual(t, original, index.rows["a"])
+			require.NoError(t, recovered.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 10, "one")}))
+			require.NoError(t, recovered.Close(ctx, map[string]any{"state": "recovered-cursor"}))
+			require.Equal(t, map[string]int64{"a": 10}, nativeVisibleValues(t, recovered.table))
+			require.Equal(t, nativeSnapshotID(recovered.table), index.snapshot)
 		})
 	}
 }

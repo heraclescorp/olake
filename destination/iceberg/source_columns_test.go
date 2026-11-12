@@ -554,3 +554,35 @@ func TestNativeRESTCoordinatorSchemaMutationsPublishLatestView(t *testing.T) {
 	require.Equal(t, map[string]any{"old": int64(42)}, nativeSourceValues(t, discoverer.table, "source_added"))
 	source.Abort()
 }
+
+func TestNativeCoordinatorSetupObservesExternalSchemaReplacement(t *testing.T) {
+	ctx := context.Background()
+	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
+	seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "before-admin-ddl", true)
+	require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("seed", "r", 1, "one")}))
+	require.NoError(t, seed.Close(ctx, nil))
+	original, found := seed.table.Schema().FindFieldByName("value")
+	require.True(t, found)
+	// A separate engine changes only schema; the main snapshot does not advance.
+	admin := cat.(*nativeCatalog).Catalog
+	current, err := admin.LoadTable(ctx, seed.table.Identifier())
+	require.NoError(t, err)
+	tx := current.NewTransaction()
+	require.NoError(t, tx.UpdateSchema(true, false).DeleteColumn([]string{"value"}).Commit())
+	dropped, err := tx.Commit(ctx)
+	require.NoError(t, err)
+	tx = dropped.NewTransaction()
+	require.NoError(t, tx.UpdateSchema(true, false).AddColumn([]string{"value"}, apacheiceberg.PrimitiveTypes.Int64, "", false, nil).Commit())
+	replaced, err := tx.Commit(ctx)
+	require.NoError(t, err)
+	field, found := replaced.Schema().FindFieldByName("value")
+	require.True(t, found)
+	require.Greater(t, field.ID, original.ID)
+	require.Equal(t, nativeSnapshotID(seed.table), nativeSnapshotID(replaced))
+	after := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "after-admin-ddl", true)
+	require.NoError(t, after.Write(ctx, []types.RawRecord{nativeTestRecord("after", "r", 42, "one")}))
+	require.NoError(t, after.Close(ctx, nil))
+	persisted, err := admin.LoadTable(ctx, seed.table.Identifier())
+	require.NoError(t, err)
+	require.Equal(t, map[string]any{"seed": nil, "after": int64(42)}, nativeSourceValues(t, persisted, "value"))
+}

@@ -582,12 +582,10 @@ func (w *nativeWriter) currentTable(ctx context.Context, state *nativeTableState
 		if err != nil {
 			return nil, err
 		}
-		if fresh.Metadata().TableUUID() != w.table.Metadata().TableUUID() {
-			state.generation++
-			state.latest = fresh
-			return nil, errors.New("Iceberg table identity changed while this writer was active")
-		}
 		state.latest = fresh
+	}
+	if state.latest.Metadata().TableUUID() != w.table.Metadata().TableUUID() {
+		return nil, errors.New("Iceberg table identity changed while this writer was active")
 	}
 	return state.latest, nil
 }
@@ -630,19 +628,14 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 		return nil, nil, err
 	}
 	ctx = context.WithValue(ctx, nativeTableLockKey{}, state)
-	tbl := state.latest
-	// REST response-config credentials are not exposed by Table. Keep a fresh
-	// load at each writer setup for servers vending config-only temporary creds;
-	// the SDK refreshes storage-credentials itself through its original FS closure.
-	// Holding the entry lock across this load prevents an older local load from
-	// being published after a newer local commit. Close never refreshes routinely.
-	if tbl == nil || cat.CatalogType() == catalog.REST {
-		tbl, err = loadOrCreateNativeTable(ctx, config, stream, cat)
-		if err != nil {
-			return nil, nil, fmt.Errorf("load or create Iceberg table: %w", err)
-		}
-		state.latest = tbl
+	// Setup is the freshness boundary for external schema-only changes and
+	// response-config credentials. Hold the table lock so an older load cannot
+	// overwrite a newer local commit; Close reuses coordinated metadata.
+	tbl, err := loadOrCreateNativeTable(ctx, config, stream, cat)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load or create Iceberg table: %w", err)
 	}
+	state.latest = tbl
 	w := &nativeWriter{table: tbl, cat: cat, coordinator: state, generation: state.generation, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), positions: make(map[string][]int64), latest: make(map[string]types.RowLocation), paths: make(map[string]struct{})}
 	defer func() {
 		if err != nil {
