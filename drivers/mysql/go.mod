@@ -171,5 +171,3 @@ require (
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0
 )
-
-replace github.com/apache/iceberg-go => ../../third_party/iceberg-go
