@@ -32,7 +32,7 @@ func cleanEnvironment(t *testing.T) {
 		"OTEL_RESOURCE_ATTRIBUTES", "OTEL_SERVICE_NAME", "OTEL_SDK_DISABLED", "OTEL_METRICS_EXPORTER",
 		"OTEL_METRIC_EXPORT_INTERVAL", "OTEL_METRIC_EXPORT_TIMEOUT",
 		"OLAKE_JOB_ID", "OLAKE_OPERATION_TYPE", "OLAKE_WORKFLOW_ID",
-		"OLAKE_PROFILE_DIR", "OLAKE_CPU_PROFILE_SECONDS", "OLAKE_JAVA_HEAP_PERCENT",
+		"OLAKE_PROFILE_DIR", "OLAKE_CPU_PROFILE_SECONDS",
 		"POD_NAME", "POD_NAMESPACE", "POD_UID", "NODE_NAME",
 		"SERVICE_NAMESPACE", "GIT_HASH",
 	} {
@@ -350,7 +350,11 @@ func TestFailureLabelsAreBoundedAndJobLevel(t *testing.T) {
 func TestRuntimeMetricsHaveStableAttributes(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	defer provider.Shutdown(context.Background())
+	defer func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Errorf("shutting down runtime meter provider: %v", err)
+		}
+	}()
 	if err := registerRuntime(provider.Meter("runtime-test"), []attribute.KeyValue{
 		attribute.String("job_id", "job-test"), attribute.String("component", "go"), attribute.String("operation", "sync"),
 	}); err != nil {

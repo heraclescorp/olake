@@ -115,18 +115,13 @@ build:
 
 # --- overridables -----------------------------------------------------------
 COMPOSE ?= docker compose
-MVN_IMAGE ?= maven:3.9-eclipse-temurin-17
 
-# --- destination stack / iceberg writer JAR ---------------------------------
+# --- destination stack ------------------------------------------------------
 DEST_COMPOSE := destination/iceberg/local-test/docker-compose.yml
 DEST_DATA_DIR := destination/iceberg/local-test/data
 # Only these services are needed by the tests; a bare `up -d` would also start
 # the unused lakekeeper REST catalog and its migrate job.
 DEST_SERVICES := minio mc postgres spark-iceberg azurite
-ICEBERG_WRITER_DIR := destination/iceberg/olake-iceberg-java-writer
-ICEBERG_JAR := $(ICEBERG_WRITER_DIR)/target/olake-iceberg-java-writer-0.0.1-SNAPSHOT.jar
-ICEBERG_JAR_SRCS := $(ICEBERG_WRITER_DIR)/pom.xml $(shell find $(ICEBERG_WRITER_DIR)/src -type f 2>/dev/null)
-ROOT_JAR := olake-iceberg-java-writer.jar
 
 # --- readiness probes (polled by olake.<d>.wait / olake.destination.all.wait, incl. in CI)
 # Defaults only; per-driver probes and overrides live in drivers/<d>/driver.mk.
@@ -326,31 +321,11 @@ olake.all.refresh:
 	@$(MAKE) --no-print-directory olake.all.teardown
 	@$(MAKE) --no-print-directory olake.all.start
 
-# --- iceberg writer JAR (file rule: skips maven when up to date) --------------
-# Refreshes the repo-root copy too: build.sh and the iceberg writer prefer it,
-# so a stale root JAR would otherwise shadow a fresh target/ build.
-$(ICEBERG_JAR): $(ICEBERG_JAR_SRCS)
-	@if command -v mvn >/dev/null 2>&1; then \
-		mvn -f $(ICEBERG_WRITER_DIR)/pom.xml clean package -Dmaven.test.skip=true; \
-	else \
-		echo "mvn not found; building JAR with dockerized Maven ($(MVN_IMAGE))"; \
-		docker run --rm -v "$(CURDIR)/$(ICEBERG_WRITER_DIR)":/build -v olake-m2-cache:/root/.m2 -w /build $(MVN_IMAGE) mvn clean package -Dmaven.test.skip=true; \
-	fi
-	cp $(ICEBERG_JAR) $(ROOT_JAR)
-
-# Phony alias so CI (and humans) can `make iceberg.jar` without knowing the file path.
-.PHONY: iceberg.jar
-iceberg.jar: $(ICEBERG_JAR)
-
-# --- dev builds (generated per driver, incl. s3) ------------------------------
-# CGO_ENABLED=0 is set here, not left to the environment: db2 is the one driver that needs cgo
-# and GO_ENV.db2 turns it back on right after (it is appended to this same recipe line). Without
-# the explicit default, a db2 build -- or a cancelled one -- leaves CGO_ENABLED=1 in the caller's
-# shell and the next driver silently links against libc.
+# --- native builds (generated per driver, including Hive GSSAPI support) ------
 define DEV_BUILD_template
 .PHONY: dev.$(1).build
 dev.$(1).build: prepare.$(1)
-	export CGO_ENABLED=0; $$(GO_ENV.$(1)) cd drivers/$(1) && go build -o olake main.go
+	export CGO_ENABLED=1; $$(GO_ENV.$(1)) cd drivers/$(1) && go build -tags kerberos -o olake main.go
 	@echo "Built drivers/$(1)/olake"
 endef
 $(foreach d,$(DRIVERS),$(eval $(call DEV_BUILD_template,$(d))))
@@ -358,7 +333,7 @@ $(foreach d,$(DRIVERS),$(eval $(call DEV_BUILD_template,$(d))))
 # --- tests --------------------------------------------------------------------
 # Everything one driver's suites need, brought up concurrently. A recursive -j sub-make, since plain
 # prerequisites only run in parallel when the caller passes -j; every goal is idempotent.
-driver_test_setup = $(MAKE) --no-print-directory -j3 olake.$(1).start olake.destination.all.start $(ICEBERG_JAR)
+driver_test_setup = $(MAKE) --no-print-directory -j3 olake.$(1).start olake.destination.all.start
 
 # Compile the driver's test binary without running it, so CI pays the cold build while its container
 # pull and image build are still in flight. Through make, for db2's clidriver and cgo env.
@@ -399,18 +374,18 @@ $(foreach d,$(CDC_DRIVERS),$(eval $(call DRIVER_SUITE_template,$(d),2pc,2PC)))
 # stacks, so depending on olake.$(1).start would boot containers the suite never touches.
 define PERFORMANCE_TEST_template
 .PHONY: test.performance.$(1)
-test.performance.$(1): prepare.$(1) $$(ICEBERG_JAR)
+test.performance.$(1): prepare.$(1)
 	$$(GO_ENV.$(1)) cd tests && go test -v ./$(1)/... -timeout 0 -count=1 -run 'Performance'
 endef
 $(foreach d,$(DRIVERS),$(eval $(call PERFORMANCE_TEST_template,$(d))))
 
-test.discover: $(addprefix prepare.,$(DRIVERS)) olake.all.start $(ICEBERG_JAR)
+test.discover: $(addprefix prepare.,$(DRIVERS)) olake.all.start
 	$(foreach d,$(DRIVERS),$(GO_ENV.$(d))) cd tests && go test -v -p $(words $(DRIVERS)) $(DRIVER_PKGS) -timeout 0 -count=1 -run 'Discover'
 
-test.sync: $(addprefix prepare.,$(DRIVERS)) olake.all.start $(ICEBERG_JAR)
+test.sync: $(addprefix prepare.,$(DRIVERS)) olake.all.start
 	$(foreach d,$(DRIVERS),$(GO_ENV.$(d))) cd tests && go test -v -p $(words $(DRIVERS)) $(DRIVER_PKGS) -timeout 0 -count=1 -run 'Sync'
 
-test.2pc: $(addprefix prepare.,$(CDC_DRIVERS)) $(addprefix olake.,$(addsuffix .start,$(CDC_DRIVERS))) olake.destination.all.start $(ICEBERG_JAR)
+test.2pc: $(addprefix prepare.,$(CDC_DRIVERS)) $(addprefix olake.,$(addsuffix .start,$(CDC_DRIVERS))) olake.destination.all.start
 	$(foreach d,$(CDC_DRIVERS),$(GO_ENV.$(d))) cd tests && go test -v -p $(words $(CDC_DRIVERS)) $(CDC_PKGS) -timeout 0 -count=1 -run '2PC'
 
 
@@ -476,7 +451,6 @@ help:
 	@$(foreach d,$(DRIVERS),printf "  %-44s %s\n" "docker.$(d).build" "build the $(d) driver image (olakego/source-$(d):$(IMAGE_TAG))";)
 	@echo ""
 	@echo "Tests (auto-provision the stacks they need):"
-	@printf "  %-44s %s\n" "iceberg.jar" "build the Iceberg writer JAR (skips maven when up to date)"
 	@$(foreach d,$(DRIVERS),printf "  %-44s %s\n" "test.integration.$(d)" "every suite for $(d) (what the matrix job runs)";)
 	@$(foreach d,$(DRIVERS),printf "  %-44s %s\n" "test.discover.$(d)" "discover suite for $(d) (catalog equality check)";)
 	@$(foreach d,$(DRIVERS),printf "  %-44s %s\n" "test.sync.$(d)" "sync suite for $(d) (full load, CDC, incremental)";)

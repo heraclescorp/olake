@@ -33,7 +33,7 @@ func (th *TestHandler) RunUpsertIceberg(t *testing.T, seedOp string, steps []Ups
 		t.Fatalf("failed to update the catalog: %s", err)
 	}
 
-	if err := th.IcebergWriter(ctx, t, testTable, true, func(ctx context.Context, t *testing.T, testTable string) error {
+	run := func(ctx context.Context, t *testing.T, testTable string) error {
 		testutils.DropIcebergTable(t, testTable, th.DestinationDB)
 		th.ExecuteQuery(ctx, t, th.TestConfig, "drop")
 		th.ExecuteQuery(ctx, t, th.TestConfig, "create")
@@ -49,7 +49,8 @@ func (th *TestHandler) RunUpsertIceberg(t *testing.T, seedOp string, steps []Ups
 		}
 		testutils.DropIcebergTable(t, testTable, th.DestinationDB)
 		return nil
-	}); err != nil {
+	}
+	if err := run(ctx, t, testTable); err != nil {
 		t.Fatalf("upsert iceberg: %v", err)
 	}
 }
@@ -69,7 +70,7 @@ func (th *TestHandler) RunUpsertIcebergExpectFail(t *testing.T, seedOp, wantErr 
 		t.Fatalf("failed to update the catalog: %s", err)
 	}
 
-	if err := th.IcebergWriter(ctx, t, testTable, true, func(ctx context.Context, t *testing.T, testTable string) error {
+	run := func(ctx context.Context, t *testing.T, testTable string) error {
 		testutils.DropIcebergTable(t, testTable, th.DestinationDB)
 		th.ExecuteQuery(ctx, t, th.TestConfig, "drop")
 		th.ExecuteQuery(ctx, t, th.TestConfig, "create")
@@ -78,7 +79,8 @@ func (th *TestHandler) RunUpsertIcebergExpectFail(t *testing.T, seedOp, wantErr 
 			return fmt.Errorf("failed to clear table index: %w", err)
 		}
 		return th.runSyncAndVerify(ctx, t, testTable, false, "iceberg", "", "c", th.ExpectedData, true)
-	}); err == nil {
+	}
+	if err := run(ctx, t, testTable); err == nil {
 		t.Fatalf("sync must fail (%s)", wantErr)
 	} else if !strings.Contains(err.Error(), wantErr) {
 		t.Fatalf("expected %q, got: %v", wantErr, err)

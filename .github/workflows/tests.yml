@@ -108,10 +108,6 @@ jobs:
         name: Set up Docker Buildx
         uses: ./.github/actions/buildx
 
-      - &jar
-        name: Restore Iceberg writer jar
-        uses: ./.github/actions/iceberg-jar
-
       - &driver-image
         name: Build driver image
         id: image
@@ -230,7 +226,6 @@ jobs:
         run: make -j --output-sync=target olake.all.up DRIVERS="$DRIVERS"
 
       - *buildx
-      - *jar
 
       - name: Restore driver images
         id: image
@@ -301,7 +296,6 @@ jobs:
       - *driver-deps
       - *containers
       - *buildx
-      - *jar
       - *driver-image
       - *go
       - *go-caches
@@ -342,12 +336,6 @@ jobs:
       - *go
       - *driver-deps
 
-      - name: Set up Java for Maven
-        uses: actions/setup-java@v5
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
       - name: Setup VPN Client
         if: matrix.driver != 'oracle'
         run: |
@@ -387,8 +375,6 @@ jobs:
       - name: Install Go Dependencies
         working-directory: ./tests/testutils
         run: go mod download
-
-      - *jar
 
       - name: Build Driver Image
         run: make docker.${{ matrix.driver }}.build

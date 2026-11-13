@@ -3,29 +3,140 @@ package iceberg
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	apacheiceberg "github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/catalog"
+	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/table"
 	"github.com/datazip-inc/olake/destination"
-	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
+	"github.com/google/uuid"
 )
 
+const (
+	resyncIDProperty         = "olake.resync.id"
+	resyncCheckpointProperty = "olake.resync.checkpoint"
+	resyncBaselineProperty   = "olake.resync.baseline-sha256"
+	resyncGenerationProperty = "olake.resync.generation"
+	resyncSnapshotProperty   = "olake.resync.snapshot-id"
+	resyncLaunchProperty     = "olake.resync.launch-id"
+)
+
+// A stage is catalog-private, not a second named table or a renamed replacement.
+// Original FileIO (including REST-vended credentials) and all table IDs survive.
+// mu also fences abort against a queued stage commit or publication.
 type resyncControl struct {
-	stream     types.StreamInterface
-	id         string
-	deadline   time.Time
-	published  bool
-	aborted    bool
-	checkpoint string
-	tableUUID  string
-	snapshotID int64
+	mu           sync.Mutex
+	id           string
+	launch       string
+	recoverOnly  bool
+	deadline     time.Time
+	baselineHash string
+	base         *table.Table
+	stage        *nativeResyncCatalog
+	published    bool
+	aborted      bool
+	unknown      bool
+	failed       bool
+	owned        map[string]struct{}
+	sessions     int
+	checkpoint   string
+	tableUUID    string
+	snapshotID   int64
+}
+
+type nativeResyncCatalog struct {
+	catalog.Catalog
+	attempt  *resyncControl
+	metadata table.Metadata
+	updates  []table.Update
+	tables   nativeTableCoordinator
+}
+
+func (s *nativeResyncCatalog) target(ident table.Identifier) bool {
+	return slices.Equal(ident, s.attempt.base.Identifier())
+}
+
+func (s *nativeResyncCatalog) table() *table.Table {
+	return table.New(s.attempt.base.Identifier(), s.metadata, s.attempt.base.MetadataLocation(), s.fileIO, s)
+}
+
+func (s *nativeResyncCatalog) fileIO(ctx context.Context) (iceio.IO, error) {
+	fs, err := s.attempt.base.FS(nativeCatalogContext(ctx, s.Catalog))
+	if err != nil {
+		return nil, err
+	}
+	return &nativeResyncIO{IO: fs, attempt: s.attempt, ctx: ctx}, nil
+}
+
+func (s *nativeResyncCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	if !s.target(ident) {
+		return s.Catalog.LoadTable(ctx, ident)
+	}
+	s.attempt.mu.Lock()
+	defer s.attempt.mu.Unlock()
+	if err := s.attempt.active(ctx); err != nil {
+		return nil, err
+	}
+	return s.table(), nil
+}
+
+func (s *nativeResyncCatalog) CommitTable(ctx context.Context, ident table.Identifier, requirements []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	if !s.target(ident) {
+		return s.Catalog.CommitTable(ctx, ident, requirements, updates)
+	}
+	s.attempt.mu.Lock()
+	defer s.attempt.mu.Unlock()
+	if err := s.attempt.active(ctx); err != nil {
+		return nil, "", err
+	}
+	for _, requirement := range requirements {
+		if err := requirement.Validate(s.metadata); err != nil {
+			return nil, "", err
+		}
+	}
+	next, err := table.UpdateTableMetadata(s.metadata, updates, "")
+	if err != nil {
+		return nil, "", err
+	}
+	if next.TableUUID() != s.attempt.base.Metadata().TableUUID() || next.Location() != s.attempt.base.Location() {
+		return nil, "", errors.New("resync cannot change the table UUID or location")
+	}
+	s.metadata = next
+	s.updates = append(s.updates, updates...)
+	return next, s.attempt.base.MetadataLocation(), nil
+}
+
+func (r *resyncControl) active(ctx context.Context) error {
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
+	if r.failed || r.aborted || r.published || r.unknown {
+		return errors.New("resync attempt is no longer writable; retain uncertain files and start a fresh runtime")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !time.Now().Before(r.deadline) {
+		return errors.New("atomic resync exceeded its 12-hour attempt deadline")
+	}
+	return nil
+}
+
+func resyncHash(value []byte) string {
+	hash := sha256.Sum256(value)
+	return hex.EncodeToString(hash[:])
 }
 
 func (i *Iceberg) PrepareResync(ctx context.Context, stream types.StreamInterface, operationID string, baseline *types.State) (*types.State, error) {
@@ -35,115 +146,209 @@ func (i *Iceberg) PrepareResync(ctx context.Context, stream types.StreamInterfac
 		return nil, err
 	}
 	if strings.TrimSpace(operationID) == "" {
-		return nil, fmt.Errorf("resync operation ID must not be blank")
+		return nil, errors.New("resync operation ID must not be blank")
 	}
 	deadline, ok := ctx.Deadline()
-	if !ok || time.Until(deadline) > destination.ResyncMaxDuration {
-		return nil, fmt.Errorf("atomic resync requires a deadline no more than 12 hours away")
+	if !ok || time.Until(deadline) > destination.ResyncMaxDuration || !time.Now().Before(deadline) {
+		return nil, errors.New("atomic resync requires a live deadline no more than 12 hours away")
 	}
 	if i.resync != nil {
-		return nil, fmt.Errorf("a resync has already been prepared on this destination")
+		return nil, errors.New("a resync has already been prepared on this destination")
 	}
 	if baseline == nil {
-		return nil, fmt.Errorf("atomic resync requires the full baseline checkpoint")
+		return nil, errors.New("atomic resync requires the full baseline checkpoint")
 	}
 	encoded, err := json.Marshal(baseline)
 	if err != nil {
-		return nil, fmt.Errorf("failed to encode resync baseline checkpoint: %w", err)
+		return nil, err
 	}
 	canonical, err := canonicalResyncCheckpoint(string(encoded), "")
 	if err != nil {
 		return nil, err
 	}
-	i.resync = &resyncControl{stream: stream, id: operationID, deadline: deadline}
-	response, err := i.resyncRequest(ctx, proto.IcebergPayload_PREPARE_RESYNC, string(canonical))
+	ident := catalog.ToIdentifier(stream.GetDestinationDatabase(&i.config.IcebergDatabase), stream.GetDestinationTable())
+	state := nativeTableEntry(i.catalog, ident)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	options, _ := types.ResyncFromContext(ctx)
+	if options == nil {
+		options = &types.ResyncOptions{}
+	}
+	original, err := i.catalog.LoadTable(context.WithValue(ctx, nativeTableLockKey{}, state), ident)
 	if err != nil {
-		return nil, fmt.Errorf("failed to prepare atomic resync: %w", err)
-	}
-	if !response.GetResyncPublished() {
-		if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
-			return nil, fmt.Errorf("UNKNOWN: recovery-only resync has no matching durable publication marker")
+		if options.RecoverOnly {
+			return nil, fmt.Errorf("UNKNOWN: recovery cannot find the durable publication table: %w", err)
 		}
-		return nil, nil
+		return nil, fmt.Errorf("load original resync table: %w", err)
 	}
-	return i.acceptPublishedResync(response, "")
+	attempt := &resyncControl{id: operationID, launch: options.LaunchID, recoverOnly: options.RecoverOnly, deadline: deadline, baselineHash: resyncHash(canonical), base: original}
+	i.resync = attempt
+	if original.Properties()[resyncIDProperty] == operationID {
+		stored := original.Properties()[resyncBaselineProperty]
+		publishedCheckpoint, err := canonicalResyncCheckpoint(original.Properties()[resyncCheckpointProperty], "")
+		if err != nil {
+			return nil, err
+		}
+		if stored == "" || stored != attempt.baselineHash && resyncHash(publishedCheckpoint) != attempt.baselineHash {
+			return nil, errors.New("resync recovery checkpoint differs from the original baseline and published checkpoint")
+		}
+		return i.acceptPublishedResync(original.Metadata(), "")
+	}
+	if options.RecoverOnly {
+		return nil, errors.New("UNKNOWN: recovery-only resync has no matching durable publication marker")
+	}
+	if state.resync != nil {
+		return nil, errors.New("another resync attempt already owns the destination table")
+	}
+	if state.sessions != 0 {
+		return nil, errors.New("close every target writer successfully before preparing resync")
+	}
+	ctx, finish, err := beginNativeWriterWork(ctx, i.config)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	stage := &nativeResyncCatalog{Catalog: i.catalog, attempt: attempt, metadata: original.Metadata()}
+	attempt.stage = stage
+	state.resync = attempt
+	// Keep history and next-row-id, but start from an explicit empty snapshot.
+	snapshot, err := newNativeResyncSnapshot(ctx, attempt, nil)
+	if err != nil {
+		attempt.failed = true
+		return nil, err
+	}
+	removals := []string{nativeRecoveryProperty, resyncIDProperty, resyncCheckpointProperty, resyncBaselineProperty, resyncGenerationProperty, resyncSnapshotProperty, resyncLaunchProperty}
+	updates := []table.Update{table.NewAddSnapshotUpdate(snapshot), nativeResyncSetMain(original.Metadata(), snapshot.SnapshotID), table.NewRemovePropertiesUpdate(removals), table.NewSetPropertiesUpdate(apacheiceberg.Properties{resyncGenerationProperty: operationID})}
+	stage.metadata, err = table.UpdateTableMetadata(stage.metadata, updates, "")
+	if err != nil {
+		attempt.failed = true
+		return nil, err
+	}
+	stage.updates = append(stage.updates, updates...)
+	return nil, nil
 }
 
 func (i *Iceberg) PublishResync(ctx context.Context, checkpoint *types.State) error {
 	i.resyncMu.Lock()
 	defer i.resyncMu.Unlock()
 	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
-		return fmt.Errorf("recovery-only resync cannot publish replacement data")
+		return errors.New("recovery-only resync cannot publish replacement data")
 	}
-	if i.resync == nil || i.resync.aborted {
-		return fmt.Errorf("atomic resync has not been prepared or was aborted")
+	r := i.resync
+	if r == nil {
+		return errors.New("atomic resync has not been prepared")
+	}
+	if r.recoverOnly {
+		return errors.New("recovery-only resync cannot publish replacement data")
 	}
 	if checkpoint == nil {
-		return fmt.Errorf("atomic resync requires the full final checkpoint")
+		return errors.New("atomic resync requires the full final checkpoint")
 	}
 	encoded, err := json.Marshal(checkpoint)
 	if err != nil {
-		return fmt.Errorf("failed to encode resync checkpoint: %w", err)
+		return err
 	}
 	canonical, err := canonicalResyncCheckpoint(string(encoded), "")
 	if err != nil {
 		return err
 	}
-	if i.resync.published {
-		_, err := canonicalResyncCheckpoint(i.resync.checkpoint, string(canonical))
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.published {
+		_, err := canonicalResyncCheckpoint(r.checkpoint, string(canonical))
 		return err
 	}
-	if err := ctx.Err(); err != nil {
+	if r.stage == nil {
+		return errors.New("atomic resync has no writable prepared stage")
+	}
+	if err := r.active(ctx); err != nil {
 		return err
 	}
-	if !time.Now().Before(i.resync.deadline) {
-		return fmt.Errorf("atomic resync exceeded its 12-hour attempt deadline")
+	if err := nativeExecutionWritable(ctx, i.config); err != nil {
+		return err
 	}
-	publishCtx, cancel := context.WithDeadline(ctx, i.resync.deadline)
+	ctx, cancelDeadline := context.WithDeadline(ctx, r.deadline)
+	defer cancelDeadline()
+	ctx, finish, err := beginNativeWriterWork(ctx, i.config)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	if r.sessions != 0 {
+		return errors.New("close every target writer successfully before publishing resync")
+	}
+	state := nativeTableEntry(i.catalog, r.base.Identifier())
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	publishCtx := context.WithValue(ctx, nativeTableLockKey{}, state)
+	current, err := i.catalog.LoadTable(publishCtx, r.base.Identifier())
+	if err != nil {
+		return err
+	}
+	if err := assertNativeResyncUnchanged(r.base.Metadata(), current.Metadata()); err != nil {
+		return err
+	}
+	tip := r.stage.metadata.CurrentSnapshot()
+	if tip == nil || tip.SnapshotID <= 0 {
+		return errors.New("resync replacement requires a positive snapshot ID, including empty results")
+	}
+	snapshot, err := newNativeResyncSnapshot(publishCtx, r, tip)
+	if err != nil {
+		return err
+	}
+	updates := nativeResyncDefinitionUpdates(r.stage.updates)
+	updates = append(updates, table.NewAddSnapshotUpdate(snapshot), nativeResyncSetMain(r.base.Metadata(), snapshot.SnapshotID), table.NewSetPropertiesUpdate(apacheiceberg.Properties{
+		resyncIDProperty: r.id, resyncGenerationProperty: r.id, resyncCheckpointProperty: string(canonical), resyncBaselineProperty: r.baselineHash, resyncSnapshotProperty: strconv.FormatInt(snapshot.SnapshotID, 10), resyncLaunchProperty: r.launch,
+	}))
+	// The original metadata is the only public commit base. No private snapshots,
+	// snapshot-log entries, refs or statistics are transplanted into public history.
+	_, _, publishErr := i.catalog.CommitTable(publishCtx, r.base.Identifier(), nativeResyncRequirements(r.base.Metadata()), updates)
+	if publishErr != nil && errors.Is(publishErr, table.ErrCommitFailed) {
+		return publishErr
+	}
+	// A lost response is not a rejection. Retain every file and reconcile using a
+	// fresh, uncancelled catalog load before claiming a durable receipt.
+	r.unknown = true
+	statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	response, publishErr := i.resyncRequest(publishCtx, proto.IcebergPayload_PUBLISH_RESYNC, string(canonical))
-	if publishErr == nil {
-		_, publishErr = i.acceptPublishedResync(response, string(canonical))
-		if publishErr == nil {
+	status, statusErr := i.catalog.LoadTable(context.WithValue(statusCtx, nativeTableLockKey{}, state), r.base.Identifier())
+	if statusErr == nil {
+		var recovered *types.State
+		recovered, statusErr = i.acceptPublishedResync(status.Metadata(), string(canonical))
+		if statusErr == nil && recovered != nil {
+			r.unknown = false
+			state.latest = status
+			state.generation++
 			return nil
 		}
 	}
-	// A cancelled/lost response is not evidence of a failed catalog commit. Read
-	// the durable marker without cancellation, and never discard uncertain files.
-	statusCtx, statusCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer statusCancel()
-	status, statusErr := i.resyncRequest(statusCtx, proto.IcebergPayload_RESYNC_STATUS, "")
-	if statusErr == nil && status.GetResyncPublished() {
-		_, statusErr = i.acceptPublishedResync(status, string(canonical))
-		if statusErr == nil {
-			return nil
-		}
-	}
-	return fmt.Errorf("atomic resync publication is unconfirmed; retry the same resync ID to recover: %w", errors.Join(publishErr, statusErr))
+	nativeExecutionUnknown(i.config)
+	return fmt.Errorf("atomic resync publication is unconfirmed; retry the same resync ID to recover: %w", errors.Join(publishErr, statusErr, errors.New("no matching durable publication receipt")))
 }
 
-// AbortResync succeeds only when the JVM has fenced this attempt against any
-// subsequent publication. An unresolved publish must retain its execution fence.
 func (i *Iceberg) AbortResync(ctx context.Context) error {
 	i.resyncMu.Lock()
 	defer i.resyncMu.Unlock()
-	if i.resync == nil {
-		return fmt.Errorf("atomic resync destination has not been prepared")
+	r := i.resync
+	if r == nil {
+		return errors.New("atomic resync destination has not been prepared")
 	}
-	if i.resync.aborted {
-		return nil
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.published {
+		return errors.New("cannot abort an already published atomic resync")
 	}
-	if i.resync.published {
-		return fmt.Errorf("cannot abort an already published atomic resync")
+	if r.unknown {
+		return errors.New("resync publication outcome unknown; retain all attempt files")
 	}
-	response, err := i.resyncRequest(ctx, proto.IcebergPayload_ABORT_RESYNC, "")
-	if err != nil {
-		return fmt.Errorf("failed to abort atomic resync: %w", err)
+	if r.recoverOnly {
+		return errors.New("recovery-only resync cannot mutate attempt state")
 	}
-	if response.GetResyncPublished() {
-		return fmt.Errorf("cannot abort an already published atomic resync")
+	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
+		return errors.New("recovery-only resync cannot mutate attempt state")
 	}
-	i.resync.aborted = true
+	// Retain the tombstone: queued writers can never revive this attempt.
+	r.aborted = true
 	return nil
 }
 
@@ -162,144 +367,91 @@ func (i *Iceberg) ResyncReceipt() (string, int64) {
 	return i.resync.tableUUID, i.resync.snapshotID
 }
 
-func (i *Iceberg) resyncRequest(ctx context.Context, kind proto.IcebergPayload_PayloadType, checkpoint string) (*proto.RecordIngestResponse, error) {
-	// Status/abort do not dispatch new data publication. Let the JVM decide
-	// whether reconciliation is still possible; rejection must remain UNKNOWN.
-	if kind == proto.IcebergPayload_PREPARE_RESYNC || kind == proto.IcebergPayload_PUBLISH_RESYNC {
-		if err := utils.CheckExecutionFence(ctx); err != nil {
-			return nil, err
-		}
+func (i *Iceberg) acceptPublishedResync(metadata table.Metadata, expected string) (*types.State, error) {
+	r := i.resync
+	props := metadata.Properties()
+	if props[resyncIDProperty] != r.id {
+		return nil, nil
 	}
-	response, err := i.server.client.SendRecords(ctx, &proto.IcebergPayload{
-		Type: kind,
-		Metadata: &proto.IcebergPayload_Metadata{
-			DestTableName:    i.resync.stream.GetDestinationTable(),
-			Namespace:        i.resync.stream.GetDestinationDatabase(&i.config.IcebergDatabase),
-			ResyncId:         i.resync.id,
-			ResyncCheckpoint: checkpoint,
-			ResyncDeadlineMs: i.resync.deadline.UnixMilli(),
-		},
-	})
-	if err != nil {
-		return nil, err
+	if r.launch != "" && props[resyncLaunchProperty] != r.launch {
+		return nil, errors.New("resync durable marker belongs to a different admitted launch")
 	}
-	if response == nil || !response.GetSuccess() {
-		return nil, fmt.Errorf("atomic resync control request was rejected: %s", response.GetResult())
+	snapshot, err := strconv.ParseInt(props[resyncSnapshotProperty], 10, 64)
+	if err != nil || snapshot <= 0 || props[resyncGenerationProperty] != r.id || metadata.TableUUID() == uuid.Nil {
+		return nil, errors.New("published atomic resync is missing a valid UUID, generation or durable snapshot receipt")
 	}
-	return response, nil
-}
-
-func (i *Iceberg) acceptPublishedResync(response *proto.RecordIngestResponse, expectedCheckpoint string) (*types.State, error) {
-	if !response.GetResyncPublished() || response.GetResyncGeneration() != i.resync.id {
-		return nil, fmt.Errorf("destination did not confirm the requested atomic resync generation")
-	}
-	if strings.TrimSpace(response.GetResyncTableUuid()) == "" || response.GetSnapshotId() <= 0 {
-		return nil, fmt.Errorf("published atomic resync is missing its table UUID or positive snapshot ID")
-	}
-	checkpoint, err := canonicalResyncCheckpoint(response.GetResyncCheckpoint(), expectedCheckpoint)
+	canonical, err := canonicalResyncCheckpoint(props[resyncCheckpointProperty], expected)
 	if err != nil {
 		return nil, err
 	}
 	state := &types.State{RWMutex: &sync.RWMutex{}}
-	decoder := json.NewDecoder(bytes.NewReader(checkpoint))
+	decoder := json.NewDecoder(bytes.NewReader(canonical))
 	decoder.UseNumber()
 	if err := decoder.Decode(state); err != nil {
-		return nil, fmt.Errorf("failed to decode published resync checkpoint: %w", err)
+		return nil, err
 	}
 	if state.Type != types.GlobalType && state.Type != types.StreamType && state.Type != types.MixedType {
-		return nil, fmt.Errorf("published atomic resync checkpoint has no valid state type")
+		return nil, errors.New("published atomic resync checkpoint has no valid state type")
 	}
-	i.resync.published = true
-	i.resync.checkpoint = response.GetResyncCheckpoint()
-	i.resync.tableUUID = response.GetResyncTableUuid()
-	i.resync.snapshotID = response.GetSnapshotId()
+	r.published, r.checkpoint, r.tableUUID, r.snapshotID = true, string(canonical), metadata.TableUUID().String(), snapshot
 	return state, nil
 }
 
-func canonicalResyncCheckpoint(checkpoint, expected string) ([]byte, error) {
-	canonicalize := func(raw string) ([]byte, error) {
-		if !json.Valid([]byte(raw)) {
-			return nil, fmt.Errorf("published atomic resync has no valid full checkpoint")
+func nativeResyncDefinitionUpdates(updates []table.Update) []table.Update {
+	result := make([]table.Update, 0, len(updates))
+	for _, update := range updates {
+		switch update.Action() {
+		case table.UpdateAddSnapshot, table.UpdateSetSnapshotRef, table.UpdateRemoveSnapshotRef, table.UpdateRemoveSnapshots, table.UpdateSetStatistics, table.UpdateRemoveStatistics, table.UpdateSetPartitionStatistics, table.UpdateRemovePartitionStatistics:
+			continue
 		}
-		var value any
-		decoder := json.NewDecoder(strings.NewReader(raw))
-		decoder.UseNumber()
-		if err := decoder.Decode(&value); err != nil {
-			return nil, err
-		}
-		object, ok := value.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("atomic resync requires a full checkpoint JSON object")
-		}
-		// Only known state collections are unordered. Cursor arrays retain their order.
-		if global, ok := object["global"].(map[string]any); ok {
-			if streams, ok := global["streams"].([]any); ok {
-				names := make([]string, len(streams))
-				for index, stream := range streams {
-					name, ok := stream.(string)
-					if !ok {
-						return nil, fmt.Errorf("published checkpoint contains a non-string stream identity")
-					}
-					names[index] = name
-				}
-				slices.Sort(names)
-				global["streams"] = names
-			}
-		}
-		if streams, ok := object["streams"].([]any); ok {
-			for _, stream := range streams {
-				if record, ok := stream.(map[string]any); ok {
-					if state, ok := record["state"].(map[string]any); ok {
-						if chunks, ok := state[types.ChunksKey].([]any); ok {
-							ordered, err := canonicalResyncRecords(chunks)
-							if err != nil {
-								return nil, err
-							}
-							state[types.ChunksKey] = ordered
-						}
-					}
-				}
-			}
-			ordered, err := canonicalResyncRecords(streams)
-			if err != nil {
-				return nil, err
-			}
-			object["streams"] = ordered
-		}
-		return json.Marshal(value)
+		result = append(result, update)
 	}
-	canonical, err := canonicalize(checkpoint)
-	if err != nil {
-		return nil, err
-	}
-	if expected != "" {
-		wanted, err := canonicalize(expected)
-		if err != nil {
-			return nil, err
-		}
-		if !bytes.Equal(canonical, wanted) {
-			return nil, fmt.Errorf("published atomic resync checkpoint differs from the final source checkpoint")
-		}
-	}
-	return canonical, nil
+	return result
 }
 
-// canonicalResyncRecords encodes each set member once, before comparing sort keys.
-func canonicalResyncRecords(records []any) ([]json.RawMessage, error) {
-	encoded := make([]json.RawMessage, len(records))
-	for index, record := range records {
-		value, err := json.Marshal(record)
-		if err != nil {
-			return nil, err
-		}
-		encoded[index] = value
+func nativeResyncRequirements(base table.Metadata) []table.Requirement {
+	requirements := []table.Requirement{table.AssertTableUUID(base.TableUUID()), table.AssertLastAssignedFieldID(base.LastColumnID()), table.AssertCurrentSchemaID(base.CurrentSchema().ID), table.AssertDefaultSpecID(base.DefaultPartitionSpec()), table.AssertDefaultSortOrderID(base.DefaultSortOrder())}
+	if id := base.LastPartitionSpecID(); id != nil {
+		requirements = append(requirements, table.AssertLastAssignedPartitionID(*id))
 	}
-	slices.SortFunc(encoded, func(left, right json.RawMessage) int {
-		return bytes.Compare(left, right)
-	})
-	return encoded, nil
+	for name, ref := range base.Refs() {
+		id := ref.SnapshotID
+		requirements = append(requirements, table.AssertRefSnapshotID(name, &id))
+	}
+	if base.CurrentSnapshot() == nil {
+		requirements = append(requirements, table.AssertRefSnapshotID(table.MainBranch, nil))
+	}
+	return requirements
 }
 
-func (i *Iceberg) FinishResync(_ context.Context) error {
-	return i.server.shutdownResync()
+func assertNativeResyncUnchanged(base, current table.Metadata) error {
+	// Includes properties, all refs/history/statistics, UUID/location and V3
+	// counters. A stage may not silently erase a concurrent metadata-only edit.
+	if !base.Equals(current) {
+		return fmt.Errorf("concurrent table identity, data, schema, properties or history change during resync: %w", table.ErrCommitFailed)
+	}
+	return nil
+}
+
+func (i *Iceberg) FinishResync(ctx context.Context) error {
+	if native, ok := i.catalog.(*nativeCatalog); ok {
+		return native.Close()
+	}
+	return nil
+}
+
+func nativeResyncSetMain(metadata table.Metadata, snapshotID int64) table.Update {
+	ref := metadata.Ref()
+	var maxRefAge, maxSnapshotAge int64
+	var minSnapshots int
+	if ref.MaxRefAgeMs != nil {
+		maxRefAge = *ref.MaxRefAgeMs
+	}
+	if ref.MaxSnapshotAgeMs != nil {
+		maxSnapshotAge = *ref.MaxSnapshotAgeMs
+	}
+	if ref.MinSnapshotsToKeep != nil {
+		minSnapshots = *ref.MinSnapshotsToKeep
+	}
+	return table.NewSetSnapshotRefUpdate(table.MainBranch, snapshotID, table.BranchRef, maxRefAge, maxSnapshotAge, minSnapshots)
 }

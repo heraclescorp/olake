@@ -16,33 +16,6 @@ function build_and_run() {
         fail "The argument does not have a recognized prefix."
     fi
     
-    # Check if writer.json is specified in the arguments
-    local writer_file=""
-    local using_iceberg=false
-    
-    # Parse the arguments to find the writer.json file path
-    local previous_arg=""
-    for arg in $joined_arguments; do
-        if [[ "$previous_arg" == "--destination" || "$previous_arg" == "-d" ]]; then
-            writer_file="$arg"
-            break
-        fi
-        previous_arg="$arg"
-    done
-    
-    # If writer file was found, check if it contains iceberg
-    if [[ -n "$writer_file" && -f "$writer_file" ]]; then
-        echo "Checking writer file: $writer_file for iceberg destination..."
-        if grep -qi "iceberg" "$writer_file"; then
-            echo "Iceberg destination detected in writer file."
-            using_iceberg=true
-        fi
-    fi
-    
-    # If using iceberg, build the writer JAR (skips maven when up to date)
-    if [[ "$using_iceberg" == true ]]; then
-        make iceberg.jar || fail "Iceberg writer JAR build failed"
-    fi
 
     [[ -n "$OLAKE_SKIP_MOD_TIDY" ]] || (cd $path && go mod tidy)
 

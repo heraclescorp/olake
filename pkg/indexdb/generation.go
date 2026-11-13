@@ -49,16 +49,17 @@ func ReconcileGeneration(index types.StreamIndex, generation string) error {
 	if index == nil {
 		return nil
 	}
-	var store *pebbleIndex
-	switch index := index.(type) {
-	case *pebbleIndex:
-		store = index
-	case *attemptIndex:
-		store = index.pebbleIndex
-	default:
+	store, ok := index.(interface{ ReconcileGeneration(string) error })
+	if !ok {
 		return fmt.Errorf("stream index does not support durable resync generations")
 	}
-	previous, err := store.resyncGeneration()
+	return store.ReconcileGeneration(generation)
+}
+
+// ReconcileGeneration binds this durable index to one public table lineage.
+// attemptIndex inherits the same implementation without special-case dispatch.
+func (i *pebbleIndex) ReconcileGeneration(generation string) error {
+	previous, err := i.resyncGeneration()
 	if err != nil {
 		return err
 	}
@@ -68,7 +69,7 @@ func ReconcileGeneration(index types.StreamIndex, generation string) error {
 	if previous == generation {
 		return nil
 	}
-	return store.truncateGeneration(generation)
+	return i.truncateGeneration(generation)
 }
 
 func (i *pebbleIndex) resyncGeneration() (string, error) {

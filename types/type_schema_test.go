@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/datazip-inc/olake/constants"
-	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/parquet-go/parquet-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -527,7 +526,7 @@ func TestTypeSchemaToIceberg(t *testing.T) {
 	schema.AddTypes("_meta_col", true, String)
 	stream := &ConfiguredStream{Stream: &Stream{Name: "test_stream", Schema: schema}}
 
-	fieldTypes := func(fields []*proto.IcebergPayload_SchemaField) map[string]string {
+	fieldTypes := func(fields []*IcebergField) map[string]string {
 		out := make(map[string]string, len(fields))
 		for _, field := range fields {
 			out[field.Key] = field.IceType

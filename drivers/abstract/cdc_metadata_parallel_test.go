@@ -48,7 +48,7 @@ type metadataCDCRun struct {
 	err  error
 }
 
-func startMetadataCDC(t *testing.T, ctx context.Context, cancel context.CancelFunc, driver DriverInterface, pool *destination.WriterPool, index int, streams []types.StreamInterface) *metadataCDCRun {
+func startMetadataCDC(ctx context.Context, t *testing.T, cancel context.CancelFunc, driver DriverInterface, pool *destination.WriterPool, index int, streams []types.StreamInterface) *metadataCDCRun {
 	t.Helper()
 	run := &metadataCDCRun{done: make(chan struct{})}
 	go func() {
@@ -66,7 +66,7 @@ func startMetadataCDC(t *testing.T, ctx context.Context, cancel context.CancelFu
 	return run
 }
 
-func awaitMetadataEvent[T any](t *testing.T, ctx context.Context, events <-chan T) T {
+func awaitMetadataEvent[T any](ctx context.Context, t *testing.T, events <-chan T) T {
 	t.Helper()
 	select {
 	case event := <-events:
@@ -83,8 +83,17 @@ func TestCDCWriterSetupParallelBarrier(t *testing.T) {
 	defer cancel()
 	streams := metadataStreams(2*constants.CDCMetadataConcurrency + 3)
 	indices := make(map[string]int, len(streams))
+	setupMetadata := make(map[string]*types.MetadataState, len(streams))
 	for index, stream := range streams {
 		indices[stream.ID()] = index
+		if index%4 != 0 {
+			metadata := &types.MetadataState{State: "position-" + stream.ID()}
+			if index%4 != 3 {
+				dedup := index%4 == 1
+				metadata.DedupInserts = &dedup
+			}
+			setupMetadata[stream.ID()] = metadata
+		}
 	}
 
 	started := make(chan string, len(streams))
@@ -116,16 +125,7 @@ func TestCDCWriterSetupParallelBarrier(t *testing.T) {
 				return nil, setupCtx.Err()
 			}
 			completed.Add(1)
-			index := indices[stream.ID()]
-			if index%4 == 0 {
-				return nil, nil
-			}
-			metadata := &types.MetadataState{State: "position-" + stream.ID()}
-			if index%4 != 3 {
-				dedup := index%4 == 1
-				metadata.DedupInserts = &dedup
-			}
-			return metadata, nil
+			return setupMetadata[stream.ID()], nil
 		},
 		Write: func(writeCtx context.Context, stream types.StreamInterface, _ *destination.Options, records []types.RawRecord) error {
 			if err := writeCtx.Err(); err != nil {
@@ -188,14 +188,14 @@ func TestCDCWriterSetupParallelBarrier(t *testing.T) {
 			return nil
 		},
 	}
-	run := startMetadataCDC(t, ctx, cancel, driver, pool, 7, streams)
+	run := startMetadataCDC(ctx, t, cancel, driver, pool, 7, streams)
 	for range constants.CDCMetadataConcurrency {
-		awaitMetadataEvent(t, ctx, started)
+		awaitMetadataEvent(ctx, t, started)
 	}
 	assert.EqualValues(t, constants.CDCMetadataConcurrency, active.Load())
 	assert.Zero(t, completed.Load())
 	close(release)
-	awaitMetadataEvent(t, ctx, run.done)
+	awaitMetadataEvent(ctx, t, run.done)
 	require.NoError(t, run.err)
 	assert.EqualValues(t, constants.CDCMetadataConcurrency, maximum.Load())
 	assert.EqualValues(t, len(streams), completed.Load())
@@ -290,17 +290,17 @@ func TestCDCWriterSetupFailureJoinsAndCleans(t *testing.T) {
 					return nil
 				},
 			}
-			run := startMetadataCDC(t, ctx, cancel, driver, pool, 0, streams)
+			run := startMetadataCDC(ctx, t, cancel, driver, pool, 0, streams)
 			for range streams {
-				awaitMetadataEvent(t, ctx, started)
+				awaitMetadataEvent(ctx, t, started)
 			}
 			close(fail)
-			awaitMetadataEvent(t, ctx, canceled)
+			awaitMetadataEvent(ctx, t, canceled)
 			assert.Zero(t, closes.Load(), "cleanup must wait for in-flight setup")
 			assert.Zero(t, postCalls.Load())
 			assert.Zero(t, reads.Load())
 			close(release)
-			awaitMetadataEvent(t, ctx, run.done)
+			awaitMetadataEvent(ctx, t, run.done)
 
 			require.Error(t, run.err)
 			if test.panicSetup {
@@ -369,16 +369,16 @@ func TestCDCWriterSetupContextCancellation(t *testing.T) {
 			return nil
 		},
 	}
-	run := startMetadataCDC(t, cdcCtx, cancelCDC, driver, pool, 0, streams)
+	run := startMetadataCDC(cdcCtx, t, cancelCDC, driver, pool, 0, streams)
 	for range streams {
-		awaitMetadataEvent(t, ctx, started)
+		awaitMetadataEvent(ctx, t, started)
 	}
 	cancelCDC()
-	awaitMetadataEvent(t, ctx, canceled)
+	awaitMetadataEvent(ctx, t, canceled)
 	assert.Zero(t, closes.Load())
 	assert.Zero(t, postCalls.Load())
 	close(release)
-	awaitMetadataEvent(t, ctx, run.done)
+	awaitMetadataEvent(ctx, t, run.done)
 
 	assert.ErrorIs(t, run.err, context.Canceled)
 	assert.Zero(t, reads.Load())
@@ -434,12 +434,12 @@ func TestCDCWriterSetupFailureStopsQueuedWork(t *testing.T) {
 			return nil
 		},
 	}
-	run := startMetadataCDC(t, ctx, cancel, driver, pool, 0, streams)
+	run := startMetadataCDC(ctx, t, cancel, driver, pool, 0, streams)
 	for range constants.CDCMetadataConcurrency {
-		awaitMetadataEvent(t, ctx, started)
+		awaitMetadataEvent(ctx, t, started)
 	}
 	close(fail)
-	awaitMetadataEvent(t, ctx, run.done)
+	awaitMetadataEvent(ctx, t, run.done)
 
 	assert.ErrorIs(t, run.err, failure)
 	assert.EqualValues(t, constants.CDCMetadataConcurrency, setups.Load(), "queued jobs must not create writers after cancellation")
@@ -457,7 +457,7 @@ func TestCDCWriterSetupCanceledBeforeScheduling(t *testing.T) {
 	pool := newMetadataWriterPool(t, streams, metadataWriterHooks{
 		Setup: func(context.Context, types.StreamInterface, *destination.Options) (*types.MetadataState, error) {
 			setups.Add(1)
-			return nil, nil
+			return nil, errors.New("setup called after cancellation")
 		},
 	})
 	driver := metadataCDCDriver{

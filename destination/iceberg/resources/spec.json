@@ -31,12 +31,6 @@
           "type": "string",
           "title": "S3 Path",
           "description": "The S3 path or storage location for Iceberg data"
-        },
-        "arrow_writes": {
-          "type": "boolean",
-          "default": false,
-          "title": "Enable Arrow Writes",
-          "description": "Enable Apache Arrow-based Writer for Iceberg"
         }
       },
       "required": [

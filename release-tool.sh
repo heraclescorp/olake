@@ -25,17 +25,6 @@ function chalk() {
     fi
 }
 
-# Function to build the Java project with Maven
-function build_java_project() {
-    echo "Building Java project with Maven..."
-    # Change to the directory containing the POM file
-    cd destination/iceberg/olake-iceberg-java-writer || fail "Failed to change to Maven project directory"
-    echo "Building Maven project in $(pwd)"
-    mvn clean package -Dmaven.test.skip=true || fail "Maven build failed"
-    # Return to the original directory
-    cd - || fail "Failed to return to original directory"
-    echo "$(chalk green "✅ Java project successfully built")"
-}
 
 # Function to fail with a message
 function fail() {
@@ -140,8 +129,5 @@ chalk green "=== Release version: $VERSION ==="
 connector=$DRIVER
 type="source"
 
-
-# Build Java project
-build_java_project
 
 release "$VERSION" "$platform" "$CURRENT_BRANCH"

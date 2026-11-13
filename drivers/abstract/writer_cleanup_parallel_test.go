@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,8 +26,9 @@ func cleanupTestStreams(count int) []types.StreamInterface {
 	return streams
 }
 
-func cleanupTestWriters(t *testing.T, ctx context.Context, pool *destination.WriterPool, streams []types.StreamInterface) map[string]*destination.WriterThread {
+func cleanupTestWriters(ctx context.Context, t *testing.T, pool *destination.WriterPool, streams []types.StreamInterface) map[string]*destination.WriterThread {
 	t.Helper()
+	require.LessOrEqual(t, int64(len(streams)), int64(math.MaxInt32), "writer count must fit the int32 lifecycle counters")
 	writers := make(map[string]*destination.WriterThread, len(streams))
 	for _, stream := range streams {
 		writer, _, err := pool.NewWriter(ctx, stream, destination.WithThreadID(stream.ID()))
@@ -109,7 +111,7 @@ func TestHandleWriterCleanupParallelMetadata(t *testing.T) {
 					return nil
 				},
 			})
-			writers := cleanupTestWriters(t, ctx, pool, streams)
+			writers := cleanupTestWriters(ctx, t, pool, streams)
 			writers["nil_writer"] = nil
 			clearDedup := false
 			result := make(chan error, 1)
@@ -297,12 +299,12 @@ func TestHandleWriterCleanupPreservesPriorAndCloseErrors(t *testing.T) {
 			return closeErrors[1]
 		},
 	})
-	writers := cleanupTestWriters(t, ctx, pool, streams)
+	writers := cleanupTestWriters(ctx, t, pool, streams)
 	err := prior
 	func() {
 		defer handleWriterCleanup(ctx, cancel, &err, writers, "", nil, nil)
 	}()
-	assert.Equal(t, int32(len(streams)), closed.Load())
+	assert.Equal(t, int64(len(streams)), int64(closed.Load()))
 	assert.ErrorIs(t, err, priorCause)
 	for _, closeErr := range closeErrors {
 		assert.ErrorIs(t, err, closeErr)
@@ -324,7 +326,7 @@ func TestHandleWriterCleanupHonorsCancellation(t *testing.T) {
 			return ctx.Err()
 		},
 	})
-	writers := cleanupTestWriters(t, ctx, pool, streams)
+	writers := cleanupTestWriters(ctx, t, pool, streams)
 	result := make(chan error, 1)
 	go func() {
 		var err error
@@ -338,7 +340,7 @@ func TestHandleWriterCleanupHonorsCancellation(t *testing.T) {
 	}
 	cancel()
 	assert.ErrorIs(t, waitCleanupResult(t, result), context.Canceled)
-	assert.Equal(t, int32(len(streams)), closed.Load())
+	assert.Equal(t, int64(len(streams)), int64(closed.Load()))
 }
 
 func TestHandleWriterCleanupSingleWriterMetadata(t *testing.T) {

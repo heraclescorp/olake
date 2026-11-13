@@ -13,14 +13,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	awss3 "github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3iface"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager/s3manageriface"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/logger"
 )
@@ -34,41 +34,60 @@ type Config struct {
 	S3Endpoint string
 }
 
+// Client is the S3 operation boundary used by Store.
+type Client interface {
+	PutObject(context.Context, *awss3.PutObjectInput, ...func(*awss3.Options)) (*awss3.PutObjectOutput, error)
+	GetObject(context.Context, *awss3.GetObjectInput, ...func(*awss3.Options)) (*awss3.GetObjectOutput, error)
+	ListObjectsV2(context.Context, *awss3.ListObjectsV2Input, ...func(*awss3.Options)) (*awss3.ListObjectsV2Output, error)
+	CopyObject(context.Context, *awss3.CopyObjectInput, ...func(*awss3.Options)) (*awss3.CopyObjectOutput, error)
+	DeleteObject(context.Context, *awss3.DeleteObjectInput, ...func(*awss3.Options)) (*awss3.DeleteObjectOutput, error)
+	DeleteObjects(context.Context, *awss3.DeleteObjectsInput, ...func(*awss3.Options)) (*awss3.DeleteObjectsOutput, error)
+}
+
+// Uploader supports streaming and multipart file uploads.
+type Uploader interface {
+	UploadObject(context.Context, *transfermanager.UploadObjectInput, ...func(*transfermanager.Options)) (*transfermanager.UploadObjectOutput, error)
+}
+
 // Store is the implementation of the ObjectStore interface for S3.
 type Store struct {
-	client   s3iface.S3API
-	uploader s3manageriface.UploaderAPI
+	client   Client
+	uploader Uploader
 	bucket   string
 	prefix   string
 	gcs      bool
 	Kind     string
 }
 
-// New creates a new AWS S3 client
+// New creates a new AWS S3 client.
 func New(cfg Config) (*Store, error) {
-	clientCfg := aws.Config{Region: aws.String(cfg.Region)}
-	if cfg.S3Endpoint != "" {
-		clientCfg.Endpoint = aws.String(cfg.S3Endpoint)
-		clientCfg.S3ForcePathStyle = aws.Bool(true)
-	}
+	options := []func(*config.LoadOptions) error{config.WithRegion(cfg.Region)}
 	if cfg.AccessKey != "" && cfg.SecretKey != "" {
-		clientCfg.Credentials = credentials.NewStaticCredentials(cfg.AccessKey, cfg.SecretKey, "")
+		options = append(options, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")))
 	}
-	sess, err := session.NewSession(&clientCfg)
+	clientCfg, err := config.LoadDefaultConfig(context.Background(), options...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create AWS session: %w", err)
+		return nil, fmt.Errorf("failed to load AWS configuration: %w", err)
 	}
-	return &Store{
-		client:   awss3.New(sess),
-		uploader: s3manager.NewUploader(sess),
-		bucket:   cfg.Bucket,
-		prefix:   strings.Trim(cfg.Prefix, "/"),
-		gcs:      strings.Contains(cfg.S3Endpoint, "googleapis.com"),
-		Kind:     "s3",
-	}, nil
+	client := awss3.NewFromConfig(clientCfg, func(options *awss3.Options) {
+		if cfg.S3Endpoint != "" {
+			options.BaseEndpoint = aws.String(cfg.S3Endpoint)
+			options.UsePathStyle = true
+		}
+		// S3-compatible endpoints may not implement optional checksum trailers.
+		options.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		options.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+	})
+	store := NewWithClient(client, transfermanager.New(client, func(options *transfermanager.Options) {
+		options.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		options.PartSizeBytes = 5 * 1024 * 1024
+		options.MultipartUploadThreshold = 5 * 1024 * 1024
+	}), cfg.Bucket, cfg.Prefix)
+	store.gcs = strings.Contains(cfg.S3Endpoint, "googleapis.com")
+	return store, nil
 }
 
-func NewWithClient(client s3iface.S3API, uploader s3manageriface.UploaderAPI, bucket, prefix string) *Store {
+func NewWithClient(client Client, uploader Uploader, bucket, prefix string) *Store {
 	return &Store{
 		client:   client,
 		uploader: uploader,
@@ -78,8 +97,7 @@ func NewWithClient(client s3iface.S3API, uploader s3manageriface.UploaderAPI, bu
 	}
 }
 
-// WithPrefix returns a store that shares this store's clients and bucket and applies prefix
-// with the same trim as New. gcs is copied so a GCS store stays on individual deletes.
+// WithPrefix shares clients and bucket, retaining endpoint-specific delete behavior.
 func (s *Store) WithPrefix(prefix string) *Store {
 	next := NewWithClient(s.client, s.uploader, s.bucket, prefix)
 	next.gcs = s.gcs
@@ -92,7 +110,7 @@ func (s *Store) ObjectKey(relativePath string) string {
 }
 
 func (s *Store) Put(ctx context.Context, key string, data []byte) error {
-	_, err := s.client.PutObjectWithContext(ctx, &awss3.PutObjectInput{
+	_, err := s.client.PutObject(ctx, &awss3.PutObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 		Body:   bytes.NewReader(data),
@@ -101,7 +119,7 @@ func (s *Store) Put(ctx context.Context, key string, data []byte) error {
 }
 
 func (s *Store) UploadFile(ctx context.Context, key string, file *os.File) error {
-	_, err := s.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
+	_, err := s.uploader.UploadObject(ctx, &transfermanager.UploadObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 		Body:   file,
@@ -114,11 +132,37 @@ func (s *Store) DeletePrefix(ctx context.Context, prefix string) error {
 		return s.deletePrefixIndividually(ctx, prefix)
 	}
 	err := utils.RetryWithSkip(ctx, 3, time.Minute, s.IsRateLimitError, func(ctx context.Context) error {
-		iter := s3manager.NewDeleteListIterator(s.client, &awss3.ListObjectsInput{
-			Bucket: aws.String(s.bucket),
-			Prefix: aws.String(prefix),
+		pages := awss3.NewListObjectsV2Paginator(s.client, &awss3.ListObjectsV2Input{
+			Bucket: aws.String(s.bucket), Prefix: aws.String(prefix),
 		})
-		return s3manager.NewBatchDeleteWithClient(s.client).Delete(ctx, iter)
+		for pages.HasMorePages() {
+			page, err := pages.NextPage(ctx)
+			if err != nil {
+				return err
+			}
+			if len(page.Contents) == 0 {
+				continue
+			}
+			objects := make([]types.ObjectIdentifier, 0, len(page.Contents))
+			for _, object := range page.Contents {
+				objects = append(objects, types.ObjectIdentifier{Key: object.Key})
+			}
+			out, err := s.client.DeleteObjects(ctx, &awss3.DeleteObjectsInput{
+				Bucket: aws.String(s.bucket), Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
+			})
+			if err != nil {
+				return err
+			}
+			// S3 may report individual failures in an otherwise successful response.
+			if len(out.Errors) != 0 {
+				failures := make([]error, 0, len(out.Errors))
+				for _, failure := range out.Errors {
+					failures = append(failures, &smithy.GenericAPIError{Code: aws.ToString(failure.Code), Message: aws.ToString(failure.Message)})
+				}
+				return errors.Join(failures...)
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		logger.Warnf("batch delete failed for prefix %s, falling back to individual deletes: %v", prefix, err)
@@ -129,46 +173,39 @@ func (s *Store) DeletePrefix(ctx context.Context, prefix string) error {
 	return nil
 }
 
-// GCP: no DeleteObjects API. Concurrent single deletes; GCS throttles at HTTP 429
-// (~5000 mutations/sec/bucket). Same behavior as the old clearS3Files googleapis branch.
+// GCS has no DeleteObjects API; delete each page concurrently with throttling retries.
 func (s *Store) deletePrefixIndividually(ctx context.Context, prefix string) error {
-	var pageErr error
-	listErr := utils.RetryWithSkip(ctx, 3, time.Minute, s.IsRateLimitError, func(_ context.Context) error {
-		pageErr = nil
-		return s.client.ListObjectsPagesWithContext(ctx, &awss3.ListObjectsInput{
-			Bucket: aws.String(s.bucket),
-			Prefix: aws.String(prefix),
-		}, func(page *awss3.ListObjectsOutput, _ bool) bool {
-			pageKeys := make([]string, 0, len(page.Contents))
-			for _, obj := range page.Contents {
-				pageKeys = append(pageKeys, aws.StringValue(obj.Key))
+	return utils.RetryWithSkip(ctx, 3, time.Minute, s.IsRateLimitError, func(ctx context.Context) error {
+		pages := awss3.NewListObjectsV2Paginator(s.client, &awss3.ListObjectsV2Input{
+			Bucket: aws.String(s.bucket), Prefix: aws.String(prefix),
+		})
+		for pages.HasMorePages() {
+			page, err := pages.NextPage(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to list objects for prefix %s: %w", prefix, err)
 			}
-			if len(pageKeys) == 0 {
-				return true
+			keys := make([]string, 0, len(page.Contents))
+			for _, object := range page.Contents {
+				keys = append(keys, aws.ToString(object.Key))
 			}
-			logger.Debugf("individual delete: found %d objects under %s, deleting", len(pageKeys), prefix)
-			concurrency := min(runtime.GOMAXPROCS(0)*4, len(pageKeys))
-			if pageErr = utils.Concurrent(ctx, pageKeys, concurrency, func(_ context.Context, key string, _ int) error {
-				return utils.RetryWithSkip(ctx, 3, time.Minute, s.IsRateLimitError, func(_ context.Context) error {
+			if len(keys) == 0 {
+				continue
+			}
+			concurrency := min(runtime.GOMAXPROCS(0)*4, len(keys))
+			if err := utils.Concurrent(ctx, keys, concurrency, func(ctx context.Context, key string, _ int) error {
+				return utils.RetryWithSkip(ctx, 3, time.Minute, s.IsRateLimitError, func(ctx context.Context) error {
 					return s.Delete(ctx, key)
 				})
-			}); pageErr != nil {
-				return false
+			}); err != nil {
+				return err
 			}
-			return true
-		})
+		}
+		return nil
 	})
-	if listErr != nil {
-		return fmt.Errorf("failed to list objects for prefix %s: %w", prefix, listErr)
-	}
-	return pageErr
 }
 
 func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
-	out, err := s.client.GetObjectWithContext(ctx, &awss3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-	})
+	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
 	if err != nil {
 		return nil, err
 	}
@@ -178,59 +215,57 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 
 func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
 	var keys []string
-	err := s.client.ListObjectsPagesWithContext(ctx, &awss3.ListObjectsInput{
-		Bucket: aws.String(s.bucket),
-		Prefix: aws.String(prefix),
-	}, func(page *awss3.ListObjectsOutput, _ bool) bool {
-		for _, obj := range page.Contents {
-			keys = append(keys, aws.StringValue(obj.Key))
+	pages := awss3.NewListObjectsV2Paginator(s.client, &awss3.ListObjectsV2Input{Bucket: aws.String(s.bucket), Prefix: aws.String(prefix)})
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			return keys, err
 		}
-		return true
-	})
-	return keys, err
+		for _, object := range page.Contents {
+			keys = append(keys, aws.ToString(object.Key))
+		}
+	}
+	return keys, nil
 }
 
 func (s *Store) Copy(ctx context.Context, srcKey, dstKey string) error {
 	escaped := strings.ReplaceAll(url.PathEscape(srcKey), "%2F", "/")
-	_, err := s.client.CopyObjectWithContext(ctx, &awss3.CopyObjectInput{
-		Bucket:     aws.String(s.bucket),
-		Key:        aws.String(dstKey),
-		CopySource: aws.String(s.bucket + "/" + escaped),
+	_, err := s.client.CopyObject(ctx, &awss3.CopyObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(dstKey), CopySource: aws.String(s.bucket + "/" + escaped),
 	})
 	return err
 }
 
 func (s *Store) Delete(ctx context.Context, key string) error {
-	_, err := s.client.DeleteObjectWithContext(ctx, &awss3.DeleteObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-	})
+	_, err := s.client.DeleteObject(ctx, &awss3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
 	return err
 }
 
 func (s *Store) IsNotFound(err error) bool {
-	var awsErr awserr.Error
-	return errors.As(err, &awsErr) && (awsErr.Code() == awss3.ErrCodeNoSuchKey || awsErr.Code() == "NotFound")
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && (apiErr.ErrorCode() == "NoSuchKey" || apiErr.ErrorCode() == "NotFound")
 }
 
-// IsRateLimitError is used to check if an error is a throttle response
-// AWS S3 returns HTTP 503 for throttling (SlowDown / ServiceUnavailable).
-// GCP Cloud Storage returns HTTP 429 (Too Many Requests).
-//
-// For batch delete operations, errors are wrapped in s3manager.BatchError which does NOT
-// implement awserr.RequestFailure directly. The actual RequestFailure is nested inside
-// BatchError.Errors[].OrigErr, so we must inspect those inner errors as well.
+// IsRateLimitError recognizes wrapped HTTP throttle responses and batch item codes.
 func (s *Store) IsRateLimitError(err error) bool {
-	isThrottled := func(target error) bool {
-		var rf awserr.RequestFailure
-		return errors.As(target, &rf) && (rf.StatusCode() == 429 || rf.StatusCode() == 503)
-	}
-	if isThrottled(err) {
+	var responseErr *smithyhttp.ResponseError
+	if errors.As(err, &responseErr) && (responseErr.HTTPStatusCode() == 429 || responseErr.HTTPStatusCode() == 503) {
 		return true
 	}
-	var batchErr awserr.Error
-	if errors.As(err, &batchErr) {
-		return isThrottled(batchErr.OrigErr())
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "SlowDown", "ServiceUnavailable", "Throttling", "ThrottlingException", "TooManyRequestsException":
+			return true
+		}
+	}
+	var joined interface{ Unwrap() []error }
+	if errors.As(err, &joined) {
+		for _, cause := range joined.Unwrap() {
+			if s.IsRateLimitError(cause) {
+				return true
+			}
+		}
 	}
 	return false
 }

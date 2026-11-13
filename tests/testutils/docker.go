@@ -124,8 +124,13 @@ func buildImageFromCommit(t *testing.T, cfg *TestConfig, commitID string) error 
 		defer func() {
 			_ = run("remove the worktree", "git", "-C", cfg.OlakeRootPath, "worktree", "remove", "--force", worktree)
 		}()
-		if err := run("build the iceberg writer jar", "make", "-C", worktree, "iceberg.jar"); err != nil {
-			return err
+		// Historical compatibility baselines may still require the Java artifact.
+		if _, statErr := os.Stat(filepath.Join(worktree, "destination", "iceberg", "olake-iceberg-java-writer", "pom.xml")); statErr == nil {
+			if err := run("build the historical iceberg writer jar", "make", "-C", worktree, "iceberg.jar"); err != nil {
+				return err
+			}
+		} else if !os.IsNotExist(statErr) {
+			return statErr
 		}
 		args := []string{"build", "--build-arg", "DRIVER_NAME=" + cfg.Driver, "-t", imageTag}
 		if cfg.ImagePlatform != "" {

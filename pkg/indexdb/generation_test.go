@@ -106,3 +106,30 @@ func TestMissingDestinationGenerationCannotDiscardReplacementIndex(t *testing.T)
 	require.True(t, found)
 	require.Equal(t, "new.parquet", location.FilePath)
 }
+
+type delegatedGenerationIndex struct {
+	types.StreamIndex
+	reconcile func(string) error
+}
+
+func (i delegatedGenerationIndex) ReconcileGeneration(generation string) error {
+	return i.reconcile(generation)
+}
+
+func TestGenerationReconciliationUsesDurableIndexCapability(t *testing.T) {
+	index, err := openIndex(filepath.Join(t.TempDir(), "index"), StoreOptions{MemTableSize: 4 << 20, MaxOpenFiles: 128})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, index.Close()) }()
+	seedGenerationIndex(t, index, "old-row", "old.parquet", 11)
+	wrapped := delegatedGenerationIndex{StreamIndex: index, reconcile: index.ReconcileGeneration}
+	require.NoError(t, ReconcileGeneration(wrapped, "replacement"))
+	_, found, err := index.Lookup("old-row")
+	require.NoError(t, err)
+	require.False(t, found)
+	seedGenerationIndex(t, index, "new-row", "new.parquet", 22)
+	require.NoError(t, ReconcileGeneration(wrapped, "replacement"))
+	require.ErrorContains(t, ReconcileGeneration(wrapped, ""), "omitted the durable resync generation")
+	_, found, err = index.Lookup("new-row")
+	require.NoError(t, err)
+	require.True(t, found)
+}

@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/datazip-inc/olake/constants"
-	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/parquet-go/parquet-go"
 )
 
@@ -181,16 +180,10 @@ func CreateRawRecord(data map[string]any, olakeColumns map[string]any, unavailab
 	}
 }
 
-// returns raw schema in iceberg format
-func GetIcebergRawSchema() []*proto.IcebergPayload_SchemaField {
-	var icebergFields []*proto.IcebergPayload_SchemaField
-	for key, typ := range RawSchema {
-		icebergFields = append(icebergFields, &proto.IcebergPayload_SchemaField{
-			IceType: typ.ToIceberg(),
-			Key:     key,
-		})
-	}
-	return icebergFields
+// IcebergField describes a selected destination column independently of a transport.
+type IcebergField struct {
+	Key     string
+	IceType string
 }
 
 // ToNewParquet returns the parquet node for d, always optional so the field is nullable.

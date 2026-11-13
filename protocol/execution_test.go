@@ -14,7 +14,7 @@ import (
 	"github.com/spf13/viper"
 )
 
-func TestExecuteFinalizesSourceAuthenticationFailureBeforeJVM(t *testing.T) {
+func TestExecuteFinalizesSourceAuthenticationFailureBeforeDestination(t *testing.T) {
 	folder := t.TempDir()
 	previous := viper.Get(constants.ConfigFolder)
 	viper.Set(constants.ConfigFolder, folder)
