@@ -451,10 +451,14 @@ func (w *nativeWriter) AlterSourceColumns(ctx context.Context, added []*nativeSo
 		}
 		err = nativeCatalogError("alter Iceberg source columns", err)
 		w.logConflict("source columns", attempt+1, fresh, err)
-		state.invalidate(!errors.Is(err, table.ErrCommitFailed))
-		if !errors.Is(err, table.ErrCommitFailed) {
+		unknown := !nativeMutationOutcomeKnown(err)
+		state.invalidate(unknown)
+		if unknown {
 			w.uncertain = true
 			return fmt.Errorf("source schema commit outcome is unknown; refresh before recovery: %w", err)
+		}
+		if !errors.Is(err, table.ErrCommitFailed) {
+			return err
 		}
 	}
 	return fmt.Errorf("alter Iceberg source columns: %w", table.ErrCommitFailed)
@@ -524,10 +528,14 @@ func (w *nativeWriter) EvolveSchema(ctx context.Context, columns map[string]stri
 		}
 		err = nativeCatalogError("evolve Iceberg schema", err)
 		w.logConflict("schema", attempt+1, fresh, err)
-		state.invalidate(!errors.Is(err, table.ErrCommitFailed))
-		if !errors.Is(err, table.ErrCommitFailed) {
+		unknown := !nativeMutationOutcomeKnown(err)
+		state.invalidate(unknown)
+		if unknown {
 			w.uncertain = true
 			return fmt.Errorf("schema commit outcome is unknown; refresh before recovery: %w", err)
+		}
+		if !errors.Is(err, table.ErrCommitFailed) {
+			return err
 		}
 	}
 	return fmt.Errorf("evolve Iceberg schema: %w", table.ErrCommitFailed)

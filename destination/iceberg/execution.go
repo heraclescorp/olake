@@ -68,22 +68,25 @@ func (e *nativeExecution) ctx(ctx context.Context) context.Context {
 
 func (e *nativeExecution) writable(ctx context.Context) error {
 	ctx = e.ctx(ctx)
-	if err := utils.CheckExecutionFence(ctx); err != nil {
-		return err
-	}
+	fenceErr := utils.CheckExecutionFence(ctx)
 	if e == nil {
-		return nil
+		return fenceErr
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// A closed fence or later positive rejection cannot downgrade an earlier
+	// dispatched mutation whose outcome is still unknown.
+	if e.unknown {
+		return rest.ErrCommitStateUnknown
+	}
+	if fenceErr != nil {
+		return fenceErr
 	}
 	if err := e.context.Err(); err != nil {
 		return err
 	}
 	if e.recoverOnly {
 		return errors.New("recover-only native Iceberg execution cannot mutate tables")
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.unknown {
-		return rest.ErrCommitStateUnknown
 	}
 	if e.retiring && !e.ownsWorkLocked(ctx) {
 		return errNativeExecutionRetired
@@ -198,12 +201,13 @@ func nativeExecutionUnknown(config *Config) {
 // Only positive rejection is proof of no publication. A read, successful retry,
 // or later successful operation must never clear an earlier ambiguous mutation.
 func nativeMutationOutcomeKnown(err error) bool {
-	var rejected *nativeMutationNotDispatched
-	if errors.As(err, &rejected) {
-		return true
-	}
 	if errors.Is(err, rest.ErrCommitStateUnknown) {
 		return false
+	}
+	var rejected *nativeMutationNotDispatched
+	var throttled *nativeRESTThrottleRejection
+	if errors.As(err, &rejected) || errors.As(err, &throttled) {
+		return true
 	}
 	return err == nil || errors.Is(err, table.ErrCommitFailed) || errors.Is(err, rest.ErrCommitFailed) ||
 		errors.Is(err, catalog.ErrNoSuchTable) || errors.Is(err, catalog.ErrNoSuchNamespace) ||
@@ -230,3 +234,19 @@ type nativeMutationNotDispatched struct{ cause error }
 
 func (e *nativeMutationNotDispatched) Error() string { return e.cause.Error() }
 func (e *nativeMutationNotDispatched) Unwrap() error { return e.cause }
+
+// The SDK exposes 429 only as ErrRESTError, without a public status accessor.
+// Preserve the wire's positive rejection rather than inferring it from a body,
+// generic REST error, or a later request. A 429 refused this mutation; failures
+// preparing a replay or closing its response cannot make it publish retroactively.
+type nativeRESTThrottleRejection struct{ cause error }
+
+func (e *nativeRESTThrottleRejection) Error() string {
+	if errors.Is(e.cause, rest.ErrCommitStateUnknown) {
+		return "catalog mutation outcome unknown despite a later HTTP 429 rejection"
+	}
+	return "catalog mutation rejected (HTTP 429); throttle retry stopped"
+}
+func (e *nativeRESTThrottleRejection) HTTPStatusCode() int  { return 429 }
+func (e *nativeRESTThrottleRejection) Is(target error) bool { return target == rest.ErrRESTError }
+func (e *nativeRESTThrottleRejection) Unwrap() error        { return e.cause }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -180,8 +181,8 @@ func TestNativeRetirementDrainsAdmittedWriterWork(t *testing.T) {
 	require.Equal(t, "settled", result.Outcome)
 }
 
-func TestNativeRESTMutatingResponsesAreNeverReplayed(t *testing.T) {
-	for _, status := range []int{http.StatusTooManyRequests, http.StatusTemporaryRedirect, http.StatusPermanentRedirect, http.StatusInternalServerError, http.StatusServiceUnavailable} {
+func TestNativeRESTDoesNotReplayConflictsRedirectsOrAmbiguousMutations(t *testing.T) {
+	for _, status := range []int{http.StatusConflict, http.StatusTemporaryRedirect, http.StatusPermanentRedirect, http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			ctx, config, _ := nativeExecutionFixture(t)
 			calls := 0
@@ -204,7 +205,7 @@ func TestNativeRESTMutatingResponsesAreNeverReplayed(t *testing.T) {
 				require.Equal(t, status, response.StatusCode)
 			}
 			require.Equal(t, 1, calls)
-			if status != http.StatusTooManyRequests {
+			if status != http.StatusConflict {
 				require.ErrorIs(t, nativeExecutionWritable(ctx, config), rest.ErrCommitStateUnknown)
 			}
 		})
@@ -557,4 +558,297 @@ func TestNativeMutationUsesIsolatedWireWithoutChangingSignedRequest(t *testing.T
 	require.Equal(t, 1, writes)
 	require.Equal(t, 1, reads)
 	require.NoError(t, nativeExecutionWritable(ctx, config))
+}
+
+type nativeCloseFailureBody struct {
+	nativeUnreadBody
+	failure error
+}
+
+func (b *nativeCloseFailureBody) Close() error {
+	b.closes++
+	return b.failure
+}
+
+func TestNativeControlledRESTThrottleStopsRemainKnown(t *testing.T) {
+	for _, name := range []string{"attempt-limit", "wait-budget", "response-close", "missing-replay", "replay-error", "nil-replay", "wait-canceled", "replay-canceled", "wait-fence-closed", "replay-fence-closed"} {
+		t.Run(name, func(t *testing.T) {
+			parent, config, fence := nativeExecutionFixture(t)
+			ctx, cancel := context.WithCancel(parent)
+			defer cancel()
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://catalog.example/v1/namespaces/db/tables/t", &nativeCloseFailureBody{})
+			require.NoError(t, err)
+			localFailure := errors.New("private replay or close failure")
+			var responseBodies, replayBodies []*nativeCloseFailureBody
+			request.GetBody = func() (io.ReadCloser, error) {
+				if name == "nil-replay" {
+					return nil, nil
+				}
+				body := &nativeCloseFailureBody{}
+				replayBodies = append(replayBodies, body)
+				switch name {
+				case "replay-error":
+					body.failure = localFailure
+					return body, localFailure
+				case "replay-canceled":
+					cancel()
+				case "replay-fence-closed":
+					closeNativeTestFence(t, fence)
+				}
+				return body, nil
+			}
+			if name == "missing-replay" {
+				request.GetBody = nil
+			}
+			calls, waits := 0, 0
+			transport := nativeThrottleTestTransport(nativeRoundTripFunc(func(attempt *http.Request) (*http.Response, error) {
+				calls++
+				require.Nil(t, attempt.GetBody)
+				require.NoError(t, attempt.Body.Close())
+				body := &nativeCloseFailureBody{}
+				if name == "response-close" {
+					body.failure = localFailure
+				}
+				responseBodies = append(responseBodies, body)
+				header := "0"
+				if name == "wait-budget" {
+					header = "40"
+				}
+				return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{"Retry-After": {header}}, Body: body}, nil
+			}))
+			transport.execution = config.execution
+			transport.wait = func(_ context.Context, delay time.Duration) error {
+				waits++
+				if name == "wait-budget" {
+					require.Equal(t, 40*time.Second, delay)
+				}
+				switch name {
+				case "wait-canceled":
+					return context.Canceled
+				case "wait-fence-closed":
+					closeNativeTestFence(t, fence)
+				}
+				return nil
+			}
+			response, err := transport.RoundTrip(request)
+			require.Nil(t, response)
+			var rejected *nativeRESTThrottleRejection
+			require.ErrorAs(t, err, &rejected)
+			require.Equal(t, http.StatusTooManyRequests, rejected.HTTPStatusCode())
+			require.ErrorIs(t, err, rest.ErrRESTError)
+			require.NotErrorIs(t, err, rest.ErrCommitStateUnknown)
+			require.True(t, nativeMutationOutcomeKnown(err))
+			require.Equal(t, "iceberg.throttled", classify(err).Code)
+			require.NotContains(t, nativeCatalogError("commit", err).Error(), "private")
+			if name == "attempt-limit" {
+				require.Equal(t, nativeRESTThrottleMaxAttempts, calls)
+				require.Equal(t, calls-1, waits)
+			} else if name == "wait-budget" {
+				require.Equal(t, 2, calls)
+				require.Equal(t, 1, waits)
+			} else {
+				require.Equal(t, 1, calls)
+			}
+			if name == "wait-canceled" || name == "replay-canceled" {
+				require.ErrorIs(t, err, context.Canceled)
+			}
+			if name == "response-close" || name == "replay-error" {
+				require.ErrorIs(t, err, localFailure)
+			}
+			for _, body := range responseBodies {
+				require.Zero(t, body.reads, "a rejection body is not publication evidence")
+				require.Equal(t, 1, body.closes)
+			}
+			for _, body := range replayBodies {
+				require.Equal(t, 1, body.closes, "undispatched replay bodies must close too")
+			}
+			config.execution.mu.Lock()
+			require.Zero(t, config.execution.active)
+			require.False(t, config.execution.unknown)
+			config.execution.mu.Unlock()
+			cat := &nativeCatalog{Catalog: &nativeExecutionTestCatalog{}, execution: config.execution}
+			require.NoError(t, cat.Close())
+			utils.SourceDrained(parent, nil)
+			result, ok := utils.OrdinaryExecutionResult(parent)
+			require.True(t, ok)
+			require.Equal(t, "settled", result.Outcome, "a rejected command may fail without an unknown publication")
+		})
+	}
+}
+
+func TestNativeControlledRESTThrottleHonorsHTTPDate(t *testing.T) {
+	ctx, config, _ := nativeExecutionFixture(t)
+	calls := 0
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	transport := nativeThrottleTestTransport(nativeRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		status := http.StatusTooManyRequests
+		if calls == 2 {
+			status = http.StatusNoContent
+		}
+		return &http.Response{StatusCode: status, Header: http.Header{"Retry-After": {now.Add(5 * time.Second).Format(http.TimeFormat)}}, Body: http.NoBody}, nil
+	}))
+	transport.execution = config.execution
+	transport.wait = func(_ context.Context, delay time.Duration) error {
+		require.Equal(t, 5*time.Second, delay)
+		config.execution.mu.Lock()
+		require.Equal(t, 1, config.execution.active, "admission spans backoff")
+		config.execution.mu.Unlock()
+		return nil
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, "https://catalog.example/v1/namespaces/db/tables/t", nil)
+	require.NoError(t, err)
+	response, err := transport.RoundTrip(request)
+	require.NoError(t, err)
+	require.Equal(t, 2, calls)
+	require.NoError(t, response.Body.Close())
+}
+
+func TestNativeUnknownOutranksPositiveRejections(t *testing.T) {
+	for _, later := range []error{nil, table.ErrCommitFailed, &nativeRESTThrottleRejection{}, &nativeMutationNotDispatched{cause: rest.ErrCommitStateUnknown}} {
+		err := errors.Join(rest.ErrCommitStateUnknown, later)
+		require.False(t, nativeMutationOutcomeKnown(err))
+		require.Equal(t, "iceberg.commit_state_unknown", classify(err).Code)
+		require.Equal(t, "commit_state_unknown", nativeConflictClass(err))
+		require.Contains(t, nativeCatalogError("commit", err).Error(), "commit state unknown")
+	}
+	ctx, config, _ := nativeExecutionFixture(t)
+	calls := 0
+	transport := nativeThrottleTestTransport(nativeRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{"Retry-After": {"0"}}, Body: http.NoBody}, nil
+	}))
+	transport.execution = config.execution
+	transport.wait = func(context.Context, time.Duration) error {
+		config.execution.markUnknown() // Another admitted mutation lost its response.
+		return nil
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, "https://catalog.example/v1/namespaces/db/tables/t", nil)
+	require.NoError(t, err)
+	_, err = transport.RoundTrip(request)
+	require.ErrorIs(t, err, rest.ErrCommitStateUnknown)
+	require.False(t, nativeMutationOutcomeKnown(err))
+	require.Equal(t, 1, calls, "429 must not authorize another attempt after earlier ambiguity")
+	for _, later := range []error{nil, table.ErrCommitFailed, &nativeRESTThrottleRejection{}} {
+		nativeExecutionMutationError(config, later)
+		require.ErrorIs(t, nativeExecutionWritable(ctx, config), rest.ErrCommitStateUnknown)
+	}
+}
+
+func TestNativeControlledRESTNeverReplaysDispatchedFailures(t *testing.T) {
+	for _, cause := range []error{io.ErrUnexpectedEOF, context.Canceled, context.DeadlineExceeded} {
+		for _, withResponse := range []bool{false, true} {
+			ctx, config, _ := nativeExecutionFixture(t)
+			calls := 0
+			body := &nativeCloseFailureBody{failure: io.ErrClosedPipe}
+			transport := nativeThrottleTestTransport(nativeRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				calls++
+				if withResponse {
+					return &http.Response{StatusCode: http.StatusTooManyRequests, Body: body}, cause
+				}
+				return nil, cause
+			}))
+			transport.execution = config.execution
+			request, err := http.NewRequestWithContext(ctx, http.MethodDelete, "https://catalog.example/v1/namespaces/db/tables/t", nil)
+			require.NoError(t, err)
+			response, err := transport.RoundTrip(request)
+			require.Nil(t, response)
+			require.ErrorIs(t, err, cause)
+			require.ErrorIs(t, err, rest.ErrCommitStateUnknown)
+			require.False(t, nativeMutationOutcomeKnown(err))
+			if withResponse {
+				require.ErrorIs(t, err, io.ErrClosedPipe)
+				require.Equal(t, 1, body.closes)
+			}
+			_, err = transport.RoundTrip(request)
+			require.ErrorIs(t, err, rest.ErrCommitStateUnknown)
+			require.False(t, nativeMutationOutcomeKnown(err))
+			require.Equal(t, 1, calls)
+		}
+	}
+}
+
+func TestNativeControlledRESTWireNeverReplaysAmbiguousMutations(t *testing.T) {
+	for _, mode := range []string{"redirect", "lost-response", "canceled-after-dispatch"} {
+		t.Run(mode, func(t *testing.T) {
+			parent, config, _ := nativeExecutionFixture(t)
+			ctx, cancel := context.WithCancel(parent)
+			defer cancel()
+			var calls atomic.Int32
+			dispatched := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				_, _ = io.Copy(io.Discard, r.Body)
+				switch mode {
+				case "redirect":
+					w.Header().Set("Location", "/redirected")
+					w.WriteHeader(http.StatusTemporaryRedirect)
+				case "lost-response":
+					connection, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Errorf("hijack mutation response: %v", err)
+						return
+					}
+					_ = connection.Close()
+				case "canceled-after-dispatch":
+					close(dispatched)
+					<-r.Context().Done()
+				}
+			}))
+			defer server.Close()
+			client, closeClient := newNativeHTTPClient(true)
+			defer closeClient()
+			transport := newNativeRESTTransport(client.Transport).(*nativeRESTThrottleTransport)
+			transport.execution = config.execution
+			client.Transport = transport
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/v1/namespaces/db/tables/t", strings.NewReader(`{"updates":[]}`))
+			require.NoError(t, err)
+			request.Header.Set("Idempotency-Key", "must-not-enable-hidden-replay")
+			finished := make(chan error, 1)
+			go func() {
+				response, err := client.Do(request)
+				if response != nil {
+					_ = response.Body.Close()
+				}
+				finished <- err
+			}()
+			if mode == "canceled-after-dispatch" {
+				select {
+				case <-dispatched:
+					cancel()
+				case <-time.After(5 * time.Second):
+					t.Fatal("mutation did not reach the server")
+				}
+			}
+			select {
+			case err := <-finished:
+				require.ErrorIs(t, err, rest.ErrCommitStateUnknown)
+				require.False(t, nativeMutationOutcomeKnown(err))
+				if mode == "canceled-after-dispatch" {
+					require.ErrorIs(t, err, context.Canceled)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("mutation did not return")
+			}
+			require.EqualValues(t, 1, calls.Load(), "neither redirects nor net/http may replay a dispatched mutation")
+			require.ErrorIs(t, nativeExecutionWritable(parent, config), rest.ErrCommitStateUnknown)
+		})
+	}
+}
+
+func TestNativeSuccessResponseCloseFailureIsUnknown(t *testing.T) {
+	ctx, config, _ := nativeExecutionFixture(t)
+	body := &nativeCloseFailureBody{failure: io.ErrClosedPipe}
+	transport := nativeThrottleTestTransport(nativeRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+	}))
+	transport.execution = config.execution
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, "https://catalog.example/v1/namespaces/db/tables/t", nil)
+	require.NoError(t, err)
+	response, err := transport.RoundTrip(request)
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, response.Body)
+	require.NoError(t, err)
+	require.ErrorIs(t, response.Body.Close(), io.ErrClosedPipe)
+	require.ErrorIs(t, nativeExecutionWritable(ctx, config), rest.ErrCommitStateUnknown)
 }

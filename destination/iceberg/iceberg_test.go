@@ -47,6 +47,7 @@ import (
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/destination"
 	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
@@ -1430,7 +1431,7 @@ func TestNativeRESTThrottleCancellationInterruptsWait(t *testing.T) {
 	}
 }
 
-func TestNativeRESTThrottleNeverReplaysControlledMutatingPOST(t *testing.T) {
+func TestNativeRESTThrottleReplaysOnlyRejectedControlledMutatingPOST(t *testing.T) {
 	ctx, config, _ := nativeExecutionFixture(t)
 	request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://catalog.example/v1/namespaces/db/tables/t", strings.NewReader(`{"updates":["exact-payload"]}`))
 	request.Header.Set("Authorization", "signed-authorization")
@@ -1441,19 +1442,23 @@ func TestNativeRESTThrottleNeverReplaysControlledMutatingPOST(t *testing.T) {
 		calls++
 		payload, err := io.ReadAll(attempt.Body)
 		_ = attempt.Body.Close()
-		if err != nil || string(payload) != `{"updates":["exact-payload"]}` || attempt.ContentLength != request.ContentLength || attempt.Method != http.MethodPost || attempt.Header.Get("Authorization") != "signed-authorization" {
-			t.Fatal("POST dispatch changed its payload or signed headers")
+		if err != nil || string(payload) != `{"updates":["exact-payload"]}` || attempt.ContentLength != request.ContentLength || attempt.Method != http.MethodPost || attempt.Header.Get("Authorization") != "signed-authorization" || attempt.GetBody != nil {
+			t.Fatal("POST dispatch changed its payload, signed headers, or allowed hidden replay")
 		}
-		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{"Retry-After": {"0"}}, Body: http.NoBody}, nil
+		status := http.StatusTooManyRequests
+		if calls == 3 {
+			status = http.StatusNoContent
+		}
+		return &http.Response{StatusCode: status, Header: http.Header{"Retry-After": {"0"}}, Body: http.NoBody}, nil
 	}))
 	transport.execution = config.execution
 	response, err := transport.RoundTrip(request)
-	if response != nil {
-		defer func() { _ = response.Body.Close() }()
-	}
-	if err != nil || response.StatusCode != http.StatusTooManyRequests || calls != 1 || replays != 0 {
-		t.Fatal("mutating POST was replayed")
-	}
+	require.NoError(t, err)
+	require.Equal(t, http.StatusNoContent, response.StatusCode)
+	require.Equal(t, 3, calls)
+	require.Equal(t, 2, replays)
+	require.NoError(t, response.Body.Close())
+	require.NoError(t, nativeExecutionWritable(ctx, config))
 }
 
 func TestNativeRESTThrottleLeavesUnreplayablePOSTResponseIntact(t *testing.T) {
@@ -1791,6 +1796,71 @@ func TestNativeWriterSchemaEvolutionKeepsFieldIDs(t *testing.T) {
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{record}))
 	require.NoError(t, writer.Close(ctx, nil))
 	require.Equal(t, map[string]int64{"a": 1, "b": 2}, nativeVisibleValues(t, writer.table))
+}
+
+func TestNativeKnownThrottleDoesNotPoisonSchemaOrMigration(t *testing.T) {
+	for _, operation := range []string{"source-columns", "schema", "format-upgrade", "equality-migration"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, realCatalog := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
+			seed := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, nil, "seed", true)
+			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("a", "r", 1, "one"), nativeTestRecord("b", "r", 2, "one")}))
+			require.NoError(t, seed.Close(ctx, map[string]any{"state": "original"}))
+			cdc := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, nil, "equality-delete", false)
+			require.NoError(t, cdc.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 3, "one")}))
+			require.NoError(t, cdc.Close(ctx, map[string]any{"state": "original"}))
+			fault := &nativeCommitFaultCatalog{Catalog: realCatalog}
+			cat := &nativeCatalog{Catalog: fault}
+			reject := func(context.Context, table.Identifier, []table.Requirement, []table.Update) (bool, error) {
+				return true, &nativeRESTThrottleRejection{}
+			}
+			if operation == "format-upgrade" || operation == "equality-migration" {
+				mode := string(types.UpdateTypePosition)
+				if operation == "format-upgrade" {
+					mode = string(types.UpdateTypeDeletionVector)
+				}
+				stream.StreamMetadata.UpdateType = &mode
+				index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
+				options := &destination.Options{ThreadID: "rejected-initialization", TableIndex: index}
+				fault.fault = reject
+				_, _, err := newNativeWriter(ctx, cfg, stream, options, cat, types.NewStreamIndexThread(index))
+				require.True(t, nativeMutationOutcomeKnown(err))
+				var throttled *nativeRESTThrottleRejection
+				require.ErrorAs(t, err, &throttled)
+				require.Equal(t, 1, fault.calls, "known throttling is not another optimistic-conflict retry loop")
+				require.False(t, cat.tables.entry(cdc.table.Identifier()).unknown)
+				fault.fault = nil
+				recovered := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "retry-initialization", false)
+				require.Equal(t, map[string]int64{"a": 3, "b": 2}, nativeVisibleValues(t, recovered.table))
+				require.Contains(t, recovered.table.Properties()[nativeRecoveryProperty], "original")
+				recovered.Abort()
+				return
+			}
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "schema-rejection", false)
+			defer writer.Abort()
+			fault.fault = reject
+			mutate := func() error {
+				if operation == "source-columns" {
+					return writer.AlterSourceColumns(ctx, []*nativeSourceColumn{{Key: "added", IceType: "long"}}, nil)
+				}
+				columns := writer.schemaMap()
+				columns["added"] = "long"
+				return writer.EvolveSchema(ctx, columns)
+			}
+			err := mutate()
+			var throttled *nativeRESTThrottleRejection
+			require.ErrorAs(t, err, &throttled)
+			require.True(t, nativeMutationOutcomeKnown(err))
+			require.False(t, writer.uncertain)
+			require.False(t, writer.coordinator.unknown)
+			require.Equal(t, 1, fault.calls)
+			fault.fault = nil
+			require.NoError(t, mutate(), "the same writer may retry a definite schema rejection")
+			_, found := writer.table.Schema().FindFieldByName("added")
+			require.True(t, found)
+			require.Contains(t, writer.table.Properties()[nativeRecoveryProperty], "original")
+		})
+	}
 }
 
 func TestNativeWriterRawAppendAndAbort(t *testing.T) {
@@ -2439,6 +2509,9 @@ type nativeRESTCommitBoundary struct {
 	mu                 sync.Mutex
 	requests           []string
 	requirements       [][]table.Requirement
+	throttleResponses  int
+	postBodies         [][]byte
+	postHeaders        []http.Header
 	failAfterCommit    bool
 	failLoad           bool
 	initialCredentials []rest.StorageCredential
@@ -2478,11 +2551,25 @@ func (b *nativeRESTCommitBoundary) ServeHTTP(w http.ResponseWriter, r *http.Requ
 	switch r.Method {
 	case http.MethodGet:
 	case http.MethodPost:
+		payload, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		b.postBodies = append(b.postBodies, payload)
+		b.postHeaders = append(b.postHeaders, r.Header.Clone())
+		if b.throttleResponses > 0 {
+			b.throttleResponses--
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, "proxy rejected mutation; deliberately not JSON")
+			return
+		}
 		var request struct {
 			Requirements table.Requirements `json:"requirements"`
 			Updates      table.Updates      `json:"updates"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		if err := json.Unmarshal(payload, &request); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -2538,6 +2625,83 @@ func nativeRESTWriterFixture(t *testing.T, mode types.UpdateType, rows ...types.
 	require.NoError(t, err)
 	t.Cleanup(func() { cleanup(context.Background()) })
 	return cfg, stream, cat, boundary
+}
+
+func TestNativeRESTControlledThrottleWriterRecovery(t *testing.T) {
+	for _, exhausted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "recovered-429", true: "exhausted-429"}[exhausted], func(t *testing.T) {
+			ctx, fence := nativeExecutionTestContext(t)
+			cfg, stream, original, boundary := nativeRESTWriterFixture(t, types.UpdateTypeEquality, nativeTestRecord("old", "r", 1, "one"))
+			require.NoError(t, original.(*nativeCatalog).Close())
+			cfg.RestSigningV4, cfg.RestSigningName, cfg.RestSigningRegion = true, "s3tables", "us-east-1"
+			cat, cleanup, err := openNativeCatalog(ctx, cfg)
+			require.NoError(t, err)
+			t.Cleanup(func() { cleanup(context.Background()) })
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "throttled", false)
+			beforeMetadata := writer.table.MetadataLocation()
+			beforeRecovery := writer.table.Properties()[nativeRecoveryProperty]
+			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("new", "i", 2, "one")}))
+			paths := slices.Collect(maps.Keys(writer.paths))
+			boundary.mu.Lock()
+			boundary.throttleResponses = 2
+			if exhausted {
+				boundary.throttleResponses = nativeRESTThrottleMaxAttempts
+			}
+			boundary.mu.Unlock()
+			err = writer.Close(ctx, map[string]any{"state": `{"attempted":2}`})
+			if exhausted {
+				var rejected *nativeRESTThrottleRejection
+				require.ErrorAs(t, err, &rejected, "the real SDK must preserve the typed wire rejection")
+				require.True(t, nativeMutationOutcomeKnown(err))
+				require.False(t, writer.uncertain)
+				require.False(t, writer.coordinator.unknown)
+				require.Equal(t, beforeMetadata, writer.table.MetadataLocation())
+				require.Equal(t, beforeRecovery, writer.table.Properties()[nativeRecoveryProperty])
+				persisted, err := boundary.cat.LoadTable(ctx, writer.table.Identifier())
+				require.NoError(t, err)
+				require.Equal(t, map[string]int64{"old": 1}, nativeVisibleValues(t, persisted))
+				require.Equal(t, beforeRecovery, persisted.Properties()[nativeRecoveryProperty])
+				fs, err := writer.table.FS(ctx)
+				require.NoError(t, err)
+				for _, path := range paths {
+					_, err := fs.Open(path)
+					require.Error(t, err, "definitively rejected staged files must be cleaned")
+				}
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, map[string]int64{"old": 1, "new": 2}, nativeVisibleValues(t, writer.table))
+			}
+			boundary.mu.Lock()
+			bodies, headers := slices.Clone(boundary.postBodies), slices.Clone(boundary.postHeaders)
+			boundary.mu.Unlock()
+			wantAttempts := 3
+			if exhausted {
+				wantAttempts = nativeRESTThrottleMaxAttempts
+			}
+			require.Len(t, bodies, wantAttempts)
+			for index, body := range bodies {
+				require.Equal(t, bodies[0], body, "wire replay must not rebuild the commit")
+				require.Equal(t, headers[0], headers[index], "SigV4 and all signed headers must survive replay")
+				require.Contains(t, headers[index].Get("Authorization"), "/us-east-1/s3tables/aws4_request")
+				require.NotEmpty(t, headers[index].Get("X-Amz-Content-Sha256"))
+			}
+			require.NoError(t, nativeExecutionWritable(ctx, cfg))
+			if exhausted {
+				retry := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "retry-after-rejection", false)
+				require.NoError(t, retry.Write(ctx, []types.RawRecord{nativeTestRecord("new", "i", 2, "one")}))
+				require.NoError(t, retry.Close(ctx, map[string]any{"state": `{"retried":3}`}))
+				require.Equal(t, map[string]int64{"old": 1, "new": 2}, nativeVisibleValues(t, retry.table))
+				require.NotContains(t, retry.table.Properties()[nativeRecoveryProperty], "attempted")
+				require.Contains(t, retry.table.Properties()[nativeRecoveryProperty], "retried")
+			}
+			closeNativeTestFence(t, fence)
+			cleanup(context.Background())
+			utils.SourceDrained(ctx, nil)
+			result, ok := utils.OrdinaryExecutionResult(ctx)
+			require.True(t, ok)
+			require.Equal(t, "settled", result.Outcome)
+		})
+	}
 }
 
 func nativeRecoveryOffsets(t *testing.T, tbl *table.Table) (map[string]int, []string) {

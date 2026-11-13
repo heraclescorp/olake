@@ -706,7 +706,7 @@ func (c *nativeCatalog) PurgeTable(ctx context.Context, ident table.Identifier) 
 	defer finish()
 	err = nativeCatalogError("purge Iceberg table", purger.PurgeTable(c.ctx(ctx), ident))
 	c.mutationResult(err)
-	state.invalidate(err != nil && !errors.Is(err, catalog.ErrNoSuchTable))
+	state.invalidate(!nativeMutationOutcomeKnown(err))
 	if err == nil || errors.Is(err, catalog.ErrNoSuchTable) {
 		state.generation++
 	}
@@ -788,7 +788,7 @@ func (c *nativeCatalog) CreateTable(ctx context.Context, ident table.Identifier,
 	err = nativeCatalogError("create Iceberg table", err)
 	c.mutationResult(err)
 	if err != nil {
-		state.invalidate(!errors.Is(err, catalog.ErrTableAlreadyExists))
+		state.invalidate(!nativeMutationOutcomeKnown(err))
 		return nil, err
 	}
 	tbl = c.bindLocalTable(tbl)
@@ -822,7 +822,7 @@ func (c *nativeCatalog) CommitTable(ctx context.Context, ident table.Identifier,
 	if !writerOwned || err != nil {
 		// Only the SDK's returned Table preserves all catalog-specific state.
 		// Writer-owned commits publish that Table after tx.Commit returns.
-		state.invalidate(err != nil && !errors.Is(err, table.ErrCommitFailed))
+		state.invalidate(!nativeMutationOutcomeKnown(err))
 	}
 	return metadata, location, err
 }
@@ -880,7 +880,7 @@ func (c *nativeCatalog) DropTable(ctx context.Context, ident table.Identifier) e
 	defer finish()
 	err = nativeCatalogError("drop Iceberg table", c.Catalog.DropTable(c.ctx(ctx), ident))
 	c.mutationResult(err)
-	state.invalidate(err != nil && !errors.Is(err, catalog.ErrNoSuchTable))
+	state.invalidate(!nativeMutationOutcomeKnown(err))
 	if err == nil || errors.Is(err, catalog.ErrNoSuchTable) {
 		state.generation++
 	}
@@ -912,7 +912,7 @@ func (c *nativeCatalog) RenameTable(ctx context.Context, from, to table.Identifi
 	tbl, err := c.Catalog.RenameTable(c.ctx(ctx), from, to)
 	err = nativeCatalogError("rename Iceberg table", err)
 	c.mutationResult(err)
-	unknown := err != nil && !errors.Is(err, catalog.ErrNoSuchTable) && !errors.Is(err, catalog.ErrTableAlreadyExists)
+	unknown := !nativeMutationOutcomeKnown(err)
 	fromState.invalidate(unknown)
 	toState.invalidate(unknown)
 	if err != nil {
@@ -1353,8 +1353,8 @@ func newNativeHTTPClient(controlled bool) (*http.Client, func()) {
 }
 
 const (
-	// Controlled mutations are dispatched once, including explicit throttles,
-	// and never redirected. Standalone sessions retain native throttle retries.
+	// Only explicit 429 rejections permit exact-body replay. All other
+	// controlled mutation failures remain single-dispatch and never redirect.
 	nativeRESTThrottleMaxAttempts = 6
 	nativeRESTThrottleMaxWait     = time.Minute
 )
@@ -1377,7 +1377,7 @@ func newNativeRESTTransport(base http.RoundTripper) http.RoundTripper {
 
 func (t *nativeRESTThrottleTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	if t.execution != nil && t.mutates(request) {
-		return t.mutate(request)
+		return t.mutate(request, true)
 	}
 	return t.read(request)
 }
@@ -1492,7 +1492,12 @@ type nativeCatalogFailure struct {
 func (e *nativeCatalogFailure) Error() string {
 	category := nativeBackendErrorCategory(e.cause)
 	var configError nativeCatalogConfigError
+	var throttled *nativeRESTThrottleRejection
 	switch {
+	case errors.Is(e.cause, rest.ErrCommitStateUnknown):
+		category = "commit state unknown; inspect the table before retrying"
+	case errors.As(e.cause, &throttled):
+		category = "catalog mutation rejected after bounded throttling (HTTP 429)"
 	case errors.As(e.cause, &configError):
 		category = configError.Error()
 	case errors.Is(e.cause, context.Canceled):
@@ -1501,8 +1506,6 @@ func (e *nativeCatalogFailure) Error() string {
 		category = "deadline exceeded"
 	case errors.Is(e.cause, table.ErrCommitFailed), errors.Is(e.cause, rest.ErrCommitFailed):
 		category = "optimistic commit conflict"
-	case errors.Is(e.cause, rest.ErrCommitStateUnknown):
-		category = "commit state unknown; inspect the table before retrying"
 	case errors.Is(e.cause, rest.ErrUnauthorized):
 		category = "catalog authentication rejected (HTTP 401)"
 	case errors.Is(e.cause, rest.ErrForbidden):
@@ -1611,8 +1614,8 @@ func classify(err error) *errs.Failure {
 		category errs.Category
 		code     string
 	}{
-		{table.ErrCommitFailed, errs.ConcurrencyConflict, "iceberg.commit_conflict"},
 		{rest.ErrCommitStateUnknown, errs.CatalogError, "iceberg.commit_state_unknown"},
+		{table.ErrCommitFailed, errs.ConcurrencyConflict, "iceberg.commit_conflict"},
 		{catalog.ErrNoSuchTable, errs.ObjectNotFound, "iceberg.table_not_found"},
 		{catalog.ErrNoSuchNamespace, errs.ObjectNotFound, "iceberg.namespace_not_found"},
 		{rest.ErrUnauthorized, errs.AuthFailed, "iceberg.unauthorized"},
@@ -1626,6 +1629,10 @@ func classify(err error) *errs.Failure {
 		if errors.Is(err, rule.cause) {
 			return &errs.Failure{Category: rule.category, ClassifiedBy: errs.ClassifiedByVendor, Code: rule.code}
 		}
+	}
+	var throttled *nativeRESTThrottleRejection
+	if errors.As(err, &throttled) {
+		return &errs.Failure{Category: errs.ResourceExhausted, ClassifiedBy: errs.ClassifiedByVendor, Code: "iceberg.throttled"}
 	}
 	var vendor interface{ ErrorCode() string }
 	if errors.As(err, &vendor) {

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/apache/iceberg-go/catalog/rest"
 )
@@ -47,13 +48,13 @@ func (t *nativeAWSExecutionTransport) RoundTrip(request *http.Request) (*http.Re
 	if strings.HasPrefix(target, "AWSGlue.") {
 		operation := strings.TrimPrefix(target, "AWSGlue.")
 		if !strings.HasPrefix(operation, "Get") && !strings.HasPrefix(operation, "BatchGet") && !strings.HasPrefix(operation, "Search") {
-			return t.guard.mutate(request)
+			return t.guard.mutate(request, false)
 		}
 	}
 	if request.Method != http.MethodGet && request.Method != http.MethodHead && request.Method != http.MethodOptions &&
 		(strings.Contains(request.Header.Get("Authorization"), "/s3/aws4_request") ||
 			(t.s3Host != "" && request.URL.Host == t.s3Host)) {
-		return t.guard.mutate(request)
+		return t.guard.mutate(request, false)
 	}
 	return t.guard.base.RoundTrip(request)
 }
@@ -113,52 +114,119 @@ func (t *nativeRESTThrottleTransport) read(request *http.Request) (*http.Respons
 	return response, err
 }
 
-func (t *nativeRESTThrottleTransport) mutate(request *http.Request) (*http.Response, error) {
+func (t *nativeRESTThrottleTransport) mutate(request *http.Request, retryThrottle bool) (*http.Response, error) {
 	ctx, finish, err := t.execution.begin(request.Context())
 	if err != nil {
 		if request.Body != nil {
-			_ = request.Body.Close()
+			err = errors.Join(err, request.Body.Close())
 		}
 		return nil, &nativeMutationNotDispatched{cause: err}
 	}
 	ctx = context.WithValue(ctx, nativeMutationWireKey{}, true)
-	// The SDK has already signed the body. Removing GetBody here prevents
-	// net/http's reused-connection replay without changing the signed bytes,
-	// method, URL, or headers. A 307/308 never reaches http.Client redirect logic.
-	wire := request.Clone(ctx)
-	wire.GetBody = nil
-	response, err := t.base.RoundTrip(wire)
-	if err != nil || response == nil {
-		t.execution.markUnknown()
-		finish()
-		if response != nil && response.Body != nil {
-			_ = response.Body.Close()
-		}
-		return nil, errors.Join(rest.ErrCommitStateUnknown, err)
-	}
-	if response.StatusCode >= 300 && response.StatusCode < 400 {
-		t.execution.markUnknown()
-		if response.Body != nil {
-			_ = response.Body.Close()
+	currentBody := request.Body
+	var waited time.Duration
+	throttled := false
+	// Keep one admission across backoff and body preparation. Retirement must
+	// drain this logical mutation, not just the intervals spent on the wire.
+	stop := func(cause error) (*http.Response, error) {
+		t.execution.mu.Lock()
+		unknown := t.execution.unknown
+		t.execution.mu.Unlock()
+		if unknown {
+			cause = errors.Join(rest.ErrCommitStateUnknown, cause)
 		}
 		finish()
-		return nil, rest.ErrCommitStateUnknown
-	}
-	if response.StatusCode >= 500 || response.StatusCode == http.StatusRequestTimeout {
-		t.execution.markUnknown()
-	}
-	if response.Body == nil {
-		finish()
-	} else {
-		response.Body = &nativeMutationResponseBody{
-			ReadCloser: response.Body,
-			execution:  t.execution,
-			finish:     finish,
-			success:    response.StatusCode >= 200 && response.StatusCode < 300,
-			eof:        response.Body == http.NoBody,
+		if throttled {
+			return nil, &nativeRESTThrottleRejection{cause: cause}
 		}
+		return nil, &nativeMutationNotDispatched{cause: cause}
 	}
-	return response, nil
+	for attempt := 1; ; attempt++ {
+		// In particular, never reuse the positive fence from before Retry-After
+		// or a caller's potentially blocking GetBody implementation.
+		err := ctx.Err()
+		if err == nil && attempt > 1 {
+			err = t.execution.writable(ctx)
+		}
+		if err != nil {
+			if currentBody != nil {
+				err = errors.Join(err, currentBody.Close())
+			}
+			return stop(err)
+		}
+		// Authentication already signed these exact bytes. Retain the original
+		// GetBody only here; neither net/http replay nor redirects may use it.
+		wire := request.Clone(ctx)
+		wire.Body = currentBody
+		wire.GetBody = nil
+		response, err := t.base.RoundTrip(wire)
+		if err != nil || response == nil {
+			t.execution.markUnknown()
+			if response != nil && response.Body != nil {
+				err = errors.Join(err, response.Body.Close())
+			}
+			finish()
+			return nil, errors.Join(rest.ErrCommitStateUnknown, err)
+		}
+		if response.StatusCode >= 300 && response.StatusCode < 400 {
+			t.execution.markUnknown()
+			if response.Body != nil {
+				err = response.Body.Close()
+			}
+			finish()
+			return nil, errors.Join(rest.ErrCommitStateUnknown, err)
+		}
+		if response.StatusCode == http.StatusTooManyRequests && retryThrottle {
+			throttled = true
+			// The status itself proves rejection even if a proxy supplied a bad
+			// body. Never reinterpret a body read/close failure as publication.
+			if response.Body != nil {
+				if err := response.Body.Close(); err != nil {
+					return stop(err)
+				}
+			}
+			delay := nativeHTTPThrottleDelay(response.Header.Get("Retry-After"), attempt, t.now())
+			if attempt >= nativeRESTThrottleMaxAttempts || delay > nativeRESTThrottleMaxWait-waited {
+				return stop(nil)
+			}
+			if request.Body != nil && request.Body != http.NoBody && request.GetBody == nil {
+				return stop(errors.New("catalog mutation body cannot be replayed"))
+			}
+			waited += delay
+			if err := t.wait(ctx, delay); err != nil {
+				return stop(err)
+			}
+			currentBody = request.Body
+			if request.Body != nil && request.Body != http.NoBody {
+				currentBody, err = request.GetBody()
+				if err != nil || currentBody == nil {
+					if currentBody != nil {
+						err = errors.Join(err, currentBody.Close())
+					}
+					if err == nil {
+						err = errors.New("catalog mutation replay returned no body")
+					}
+					return stop(err)
+				}
+			}
+			continue
+		}
+		if response.StatusCode >= 500 || response.StatusCode == http.StatusRequestTimeout {
+			t.execution.markUnknown()
+		}
+		if response.Body == nil {
+			finish()
+		} else {
+			response.Body = &nativeMutationResponseBody{
+				ReadCloser: response.Body,
+				execution:  t.execution,
+				finish:     finish,
+				success:    response.StatusCode >= 200 && response.StatusCode < 300,
+				eof:        response.Body == http.NoBody,
+			}
+		}
+		return response, nil
+	}
 }
 
 // RoundTrip returning headers does not mean native work has drained. The SDK

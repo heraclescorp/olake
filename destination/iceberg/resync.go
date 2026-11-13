@@ -309,7 +309,7 @@ func (i *Iceberg) PublishResync(ctx context.Context, checkpoint *types.State) er
 	// The original metadata is the only public commit base. No private snapshots,
 	// snapshot-log entries, refs or statistics are transplanted into public history.
 	_, _, publishErr := i.catalog.CommitTable(publishCtx, r.base.Identifier(), nativeResyncRequirements(r.base.Metadata()), updates)
-	if publishErr != nil && errors.Is(publishErr, table.ErrCommitFailed) {
+	if publishErr != nil && nativeMutationOutcomeKnown(publishErr) {
 		return publishErr
 	}
 	// A lost response is not a rejection. Retain every file and reconcile using a

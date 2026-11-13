@@ -25,6 +25,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	apacheiceberg "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/catalog/rest"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/table/dv"
@@ -641,9 +642,14 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 	if err != nil {
 		return nil, nil, err
 	}
+	var w *nativeWriter
 	defer func() {
 		if err != nil {
-			release(false)
+			if w != nil {
+				w.Abort()
+			} else {
+				release(false)
+			}
 		}
 	}()
 	ctx = nativeCatalogContext(ctx, cat)
@@ -662,13 +668,8 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 		return nil, nil, fmt.Errorf("load or create Iceberg table: %w", err)
 	}
 	state.latest = tbl
-	w := &nativeWriter{table: tbl, cat: cat, coordinator: state, generation: state.generation, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), positions: make(map[string][]int64), latest: make(map[string]types.RowLocation), paths: make(map[string]struct{})}
+	w = &nativeWriter{table: tbl, cat: cat, coordinator: state, generation: state.generation, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), positions: make(map[string][]int64), latest: make(map[string]types.RowLocation), paths: make(map[string]struct{})}
 	w.releaseSession = release
-	defer func() {
-		if err != nil {
-			w.Abort()
-		}
-	}()
 	if err := w.validateFormat(ctx); err != nil {
 		return nil, nil, err
 	}
@@ -758,10 +759,14 @@ func (w *nativeWriter) validateFormat(ctx context.Context) error {
 		w.mutationError(err)
 		err = nativeCatalogError("upgrade Iceberg format", err)
 		w.logConflict("format-upgrade", attempt+1, fresh, err)
-		state.invalidate(!errors.Is(err, table.ErrCommitFailed))
-		if !errors.Is(err, table.ErrCommitFailed) {
+		unknown := !nativeMutationOutcomeKnown(err)
+		state.invalidate(unknown)
+		if unknown {
 			w.uncertain = true
 			return fmt.Errorf("Iceberg format upgrade outcome is unknown: %w", err)
+		}
+		if !errors.Is(err, table.ErrCommitFailed) {
+			return err
 		}
 	}
 	return fmt.Errorf("upgrade Iceberg format: %w", table.ErrCommitFailed)
@@ -1119,15 +1124,20 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 			commitErr = nativeCatalogError("commit Iceberg table", commitErr)
 			lastConflict = commitErr
 			w.logConflict("commit", attempt+1, fresh, commitErr)
-			coordinated.invalidate(!errors.Is(commitErr, table.ErrCommitFailed))
-			if !errors.Is(commitErr, table.ErrCommitFailed) {
+			unknown := !nativeMutationOutcomeKnown(commitErr)
+			coordinated.invalidate(unknown)
+			if unknown {
 				w.uncertain = true
 				return fmt.Errorf("Iceberg commit outcome is unknown; staged files retained for recovery: %w", commitErr)
 			}
-			// The attempt was definitively rejected: only its newly written
-			// delete files can be discarded; data is reused by the next attempt.
+			// Delete files belong to this rejected attempt. Only optimistic
+			// conflicts retry here; other known rejections return and Abort
+			// cleans the unpublished staged data without advancing recovery.
 			w.removeFiles(ctx, positionFiles)
 			w.removeFiles(ctx, equalityFiles)
+			if !errors.Is(commitErr, table.ErrCommitFailed) {
+				return commitErr
+			}
 			continue
 		}
 		w.table, w.closed = committed, true
@@ -1217,17 +1227,28 @@ func (w *nativeWriter) migrateEqualityDeletes(ctx context.Context) error {
 		w.mutationError(commitErr)
 		commitErr = nativeCatalogError("migrate Iceberg equality deletes", commitErr)
 		w.logConflict("equality-migration", attempt+1, fresh, commitErr)
-		state.invalidate(!errors.Is(commitErr, table.ErrCommitFailed))
-		if !errors.Is(commitErr, table.ErrCommitFailed) {
+		unknown := !nativeMutationOutcomeKnown(commitErr)
+		state.invalidate(unknown)
+		if unknown {
 			w.uncertain = true
 			return fmt.Errorf("Iceberg equality migration outcome is unknown: %w", commitErr)
 		}
 		w.removeFiles(ctx, files)
+		if !errors.Is(commitErr, table.ErrCommitFailed) {
+			return commitErr
+		}
 	}
 	return fmt.Errorf("Iceberg equality migration retries exhausted: %w", table.ErrCommitFailed)
 }
 
 func nativeConflictClass(err error) string {
+	if errors.Is(err, rest.ErrCommitStateUnknown) {
+		return "commit_state_unknown"
+	}
+	var throttled *nativeRESTThrottleRejection
+	if errors.As(err, &throttled) {
+		return "catalog_throttled"
+	}
 	switch {
 	case errors.Is(err, table.ErrConflictingDataFiles):
 		return "concurrent_data"

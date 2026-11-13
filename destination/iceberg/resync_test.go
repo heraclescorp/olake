@@ -326,8 +326,9 @@ func TestNativeAtomicResyncConflictAbortDeadlineAndClosedFence(t *testing.T) {
 // Uses the real native REST catalog and on-disk Hadoop backend, not a fake
 // publication response. This is the runtime smoke route used by local/CI tests.
 func TestNativeRESTAtomicResyncSmokeAndLostPublishResponse(t *testing.T) {
-	for _, loseResponse := range []bool{false, true} {
-		t.Run(map[bool]string{false: "confirmed", true: "lost-response"}[loseResponse], func(t *testing.T) {
+	for _, outcome := range []string{"confirmed", "lost-response", "throttle-rejected"} {
+		t.Run(outcome, func(t *testing.T) {
+			loseResponse := outcome == "lost-response"
 			ctx := resyncTestContext(t)
 			cfg, stream, cat, boundary := nativeRESTWriterFixture(t, types.UpdateTypeEquality, nativeTestRecord("old", "r", 1, "one"))
 			controlled, _ := nativeExecutionTestContext(t)
@@ -360,8 +361,25 @@ func TestNativeRESTAtomicResyncSmokeAndLostPublishResponse(t *testing.T) {
 			require.NotContains(t, boundary.tableRequests(), http.MethodPost, "private writer commits must not send public REST POSTs")
 			boundary.mu.Lock()
 			boundary.failAfterCommit = loseResponse
+			if outcome == "throttle-rejected" {
+				boundary.throttleResponses = nativeRESTThrottleMaxAttempts
+			}
 			boundary.mu.Unlock()
-			require.NoError(t, adapter.PublishResync(ctx, resyncTestState()))
+			publishErr := adapter.PublishResync(ctx, resyncTestState())
+			if outcome == "throttle-rejected" {
+				var throttled *nativeRESTThrottleRejection
+				require.ErrorAs(t, publishErr, &throttled)
+				require.True(t, nativeMutationOutcomeKnown(publishErr))
+				require.False(t, adapter.resync.unknown)
+				require.False(t, adapter.ResyncPublished())
+				require.NoError(t, nativeExecutionWritable(ctx, cfg))
+				require.NoError(t, adapter.AbortResync(ctx), "positive rejection permits confirmed abort")
+				visible, err := boundary.cat.LoadTable(ctx, table.Identifier{"db", "records"})
+				require.NoError(t, err)
+				require.Equal(t, map[string]int64{"old": 1}, nativeVisibleValues(t, visible))
+				return
+			}
+			require.NoError(t, publishErr)
 			methods := boundary.tableRequests()
 			posts := 0
 			for _, method := range methods {
