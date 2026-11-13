@@ -9,6 +9,7 @@ import (
 	"github.com/apache/iceberg-go/catalog"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
+	"github.com/datazip-inc/olake/utils"
 )
 
 // Admission and release are catalog-lifetime scoped. A failed stage session is
@@ -29,6 +30,17 @@ func routeNativeResyncWriter(ctx context.Context, cat catalog.Catalog, ident tab
 	}
 	state.mu.Unlock()
 	attempt.mu.Lock()
+	if !attempt.published {
+		if err := attempt.activeLocal(ctx); err != nil {
+			attempt.mu.Unlock()
+			return nil, nil, err
+		}
+		attempt.mu.Unlock()
+		if err := utils.CheckExecutionFence(ctx); err != nil {
+			return nil, nil, err
+		}
+		attempt.mu.Lock()
+	}
 	if attempt.published {
 		attempt.mu.Unlock()
 		state.mu.Lock()
@@ -38,7 +50,7 @@ func routeNativeResyncWriter(ctx context.Context, cat catalog.Catalog, ident tab
 		return cat, func(bool) { once.Do(func() { state.mu.Lock(); state.sessions--; state.mu.Unlock() }) }, nil
 	}
 	defer attempt.mu.Unlock()
-	if err := attempt.active(ctx); err != nil {
+	if err := attempt.activeLocal(ctx); err != nil {
 		return nil, nil, err
 	}
 	attempt.sessions++
@@ -53,26 +65,57 @@ func routeNativeResyncWriter(ctx context.Context, cat catalog.Catalog, ident tab
 	}, nil
 }
 
-// A stage cannot remove any original object. Keep private uploads until catalog
-// outcome is known, and check the live execution fence on every actual write.
+// A stage cannot remove any original object. Private I/O holds a short-lived
+// session lease, not the attempt mutex, so publication cannot race in-flight I/O.
 type nativeResyncIO struct {
 	iceio.IO
 	attempt *resyncControl
 	ctx     context.Context
 }
 
-func (s *nativeResyncIO) Create(path string) (iceio.FileWriter, error) {
-	r := s.attempt
+func (r *resyncControl) beginPrivateIO(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := r.active(s.ctx); err != nil {
+	if err := r.activeLocal(ctx); err != nil {
+		return err
+	}
+	// Share the publication admission gate with catalog writer sessions. Abort
+	// can still tombstone the attempt without waiting for a blocked upload.
+	r.sessions++
+	return nil
+}
+
+func (r *resyncControl) beginFencedPrivateIO(ctx context.Context) error {
+	r.mu.Lock()
+	err := r.activeLocal(ctx)
+	r.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
+	// The remote read may have raced abort or publication; admit only after a
+	// fresh local check, and never hold mu over the read or underlying FileIO.
+	return r.beginPrivateIO(ctx)
+}
+
+func (s *nativeResyncIO) Create(path string) (iceio.FileWriter, error) {
+	r := s.attempt
+	if err := r.beginFencedPrivateIO(s.ctx); err != nil {
 		return nil, err
 	}
 	writable, ok := s.IO.(iceio.WriteFileIO)
 	if !ok {
+		r.mu.Lock()
+		r.sessions--
+		r.mu.Unlock()
 		return nil, errors.New("native resync table FileIO does not support writing")
 	}
 	writer, err := writable.Create(path)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sessions--
 	if err != nil {
 		return nil, err
 	}
@@ -80,6 +123,12 @@ func (s *nativeResyncIO) Create(path string) (iceio.FileWriter, error) {
 		r.owned = make(map[string]struct{})
 	}
 	r.owned[path] = struct{}{}
+	if err := r.activeLocal(s.ctx); err != nil {
+		// Creation may already have produced an object or multipart upload. Do
+		// not finalize or remove it after the attempt became unwritable.
+		r.failed = true
+		return nil, err
+	}
 	return &nativeResyncFileWriter{FileWriter: writer, attempt: r, ctx: s.ctx}, nil
 }
 
@@ -95,29 +144,46 @@ func (s *nativeResyncIO) WriteFile(path string, data []byte) error {
 func (s *nativeResyncIO) Remove(path string) error {
 	r := s.attempt
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	// Publication must not pass its zero-session gate while removal is in flight.
 	if r.unknown || r.published {
+		r.mu.Unlock()
 		return errors.New("cannot remove files after a possibly successful resync publication")
 	}
 	if _, owned := r.owned[path]; !owned {
+		r.mu.Unlock()
 		return errors.New("cannot remove a file not created by this resync stage")
 	}
-	return s.IO.Remove(path)
+	r.sessions++
+	r.mu.Unlock()
+	err := s.IO.Remove(path)
+	r.mu.Lock()
+	r.sessions--
+	r.mu.Unlock()
+	return err
 }
 
 type nativeResyncFileWriter struct {
 	iceio.FileWriter
+	mu      sync.Mutex
 	attempt *resyncControl
 	ctx     context.Context
 }
 
 func (w *nativeResyncFileWriter) Write(data []byte) (int, error) {
-	w.attempt.mu.Lock()
-	defer w.attempt.mu.Unlock()
-	if err := w.attempt.active(w.ctx); err != nil {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.attempt.beginPrivateIO(w.ctx); err != nil {
 		return 0, err
 	}
-	return w.FileWriter.Write(data)
+	n, err := w.FileWriter.Write(data)
+	w.attempt.mu.Lock()
+	w.attempt.sessions--
+	stateErr := w.attempt.activeLocal(w.ctx)
+	w.attempt.mu.Unlock()
+	if err != nil {
+		return n, err
+	}
+	return n, stateErr
 }
 
 func (w *nativeResyncFileWriter) ReadFrom(reader io.Reader) (int64, error) {
@@ -125,13 +191,26 @@ func (w *nativeResyncFileWriter) ReadFrom(reader io.Reader) (int64, error) {
 }
 
 func (w *nativeResyncFileWriter) Close() error {
-	w.attempt.mu.Lock()
-	defer w.attempt.mu.Unlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	// Close can finalize a multipart upload. Under a revoked fence do not
 	// dispatch it; retain the unfinalized upload rather than publish an object.
-	if err := w.attempt.active(w.ctx); err != nil {
+	if err := w.attempt.beginFencedPrivateIO(w.ctx); err != nil {
+		w.attempt.mu.Lock()
 		w.attempt.failed = true
+		w.attempt.mu.Unlock()
 		return err
 	}
-	return w.FileWriter.Close()
+	err := w.FileWriter.Close()
+	w.attempt.mu.Lock()
+	w.attempt.sessions--
+	stateErr := w.attempt.activeLocal(w.ctx)
+	if stateErr != nil {
+		w.attempt.failed = true
+	}
+	w.attempt.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return stateErr
 }

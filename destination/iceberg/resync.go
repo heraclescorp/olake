@@ -122,6 +122,12 @@ func (r *resyncControl) active(ctx context.Context) error {
 	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return err
 	}
+	return r.activeLocal(ctx)
+}
+
+// activeLocal requires mu and guards private I/O without reading the remote
+// execution fence. Public catalog mutations still use active and wire fences.
+func (r *resyncControl) activeLocal(ctx context.Context) error {
 	if r.failed || r.aborted || r.published || r.unknown {
 		return errors.New("resync attempt is no longer writable; retain uncertain files and start a fresh runtime")
 	}
