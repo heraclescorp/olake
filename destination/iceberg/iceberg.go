@@ -608,27 +608,31 @@ type nativeIndexRead struct {
 }
 
 type nativeWriter struct {
-	table          *table.Table
-	cat            catalog.Catalog
-	coordinator    *nativeTableState
-	generation     uint64
-	config         *Config
-	stream         types.StreamInterface
-	options        *destination.Options
-	indexThread    *types.StreamIndexThread
-	indexReads     map[string]nativeIndexRead
-	indexTouched   map[string]struct{}
-	upsert         bool
-	deleteMode     types.UpdateType
-	dataFiles      []apacheiceberg.DataFile
-	dataSchemas    map[string]*apacheiceberg.Schema
-	positions      map[string][]int64
-	latest         map[string]types.RowLocation
-	paths          map[string]struct{}
-	closed         bool
-	uncertain      bool
-	failed         error
-	releaseSession func(bool)
+	table                  *table.Table
+	cat                    catalog.Catalog
+	coordinator            *nativeTableState
+	generation             uint64
+	config                 *Config
+	stream                 types.StreamInterface
+	options                *destination.Options
+	indexThread            *types.StreamIndexThread
+	indexReads             map[string]nativeIndexRead
+	indexTouched           map[string]struct{}
+	upsert                 bool
+	deleteMode             types.UpdateType
+	dataFiles              []apacheiceberg.DataFile
+	dataSchemas            map[string]*apacheiceberg.Schema
+	positions              map[string][]int64
+	latest                 map[string]types.RowLocation
+	paths                  map[string]struct{}
+	backfillFiles          map[string]*nativeBackfillFile
+	backfillClock          uint64
+	backfillTargetBytes    int64
+	backfillPartitionLimit int
+	closed                 bool
+	uncertain              bool
+	failed                 error
+	releaseSession         func(bool)
 }
 
 func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInterface, options *destination.Options, cat catalog.Catalog, indexThread *types.StreamIndexThread) (_ *nativeWriter, _ *types.MetadataState, err error) {
@@ -703,6 +707,9 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 func (w *nativeWriter) writable() error {
 	if w.uncertain {
 		return errors.New("Iceberg commit outcome is unknown; writer cannot be reused or cleaned up")
+	}
+	if w.options != nil && w.options.Backfill && w.failed != nil {
+		return fmt.Errorf("Iceberg writer has failed: %w", w.failed)
 	}
 	if w.closed {
 		return errors.New("Iceberg writer is closed")
@@ -781,6 +788,10 @@ type nativeWriteGroup struct {
 func (w *nativeWriter) Write(ctx context.Context, records []types.RawRecord) (err error) {
 	ctx, finish, err := beginNativeWriterWork(ctx, w.config)
 	if err != nil {
+		if w.options.Backfill && ctx.Err() != nil && !w.closed {
+			w.failed = err
+			w.Abort()
+		}
 		return err
 	}
 	defer finish()
@@ -795,6 +806,9 @@ func (w *nativeWriter) Write(ctx context.Context, records []types.RawRecord) (er
 	}()
 	ctx = nativeCatalogContext(ctx, w.cat)
 	w.indexThread.SetObservabilityContext(ctx)
+	if w.options.Backfill {
+		return w.writeBackfill(ctx, records)
+	}
 	groups := make(map[string]*nativeWriteGroup)
 	rows := make([]map[string]any, len(records))
 	operations := make([]string, len(records))
@@ -928,6 +942,26 @@ func (w *nativeWriter) EnsureReadable(ctx context.Context, paths []string) error
 	if err := w.writable(); err != nil {
 		return err
 	}
+	if len(w.backfillFiles) != 0 {
+		ctx, finish, err := beginNativeWriterWork(ctx, w.config)
+		if err != nil {
+			if ctx.Err() != nil {
+				w.failed = err
+				w.Abort()
+			}
+			return err
+		}
+		defer finish()
+		for _, key := range slices.Sorted(maps.Keys(w.backfillFiles)) {
+			if slices.Contains(paths, w.backfillFiles[key].path) {
+				if err := w.finishBackfillFile(ctx, key); err != nil {
+					w.failed = err
+					w.Abort()
+					return err
+				}
+			}
+		}
+	}
 	fs, err := w.table.FS(nativeCatalogContext(ctx, w.cat))
 	if err != nil {
 		return err
@@ -936,8 +970,6 @@ func (w *nativeWriter) EnsureReadable(ctx context.Context, paths []string) error
 		if _, ours := w.paths[path]; !ours {
 			continue
 		}
-		// Write has already closed every footer and cloud upload. Opening it here
-		// verifies that a pending indexed location is actually recoverable.
 		file, err := fs.Open(path)
 		if err != nil {
 			return fmt.Errorf("open staged Iceberg recovery file: %w", err)
@@ -1024,6 +1056,10 @@ func nativeSnapshotID(tbl *table.Table) int64 {
 func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err error) {
 	ctx, finish, err := beginNativeWriterWork(ctx, w.config)
 	if err != nil {
+		if w.options.Backfill && ctx.Err() != nil && !w.closed {
+			w.failed = err
+			w.Abort()
+		}
 		return err
 	}
 	defer finish()
@@ -1036,10 +1072,16 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		}
 		w.indexThread.ReleaseObservability()
 		if err != nil {
+			if w.options.Backfill {
+				w.failed = err
+			}
 			w.Abort()
 		}
 	}()
 	ctx = nativeCatalogContext(ctx, w.cat)
+	if err := w.finishBackfillFiles(ctx); err != nil {
+		return fmt.Errorf("finish backfill Iceberg files: %w", err)
+	}
 	if err := w.compactStagedDataFiles(ctx); err != nil {
 		return fmt.Errorf("compact superseded staged Iceberg rows: %w", err)
 	}
@@ -1299,6 +1341,10 @@ func (w *nativeWriter) removeFiles(ctx context.Context, files []apacheiceberg.Da
 }
 
 func (w *nativeWriter) Abort() {
+	for _, f := range w.backfillFiles {
+		f.abort()
+	}
+	clear(w.backfillFiles)
 	if w.releaseSession != nil {
 		w.releaseSession(false)
 	}

@@ -1123,6 +1123,7 @@ func TestNativeRESTCoordinatorRejectsDeletesAfterExternalCompaction(t *testing.T
 				rows[0], rows[1] = rows[1], rows[0]
 			}
 			require.NoError(t, compactor.Write(ctx, rows))
+			require.NoError(t, compactor.finishBackfillFiles(ctx))
 			entries, err := nativeLiveEntries(ctx, compactor.table)
 			require.NoError(t, err)
 			var removed []apacheiceberg.DataFile

@@ -7,6 +7,7 @@
     },
     "writer": {
       "type": "object",
+      "description": "Backfill and resync write rolling native Parquet files targeting approximately 512 MiB; CDC file behavior is unchanged.",
       "properties": {
         "catalog_type": {
           "type": "string",

@@ -356,6 +356,11 @@ func (w *nativeWriter) AlterSourceColumns(ctx context.Context, added []*nativeSo
 	}
 	defer finish()
 	ctx = nativeCatalogContext(ctx, w.cat)
+	if err := w.finishBackfillFiles(ctx); err != nil {
+		w.failed = err
+		w.Abort()
+		return fmt.Errorf("finish backfill Iceberg files before source schema change: %w", err)
+	}
 	ctx, state, err := w.lockTable(ctx)
 	if err != nil {
 		return err
@@ -474,6 +479,11 @@ func (w *nativeWriter) EvolveSchema(ctx context.Context, columns map[string]stri
 	}
 	defer finish()
 	ctx = nativeCatalogContext(ctx, w.cat)
+	if err := w.finishBackfillFiles(ctx); err != nil {
+		w.failed = err
+		w.Abort()
+		return fmt.Errorf("finish backfill Iceberg files before schema evolution: %w", err)
+	}
 	ctx, state, err := w.lockTable(ctx)
 	if err != nil {
 		return err

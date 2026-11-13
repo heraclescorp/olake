@@ -1716,8 +1716,8 @@ func TestNativeWriterIndexedDeletesAndRecoveryReads(t *testing.T) {
 			index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
 			seed := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "snapshot", true)
 			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("a", "r", 1, "one"), nativeTestRecord("b", "r", 2, "one")}))
-			original := seed.dataFiles[0].FilePath()
 			require.NoError(t, seed.Close(ctx, nil))
+			original := seed.dataFiles[0].FilePath()
 			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "cdc-a", false)
 			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 3, "two"), nativeTestRecord("a", "u", 4, "one")}))
 			loc, found, err := writer.indexThread.Lookup("a")

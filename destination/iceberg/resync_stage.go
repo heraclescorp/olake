@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/apache/iceberg-go/catalog"
 	iceio "github.com/apache/iceberg-go/io"
@@ -213,4 +214,19 @@ func (w *nativeResyncFileWriter) Close() error {
 		return err
 	}
 	return stateErr
+}
+
+func (w *nativeResyncFileWriter) abort() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), 30*time.Second)
+	defer cancel()
+	if err := w.attempt.beginFencedPrivateIO(ctx); err != nil {
+		return err
+	}
+	err := w.FileWriter.Close()
+	w.attempt.mu.Lock()
+	w.attempt.sessions--
+	w.attempt.mu.Unlock()
+	return err
 }

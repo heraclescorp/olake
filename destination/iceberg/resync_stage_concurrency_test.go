@@ -320,7 +320,7 @@ func TestNativeResyncPrivateFragmentsDoNotFetchS3FenceAndRevocationBlocksPublica
 	replacement := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "replacement", true)
 	parquetBefore := fence.gets.Load()
 	require.NoError(t, replacement.Write(ctx, []types.RawRecord{nativeTestRecord("replacement", "r", 2, "new")}))
-	require.Equal(t, int64(3), fence.gets.Load()-parquetBefore, "actual Parquet output may fetch the fence only for writer admission, Create, and Close, never for column fragments")
+	require.Equal(t, int64(2), fence.gets.Load()-parquetBefore, "actual Parquet output may fetch the fence only for writer admission and Create, never for column fragments")
 	require.NoError(t, replacement.Close(ctx, nil))
 	require.Equal(t, map[string]int64{"replacement": 2}, nativeVisibleValues(t, replacement.table))
 	fs, err := adapter.resync.stage.fileIO(ctx)
