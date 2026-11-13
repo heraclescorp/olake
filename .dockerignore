@@ -3,8 +3,6 @@ test/
 destination/iceberg/local-test/data/
 tests/
 drivers/*/olake
-destination/iceberg/olake-iceberg-java-writer/target/
-olake-iceberg-java-writer.jar
 # Other gitignored local artifacts (native-run outputs, debugger binaries,
 # editor and Finder junk).
 olake-data

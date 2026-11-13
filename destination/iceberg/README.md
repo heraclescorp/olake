@@ -2,43 +2,44 @@
 
 Writes to apache-iceberg. This writer takes configuration of catalog and s3 buckets and writes data received from the Olake source.
 
-## How It Works 
+## How It Works
 
-Iceberg writer writes data primarily as a equality delete which doesn't requires spark. 
+The destination uses Apache Iceberg Go v0.7.0 and Arrow Go to write Parquet files and commit directly to the catalog. It does not launch a JVM or use a gRPC writer service.
 
-For backfill --> Works in append mode
+The destination uses upstream `github.com/apache/iceberg-go v0.7.0` without patches or a local replacement. Known upstream default-handling bugs remain: JSON decoding can round integer defaults above 2^53, temporal defaults do not round-trip in the standard ISO representation, and projections containing only fields absent from an older file can fail with a zero-child-array error.
 
-For CDC --> Works in Upsert mode by creating delete files
+- Backfill appends data files.
+- CDC supports equality deletes, positional deletes, and Iceberg v3 deletion vectors. Deletes retain OLake's soft-delete rows.
+- Recovery metadata and data/delete files publish in the same catalog transaction. Positional/deletion-vector modes preserve the durable Pebble index and recover unchanged PostgreSQL TOAST values. Reconciliation reads added/replacement files, not the whole table merely because files were removed. Changed delete sets read only newly visible physical positions; stale mappings are removed through a local Pebble file-ID scan without reopening retired Parquet files.
+- A catalog-scoped per-table coordinator serializes local metadata mutations and reuses the latest successful commit response. Normal Close does not reload metadata; definite conflicts refresh it, while ambiguous outcomes retain staged files and require catalog reopen/recovery. Every writer setup loads authoritative metadata for external schema changes and REST credentials. Active writers verify table identity even after cache invalidation or replacement.
+- Each destination table must have one OLake process owner. The coordinator is not a distributed lock or a CAS on recovery properties; server snapshot/default-shape guards remain enabled for external data changes. Full-refresh file writes stay parallel, but table commits and index publication are serialized.
+- S3 Tables manages removal of unreferenced objects. Superseded staged files are excluded from commits and left for that maintenance; rewrite, abort, and rejected-commit cleanup never issue object DELETEs to reserved `--table-s3` buckets. Other storage backends retain physical cleanup and propagate rewrite cleanup errors.
+- Source-column changes honor `drop_removed_columns`, keep identifier/partition/sort source columns, and assign fresh IDs on drop/re-add. Version 3 uses upstream historical-default handling with the limitations above; version 2 logs a warning and leaves historical rows NULL rather than upgrading implicitly. Changed columns invalidate TOAST carry values; unchanged carry and deletion tombstones remain intact.
+- REST (including S3 Tables and Unity), Glue, JDBC PostgreSQL/SQLite, Hive, and Hadoop catalogs use native adapters. S3, GCS, local files, and HDFS use native FileIO. Managed REST catalogs choose physical table locations; `iceberg_s3_path` remains the warehouse identifier for their catalog configuration.
+- HTTP diagnostics emit one `iceberg_http` event per wire attempt with status, latency, request ID, and retry/conflict outcome. Credentials, query strings, headers, and bodies are omitted. REST throttling retries use cryptographically secure sub-10% jitter and remain bounded; ambiguous commit failures are not blindly replayed.
 
-### Current Architecture :
+## Index Diagnostics
 
-> Golang Code  --gRPC-->  Java (This Project)  --Write to Iceberg-->  S3 + Iceberg Catalog
+`native_index_reconcile` emits a `decision` and `complete` event per indexed table reconciliation, linked by `reconcile_id` within the connector process. Count `event=complete` by pod/table/mode/reason to measure frequency without double-counting decisions or confusing scan batches with separate rebuilds. Failures before planning emit a completion with the failing stage.
 
-Important reason why we are using Java to write is, current Golang-iceberg project doesn't support Equality delete writes. We plan to move this to iceberg-rust to improve on memory footprint.
+- `skip / up_to_date`: reuse the durable checkpoint without scanning files.
+- `incremental / files_added`: index new files only; `snapshot_advanced_without_file_changes` advances only the checkpoint.
+- `incremental / files_removed`, `delete_sets_changed`, or `files_removed_and_delete_sets_changed`: repair affected mappings while preserving newer unchanged mappings. A bounded newest-first search handles invalidated keys or preserved-sequence replacements that could expose a surviving duplicate in another file; that search can read otherwise unchanged files.
+- `rebuild / missing_or_invalid_checkpoint`: no usable checkpoint; this alone does not distinguish deployment, lost storage, or an interrupted scan.
+- `rebuild / repair_key_limit`: at least 200,000 keys need duplicate resolution; use one streamed rebuild rather than repeatedly scanning the table or retaining unbounded key sets.
+- `error / checkpoint_not_ancestor`: an explicit reset is required; no automatic destructive reset occurs.
 
-1. Flow starts with iceberg.go file. 
-2. We create Java rpc server by a process call.
-3. Send records via rpc in batches of 256 mb (in-memory object size, not a real parquet size)
+Events include old/target snapshots, the target snapshot's operation, file-delta counts, selected rows/bytes, scanned/indexed/skipped rows, invalidated mappings, fallback files/rows, completed files, flushes, checkpoint invalidation/publication, duration, and failure stage. Selected row/byte counts are file-metadata upper bounds; delete-only repair can read fewer rows or none. Indexed rows count staged puts, not distinct keys. Partial durable flushes atomically invalidate the old checkpoint; an interrupted repair rebuilds safely on restart. A full reset is not part of ordinary file-replacement repair. The target operation is not proof of which engine performed maintenance. No row values, identifiers, credentials, or object paths are emitted.
 
-### Java Iceberg Writer/sink : 
+## Build and Runtime
 
-Its based in the directory olake-iceberg-java-writer. Read more ./olake-iceberg-java-writer/README.md on how to run it in standalone mode and test.
-
-## Environment Variables
-
-### OLAKE_DEBUG_MODE
-
-Set this environment variable to enable debug mode for the Java Iceberg writer. When enabled, the Java process will start with remote debugging options, allowing you to attach a debugger on port 5005.
-
-**Note:** Debug mode is only enabled during sync operations (not during check operations) to avoid blocking the connection check process.
+Use the repository's Go toolchain. `make dev.postgres.build` and the container build enable CGO and the `kerberos` build tag for Hive SASL. Linux Hive SASL also needs the MIT GSSAPI runtime (`libgssapi_krb5.so`); the runtime image supplies it. A direct build is:
 
 ```bash
-# Enable debug mode
-export OLAKE_DEBUG_MODE=1
-
-# Run your sync command
-olake sync --config source.json --destination destination.json --catalog catalog.json
+CGO_ENABLED=1 go build -tags kerberos -o olake ./drivers/postgres
 ```
+
+`GOMEMLIMIT` controls the Go heap budget. `OLAKE_INDEX_DB_DIR` selects the durable index directory. `OLAKE_TIMING=1` enables phase timing logs. No JDK, Maven, writer JAR, RPC port, or Arrow/legacy writer selector is required.
 
 ## How to run 
 
@@ -98,9 +99,7 @@ Create a json for writer config (Works for S3 as storage and AWS Glue as a catal
       "iceberg_s3_path": "s3://bucket_name/olake_iceberg/test_olake",
       "aws_region": "ap-south-1",
       "aws_access_key": "XXX",
-      "aws_secret_key": "XXX",
-      "grpc_port": 50051,
-      "sink_rpc_server_host": "localhost"
+      "aws_secret_key": "XXX"
     }
   }  
 ```

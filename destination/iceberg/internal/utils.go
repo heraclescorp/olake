@@ -1,17 +1,9 @@
 package internal
 
-import (
-	"context"
-)
-
-type ServerClient interface {
-	SendClientRequest(ctx context.Context, reqPayload interface{}) (interface{}, error)
-}
-
 // PartitionInfo represents an Iceberg partition column with its transform, preserving order.
 // Field is the original source column name (used for record.Data lookups before pre-shaping).
-// SchemaField is the resolved destination column name (used for schema, Java partition spec,
-// and record.Data lookups after pre-shaping). Computed once at parse time via i.stream.ResolveColumnName.
+// SchemaField is the resolved destination column name used by the native writer
+// and record.Data after pre-shaping.
 type PartitionInfo struct {
 	Field       string // original case — matches source record.Data keys
 	SchemaField string // resolved — matches Iceberg schema field names

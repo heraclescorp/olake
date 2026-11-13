@@ -3,25 +3,40 @@ package iceberg
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"math"
 	"regexp"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/compress"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+	apacheiceberg "github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/catalog"
+	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/table"
+	"github.com/apache/iceberg-go/table/dv"
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/destination"
-	arrowwriter "github.com/datazip-inc/olake/destination/iceberg/arrow-writer"
 	"github.com/datazip-inc/olake/destination/iceberg/internal"
-	legacywriter "github.com/datazip-inc/olake/destination/iceberg/legacy-writer"
-	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/errs"
 	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/datazip-inc/olake/utils/typeutils"
+	"github.com/google/uuid"
 	"github.com/spf13/viper"
 )
 
@@ -30,16 +45,14 @@ type Iceberg struct {
 	config        *Config
 	stream        types.StreamInterface
 	partitionInfo []internal.PartitionInfo // ordered slice to preserve partition column order
-	server        *serverInstance          // shared Java server instance (per-process singleton)
-	schema        map[string]string        // schema for current thread associated with Java writer (col -> type)
-	writer        Writer                   // writer instance
+	catalog       catalog.Catalog
+	schema        map[string]string
+	writer        Writer
 	// unavailableValues recovers values the source could not send; nil unless the stream keeps a row index (pos or dv)
 	unavailableValues *unavailableValuesResolver
-	// syncStartColumns are columns added from the source catalog at sync start (see planSourceColumns)
+	// syncStartColumns are columns added from the source catalog at sync start (see planSourceColumns).
 	syncStartColumns map[string]struct{}
-	// Why Schema On Thread Level?
-	// Schema on thread level is identical to the writer instance available in the Java server.
-	// It defines when to complete the Java writer and when schema evolution is required.
+	// Schema is refreshed at explicit evolution and commit boundaries.
 }
 
 // Pre-computed lookup tables for type validation
@@ -68,110 +81,26 @@ func (i *Iceberg) Spec() any {
 }
 
 func (i *Iceberg) Setup(ctx context.Context, stream types.StreamInterface, _ any, options *destination.Options) (any, *types.MetadataState, error) {
-	i.options = options
-	i.stream = stream
-	i.partitionInfo = make([]internal.PartitionInfo, 0)
-	i.schema = make(map[string]string)
-
-	// parse partition regex
+	i.options, i.stream = options, stream
 	var err error
 	i.partitionInfo, err = parsePartitionRegex(stream.GetPartitionRegex(), stream.ResolveColumnName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse partition regex: %w", err)
+		return nil, nil, err
 	}
-	logger.Debugf("Thread[%s]: setting up iceberg writer for table[%s.%s]", i.options.ThreadID, stream.GetDestinationDatabase(&i.config.IcebergDatabase), stream.GetDestinationTable())
-
-	// when normalization=false, include partition columns in the Iceberg schema so
-	// the Java server can build the partition spec (spec references columns by field ID)
-	partitionFields := make([]string, 0, len(i.partitionInfo))
-	if !stream.NormalizationEnabled() {
-		for _, p := range i.partitionInfo {
-			partitionFields = append(partitionFields, p.Field)
-		}
-	}
-
-	icebergPartFields := make([]*proto.IcebergPayload_PartitionField, 0, len(i.partitionInfo))
-	for _, p := range i.partitionInfo {
-		icebergPartFields = append(icebergPartFields, &proto.IcebergPayload_PartitionField{
-			Field:     p.SchemaField,
-			Transform: p.Transform,
-		})
-	}
-
-	upsertMode := isUpsertMode(stream, options.Backfill)
-	deleteMode := stream.GetUpdateType()
-
-	// Row-identity column, sent even where the catalog forbids declaring it.
-	identifierField := constants.OlakeID
-	iceSchema := stream.Schema().ToIceberg(!stream.NormalizationEnabled(), i.stream, partitionFields...)
-	requestPayload := proto.IcebergPayload{
-		Type: proto.IcebergPayload_GET_OR_CREATE_TABLE,
-		Metadata: &proto.IcebergPayload_Metadata{
-			Schema:          iceSchema,
-			DestTableName:   stream.GetDestinationTable(),
-			ThreadId:        options.ThreadID,
-			IdentifierField: &identifierField,
-			// Unity Catalog rejects identifier columns; only equality deletes need them declared.
-			DeclareIdentifierFields: !i.config.NoIdentifierFields,
-			Namespace:               stream.GetDestinationDatabase(&i.config.IcebergDatabase),
-			Upsert:                  upsertMode,
-			DeleteMode:              protoDeleteMode(deleteMode),
-			PartitionFields:         icebergPartFields,
-		},
-	}
-
-	response, err := i.server.SendClientRequest(ctx, &requestPayload)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load or create table: %w", err)
-	}
-
-	// get schema from response
-	ingestResponse := response.(*proto.RecordIngestResponse)
-	schema, err := parseSchema(ingestResponse.GetResult())
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse schema from resp[%s]: %w", ingestResponse.GetResult(), err)
-	}
-
-	// get metadata state from response
-	var metadataState types.MetadataState
-	if olake2PCState := ingestResponse.GetOlake_2PcState(); olake2PCState != "" {
-		if err := json.Unmarshal([]byte(olake2PCState), &metadataState); err != nil {
-			return schema, nil, fmt.Errorf("failed to unmarshal 2pc metadata state: %w", err)
-		}
-	}
-
-	// set schema for current thread
-	i.schema = copySchema(schema)
-
-	if err := i.reconcileTableIndex(ctx, options.TableIndex, ingestResponse.GetSnapshotId(), ingestResponse.GetHasEqualityDeletes()); err != nil {
-		return schema, nil, err
-	}
-
-	// nil in equality mode; shared by the writer, which buffers this thread's row locations
-	// in it, and the unavailable values resolver, which looks rows up in it
 	indexThread := types.NewStreamIndexThread(options.TableIndex)
-	if i.config.UseArrowWrites {
-		i.writer, err = arrowwriter.New(ctx, i.options, i.partitionInfo, i.schema, i.stream, i.server, upsertMode, indexThread)
-		if err != nil {
-			return nil, nil, destination.WriteFailure(fmt.Errorf("failed to create arrow writer: %w", err))
-		}
-	} else {
-		i.writer = legacywriter.New(i.options, i.schema, i.stream, i.server, upsertMode, indexThread)
+	writer, state, err := newNativeWriter(ctx, i.config, stream, options, i.catalog, indexThread)
+	if err != nil {
+		return nil, nil, err
 	}
-
-	// Recovery needs the row's previous location, which only a thread with a stream index
-	// has. Equality mode cannot recover, so RejectUnavailableValues fails its marked records;
-	// backfill records never carry one.
+	i.writer = writer
+	i.schema = writer.schemaMap()
 	if indexThread != nil {
-		i.unavailableValues = newUnavailableValuesResolver(options.ThreadID, i.stream, i.writer, indexThread, i.server.tableIndexClient)
+		i.unavailableValues = newUnavailableValuesResolver(options.ThreadID, stream, writer, indexThread, writer)
 	}
-
-	return schema, &metadataState, nil
+	return i.schema, state, nil
 }
 
-// Write sends records in order, split into chunks of at most MaxDestinationBatchBytes when values
-// recovered from the destination (unchanged TOAST) grew the batch past what the buffer measured,
-// so no single write exceeds the 2 GB message limit.
+// Write bounds batches after TOAST recovery expands their in-memory size.
 func (i *Iceberg) Write(ctx context.Context, records []types.RawRecord) error {
 	if i.unavailableValues == nil || i.unavailableValues.filledBytes == 0 {
 		return i.writer.Write(ctx, records)
@@ -196,39 +125,15 @@ func (i *Iceberg) Write(ctx context.Context, records []types.RawRecord) error {
 	return i.writer.Write(ctx, records[start:])
 }
 
-func (i *Iceberg) Close(ctx context.Context, finalMetadataState any) (err error) {
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		req := &proto.IcebergPayload{
-			Type: proto.IcebergPayload_CLOSE_SESSION,
-			Metadata: &proto.IcebergPayload_Metadata{
-				ThreadId: i.options.ThreadID,
-			},
-		}
-
-		if _, cleanupErr := i.server.SendClientRequest(cleanupCtx, req); cleanupErr != nil {
-			if err == nil {
-				err = cleanupErr
-			} else {
-				err = fmt.Errorf("%w: cleanup error: %w", err, cleanupErr)
-			}
-		}
-	}()
-
+func (i *Iceberg) Close(ctx context.Context, finalMetadataState any) error {
 	if i.unavailableValues != nil {
 		i.unavailableValues.Close()
 	}
-
-	select {
-	case <-ctx.Done():
-		// skip commit in case of context cancellation
+	if err := ctx.Err(); err != nil {
 		i.writer.Abort()
-		return ctx.Err()
-	default:
-		return i.writer.Close(ctx, finalMetadataState)
+		return err
 	}
+	return i.writer.Close(ctx, finalMetadataState)
 }
 
 func (i *Iceberg) Check(ctx context.Context) error {
@@ -236,68 +141,41 @@ func (i *Iceberg) Check(ctx context.Context) error {
 	if prefix := viper.GetString(constants.DestinationDatabasePrefix); prefix != "" {
 		destinationDB = fmt.Sprintf("%s_%s", utils.Reformat(prefix), destinationDB)
 	}
-
 	ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
-
-	// Row-identity column, sent even where the catalog forbids declaring it.
-	identifierField := constants.OlakeID
-	request := &proto.IcebergPayload{
-		Type: proto.IcebergPayload_GET_OR_CREATE_TABLE,
-		Metadata: &proto.IcebergPayload_Metadata{
-			ThreadId:        i.server.defaultServerID,
-			DestTableName:   destinationDB,
-			Schema:          types.GetIcebergRawSchema(),
-			Namespace:       destinationDB,
-			Upsert:          false,
-			IdentifierField: &identifierField,
-			// Unity Catalog rejects identifier columns; only equality deletes need them declared.
-			DeclareIdentifierFields: !i.config.NoIdentifierFields,
-			// The check table is written once, appended, and never updated, so no
-			// delete mode is meaningful here. Equality is the one that constrains the
-			// table least: it creates at format version 2 and needs no table index.
-			DeleteMode: proto.IcebergPayload_DELETE_MODE_EQUALITY,
-		},
+	stream := types.NewStream(destinationDB, destinationDB, nil)
+	stream.DestinationDatabase, stream.DestinationTable = destinationDB, destinationDB
+	for name, dataType := range types.RawSchema {
+		if name != constants.StringifiedData {
+			stream.Schema.AddTypes(name, true, dataType)
+		}
 	}
-
-	res, err := i.server.SendClientRequest(ctx, request)
+	stream.Schema.AddTypes("name", false, types.String)
+	appendMode, normalized := true, false
+	configured := &types.ConfiguredStream{Stream: stream, StreamMetadata: types.StreamMetadata{
+		AppendMode: &appendMode, Normalization: &normalized,
+	}}
+	checker := &Iceberg{config: i.config, catalog: i.catalog}
+	if _, _, err := checker.Setup(ctx, configured, nil, &destination.Options{
+		ThreadID: "olake-check", Backfill: true,
+	}); err != nil {
+		return fmt.Errorf("initialize native Iceberg check: %w", err)
+	}
+	now := time.Now().UTC()
+	record := types.CreateRawRecord(map[string]any{"name": "olake"}, map[string]any{
+		constants.OlakeID: "olake", constants.OpType: "r", constants.OlakeTimestamp: now,
+		constants.CdcTimestamp: now,
+	}, nil)
+	_, records, _, err := checker.FlattenAndCleanData(ctx, []types.RawRecord{record})
 	if err != nil {
-		return fmt.Errorf("failed to create or get table: %w", err)
+		checker.writer.Abort()
+		return err
 	}
-
-	ingestResponse := res.(*proto.RecordIngestResponse)
-	logger.Infof("Thread[%s]: table created or loaded test olake: %s", i.server.defaultServerID, ingestResponse.GetResult())
-
-	// try writing record in dest table
-	currentTime := time.Now().UTC()
-	protoSchema := types.GetIcebergRawSchema()
-	record := types.CreateRawRecord(map[string]any{"name": "olake"}, map[string]any{constants.OlakeID: "olake", constants.OpType: "r", constants.CdcTimestamp: &currentTime}, nil)
-	protoColumns, err := legacywriter.RawDataColumnBuffer(record, protoSchema)
-	if err != nil {
-		return destination.WriteFailure(fmt.Errorf("failed to create raw data column buffer: %w", err))
+	if err := checker.Write(ctx, records); err != nil {
+		checker.writer.Abort()
+		return err
 	}
-	recrodInsertRequest := &proto.IcebergPayload{
-		Type: proto.IcebergPayload_RECORDS,
-		Metadata: &proto.IcebergPayload_Metadata{
-			// Session already created by the GET_OR_CREATE_TABLE above; RECORDS
-			// carries only the routing thread_id plus the schema for this batch.
-			ThreadId: i.server.defaultServerID,
-			Schema:   protoSchema,
-		},
-		Records: []*proto.IcebergPayload_IceRecord{{
-			Fields:     protoColumns,
-			RecordType: "r",
-		}},
-	}
-
-	resInsert, err := i.server.SendClientRequest(ctx, recrodInsertRequest)
-	if err != nil {
-		return fmt.Errorf("failed to insert request: %w", err)
-	}
-
-	ingestResponse = resInsert.(*proto.RecordIngestResponse)
-	logger.Debugf("Thread[%s]: record inserted successfully: %s", i.server.defaultServerID, ingestResponse.GetResult())
-	return nil
+	return checker.Close(ctx, nil)
 }
 
 // validate schema change & evolution and removes null records
@@ -455,83 +333,30 @@ func (i *Iceberg) FlattenAndCleanData(ctx context.Context, records []types.RawRe
 	return schemaDifference, records, recordsSchema, nil
 }
 
-// compares with global schema and update schema in destination accordingly
+// EvolveSchema applies compatible source changes to the coordinated table view.
 func (i *Iceberg) EvolveSchema(ctx context.Context, globalSchema, recordsRawSchema any) (any, error) {
 	if !i.stream.NormalizationEnabled() {
 		return i.schema, nil
 	}
-	// cases as local thread schema has detected changes w.r.t. batch records schema
-	//  	i.  iceberg table already have changes (i.e. no difference with global schema), in this case
-	//		    only refresh table in iceberg for this thread.
-	// 		ii. Schema difference is detected w.r.t. iceberg table (i.e. global schema), in this case
-	// 			we need to evolve schema in iceberg table
-	// NOTE: All the above cases will also complete current writer (java writer instance) as schema change in thread detected
-
-	globalSchemaMap, ok := globalSchema.(map[string]string)
+	global, ok := globalSchema.(map[string]string)
 	if !ok {
-		return nil, fmt.Errorf("failed to convert globalSchema of type[%T] to map[string]string", globalSchema)
+		return nil, fmt.Errorf("invalid global schema type %T", globalSchema)
 	}
-
-	recordsSchema, ok := recordsRawSchema.(map[string]string)
+	records, ok := recordsRawSchema.(map[string]string)
 	if !ok {
-		return nil, fmt.Errorf("failed to convert newSchemaMap of type[%T] to map[string]string", recordsRawSchema)
+		return nil, fmt.Errorf("invalid record schema type %T", recordsRawSchema)
 	}
-
-	// case handled:
-	// 1. returns true if promotion is possible or new column is added
-	// 2. in case of int(globalType) and string(threadType) it return false
-	//    and write method will try to parse the string (write will fail if not parsable)
-	differentSchema := func(oldSchema, newSchema map[string]string) bool {
-		for fieldName, newType := range newSchema {
-			if oldType, exists := oldSchema[fieldName]; !exists {
-				return true
-			} else if isPromotionRequired(oldType, newType) {
-				return true
-			}
+	columns := copySchema(global)
+	for name, fieldType := range records {
+		if previous, found := columns[name]; !found || isPromotionRequired(previous, fieldType) {
+			columns[name] = fieldType
 		}
-		return false
 	}
-
-	request := proto.IcebergPayload{
-		Type: proto.IcebergPayload_EVOLVE_SCHEMA,
-		Metadata: &proto.IcebergPayload_Metadata{
-			ThreadId: i.options.ThreadID,
-		},
+	if err := i.writer.EvolveSchema(ctx, columns); err != nil {
+		return nil, destination.WriteFailure(fmt.Errorf("evolve native Iceberg schema: %w", err))
 	}
-
-	if differentSchema(globalSchemaMap, recordsSchema) {
-		logger.Infof("Thread[%s]: evolving schema in iceberg table", i.options.ThreadID)
-		for field, fieldType := range recordsSchema {
-			request.Metadata.Schema = append(request.Metadata.Schema, &proto.IcebergPayload_SchemaField{
-				Key:     field,
-				IceType: fieldType,
-			})
-		}
-	} else {
-		logger.Debugf("Thread[%s]: refreshing table schema", i.options.ThreadID)
-		request.Type = proto.IcebergPayload_REFRESH_TABLE_SCHEMA
-	}
-
-	resp, err := i.server.SendClientRequest(ctx, &request)
-	if err != nil {
-		return false, fmt.Errorf("failed to %s: %w", request.Type.String(), err)
-	}
-
-	ingestResponse := resp.(*proto.RecordIngestResponse)
-	response := ingestResponse.GetResult()
-
-	// only refresh table schema
-	schemaAfterEvolution, err := parseSchema(response)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse schema from resp[%s]: %w", response, err)
-	}
-
-	i.schema = copySchema(schemaAfterEvolution)
-	if err := i.writer.EvolveSchema(ctx, schemaAfterEvolution); err != nil {
-		return nil, destination.WriteFailure(fmt.Errorf("failed to evolve writer schema: %w", err))
-	}
-
-	return schemaAfterEvolution, nil
+	i.schema = i.writer.(*nativeWriter).schemaMap()
+	return i.schema, nil
 }
 
 // parsePartitionRegex parses the partition regex and populates the partitionInfo slice
@@ -590,74 +415,24 @@ func isPromotionRequired(oldType, newType string) bool {
 	return false
 }
 
-// drop streams required for clear destination
-func (i *Iceberg) DropStreams(ctx context.Context, tables []types.StreamInterface) error {
-	if len(tables) == 0 {
-		logger.Info("No streams selected for clearing Iceberg destination, skipping operation")
-		return nil
+// DropStreams purges only the selected destination tables.
+func (i *Iceberg) DropStreams(ctx context.Context, streams []types.StreamInterface) error {
+	purger, ok := i.catalog.(catalog.PurgeableTable)
+	if !ok {
+		return fmt.Errorf("Iceberg catalog %s does not support purging tables", i.config.CatalogType)
 	}
-	logger.Infof("Starting Clear Iceberg destination for %d selected tables", len(tables))
-
-	threadID := "iceberg_destination_drop"
-	for _, stream := range tables {
-		destDB := stream.GetDestinationDatabase(&i.config.IcebergDatabase)
-		destTable := stream.GetDestinationTable()
-		dropTable := fmt.Sprintf("%s.%s", destDB, destTable)
-
-		logger.Infof("Dropping Iceberg table: %s", dropTable)
-
-		request := proto.IcebergPayload{
-			Type: proto.IcebergPayload_DROP_TABLE,
-			Metadata: &proto.IcebergPayload_Metadata{
-				DestTableName: dropTable,
-				ThreadId:      threadID,
-				// Namespace is encoded inside DropTable (db.table) and parsed Java-side.
-			},
-		}
-		_, err := i.server.SendClientRequest(ctx, &request)
-		if err != nil {
-			return fmt.Errorf("failed to drop table %s: %w", dropTable, err)
+	for _, stream := range streams {
+		identifier := table.Identifier{stream.GetDestinationDatabase(&i.config.IcebergDatabase), stream.GetDestinationTable()}
+		if err := purger.PurgeTable(nativeCatalogContext(ctx, i.catalog), identifier); err != nil && !errors.Is(err, catalog.ErrNoSuchTable) {
+			return fmt.Errorf("purge Iceberg table %v: %w", identifier, err)
 		}
 	}
-
-	logger.Info("Successfully cleared Iceberg destination for selected streams")
 	return nil
 }
 
 // returns a new copy of schema
 func copySchema(schema map[string]string) map[string]string {
 	return maps.Clone(schema)
-}
-
-func parseSchema(schemaStr string) (map[string]string, error) {
-	// Remove the outer "table {" and "}"
-	schemaStr = strings.TrimPrefix(schemaStr, "table {")
-	schemaStr = strings.TrimSuffix(schemaStr, "}")
-
-	// Process each line
-	lines := strings.Split(schemaStr, "\n")
-	fields := make(map[string]string)
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		// Parse line like: "1: col_name: optional string"
-		parts := strings.SplitN(line, ":", 3)
-		if len(parts) < 3 {
-			continue
-		}
-
-		name := strings.TrimSpace(parts[1])
-		typeInfo := strings.TrimSpace(parts[2])
-
-		// typeInfo will contain `required type (id)` or `optional type`
-		types := strings.Split(typeInfo, " ")
-		fields[name] = types[1]
-	}
-	return fields, nil
 }
 
 func getCommonAncestorType(d1, d2 string) string {
@@ -676,54 +451,1338 @@ func isUpsertMode(stream types.StreamInterface, backfill bool) bool {
 	return utils.Ternary(stream.AppendModeEnabled(), false, !backfill).(bool)
 }
 
-// protoDeleteMode maps the config-facing delete mode onto the wire enum. An
-// unknown mode reaches the server as UNSPECIFIED, which it rejects; config is
-// validated by types.UpdateType.Validate() long before this point.
-func protoDeleteMode(mode types.UpdateType) proto.IcebergPayload_DeleteMode {
-	switch mode {
-	case types.UpdateTypeEquality:
-		return proto.IcebergPayload_DELETE_MODE_EQUALITY
-	case types.UpdateTypePosition:
-		return proto.IcebergPayload_DELETE_MODE_POSITION
-	case types.UpdateTypeDeletionVector:
-		return proto.IcebergPayload_DELETE_MODE_DELETION_VECTOR
-	default:
-		return proto.IcebergPayload_DELETE_MODE_UNSPECIFIED
+func init() {
+	var mu sync.Mutex
+	var sharedCatalog catalog.Catalog
+	var sharedConfig *Config
+	destination.RegisteredWriters[types.Iceberg] = func(raw any) (destination.Writer, func(context.Context), error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if sharedCatalog != nil {
+			return &Iceberg{config: sharedConfig, catalog: sharedCatalog}, nil, nil
+		}
+		config := &Config{}
+		if err := utils.Unmarshal(raw, config); err != nil {
+			return nil, nil, fmt.Errorf("decode native Iceberg config: %w", err)
+		}
+		if err := config.Validate(); err != nil {
+			return nil, nil, err
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cat, closeCatalog, err := openNativeCatalog(ctx, config)
+		if err != nil {
+			cancel()
+			return nil, nil, err
+		}
+		sharedCatalog, sharedConfig = cat, config
+		cleanup := func(ctx context.Context) {
+			mu.Lock()
+			defer mu.Unlock()
+			defer cancel()
+			closeCatalog(ctx)
+			sharedCatalog, sharedConfig = nil, nil
+		}
+		return &Iceberg{config: config, catalog: cat}, cleanup, nil
 	}
 }
 
-func init() {
-	var server *serverInstance
-	var icebergConfig *Config
-	destination.RegisteredWriters[types.Iceberg] = func(config any) (destination.Writer, func(ctx context.Context), error) {
-		if icebergConfig != nil || server != nil {
-			// for already initialized writer, return the same server and config instance
-			return &Iceberg{
-				config: icebergConfig,
-				server: server,
-			}, nil, nil
-		}
+const nativeCommitAttempts = 4
+const nativeRecoveryProperty = "olake_2pc"
 
-		icebergConfig = &Config{}
-		// unmarshal config according to iceberg config struct
-		err := utils.Unmarshal(config, icebergConfig)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to unmarshal iceberg config: %w", err)
-		}
+// The coordinator belongs to one catalog lifetime, never a process-global cache.
+// OLake must be the sole OLake process owning a destination table: this mutex
+// serializes local recovery-property merges, not distributed property writers.
+// Ref and default-shape assertions remain enabled; schema mutations retain the
+// SDK's schema requirements. None is a CAS on arbitrary table properties.
+type nativeTableCoordinator struct {
+	mu     sync.Mutex
+	tables map[string]*nativeTableState
+	closed bool
+}
 
-		server, err = startServer(icebergConfig)
-		if err != nil {
-			icebergConfig = nil
-			return nil, nil, fmt.Errorf("failed to start iceberg server: %w", err)
-		}
+type nativeTableState struct {
+	mu         sync.Mutex
+	latest     *table.Table
+	unknown    bool
+	closed     bool
+	generation uint64
+}
 
-		return &Iceberg{
-				config: icebergConfig,
-				server: server,
-			}, func(ctx context.Context) {
-				server.Shutdown(ctx)
-				icebergConfig = nil
-				server = nil
-			}, nil
+type nativeTableLockKey struct{}
+
+func (c *nativeTableCoordinator) entry(identifier table.Identifier) *nativeTableState {
+	// Length-prefixed components distinguish identifiers containing separators.
+	var key strings.Builder
+	for _, component := range identifier {
+		key.WriteString(strconv.Itoa(len(component)))
+		key.WriteByte(':')
+		key.WriteString(component)
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tables == nil {
+		c.tables = make(map[string]*nativeTableState)
+	}
+	state := c.tables[key.String()]
+	if state == nil {
+		state = &nativeTableState{closed: c.closed}
+		c.tables[key.String()] = state
+	}
+	return state
+}
+
+func nativeTableEntry(cat catalog.Catalog, identifier table.Identifier) *nativeTableState {
+	if native, ok := cat.(*nativeCatalog); ok {
+		return native.tables.entry(identifier)
+	}
+	// Callers supplying their own catalog can opt into sharing by wrapping it in
+	// nativeCatalog. Never retain arbitrary catalog instances in a global map.
+	return &nativeTableState{}
+}
+
+func (s *nativeTableState) usable() error {
+	if s.closed {
+		return errors.New("Iceberg catalog is closed")
+	}
+	if s.unknown {
+		return errors.New("Iceberg table commit outcome is unknown; reopen the catalog before recovery")
+	}
+	return nil
+}
+
+func (s *nativeTableState) invalidate(unknown bool) {
+	s.latest = nil
+	s.unknown = s.unknown || unknown
+}
+
+func (w *nativeWriter) lockTable(ctx context.Context) (context.Context, *nativeTableState, error) {
+	state := w.coordinator
+	if state == nil {
+		state = nativeTableEntry(w.cat, w.table.Identifier())
+		w.coordinator = state
+	}
+	state.mu.Lock()
+	if err := state.usable(); err != nil {
+		if state.unknown {
+			w.uncertain = true
+		}
+		state.mu.Unlock()
+		return ctx, nil, err
+	}
+	if state.generation != w.generation {
+		state.mu.Unlock()
+		return ctx, nil, errors.New("Iceberg table was replaced or removed while this writer was active")
+	}
+	return context.WithValue(ctx, nativeTableLockKey{}, state), state, nil
+}
+
+func (w *nativeWriter) currentTable(ctx context.Context, state *nativeTableState) (*table.Table, error) {
+	if state.latest == nil {
+		fresh, err := w.cat.LoadTable(ctx, w.table.Identifier())
+		if err != nil {
+			return nil, err
+		}
+		state.latest = fresh
+	}
+	if state.latest.Metadata().TableUUID() != w.table.Metadata().TableUUID() {
+		return nil, errors.New("Iceberg table identity changed while this writer was active")
+	}
+	return state.latest, nil
+}
+
+type nativeIndexRead struct {
+	location types.RowLocation
+	found    bool
+}
+
+type nativeWriter struct {
+	table        *table.Table
+	cat          catalog.Catalog
+	coordinator  *nativeTableState
+	generation   uint64
+	config       *Config
+	stream       types.StreamInterface
+	options      *destination.Options
+	indexThread  *types.StreamIndexThread
+	indexReads   map[string]nativeIndexRead
+	indexTouched map[string]struct{}
+	upsert       bool
+	deleteMode   types.UpdateType
+	dataFiles    []apacheiceberg.DataFile
+	dataSchemas  map[string]*apacheiceberg.Schema
+	positions    map[string][]int64
+	latest       map[string]types.RowLocation
+	paths        map[string]struct{}
+	closed       bool
+	uncertain    bool
+	failed       error
+}
+
+func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInterface, options *destination.Options, cat catalog.Catalog, indexThread *types.StreamIndexThread) (_ *nativeWriter, _ *types.MetadataState, err error) {
+	ctx = nativeCatalogContext(ctx, cat)
+	identifier := catalog.ToIdentifier(stream.GetDestinationDatabase(&config.IcebergDatabase), stream.GetDestinationTable())
+	state := nativeTableEntry(cat, identifier)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if err := state.usable(); err != nil {
+		return nil, nil, err
+	}
+	ctx = context.WithValue(ctx, nativeTableLockKey{}, state)
+	// Setup is the freshness boundary for external schema-only changes and
+	// response-config credentials. Hold the table lock so an older load cannot
+	// overwrite a newer local commit; Close reuses coordinated metadata.
+	tbl, err := loadOrCreateNativeTable(ctx, config, stream, cat)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load or create Iceberg table: %w", err)
+	}
+	state.latest = tbl
+	w := &nativeWriter{table: tbl, cat: cat, coordinator: state, generation: state.generation, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), positions: make(map[string][]int64), latest: make(map[string]types.RowLocation), paths: make(map[string]struct{})}
+	defer func() {
+		if err != nil {
+			w.Abort()
+		}
+	}()
+	if err := w.validateFormat(ctx); err != nil {
+		return nil, nil, err
+	}
+	// Existing source columns are reconciled by ApplySourceColumns after the
+	// SyncStart phase, when PostgreSQL defaults have become authoritative. Eager
+	// union here would consume additions before their initial defaults arrive.
+	if options.TableIndex != nil {
+		if err := w.migrateEqualityDeletes(ctx); err != nil {
+			return nil, nil, err
+		}
+	}
+	// Reconcile and return recovery from the loaded metadata, or from the
+	// successful format/migration commit that replaced it. A no-op
+	// initialization must not issue another catalog GET.
+	if err := reconcileNativeTableIndex(ctx, options.TableIndex, w.table, constants.OlakeID); err != nil {
+		return nil, nil, err
+	}
+	metadataState := &types.MetadataState{}
+	if value := w.table.Properties()[nativeRecoveryProperty]; value != "" {
+		if err := json.Unmarshal([]byte(value), metadataState); err != nil {
+			return nil, nil, fmt.Errorf("decode Iceberg recovery state: %w", err)
+		}
+	}
+	indexThread.SetObservabilityContext(ctx)
+	return w, metadataState, nil
+}
+
+func (w *nativeWriter) writable() error {
+	if w.uncertain {
+		return errors.New("Iceberg commit outcome is unknown; writer cannot be reused or cleaned up")
+	}
+	if w.closed {
+		return errors.New("Iceberg writer is closed")
+	}
+	if w.failed != nil {
+		return fmt.Errorf("Iceberg writer has failed: %w", w.failed)
+	}
+	return nil
+}
+
+func (w *nativeWriter) validateFormat(ctx context.Context) error {
+	// Initialization holds the entry lock through format changes, equality
+	// migration, index reconciliation and recovery-state publication.
+	state := w.coordinator
+	version := w.table.Metadata().Version()
+	if version > 3 {
+		return fmt.Errorf("unsupported Iceberg format version %d", version)
+	}
+	if w.deleteMode != types.UpdateTypeDeletionVector {
+		if version >= 3 {
+			return fmt.Errorf("Iceberg format v%d requires deletion vector update mode; reset the table before changing update mode", version)
+		}
+		if w.upsert && version < 2 {
+			return errors.New("Iceberg upserts require table format version 2 or later")
+		}
+		return nil
+	}
+	if version >= 3 {
+		return nil
+	}
+	for attempt := range nativeCommitAttempts {
+		fresh, err := w.currentTable(ctx, state)
+		if err != nil {
+			return err
+		}
+		tx := fresh.NewTransaction()
+		if err := tx.AssertRefSnapshotID(table.MainBranch); err != nil {
+			return err
+		}
+		if err := tx.UpgradeFormatVersion(3); err != nil {
+			return err
+		}
+		updated, err := tx.Commit(ctx)
+		if err == nil {
+			w.table, state.latest = updated, updated
+			return nil
+		}
+		err = nativeCatalogError("upgrade Iceberg format", err)
+		w.logConflict("format-upgrade", attempt+1, fresh, err)
+		state.invalidate(!errors.Is(err, table.ErrCommitFailed))
+		if !errors.Is(err, table.ErrCommitFailed) {
+			w.uncertain = true
+			return fmt.Errorf("Iceberg format upgrade outcome is unknown: %w", err)
+		}
+	}
+	return fmt.Errorf("upgrade Iceberg format: %w", table.ErrCommitFailed)
+}
+
+type nativeWriteGroup struct {
+	rows      []map[string]any
+	indices   []int
+	partition map[int]any
+}
+
+func (w *nativeWriter) Write(ctx context.Context, records []types.RawRecord) (err error) {
+	if err := w.writable(); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			w.failed = err
+			w.Abort()
+		}
+	}()
+	ctx = nativeCatalogContext(ctx, w.cat)
+	w.indexThread.SetObservabilityContext(ctx)
+	groups := make(map[string]*nativeWriteGroup)
+	rows := make([]map[string]any, len(records))
+	operations := make([]string, len(records))
+	keys := make([]string, len(records))
+	var batchSeen map[string]struct{}
+	if w.indexThread != nil && w.upsert {
+		batchSeen = make(map[string]struct{})
+	}
+	for idx, record := range records {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if record.Data == nil {
+			continue
+		}
+		row := record.Data
+		maps.Copy(row, record.OlakeColumns)
+		id, ok := row[constants.OlakeID].(string)
+		if !ok {
+			return errors.New("Iceberg row is missing its string _olake_id")
+		}
+		op, ok := row[constants.OpType].(string)
+		if !ok {
+			return errors.New("Iceberg row is missing its string _op_type")
+		}
+		operations[idx], keys[idx] = op, id
+		if w.indexThread != nil && w.upsert && op != "r" && op != "c" {
+			_, touched := w.indexTouched[id]
+			_, seen := batchSeen[id]
+			if !touched && !seen {
+				previous, found, err := w.options.TableIndex.Lookup(id)
+				if err != nil {
+					return fmt.Errorf("look up Iceberg row identity: %w", err)
+				}
+				if w.indexReads == nil {
+					w.indexReads = make(map[string]nativeIndexRead)
+				}
+				w.indexReads[id] = nativeIndexRead{location: previous, found: found}
+				if op == "u" && w.stream.ResolveUpsertOp() && !found {
+					row[constants.OpType] = "c"
+				}
+			}
+		}
+		if op == "i" {
+			row[constants.OpType] = "c"
+		}
+		key, partition, err := nativeRecordPartition(w.table.Schema(), w.table.Spec(), row)
+		if err != nil {
+			return err
+		}
+		group := groups[key]
+		if group == nil {
+			group = &nativeWriteGroup{partition: partition}
+			groups[key] = group
+		}
+		group.rows = append(group.rows, row)
+		group.indices = append(group.indices, idx)
+		rows[idx] = row
+		if batchSeen != nil {
+			batchSeen[id] = struct{}{}
+		}
+	}
+	locations := make([]types.RowLocation, len(records))
+	for _, key := range slices.Sorted(maps.Keys(groups)) {
+		group := groups[key]
+		batch, err := nativeArrowRecord(w.table.Schema(), group.rows)
+		if err != nil {
+			return err
+		}
+		file, err := w.writeNativeParquet(ctx, w.table.Schema(), w.table.Spec(), group.partition, batch, apacheiceberg.EntryContentData, nil, nil)
+		batch.Release()
+		if err != nil {
+			return err
+		}
+		w.dataFiles = append(w.dataFiles, file)
+		if w.dataSchemas == nil {
+			w.dataSchemas = make(map[string]*apacheiceberg.Schema)
+		}
+		w.dataSchemas[file.FilePath()] = w.table.Schema()
+		for position, idx := range group.indices {
+			locations[idx] = types.RowLocation{FilePath: file.FilePath(), Position: int64(position)}
+		}
+	}
+	// Resolve superseded locations in SOURCE order, not partition iteration
+	// order. The pending index and latest maps therefore see earlier records in
+	// this same batch, even when a key changes partition.
+	for idx, row := range rows {
+		if row == nil {
+			continue
+		}
+		id, op := keys[idx], operations[idx]
+		if w.upsert {
+			if w.indexThread != nil {
+				_, touched := w.indexTouched[id]
+				if touched {
+					// A touched key is guaranteed to be pending: this lookup never
+					// reaches the committed store, including for later c/r events.
+					previous, found, err := w.indexThread.Lookup(id)
+					if err != nil {
+						return err
+					}
+					if !found {
+						return errors.New("touched Iceberg row is missing from the pending index")
+					}
+					w.positions[previous.FilePath] = append(w.positions[previous.FilePath], previous.Position)
+				} else if op != "r" && op != "c" {
+					previous := w.indexReads[id]
+					if previous.found {
+						w.positions[previous.location.FilePath] = append(w.positions[previous.location.FilePath], previous.location.Position)
+					}
+				}
+				if w.indexTouched == nil {
+					w.indexTouched = make(map[string]struct{})
+				}
+				w.indexTouched[id] = struct{}{}
+			} else if op != "r" {
+				if previous, found := w.latest[id]; found {
+					w.positions[previous.FilePath] = append(w.positions[previous.FilePath], previous.Position)
+				}
+				w.latest[id] = locations[idx]
+			}
+		}
+		if w.indexThread != nil {
+			w.indexThread.Put(id, locations[idx])
+		}
+	}
+	return nil
+}
+
+func (w *nativeWriter) EnsureReadable(ctx context.Context, paths []string) error {
+	if err := w.writable(); err != nil {
+		return err
+	}
+	fs, err := w.table.FS(nativeCatalogContext(ctx, w.cat))
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		if _, ours := w.paths[path]; !ours {
+			continue
+		}
+		// Write has already closed every footer and cloud upload. Opening it here
+		// verifies that a pending indexed location is actually recoverable.
+		file, err := fs.Open(path)
+		if err != nil {
+			return fmt.Errorf("open staged Iceberg recovery file: %w", err)
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+func mergeNativeRecovery(current, threadID string, payload any, hasFiles bool) (string, bool, error) {
+	root := make(map[string]json.RawMessage)
+	if current != "" {
+		if err := json.Unmarshal([]byte(current), &root); err != nil {
+			return "", false, fmt.Errorf("decode stored Iceberg recovery document: %w", err)
+		}
+	}
+	if root == nil {
+		return "", false, errors.New("stored Iceberg recovery document is not an object")
+	}
+	if payload == nil {
+		if !hasFiles {
+			return current, false, nil
+		}
+		var ids []string
+		if raw := root["full_refresh_committed_ids"]; len(raw) > 0 {
+			if err := json.Unmarshal(raw, &ids); err != nil {
+				return "", false, err
+			}
+		}
+		if !slices.Contains(ids, threadID) {
+			ids = append(ids, threadID)
+		}
+		root["full_refresh_committed_ids"], _ = json.Marshal(ids)
+		root["dedup_inserts"] = json.RawMessage("true")
+	} else {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return "", false, fmt.Errorf("encode Iceberg recovery payload: %w", err)
+		}
+		incoming := make(map[string]json.RawMessage)
+		if err := json.Unmarshal(encoded, &incoming); err != nil {
+			return "", false, fmt.Errorf("Iceberg recovery payload must be an object: %w", err)
+		}
+		root["id"], _ = json.Marshal(threadID)
+		for key, value := range incoming {
+			oldObject, oldOK := nativeJSONStringObject(root[key])
+			newObject, newOK := nativeJSONStringObject(value)
+			if oldOK && newOK {
+				maps.Copy(oldObject, newObject)
+				merged, err := json.Marshal(oldObject)
+				if err != nil {
+					return "", false, err
+				}
+				value, _ = json.Marshal(string(merged))
+			}
+			root[key] = value
+		}
+	}
+	encoded, err := json.Marshal(root)
+	return string(encoded), string(encoded) != current, err
+}
+
+func nativeJSONStringObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return nil, false
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal([]byte(value), &object) != nil || object == nil {
+		return nil, false
+	}
+	return object, true
+}
+
+func nativeSnapshotID(tbl *table.Table) int64 {
+	if snapshot := tbl.CurrentSnapshot(); snapshot != nil {
+		return snapshot.SnapshotID
+	}
+	return 0
+}
+
+func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err error) {
+	if err := w.writable(); err != nil {
+		return err
+	}
+	defer func() {
+		w.indexThread.ReleaseObservability()
+		if err != nil {
+			w.Abort()
+		}
+	}()
+	ctx = nativeCatalogContext(ctx, w.cat)
+	if err := w.compactStagedDataFiles(ctx); err != nil {
+		return fmt.Errorf("compact superseded staged Iceberg rows: %w", err)
+	}
+	ctx, coordinated, err := w.lockTable(ctx)
+	if err != nil {
+		return err
+	}
+	defer coordinated.mu.Unlock()
+	hasFiles := len(w.dataFiles) > 0 || len(w.positions) > 0
+	var lastConflict error
+	for attempt := range nativeCommitAttempts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		fresh, err := w.currentTable(ctx, coordinated)
+		if err != nil {
+			return err
+		}
+		var indexBase int64
+		if hasFiles && w.indexThread != nil {
+			indexBase, err = w.options.TableIndex.LastCommittedSnapshot()
+			if err != nil {
+				return err
+			}
+			if nativeSnapshotID(fresh) != indexBase {
+				w.logConflict("commit-index-base", attempt+1, fresh, table.ErrConflictingDeleteFiles)
+				return fmt.Errorf("Iceberg index checkpoint %d differs from current snapshot %d; refusing stale positional deletes: %w", indexBase, nativeSnapshotID(fresh), table.ErrCommitFailed)
+			}
+			for id, original := range w.indexReads {
+				location, found, err := w.options.TableIndex.Lookup(id)
+				if err != nil {
+					return err
+				}
+				if found != original.found || found && location != original.location {
+					w.logConflict("commit-index-key", attempt+1, fresh, table.ErrConflictingDataFiles)
+					return fmt.Errorf("indexed row changed while this thread was writing; refusing stale positional deletes: %w", table.ErrConflictingDataFiles)
+				}
+			}
+		}
+		state, changed, err := mergeNativeRecovery(fresh.Properties()[nativeRecoveryProperty], w.options.ThreadID, finalMetadataState, hasFiles)
+		if err != nil {
+			return err
+		}
+		if !hasFiles && !changed {
+			w.table = fresh
+			w.closed = true
+			return nil
+		}
+		tx := fresh.NewTransaction()
+		if err := tx.AssertRefSnapshotID(table.MainBranch); err != nil {
+			return err
+		}
+		if err := tx.AssertDefaultShape(); err != nil {
+			return err
+		}
+		if changed {
+			if err := tx.SetProperties(apacheiceberg.Properties{nativeRecoveryProperty: state}); err != nil {
+				return err
+			}
+		}
+		// Rebuild position deletes against the fresh table on every retry. A
+		// replacement DV must retain every prior vector bit and retire exactly
+		// the vector currently live on this base snapshot.
+		positionFiles, replaced, err := w.writePositionDeletes(ctx, w.positions, fresh)
+		if err != nil {
+			return err
+		}
+		equalityFiles, err := w.writeEqualityDeletes(ctx, fresh)
+		if err != nil {
+			return err
+		}
+		if hasFiles {
+			delta := tx.NewRowDelta(apacheiceberg.Properties{"olake.thread-id": w.options.ThreadID})
+			delta.AddRows(w.dataFiles...).AddDeletes(equalityFiles...).AddDeletes(positionFiles...).RemoveDeletes(replaced...)
+			if err := delta.Commit(ctx); err != nil {
+				return err
+			}
+		}
+		committed, commitErr := tx.Commit(ctx)
+		if commitErr != nil {
+			commitErr = nativeCatalogError("commit Iceberg table", commitErr)
+			lastConflict = commitErr
+			w.logConflict("commit", attempt+1, fresh, commitErr)
+			coordinated.invalidate(!errors.Is(commitErr, table.ErrCommitFailed))
+			if !errors.Is(commitErr, table.ErrCommitFailed) {
+				w.uncertain = true
+				return fmt.Errorf("Iceberg commit outcome is unknown; staged files retained for recovery: %w", commitErr)
+			}
+			// The attempt was definitively rejected: only its newly written
+			// delete files can be discarded; data is reused by the next attempt.
+			w.removeFiles(ctx, positionFiles)
+			w.removeFiles(ctx, equalityFiles)
+			continue
+		}
+		w.table, w.closed = committed, true
+		coordinated.latest = committed
+		// A successful metadata commit owns all staged files from now on.
+		// Never delete them, including when the local index checkpoint fails.
+		clear(w.paths)
+		if hasFiles && w.indexThread != nil {
+			snapshot := committed.CurrentSnapshot()
+			parent := int64(0)
+			if snapshot.ParentSnapshotID != nil {
+				parent = *snapshot.ParentSnapshotID
+			}
+			if parent == indexBase {
+				if err := w.options.TableIndex.Commit(w.indexThread, &snapshot.SnapshotID); err != nil {
+					return fmt.Errorf("Iceberg committed but local index checkpoint failed: %w", err)
+				}
+			}
+		}
+		w.indexThread.ReleaseObservability()
+		w.indexThread = nil
+		return nil
+	}
+	return fmt.Errorf("Iceberg commit retries exhausted: %w", lastConflict)
+}
+
+// Summary counters are authoritative when present; absent/unknown counters
+// require manifest inspection rather than guessing that the table is clean.
+func nativeMayHaveEqualityDeletes(tbl *table.Table) bool {
+	snapshot := tbl.CurrentSnapshot()
+	if snapshot == nil {
+		return false
+	}
+	if snapshot.Summary != nil {
+		properties := snapshot.Summary.Properties
+		if properties["total-equality-deletes"] == "0" || properties["total-delete-files"] == "0" {
+			return false
+		}
+	}
+	return true
+}
+
+func (w *nativeWriter) migrateEqualityDeletes(ctx context.Context) error {
+	// Called only during initialization, with the coordinator entry locked.
+	state := w.coordinator
+	for attempt := range nativeCommitAttempts {
+		fresh, err := w.currentTable(ctx, state)
+		if err != nil {
+			return err
+		}
+		w.table = fresh
+		if !nativeMayHaveEqualityDeletes(fresh) {
+			return nil
+		}
+		positions, equalityFiles, err := collectNativeEqualityDeletePositions(ctx, fresh)
+		if err != nil {
+			return err
+		}
+		if len(equalityFiles) == 0 {
+			return nil
+		}
+		files, replaced, err := w.writePositionDeletes(ctx, positions, fresh)
+		if err != nil {
+			return err
+		}
+		tx := fresh.NewTransaction()
+		if err := tx.AssertRefSnapshotID(table.MainBranch); err != nil {
+			return err
+		}
+		// iceberg-go's delete-file rewrite API does not allow changing content
+		// kinds. Two staged snapshots in one transaction provide the same atomic
+		// conversion without publishing an equality-free intermediate table.
+		if err := tx.ReplaceFiles(ctx, nil, nil, equalityFiles, nil); err != nil {
+			return err
+		}
+		if len(files) > 0 {
+			if err := tx.NewRowDelta(nil).AddDeletes(files...).RemoveDeletes(replaced...).Commit(ctx); err != nil {
+				return err
+			}
+		}
+		updated, commitErr := tx.Commit(ctx)
+		if commitErr == nil {
+			w.table, state.latest = updated, updated
+			clear(w.paths)
+			return nil
+		}
+		commitErr = nativeCatalogError("migrate Iceberg equality deletes", commitErr)
+		w.logConflict("equality-migration", attempt+1, fresh, commitErr)
+		state.invalidate(!errors.Is(commitErr, table.ErrCommitFailed))
+		if !errors.Is(commitErr, table.ErrCommitFailed) {
+			w.uncertain = true
+			return fmt.Errorf("Iceberg equality migration outcome is unknown: %w", commitErr)
+		}
+		w.removeFiles(ctx, files)
+	}
+	return fmt.Errorf("Iceberg equality migration retries exhausted: %w", table.ErrCommitFailed)
+}
+
+func nativeConflictClass(err error) string {
+	switch {
+	case errors.Is(err, table.ErrConflictingDataFiles):
+		return "concurrent_data"
+	case errors.Is(err, table.ErrConflictingDeleteFiles):
+		return "concurrent_deletes"
+	case errors.Is(err, table.ErrDataFilesMissing):
+		return "referenced_data_missing"
+	case errors.Is(err, table.ErrCommitFailed):
+		return "catalog_compare_and_swap"
+	default:
+		return "commit_state_unknown"
+	}
+}
+
+func (w *nativeWriter) logConflict(operation string, attempt int, tbl *table.Table, err error) {
+	// Never log the raw catalog error: REST errors may embed response bodies,
+	// signed URLs or credentials. The classification and snapshot IDs suffice.
+	logger.Warnf("Thread[%s]: native Iceberg %s attempt=%d base_snapshot=%d classification=%s", w.options.ThreadID, operation, attempt, nativeSnapshotID(tbl), nativeConflictClass(err))
+}
+
+// S3 Tables reserves the --table-s3 bucket suffix and removes unreferenced
+// objects through managed maintenance; its object API does not support DELETE.
+// Only writer-owned, uncommitted files may be handed off to that cleanup.
+func (w *nativeWriter) discardStagedFile(fs iceio.IO, path string) error {
+	if _, ours := w.paths[path]; !ours {
+		return errors.New("refusing to discard a file not staged by this writer")
+	}
+	scheme, object, hasScheme := strings.Cut(path, "://")
+	bucket, _, _ := strings.Cut(object, "/")
+	managed := hasScheme && (scheme == "s3" || scheme == "s3a" || scheme == "s3n") && strings.HasSuffix(bucket, "--table-s3")
+	if !managed {
+		if err := fs.Remove(path); err != nil {
+			return err
+		}
+	}
+	delete(w.paths, path)
+	return nil
+}
+
+func (w *nativeWriter) removeFiles(ctx context.Context, files []apacheiceberg.DataFile) {
+	fs, err := w.table.FS(nativeCatalogContext(ctx, w.cat))
+	if err != nil {
+		return
+	}
+	for _, file := range files {
+		_ = w.discardStagedFile(fs, file.FilePath())
+	}
+}
+
+func (w *nativeWriter) Abort() {
+	w.indexThread.ReleaseObservability()
+	w.indexThread = nil
+	w.closed = true
+	if w.uncertain || len(w.paths) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	fs, err := w.table.FS(nativeCatalogContext(ctx, w.cat))
+	if err != nil {
+		return
+	}
+	for path := range w.paths {
+		_ = w.discardStagedFile(fs, path)
+	}
+}
+
+type nativePartition []any
+
+func (p nativePartition) Size() int              { return len(p) }
+func (p nativePartition) Get(pos int) any        { return p[pos] }
+func (p nativePartition) Set(pos int, value any) { p[pos] = value }
+
+type nativeCountingWriter struct {
+	writer io.Writer
+	size   int64
+}
+
+func (w *nativeCountingWriter) Write(data []byte) (int, error) {
+	n, err := w.writer.Write(data)
+	w.size += int64(n)
+	return n, err
+}
+
+func nativeArrowRecord(schema *apacheiceberg.Schema, rows []map[string]any) (arrow.RecordBatch, error) {
+	arrowSchema, err := table.SchemaToArrowSchema(schema, nil, true, false)
+	if err != nil {
+		return nil, err
+	}
+	builder := array.NewRecordBuilder(memory.DefaultAllocator, arrowSchema)
+	defer builder.Release()
+	builder.Reserve(len(rows))
+	for _, row := range rows {
+		for idx, field := range arrowSchema.Fields() {
+			value := row[field.Name]
+			if value == nil {
+				if !field.Nullable {
+					return nil, fmt.Errorf("required Iceberg column %q is null", field.Name)
+				}
+				builder.Field(idx).AppendNull()
+				continue
+			}
+			if err := appendNativeValue(builder.Field(idx), value); err != nil {
+				return nil, fmt.Errorf("encode Iceberg column %q: %w", field.Name, err)
+			}
+		}
+	}
+	return builder.NewRecordBatch(), nil
+}
+
+func appendNativeValue(builder array.Builder, value any) error {
+	switch b := builder.(type) {
+	case *array.BooleanBuilder:
+		v, err := typeutils.ReformatBool(value)
+		if err != nil {
+			return err
+		}
+		b.Append(v)
+	case *array.Int32Builder:
+		v, err := typeutils.ReformatInt32(value)
+		if err != nil {
+			return err
+		}
+		b.Append(v)
+	case *array.Int64Builder:
+		v, err := typeutils.ReformatInt64(value)
+		if err != nil {
+			return err
+		}
+		b.Append(v)
+	case *array.Float32Builder:
+		v, err := typeutils.ReformatFloat32(value)
+		if err != nil {
+			return err
+		}
+		b.Append(v)
+	case *array.Float64Builder:
+		v, err := typeutils.ReformatFloat64(value)
+		if err != nil {
+			return err
+		}
+		b.Append(v)
+	case *array.TimestampBuilder:
+		v, err := typeutils.ReformatDate(value, true)
+		if err != nil {
+			return err
+		}
+		ts, err := arrow.TimestampFromTime(v, b.Type().(*arrow.TimestampType).Unit)
+		if err != nil {
+			return err
+		}
+		b.Append(ts)
+	case *array.BinaryBuilder:
+		v, err := typeutils.ReformatBytes(value)
+		if err != nil {
+			return err
+		}
+		b.Append(v)
+	case *array.FixedSizeBinaryBuilder:
+		v, err := typeutils.ReformatBytes(value)
+		if err != nil {
+			return err
+		}
+		if len(v) != b.Type().(*arrow.FixedSizeBinaryType).ByteWidth {
+			return fmt.Errorf("fixed binary width mismatch: expected %d bytes, got %d", b.Type().(*arrow.FixedSizeBinaryType).ByteWidth, len(v))
+		}
+		b.Append(v)
+	case *array.StringBuilder:
+		switch v := value.(type) {
+		case map[string]any, []any:
+			encoded, err := json.Marshal(v)
+			if err != nil {
+				return err
+			}
+			b.Append(string(encoded))
+		default:
+			b.Append(utils.ConvertToString(v))
+		}
+	default:
+		return fmt.Errorf("unsupported Iceberg Arrow column type %s", builder.Type())
+	}
+	return nil
+}
+
+// nativePartitionLiteral represents SQL NULL as an invalid optional, not an error.
+func nativePartitionLiteral(field apacheiceberg.NestedField, value any) (apacheiceberg.Optional[apacheiceberg.Literal], error) {
+	if value == nil {
+		return apacheiceberg.Optional[apacheiceberg.Literal]{}, nil
+	}
+	switch field.Type.(type) {
+	case apacheiceberg.BooleanType:
+		v, err := typeutils.ReformatBool(value)
+		if err != nil {
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
+		}
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
+	case apacheiceberg.Int32Type:
+		v, err := typeutils.ReformatInt32(value)
+		if err != nil {
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
+		}
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
+	case apacheiceberg.Int64Type:
+		v, err := typeutils.ReformatInt64(value)
+		if err != nil {
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
+		}
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
+	case apacheiceberg.Float32Type:
+		v, err := typeutils.ReformatFloat32(value)
+		if err != nil {
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
+		}
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
+	case apacheiceberg.Float64Type:
+		v, err := typeutils.ReformatFloat64(value)
+		if err != nil {
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
+		}
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
+	case apacheiceberg.TimestampType, apacheiceberg.TimestampTzType:
+		v, err := typeutils.ReformatDate(value, true)
+		if err != nil {
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
+		}
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(apacheiceberg.Timestamp(v.UnixMicro())), Valid: true}, nil
+	case apacheiceberg.BinaryType, apacheiceberg.FixedType:
+		v, err := typeutils.ReformatBytes(value)
+		if err != nil {
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
+		}
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
+	case apacheiceberg.StringType:
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(utils.ConvertToString(value)), Valid: true}, nil
+	default:
+		return apacheiceberg.Optional[apacheiceberg.Literal]{}, fmt.Errorf("unsupported partition source type %s", field.Type)
+	}
+}
+
+func nativeRecordPartition(schema *apacheiceberg.Schema, spec apacheiceberg.PartitionSpec, row map[string]any) (string, map[int]any, error) {
+	if spec.NumFields() == 0 {
+		return "", nil, nil
+	}
+	partition := make(nativePartition, spec.NumFields())
+	values := make(map[int]any, spec.NumFields())
+	for idx, part := range spec.Fields() {
+		field, ok := schema.FindFieldByID(part.SourceID())
+		if !ok {
+			return "", nil, fmt.Errorf("partition source field ID %d is missing", part.SourceID())
+		}
+		lit, err := nativePartitionLiteral(field, row[field.Name])
+		if err != nil {
+			return "", nil, fmt.Errorf("partition column %q: %w", field.Name, err)
+		}
+		transformed := part.Transform.Apply(lit)
+		if transformed.Valid {
+			partition[idx] = transformed.Val.Any()
+		}
+		values[part.FieldID] = partition[idx]
+	}
+	// Human partition paths intentionally conflate null and the string "null".
+	return fmt.Sprintf("%#v", partition), values, nil
+}
+
+// Files are streamed directly through the catalog's native FileIO. The Parquet
+// footer and the object itself are closed before a RowLocation is made visible.
+func (w *nativeWriter) writeNativeParquet(ctx context.Context, schema *apacheiceberg.Schema, spec apacheiceberg.PartitionSpec, partition map[int]any, batch arrow.RecordBatch, content apacheiceberg.ManifestEntryContent, equalityIDs []int, referenced *string) (_ apacheiceberg.DataFile, err error) {
+	return w.writeNativeParquetStream(ctx, schema, spec, partition, batch.Schema(), func(writer *pqarrow.FileWriter) error { return writer.Write(batch) }, content, equalityIDs, referenced)
+}
+
+// Streaming callers borrow each input batch only for the duration of write.
+// The shared lifecycle always closes the footer and FileIO upload before return.
+func (w *nativeWriter) writeNativeParquetStream(ctx context.Context, schema *apacheiceberg.Schema, spec apacheiceberg.PartitionSpec, partition map[int]any, arrowSchema *arrow.Schema, write func(*pqarrow.FileWriter) error, content apacheiceberg.ManifestEntryContent, equalityIDs []int, referenced *string) (_ apacheiceberg.DataFile, err error) {
+	ctx = nativeCatalogContext(ctx, w.cat)
+	fs, err := w.table.FS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	writeFS, ok := fs.(iceio.WriteFileIO)
+	if !ok {
+		return nil, table.ErrWriteIORequired
+	}
+	provider, err := w.table.LocationProvider()
+	if err != nil {
+		return nil, err
+	}
+	name := uuid.NewString() + ".parquet"
+	if spec.NumFields() > 0 {
+		values := make(nativePartition, spec.NumFields())
+		for idx, field := range spec.Fields() {
+			values[idx] = partition[field.FieldID]
+		}
+		name = spec.PartitionToPath(values, w.table.Schema()) + "/" + name
+	}
+	path := provider.NewDataLocation(name)
+	w.paths[path] = struct{}{}
+	file, err := writeFS.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	counter := &nativeCountingWriter{writer: file}
+	props := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Zstd), parquet.WithCompressionLevel(3), parquet.WithStats(true), parquet.WithMaxRowGroupLength(64*1024), parquet.WithRootName("table"), parquet.WithPageIndexEnabled(true))
+	writer, err := pqarrow.NewFileWriter(arrowSchema, counter, props, pqarrow.DefaultWriterProps())
+	if err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
+	schemaJSON, err := json.Marshal(schema)
+	if err == nil {
+		err = writer.AppendKeyValueMetadata("iceberg.schema", string(schemaJSON))
+	}
+	if err == nil && content == apacheiceberg.EntryContentEqDeletes {
+		err = writer.AppendKeyValueMetadata("delete-type", "equality")
+		if err == nil {
+			ids := make([]string, len(equalityIDs))
+			for idx, id := range equalityIDs {
+				ids[idx] = strconv.Itoa(id)
+			}
+			err = writer.AppendKeyValueMetadata("delete-field-ids", strings.Join(ids, ","))
+		}
+	}
+	if err == nil {
+		err = write(writer)
+	}
+	err = errors.Join(err, writer.Close(), file.Close())
+	if err != nil {
+		return nil, err
+	}
+	metadata, err := writer.FileMetadata()
+	if err != nil {
+		return nil, err
+	}
+	// Delete files project away partition sources, but the metadata builder
+	// still needs their types (notably timestamp/date logical types).
+	metadataSchema := schema
+	if content != apacheiceberg.EntryContentData && spec.NumFields() > 0 {
+		fields := schema.Fields()
+		for _, part := range spec.Fields() {
+			if slices.ContainsFunc(fields, func(field apacheiceberg.NestedField) bool { return field.ID == part.SourceID() }) {
+				continue
+			}
+			for _, tableSchema := range w.table.Schemas() {
+				if source, present := tableSchema.FindFieldByID(part.SourceID()); present {
+					source.Name = fmt.Sprintf("__olake_partition_source_%d", source.ID)
+					fields = append(fields, source)
+					break
+				}
+			}
+		}
+		metadataSchema = apacheiceberg.NewSchema(schema.ID, fields...)
+	}
+	return table.DataFileFromMetadata(table.DataFileArgs{Schema: metadataSchema, Spec: spec, Format: apacheiceberg.ParquetFile, Metadata: metadata, FilePath: path, FileSize: counter.size, Content: content, PartitionValues: partition, Properties: w.table.Properties(), EqualityFieldIDs: equalityIDs, FormatVersion: w.table.Metadata().Version(), ReferencedDataFile: referenced})
+}
+
+func nativeLiveEntries(ctx context.Context, tbl *table.Table) ([]apacheiceberg.ManifestEntry, error) {
+	if tbl.CurrentSnapshot() == nil {
+		return nil, nil
+	}
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	manifests, err := tbl.CurrentSnapshot().Manifests(fs)
+	if err != nil {
+		return nil, err
+	}
+	var entries []apacheiceberg.ManifestEntry
+	for _, manifest := range manifests {
+		for entry, err := range manifest.Entries(fs, true) {
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, entry)
+		}
+	}
+	return entries, nil
+}
+
+// All prior position deletes are folded into a replacement DV, not just its
+// prior vector. This also supports a v2 table upgraded after positional writes.
+func nativeDeletedPositions(ctx context.Context, tbl *table.Table, path string) ([]int64, []apacheiceberg.DataFile, error) {
+	entries, err := nativeLiveEntries(ctx, tbl)
+	if err != nil {
+		return nil, nil, err
+	}
+	bitmaps, replaced, err := nativePriorPositionDeletes(ctx, tbl, entries, map[string][]int64{path: nil})
+	if err != nil {
+		return nil, nil, err
+	}
+	var result []int64
+	if bitmap := bitmaps[path]; bitmap != nil {
+		for position := range bitmap.Positions() {
+			if position > math.MaxInt64 {
+				return nil, nil, errors.New("native delete position exceeds signed row position range")
+			}
+			result = append(result, int64(position))
+		}
+	}
+	return result, replaced[path], nil
+}
+
+func nativePriorPositionDeletes(ctx context.Context, tbl *table.Table, entries []apacheiceberg.ManifestEntry, targets map[string][]int64) (map[string]*dv.RoaringPositionBitmap, map[string][]apacheiceberg.DataFile, error) {
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	bitmaps := make(map[string]*dv.RoaringPositionBitmap)
+	replaced := make(map[string][]apacheiceberg.DataFile)
+	for _, entry := range entries {
+		file := entry.DataFile()
+		if file.ContentType() != apacheiceberg.EntryContentPosDeletes {
+			continue
+		}
+		if ref := file.ReferencedDataFile(); ref != nil {
+			if _, wanted := targets[*ref]; !wanted {
+				continue
+			}
+		}
+		if table.IsDeletionVector(file) {
+			ref := file.ReferencedDataFile()
+			if ref == nil {
+				return nil, nil, errors.New("deletion vector has no referenced data file")
+			}
+			bitmap, err := dv.ReadDV(fs, file)
+			if err != nil {
+				return nil, nil, err
+			}
+			if bitmaps[*ref] == nil {
+				bitmaps[*ref] = dv.NewRoaringPositionBitmap()
+			}
+			bitmaps[*ref].Or(bitmap)
+			replaced[*ref] = append(replaced[*ref], file)
+			continue
+		}
+		rows, err := readNativePositionDeletes(ctx, tbl, file.FilePath())
+		if err != nil {
+			return nil, nil, err
+		}
+		for path, positions := range rows {
+			if _, wanted := targets[path]; !wanted {
+				continue
+			}
+			if bitmaps[path] == nil {
+				bitmaps[path] = dv.NewRoaringPositionBitmap()
+			}
+			for _, position := range positions {
+				if position < 0 {
+					return nil, nil, errors.New("negative position in existing delete file")
+				}
+				bitmaps[path].Set(uint64(position))
+			}
+		}
+	}
+	return bitmaps, replaced, nil
+}
+
+func (w *nativeWriter) writePositionDeletes(ctx context.Context, positions map[string][]int64, tbl *table.Table) ([]apacheiceberg.DataFile, []apacheiceberg.DataFile, error) {
+	if len(positions) == 0 {
+		return nil, nil, nil
+	}
+	entries, err := nativeLiveEntries(ctx, tbl)
+	if err != nil {
+		return nil, nil, err
+	}
+	dataFiles := make(map[string]apacheiceberg.DataFile)
+	for _, entry := range entries {
+		file := entry.DataFile()
+		if file.ContentType() == apacheiceberg.EntryContentData {
+			dataFiles[file.FilePath()] = file
+		}
+	}
+	for _, file := range w.dataFiles {
+		dataFiles[file.FilePath()] = file
+	}
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	writeFS, ok := fs.(iceio.WriteFileIO)
+	if !ok {
+		return nil, nil, table.ErrWriteIORequired
+	}
+	var prior map[string]*dv.RoaringPositionBitmap
+	var oldVectors map[string][]apacheiceberg.DataFile
+	if w.deleteMode == types.UpdateTypeDeletionVector {
+		prior, oldVectors, err = nativePriorPositionDeletes(ctx, tbl, entries, positions)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	var files, replaced []apacheiceberg.DataFile
+	for _, path := range slices.Sorted(maps.Keys(positions)) {
+		file, found := dataFiles[path]
+		if !found {
+			return nil, nil, fmt.Errorf("%w: a positional delete references an unavailable data file", table.ErrDataFilesMissing)
+		}
+		spec := tbl.Metadata().PartitionSpecByID(int(file.SpecID()))
+		if spec == nil {
+			return nil, nil, fmt.Errorf("missing partition spec %d", file.SpecID())
+		}
+		pending := slices.Clone(positions[path])
+		slices.Sort(pending)
+		pending = slices.Compact(pending)
+		if len(pending) == 0 {
+			continue
+		}
+		for _, position := range pending {
+			if position < 0 || position >= file.Count() {
+				return nil, nil, errors.New("positional delete ordinal is outside its data file")
+			}
+		}
+		if w.deleteMode == types.UpdateTypeDeletionVector {
+			vector := dv.NewDVWriter(writeFS, func(id int32) *apacheiceberg.PartitionSpec { return tbl.Metadata().PartitionSpecByID(int(id)) })
+			if err := vector.Add(path, pending, file.SpecID(), file.Partition()); err != nil {
+				return nil, nil, err
+			}
+			vector.Load(path, prior[path], file.SpecID(), file.Partition())
+			provider, err := tbl.LocationProvider()
+			if err != nil {
+				return nil, nil, err
+			}
+			vectorPath := provider.NewMetadataLocation(uuid.NewString() + ".puffin")
+			w.paths[vectorPath] = struct{}{}
+			created, err := vector.Flush(ctx, vectorPath)
+			if err != nil {
+				return nil, nil, err
+			}
+			files = append(files, created...)
+			replaced = append(replaced, oldVectors[path]...)
+		} else {
+			rows := make([]map[string]any, len(pending))
+			for idx, position := range pending {
+				rows[idx] = map[string]any{"file_path": path, "pos": position}
+			}
+			batch, err := nativeArrowRecord(apacheiceberg.PositionalDeleteSchema, rows)
+			if err != nil {
+				return nil, nil, err
+			}
+			created, err := w.writeNativeParquet(ctx, apacheiceberg.PositionalDeleteSchema, *spec, file.Partition(), batch, apacheiceberg.EntryContentPosDeletes, nil, &path)
+			batch.Release()
+			if err != nil {
+				return nil, nil, err
+			}
+			files = append(files, created)
+		}
+	}
+	return files, replaced, nil
+}
+
+// Equality mode has no row index. A changed partition column cannot tell us
+// the old row's partition, so scope the key deletes to every live partition
+// (including historical specs). Files added in this commit have the same data
+// sequence as these deletes and are therefore not equality-deleted.
+func (w *nativeWriter) writeEqualityDeletes(ctx context.Context, tbl *table.Table) ([]apacheiceberg.DataFile, error) {
+	if !w.upsert || w.indexThread != nil || len(w.latest) == 0 {
+		return nil, nil
+	}
+	entries, err := nativeLiveEntries(ctx, tbl)
+	if err != nil {
+		return nil, err
+	}
+	partitions := make(map[string]apacheiceberg.DataFile)
+	for _, entry := range entries {
+		file := entry.DataFile()
+		if file.ContentType() == apacheiceberg.EntryContentData {
+			partitions[fmt.Sprintf("%d:%#v", file.SpecID(), file.Partition())] = file
+		}
+	}
+	if len(partitions) == 0 {
+		return nil, nil
+	}
+	field, ok := tbl.Schema().FindFieldByName(constants.OlakeID)
+	if !ok {
+		return nil, errors.New("Iceberg identifier column missing")
+	}
+	schema := apacheiceberg.NewSchema(tbl.Schema().ID, field)
+	rows := make([]map[string]any, 0, len(w.latest))
+	for _, id := range slices.Sorted(maps.Keys(w.latest)) {
+		rows = append(rows, map[string]any{constants.OlakeID: id})
+	}
+	batch, err := nativeArrowRecord(schema, rows)
+	if err != nil {
+		return nil, err
+	}
+	defer batch.Release()
+	files := make([]apacheiceberg.DataFile, 0, len(partitions))
+	for _, key := range slices.Sorted(maps.Keys(partitions)) {
+		file := partitions[key]
+		spec := tbl.Metadata().PartitionSpecByID(int(file.SpecID()))
+		if spec == nil {
+			return nil, fmt.Errorf("missing equality delete partition spec %d", file.SpecID())
+		}
+		created, err := w.writeNativeParquet(ctx, schema, *spec, file.Partition(), batch, apacheiceberg.EntryContentEqDeletes, []int{field.ID}, nil)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, created)
+	}
+	return files, nil
+}
+
+type Writer interface {
+	Write(ctx context.Context, records []types.RawRecord) error
+	EvolveSchema(ctx context.Context, newSchema map[string]string) error
+	AlterSourceColumns(ctx context.Context, added []*nativeSourceColumn, dropped []string) error
+	schemaMap() map[string]string
+	Close(ctx context.Context, finalMetadataState any) error
+	// Abort discards whatever the writer staged outside Iceberg, for the paths
+	// that give up before Close can commit.
+	Abort()
 }

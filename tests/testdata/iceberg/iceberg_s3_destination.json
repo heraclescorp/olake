@@ -1,7 +1,6 @@
 {
   "type": "ICEBERG",
   "writer": {
-    "arrow_writes": false,
     "aws_access_key": "admin",
     "aws_region": "us-east-1",
     "aws_secret_key": "password",

@@ -30,11 +30,8 @@ func testRebalance(t *testing.T, cfg *integration.TestHandler) {
 		}
 		t.Logf("Enabled normalization and added partition regex in %s", cfg.Catalog())
 
-		// 3. Run the recovery test against the legacy Iceberg writer
-		recoverFn := func(ctx context.Context, t *testing.T, testTable string) error {
-			return rebalanceRecovery(ctx, t, cfg, testTable)
-		}
-		if err := cfg.IcebergWriter(ctx, t, testTable, false, recoverFn); err != nil {
+		// Run recovery against the native Iceberg writer.
+		if err := rebalanceRecovery(ctx, t, cfg, testTable); err != nil {
 			t.Fatalf("Kafka rebalance test failed: %v", err)
 		}
 

@@ -161,13 +161,11 @@ func dvFullTableName(th *TestHandler, table string) string {
 	return fmt.Sprintf("%s.%s.%s", testutils.IcebergCatalog, th.TestConfig.DestinationDB, table)
 }
 
-// dvSync runs one sync against the arrow or legacy destination config, then fails the test
-// immediately on a failed run - every dv scenario is a sequence of these. A scenario's first sync
-// runs without state; every later one resumes it.
-func (th *TestHandler) dvSync(ctx context.Context, t *testing.T, useArrow, useState bool, label string) {
+// dvSync runs one sync against the destination config. The first sync runs
+// without state; every later one resumes it.
+func (th *TestHandler) dvSync(ctx context.Context, t *testing.T, useState bool, label string) {
 	t.Helper()
-	destinationFile := testutils.Ternary(useArrow, icebergArrowDestinationFile, icebergDestinationFile).(string)
-	require.NoError(t, testutils.RunSync(ctx, t, th.TestConfig, destinationFile, useState), "%s sync failed", label)
+	require.NoError(t, testutils.RunSync(ctx, t, th.TestConfig, icebergDestinationFile, useState), "%s sync failed", label)
 }
 
 // dvTableState is the full picture one table's assertions are checked against after a sync.
@@ -318,7 +316,7 @@ func requireLiveRowsEqual(t *testing.T, want map[string]string, got dvTableState
 // server end to end: a table created under this mode should be on format version 3 from the
 // very first sync (never 2, upgraded later), and every delete it produces should show up as a
 // Puffin file, never a Parquet one.
-func (th *TestHandler) testIcebergDVBackfillAndCore(ctx context.Context, t *testing.T, useArrow bool) error {
+func (th *TestHandler) testIcebergDVBackfillAndCore(ctx context.Context, t *testing.T) error {
 	defer testutils.DropIcebergTable(t, DVUnpartTable, th.TestConfig.DestinationDB)
 	defer testutils.DropIcebergTable(t, DVPartTable, th.TestConfig.DestinationDB)
 
@@ -326,7 +324,7 @@ func (th *TestHandler) testIcebergDVBackfillAndCore(ctx context.Context, t *test
 		return err
 	}
 
-	th.dvSync(ctx, t, useArrow, false, "backfill")
+	th.dvSync(ctx, t, false, "backfill")
 
 	spark := getSparkSession(ctx, t)
 	for _, table := range []string{DVUnpartTable, DVPartTable} {
@@ -340,7 +338,7 @@ func (th *TestHandler) testIcebergDVBackfillAndCore(ctx context.Context, t *test
 	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "dv-part-update-id1")
 	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "dv-unpart-delete-id5")
 	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "dv-part-delete-id5")
-	th.dvSync(ctx, t, useArrow, true, "cdc update+delete")
+	th.dvSync(ctx, t, true, "cdc update+delete")
 
 	// A delete does not remove its id from a plain SELECT: the old row is removed via the
 	// delete mechanism, but a new tombstone row recording the delete event stays, carrying
@@ -368,22 +366,22 @@ func (th *TestHandler) testIcebergDVBackfillAndCore(ctx context.Context, t *test
 // but the table's OTHER seed rows sit in different partitions - so this also proves the single
 // shared vector writer used for the whole commit handles more than one partition's data files
 // correctly, not just the one dv_unpart happens to have.
-func (th *TestHandler) testIcebergDVMergeAcrossSyncs(ctx context.Context, t *testing.T, useArrow bool) error {
+func (th *TestHandler) testIcebergDVMergeAcrossSyncs(ctx context.Context, t *testing.T) error {
 	defer testutils.DropIcebergTable(t, DVUnpartTable, th.TestConfig.DestinationDB)
 	defer testutils.DropIcebergTable(t, DVPartTable, th.TestConfig.DestinationDB)
 
 	if err := th.prepareDVSync(ctx, t, "dv"); err != nil {
 		return err
 	}
-	th.dvSync(ctx, t, useArrow, false, "backfill")
+	th.dvSync(ctx, t, false, "backfill")
 
 	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "dv-unpart-delete-id2")
 	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "dv-part-delete-id2")
-	th.dvSync(ctx, t, useArrow, true, "delete id=2")
+	th.dvSync(ctx, t, true, "delete id=2")
 
 	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "dv-unpart-delete-id3")
 	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "dv-part-delete-id3")
-	th.dvSync(ctx, t, useArrow, true, "delete id=3")
+	th.dvSync(ctx, t, true, "delete id=3")
 
 	spark := getSparkSession(ctx, t)
 	// Same tombstone convention as testIcebergDVBackfillAndCore: id=2 and id=3 stay present
@@ -416,20 +414,20 @@ func (th *TestHandler) testIcebergDVMergeAcrossSyncs(ctx context.Context, t *tes
 // happens, rather than the table passing through positional deletes on the way. The row set
 // must come out identical to what it was under eq - a migration that changes what a query
 // returns is a correctness bug regardless of which representation it lands on.
-func (th *TestHandler) testIcebergEqToDVMigration(ctx context.Context, t *testing.T, useArrow bool) error {
+func (th *TestHandler) testIcebergEqToDVMigration(ctx context.Context, t *testing.T) error {
 	defer testutils.DropIcebergTable(t, DVUnpartTable, th.TestConfig.DestinationDB)
 	defer testutils.DropIcebergTable(t, DVPartTable, th.TestConfig.DestinationDB)
 
 	if err := th.prepareDVSync(ctx, t, "eq"); err != nil {
 		return err
 	}
-	th.dvSync(ctx, t, useArrow, false, "eq backfill")
+	th.dvSync(ctx, t, false, "eq backfill")
 
 	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "dv-unpart-update-id1")
 	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "dv-part-update-id1")
 	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "dv-unpart-delete-id5")
 	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "dv-part-delete-id5")
-	th.dvSync(ctx, t, useArrow, true, "eq cdc")
+	th.dvSync(ctx, t, true, "eq cdc")
 
 	spark := getSparkSession(ctx, t)
 	rowsBefore := map[string]dvTableState{}
@@ -445,7 +443,7 @@ func (th *TestHandler) testIcebergEqToDVMigration(ctx context.Context, t *testin
 	}
 	// Nothing changes on the source between eq and dv - the migration alone is what this
 	// sync exercises, triggered purely by the update_type flip.
-	th.dvSync(ctx, t, useArrow, true, "migrate eq to dv")
+	th.dvSync(ctx, t, true, "migrate eq to dv")
 
 	for _, table := range []string{DVUnpartTable, DVPartTable} {
 		full := dvFullTableName(th, table)
@@ -459,7 +457,7 @@ func (th *TestHandler) testIcebergEqToDVMigration(ctx context.Context, t *testin
 	// from the start - re-run the merge-across-syncs style check once more.
 	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "dv-unpart-delete-id2")
 	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "dv-part-delete-id2")
-	th.dvSync(ctx, t, useArrow, true, "post-migration delete")
+	th.dvSync(ctx, t, true, "post-migration delete")
 	for _, table := range []string{DVUnpartTable, DVPartTable} {
 		state := dvState(ctx, t, spark, dvFullTableName(th, table))
 		require.Equal(t, int64(0), state.parquetPosFiles, "%s: post-migration deletes must still be vectors, not Parquet", table)
@@ -467,24 +465,8 @@ func (th *TestHandler) testIcebergEqToDVMigration(ctx context.Context, t *testin
 	return nil
 }
 
-// TestIcebergDV runs the deletion-vector suite. Every sync in every scenario is a real docker
-// container launch (source + destination + Spark), so the scenario count here is deliberately
-// kept to what actually needs its own run - each one is minutes, not seconds, and this suite
-// runs inside the same per-driver job budget as everything else in the mysql package.
-//
-// All three remaining scenarios run under BOTH writers, because that is the whole point of each:
-// they are checking the rows writer and the arrow writer produce the same Iceberg state, or (for
-// migration) that CDC syncs on either writer behave the same before and after the mode switch.
-//
-// Two prior scenarios were cut for cost rather than kept "for completeness": an append-mode
-// check and an eq/pos-rejection check, both real behavior but both writer-independent (append
-// mode never writes a delete file regardless of writer; the eq/pos rejection is enforced
-// server-side at handshake, before any writer is chosen) and both fully covered in spirit by
-// unit-level or Iceberg-bytecode verification already recorded, so
-// spending real container-launch time on them here wasn't worth it. A prior arrow-only
-// rolled-file scenario was cut earlier for the same reason: at a size that fits inside an
-// integration test's time budget, it never actually reached the writer's real file-roll
-// threshold, so it exercised nothing beyond what backfill/core already covers.
+// TestIcebergDV exercises backfill, vector replacement, and equality-delete migration
+// through real source, destination, and Spark containers.
 func (th *TestHandler) TestIcebergDV(t *testing.T) {
 	ctx := t.Context()
 	if !hasIcebergDVTest(th.Driver) {
@@ -492,25 +474,13 @@ func (th *TestHandler) TestIcebergDV(t *testing.T) {
 	}
 	require.NoError(t, th.IsolateDestinationDB(), "failed to give the deletion-vector suite its own destination namespace")
 
-	writerTypes := []struct {
-		name     string
-		useArrow bool
-	}{
-		{"Legacy", false},
-		{"Arrow", true},
-	}
-
-	for _, wt := range writerTypes {
-		t.Run(wt.name, func(t *testing.T) {
-			t.Run("Backfill and core", func(t *testing.T) {
-				require.NoError(t, th.testIcebergDVBackfillAndCore(ctx, t, wt.useArrow))
-			})
-			t.Run("Merge across syncs", func(t *testing.T) {
-				require.NoError(t, th.testIcebergDVMergeAcrossSyncs(ctx, t, wt.useArrow))
-			})
-			t.Run("Eq to DV migration", func(t *testing.T) {
-				require.NoError(t, th.testIcebergEqToDVMigration(ctx, t, wt.useArrow))
-			})
-		})
-	}
+	t.Run("Backfill and core", func(t *testing.T) {
+		require.NoError(t, th.testIcebergDVBackfillAndCore(ctx, t))
+	})
+	t.Run("Merge across syncs", func(t *testing.T) {
+		require.NoError(t, th.testIcebergDVMergeAcrossSyncs(ctx, t))
+	})
+	t.Run("Eq to DV migration", func(t *testing.T) {
+		require.NoError(t, th.testIcebergEqToDVMigration(ctx, t))
+	})
 }

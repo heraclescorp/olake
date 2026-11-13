@@ -600,8 +600,7 @@ const IcebergUISchema = `{
       { "glue_additional_config": 24 },
       { "glue_catalog_id": 12, "glue_endpoint": 12},
 	    { "glue_access_key": 12, "glue_secret_key": 12 }, 
-      { "glue_region": 12 },
-      { "arrow_writes": 24 }
+      { "glue_region": 12 }
     ],
     "gcp_service_account_json": {
       "ui:widget": "textarea",
@@ -622,9 +621,6 @@ const IcebergUISchema = `{
       "ui:widget": "boolean"
     },
     "s3_path_style": {
-      "ui:widget": "boolean"
-    },
-    "arrow_writes": {
       "ui:widget": "boolean"
     },
     "glue_additional_config": {

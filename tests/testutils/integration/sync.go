@@ -10,30 +10,27 @@ import (
 	"github.com/datazip-inc/olake/tests/testutils/constants"
 )
 
-// TestSync runs the happy-path sync suite: full load, CDC and incremental, over both Iceberg writers
-// and Parquet. It seeds its catalog from the committed catalog templates instead of discovering one, the way the
-// 2PC and rebalance suites do -- TestDiscover already proves the two are identical.
+// TestSync exercises full load, CDC and incremental over native Iceberg and Parquet.
 func (th *TestHandler) TestSync(t *testing.T) {
 	ctx := t.Context()
 	testTable := th.GetTableName()
 
 	th.TestCommonSync(t)
 
-	// Iceberg row-index / delete-mode tests run on the base (legacy) writer config, the one
-	// the java writer's table indexer serves; IcebergWriter pins it back after the arrow runs.
+	// Row-index and delete-mode scenarios exercise the native writer.
 	if !slices.Contains(constants.SkipCDCDrivers, constants.DriverType(th.Driver)) && hasIcebergTableIndexTest(th.Driver) {
 		t.Run("Iceberg Table Index Eq to Pos Conversion", func(t *testing.T) {
-			if err := th.IcebergWriter(ctx, t, testTable, false, th.testIcebergEqToPosConversion); err != nil {
+			if err := th.testIcebergEqToPosConversion(ctx, t, testTable); err != nil {
 				t.Fatalf("Iceberg Table Index Eq to Pos Conversion test failed: %v", err)
 			}
 		})
 		t.Run("Iceberg Table Index Clean Table Positional", func(t *testing.T) {
-			if err := th.IcebergWriter(ctx, t, testTable, false, th.testIcebergCleanTablePositionalWithPebbleIndex); err != nil {
+			if err := th.testIcebergCleanTablePositionalWithPebbleIndex(ctx, t, testTable); err != nil {
 				t.Fatalf("Iceberg Table Index Clean Table Positional test failed: %v", err)
 			}
 		})
 		t.Run("Iceberg Table Index Rebuild Index From Scratch", func(t *testing.T) {
-			if err := th.IcebergWriter(ctx, t, testTable, false, th.testIcebergRebuildIndexFromScratch); err != nil {
+			if err := th.testIcebergRebuildIndexFromScratch(ctx, t, testTable); err != nil {
 				t.Fatalf("Iceberg Table Index Rebuild Index From Scratch test failed: %v", err)
 			}
 		})
@@ -65,7 +62,7 @@ func (th *TestHandler) TestSync(t *testing.T) {
 }
 
 // TestCommonSync is the boilerplate every sync suite runs: seed the source, point the catalog at
-// the handler's settings, then full load, CDC and incremental over both Iceberg writers and Parquet.
+// the handler's settings, then full load, CDC and incremental over Iceberg and Parquet.
 // It leaves the source table in place: dropping it afterwards is the caller's job, as TestSync does.
 func (th *TestHandler) TestCommonSync(t *testing.T) {
 	ctx := t.Context()
@@ -83,23 +80,13 @@ func (th *TestHandler) TestCommonSync(t *testing.T) {
 	th.resetCatalog(t)
 	t.Logf("Enabled normalization and added partition regex in %s", th.Catalog())
 
-	writerTypes := []struct {
-		name     string
-		useArrow bool
-	}{
-		{"Legacy", false},
-		{"Arrow", true},
-	}
-
 	// Skip cdc tests for drivers not supporting cdc mode
 	if !slices.Contains(constants.SkipCDCDrivers, constants.DriverType(th.Driver)) {
-		for _, wt := range writerTypes {
-			t.Run(fmt.Sprintf("Iceberg (%s) Full load + CDC tests", wt.name), func(t *testing.T) {
-				if err := th.IcebergWriter(ctx, t, testTable, wt.useArrow, th.IcebergFullLoadAndCDC); err != nil {
-					t.Fatalf("Iceberg (%s) Full load + CDC tests failed: %v", wt.name, err)
-				}
-			})
-		}
+		t.Run("Native Iceberg Full load + CDC tests", func(t *testing.T) {
+			if err := th.IcebergFullLoadAndCDC(ctx, t, testTable); err != nil {
+				t.Fatalf("Iceberg Full load + CDC tests failed: %v", err)
+			}
+		})
 
 		t.Run("Parquet Full load + CDC tests", func(t *testing.T) {
 			if err := th.ParquetFullLoadAndCDC(ctx, t, testTable); err != nil {
@@ -110,13 +97,11 @@ func (th *TestHandler) TestCommonSync(t *testing.T) {
 
 	// Skip incremental tests for drivers not supporting incremental mode
 	if th.Driver != string(constants.Kafka) {
-		for _, wt := range writerTypes {
-			t.Run(fmt.Sprintf("Iceberg (%s) Full load + Incremental tests", wt.name), func(t *testing.T) {
-				if err := th.IcebergWriter(ctx, t, testTable, wt.useArrow, th.IcebergFullLoadAndIncremental); err != nil {
-					t.Fatalf("Iceberg (%s) Full load + Incremental tests failed: %v", wt.name, err)
-				}
-			})
-		}
+		t.Run("Native Iceberg Full load + Incremental tests", func(t *testing.T) {
+			if err := th.IcebergFullLoadAndIncremental(ctx, t, testTable); err != nil {
+				t.Fatalf("Iceberg Full load + Incremental tests failed: %v", err)
+			}
+		})
 
 		t.Run("Parquet Full load + Incremental tests", func(t *testing.T) {
 			if err := th.ParquetFullLoadAndIncremental(ctx, t, testTable); err != nil {

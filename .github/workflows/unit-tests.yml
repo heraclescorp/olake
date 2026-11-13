@@ -12,7 +12,8 @@ permissions:
 jobs:
   unit-tests:
     name: Run Unit Tests
-    runs-on: ubuntu-latest
+    # IBM's clidriver requires libxml2.so.2, matching the Ubuntu 24.04 runtime image.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -25,8 +26,26 @@ jobs:
         with:
           save: "true"
 
+      - name: Install DB2 runtime library
+        run: sudo apt-get install -y libxml2
+
       - name: Run All Unit Tests
-        run: make test.unit
+        run: |
+          set +e
+          make test.unit 2>&1 | tee "$RUNNER_TEMP/unit-tests.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            python3 - "$RUNNER_TEMP/unit-tests.log" <<'PY'
+          import pathlib, re, sys
+          lines = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          anchors = [index for index, line in enumerate(lines) if re.search(r"--- FAIL:|^FAIL(?:\s|$)|panic:|fatal error:|error while loading|symbol lookup", line, re.IGNORECASE)]
+          for number, index in enumerate(anchors):
+              message = "\n".join(lines[max(0, index - 8):min(len(lines), index + 9)])[-3800:]
+              message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title=Unit test failure {number + 1}::{message}")
+          PY
+          fi
+          exit "$status"
 
       - name: Upload coverage to Codecov
         if: github.event_name == 'push'
@@ -34,20 +53,3 @@ jobs:
         with:
           files: coverage.out
           token: ${{ secrets.CODECOV_TOKEN }}
-
-  java-unit-tests:
-    name: Run Java Unit Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up JDK
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: "17"
-          cache: maven
-
-      - name: Run Java Unit Tests
-        working-directory: destination/iceberg/olake-iceberg-java-writer
-        run: mvn -B --no-transfer-progress test
