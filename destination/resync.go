@@ -10,6 +10,7 @@ import (
 	"github.com/datazip-inc/olake/pkg/indexdb"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/logger"
 )
 
 const ResyncMaxDuration = 12 * time.Hour
@@ -65,6 +66,9 @@ func (w *WriterPool) PrepareResync(ctx context.Context, stream types.StreamInter
 			return nil, errors.Join(err, w.resync.AbortResync(cleanupCtx))
 		}
 	}
+	w.resyncTargetID = stream.ID()
+	w.resyncOperationID = operationID
+	w.resyncContext = ctx
 	return nil, nil
 }
 
@@ -102,11 +106,21 @@ func (w *WriterPool) ResyncReceipt() (string, int64) {
 // FinishResync reports cleanup failures before the CLI emits a success receipt.
 func (w *WriterPool) FinishResync(ctx context.Context) error {
 	var cleanupErr error
-	w.writerSchema.Range(func(_, value any) bool {
+	w.writerSchema.Range(func(key, value any) bool {
 		artifact := value.(*writerSchema)
 		artifact.mu.Lock()
 		defer artifact.mu.Unlock()
 		if artifact.streamIndex != nil {
+			if key == w.resyncTargetID && w.resyncContext != nil && w.ResyncPublished() {
+				tableUUID, snapshotID := w.ResyncReceipt()
+				if err := utils.CheckExecutionFence(w.resyncContext); err == nil {
+					if err := indexdb.PromoteAttempt(artifact.streamIndex, w.resyncOperationID, tableUUID, snapshotID); err != nil {
+						logger.Warnf("resync index promotion unavailable for stream[%v]; next sync will reconcile the index: %s", key, err)
+					}
+				} else {
+					logger.Warnf("resync index promotion skipped for stream[%v] because runtime authority is unavailable: %s", key, err)
+				}
+			}
 			cleanupErr = errors.Join(cleanupErr, artifact.streamIndex.Close())
 			artifact.streamIndex = nil
 		}

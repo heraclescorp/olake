@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -61,19 +62,49 @@ func DefaultOptions() StoreOptions {
 func Open(stream types.StreamInterface) (types.StreamIndex, error) {
 	opts := DefaultOptions()
 	dir := indexDir(opts.Dir, stream)
-	index, err := openIndex(dir, opts)
-	if index != nil {
-		index.table = fmt.Sprintf("%s.%s", stream.GetDestinationDatabase(nil), stream.GetDestinationTable())
+	lock, err := lockCanonical(dir)
+	if err != nil {
+		return nil, err
 	}
-	return index, err
+	if err := recoverPromotion(dir, opts); err != nil {
+		return nil, errors.Join(err, lock.Close())
+	}
+	index, err := openIndex(dir, opts)
+	if err != nil {
+		return nil, errors.Join(err, lock.Close())
+	}
+	if err := syncDirectory(filepath.Dir(dir)); err != nil {
+		return nil, errors.Join(err, index.Close(), lock.Close())
+	}
+	index.lock = lock
+	index.table = fmt.Sprintf("%s.%s", stream.GetDestinationDatabase(nil), stream.GetDestinationTable())
+	return index, nil
 }
 
 // Drop removes the on-disk index directory for streamID.
 func Drop(stream types.StreamInterface) error {
 	opts := DefaultOptions()
 	dir := indexDir(opts.Dir, stream)
+	lock, err := lockCanonical(dir)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := recoverPromotion(dir, opts); err != nil {
+		return err
+	}
+	indexLock, err := lockIndexDirectory(dir)
+	if err != nil {
+		return err
+	}
+	if indexLock != nil {
+		defer indexLock.Close()
+	}
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("failed to remove stream index for stream[%s]: %w", stream.ID(), err)
+	}
+	if err := syncDirectory(filepath.Dir(dir)); err != nil {
+		return err
 	}
 	return nil
 }
@@ -111,6 +142,7 @@ type pebbleIndex struct {
 	dir   string
 	table string
 	db    *pebble.DB
+	lock  io.Closer
 
 	fileMu     sync.RWMutex
 	pathToID   map[string]uint64
@@ -119,6 +151,10 @@ type pebbleIndex struct {
 }
 
 func openIndex(dir string, opts StoreOptions) (*pebbleIndex, error) {
+	return openIndexWithLock(dir, opts, nil)
+}
+
+func openIndexWithLock(dir string, opts StoreOptions, lock *pebble.Lock) (*pebbleIndex, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create stream index directory %s: %s", dir, err)
 	}
@@ -126,6 +162,7 @@ func openIndex(dir string, opts StoreOptions) (*pebbleIndex, error) {
 	pebbleOpts := &pebble.Options{
 		MemTableSize:               opts.MemTableSize,
 		MaxOpenFiles:               opts.MaxOpenFiles,
+		Lock:                       lock,
 		Logger:                     pebbleLogger{},
 		CompactionConcurrencyRange: func() (int, int) { return 1, maxCompactions },
 	}
@@ -452,8 +489,13 @@ func (i *pebbleIndex) truncateGeneration(generation string) error {
 }
 
 func (i *pebbleIndex) Close() error {
-	if err := i.db.Close(); err != nil {
-		return fmt.Errorf("failed to close stream index %s: %s", i.dir, err)
+	err := i.db.Close()
+	if i.lock != nil {
+		err = errors.Join(err, i.lock.Close())
+		i.lock = nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to close stream index %s: %w", i.dir, err)
 	}
 	return nil
 }

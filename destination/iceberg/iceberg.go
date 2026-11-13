@@ -688,7 +688,7 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 	// Reconcile and return recovery from the loaded metadata, or from the
 	// successful format/migration commit that replaced it. A no-op
 	// initialization must not issue another catalog GET.
-	if err := indexdb.ReconcileGeneration(options.TableIndex, w.table.Properties()[resyncGenerationProperty]); err != nil {
+	if err := indexdb.ReconcileTable(options.TableIndex, w.table.Properties()[resyncGenerationProperty], w.table.Metadata().TableUUID().String()); err != nil {
 		return nil, nil, fmt.Errorf("reconcile stream index generation: %w", err)
 	}
 	if err := reconcileNativeTableIndex(ctx, options.TableIndex, w.table, constants.OlakeID); err != nil {

@@ -45,12 +45,15 @@ type (
 	}
 
 	WriterPool struct {
-		stats        *Stats
-		initWriter   initWriter
-		shutdown     func(ctx context.Context)
-		writerSchema sync.Map
-		batchSize    int64
-		resync       resyncDestination
+		stats             *Stats
+		initWriter        initWriter
+		shutdown          func(ctx context.Context)
+		writerSchema      sync.Map
+		batchSize         int64
+		resync            resyncDestination
+		resyncTargetID    string
+		resyncOperationID string
+		resyncContext     context.Context
 	}
 
 	// writer thread used by reader
