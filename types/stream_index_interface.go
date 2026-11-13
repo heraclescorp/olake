@@ -16,7 +16,9 @@ type RowLocation struct {
 type StreamIndex interface {
 	// lookup for keys in index store
 	Lookup(key string) (loc RowLocation, found bool, err error)
-	// commit changes to index store
+	// RangeFiles visits a consistent snapshot of mappings to paths. Callbacks may Commit.
+	RangeFiles(paths map[string]struct{}, fn func(key string, loc RowLocation) error) error
+	// Commit atomically applies pending puts, deletes, and the optional snapshot checkpoint.
 	Commit(batch *StreamIndexThread, snapshotID *int64) error
 	// LastCommittedSnapshot returns the last committed snapshot ID
 	LastCommittedSnapshot() (snapshotID int64, err error)
@@ -34,6 +36,7 @@ type streamIndexChange struct {
 type StreamIndexThread struct {
 	index           StreamIndex
 	changes         map[string]streamIndexChange
+	deletes         map[string]struct{}
 	metricsContext  context.Context
 	metricsEntries  int64
 	metricsBytes    int64
@@ -56,8 +59,12 @@ func (b *StreamIndexThread) Put(key string, loc RowLocation) {
 	if b.metricsContext != nil {
 		previous, exists := b.changes[key]
 		if !exists {
-			b.metricsEntries++
-			b.metricsBytes += int64(len(key) + 48)
+			if _, deleted := b.deletes[key]; deleted {
+				b.metricsBytes += 32
+			} else {
+				b.metricsEntries++
+				b.metricsBytes += int64(len(key) + 48)
+			}
 		} else {
 			b.metricsBytes -= int64(len(previous.loc.FilePath))
 		}
@@ -67,7 +74,31 @@ func (b *StreamIndexThread) Put(key string, loc RowLocation) {
 			b.reportPendingIndex()
 		}
 	}
+	if b.deletes != nil {
+		delete(b.deletes, key)
+	}
 	b.changes[key] = streamIndexChange{loc: loc}
+}
+
+// Delete records key as absent once this batch is applied, replacing any pending put.
+func (b *StreamIndexThread) Delete(key string) {
+	if b.metricsContext != nil {
+		if previous, exists := b.changes[key]; exists {
+			b.metricsBytes -= int64(len(previous.loc.FilePath) + 32)
+		} else if _, deleted := b.deletes[key]; !deleted {
+			b.metricsEntries++
+			b.metricsBytes += int64(len(key) + 16)
+		}
+		b.metricUpdates++
+		if b.metricUpdates%1024 == 0 {
+			b.reportPendingIndex()
+		}
+	}
+	delete(b.changes, key)
+	if b.deletes == nil {
+		b.deletes = make(map[string]struct{})
+	}
+	b.deletes[key] = struct{}{}
 }
 
 // Lookup resolves key against this batch's pending changes first, so a row
@@ -77,16 +108,29 @@ func (b *StreamIndexThread) Lookup(key string) (RowLocation, bool, error) {
 	if change, pending := b.changes[key]; pending {
 		return change.loc, true, nil
 	}
+	if _, deleted := b.deletes[key]; deleted {
+		return RowLocation{}, false, nil
+	}
 	if b.index == nil {
 		return RowLocation{}, false, nil
 	}
 	return b.index.Lookup(key)
 }
 
-// Range hands every pending change to fn, stopping at the first error.
+// Range hands every pending put to fn, stopping at the first error.
 func (b *StreamIndexThread) Range(fn func(key string, loc RowLocation) error) error {
 	for key, change := range b.changes {
 		if err := fn(key, change.loc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RangeDeletes hands every pending deletion key to fn, stopping at the first error.
+func (b *StreamIndexThread) RangeDeletes(fn func(string) error) error {
+	for key := range b.deletes {
+		if err := fn(key); err != nil {
 			return err
 		}
 	}

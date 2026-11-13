@@ -1571,12 +1571,34 @@ func (i *nativeMemoryIndex) Lookup(key string) (types.RowLocation, bool, error) 
 	loc, ok := i.rows[key]
 	return loc, ok, nil
 }
+func (i *nativeMemoryIndex) RangeFiles(paths map[string]struct{}, fn func(string, types.RowLocation) error) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	rows := make(map[string]types.RowLocation)
+	for key, loc := range i.rows {
+		if _, matches := paths[loc.FilePath]; matches {
+			rows[key] = loc
+		}
+	}
+	for key, loc := range rows {
+		if err := fn(key, loc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 func (i *nativeMemoryIndex) Commit(batch *types.StreamIndexThread, snapshot *int64) error {
 	if i.commitErr != nil {
 		return i.commitErr
 	}
-	if err := batch.Range(func(key string, loc types.RowLocation) error { i.rows[key] = loc; return nil }); err != nil {
-		return err
+	if batch != nil {
+		if err := batch.RangeDeletes(func(key string) error { delete(i.rows, key); return nil }); err != nil {
+			return err
+		}
+		if err := batch.Range(func(key string, loc types.RowLocation) error { i.rows[key] = loc; return nil }); err != nil {
+			return err
+		}
 	}
 	if snapshot != nil {
 		i.snapshot = *snapshot

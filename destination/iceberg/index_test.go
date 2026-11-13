@@ -97,6 +97,40 @@ func openNativeTestIndex(t *testing.T) types.StreamIndex {
 	return index
 }
 
+// Write bounded Arrow batches so large invalidation fixtures do not construct
+// a second, JSON-encoded copy of every key or tiny table-configured row groups.
+func writeNativeIndexData(t *testing.T, tbl *table.Table, path string, count int, key func(int) string) apacheiceberg.DataFile {
+	t.Helper()
+	schema, err := table.SchemaToArrowSchema(tbl.Schema(), nil, true, false)
+	require.NoError(t, err)
+	output, err := os.Create(path)
+	require.NoError(t, err)
+	writer, err := pqarrow.NewFileWriter(schema, output, parquet.NewWriterProperties(), pqarrow.DefaultWriterProps())
+	require.NoError(t, err)
+	builder := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer builder.Release()
+	for start := 0; start < count; start += 8192 {
+		end := min(start+8192, count)
+		builder.Reserve(end - start)
+		for row := start; row < end; row++ {
+			id := key(row)
+			builder.Field(0).(*array.StringBuilder).Append(id)
+			builder.Field(1).(*array.StringBuilder).Append("value-" + id)
+			builder.Field(2).(*array.StringBuilder).Append("u")
+		}
+		record := builder.NewRecordBatch()
+		err := writer.Write(record)
+		record.Release()
+		require.NoError(t, err)
+	}
+	require.NoError(t, writer.Close())
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	file, err := apacheiceberg.NewDataFileBuilder(*apacheiceberg.UnpartitionedSpec, apacheiceberg.EntryContentData, path, apacheiceberg.ParquetFile, nil, nil, nil, int64(count), info.Size())
+	require.NoError(t, err)
+	return file.Build()
+}
+
 func writeNativeIndexDelete(t *testing.T, projection *apacheiceberg.Schema, rows string, equality bool, count int64) apacheiceberg.DataFile {
 	t.Helper()
 	schema, err := table.SchemaToArrowSchema(projection, nil, true, false)
@@ -143,6 +177,375 @@ func commitNativeIndexDeletes(t *testing.T, tbl *table.Table, files ...apacheice
 	return tbl
 }
 
+// Only data files explicitly denied by the test are blocked. Metadata,
+// manifests, and delete files still use the real filesystem.
+type nativeIndexReadScopeIO struct {
+	iceio.IO
+	denied map[string]bool
+	mu     sync.Mutex
+	opens  map[string]int
+}
+
+func (fs *nativeIndexReadScopeIO) Open(name string) (iceio.File, error) {
+	fs.mu.Lock()
+	if fs.opens != nil {
+		fs.opens[name]++
+	}
+	fs.mu.Unlock()
+	if fs.denied[name] {
+		return nil, fmt.Errorf("untouched data file must not be read: %s", name)
+	}
+	return fs.IO.Open(name)
+}
+
+func nativeIndexWithReadScope(tbl *table.Table, denied ...string) *table.Table {
+	fs := &nativeIndexReadScopeIO{IO: iceio.LocalFS{}, denied: make(map[string]bool, len(denied))}
+	for _, path := range denied {
+		fs.denied[path] = true
+	}
+	return table.New(tbl.Identifier(), tbl.Metadata(), tbl.MetadataLocation(), func(context.Context) (iceio.IO, error) { return fs, nil }, nil)
+}
+
+func requireNativeIndexMappings(t *testing.T, index types.StreamIndex, tbl *table.Table, expected map[string]types.RowLocation, absent ...string) {
+	t.Helper()
+	for key, want := range expected {
+		got, found, err := index.Lookup(key)
+		require.NoError(t, err)
+		require.True(t, found, key)
+		require.Equal(t, want, got, key)
+		rows, err := readNativeRows(context.Background(), tbl, got.FilePath, []int64{got.Position}, []string{constants.OlakeID})
+		require.NoError(t, err)
+		require.Equal(t, key, rows[got.Position][constants.OlakeID])
+	}
+	for _, key := range absent {
+		_, found, err := index.Lookup(key)
+		require.NoError(t, err)
+		require.False(t, found, key)
+	}
+	checkpoint, err := index.LastCommittedSnapshot()
+	require.NoError(t, err)
+	require.Equal(t, tbl.CurrentSnapshot().SnapshotID, checkpoint)
+}
+
+func requireNativeVisibleIDs(t *testing.T, tbl *table.Table, expected ...string) {
+	t.Helper()
+	scan := tbl.Scan()
+	defer scan.Close()
+	schema, records, err := scan.ToArrowRecords(context.Background())
+	require.NoError(t, err)
+	fields := schema.FieldIndices(constants.OlakeID)
+	require.Len(t, fields, 1)
+	var actual []string
+	for record, err := range records {
+		require.NoError(t, err)
+		ids := record.Column(fields[0]).(*array.String)
+		for row := range ids.Len() {
+			actual = append(actual, ids.Value(row))
+		}
+		record.Release()
+	}
+	require.ElementsMatch(t, expected, actual)
+}
+
+func TestNativeIndexReplacementSkipsUntouchedFiles(t *testing.T) {
+	ctx := context.Background()
+	untouchedIDs := make([]string, 256)
+	for row := range untouchedIDs {
+		untouchedIDs[row] = fmt.Sprintf("untouched-%d", row)
+	}
+	tbl := appendNativeIndexRows(t, nativeIndexTestTable(t, 2), nativeIndexRows(untouchedIDs...))
+	tbl = appendNativeIndexRows(t, tbl, nativeIndexRows("replace", "tail"))
+	index := openNativeTestIndex(t)
+	require.NoError(t, reconcileNativeTableIndex(ctx, index, tbl, constants.OlakeID))
+	untouched, found, err := index.Lookup(untouchedIDs[0])
+	require.NoError(t, err)
+	require.True(t, found)
+	previous, found, err := index.Lookup("replace")
+	require.NoError(t, err)
+	require.True(t, found)
+	files, err := planNativeIndexFiles(ctx, tbl, tbl.CurrentSnapshot().SnapshotID)
+	require.NoError(t, err)
+	var removed apacheiceberg.DataFile
+	for _, task := range files {
+		if task.File.FilePath() == previous.FilePath {
+			removed = task.File
+		}
+	}
+	require.NotNil(t, removed)
+	replacement := appendNativeIndexRows(t, nativeIndexTestTable(t, 2), nativeIndexRows("tail", "replace"))
+	added, err := planNativeIndexFiles(ctx, replacement, replacement.CurrentSnapshot().SnapshotID)
+	require.NoError(t, err)
+	require.Len(t, added, 1)
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.ReplaceFiles(ctx, []apacheiceberg.DataFile{removed}, []apacheiceberg.DataFile{added[0].File}, nil, nil))
+	tbl, err = tx.Commit(ctx)
+	require.NoError(t, err)
+	require.NoError(t, reconcileNativeTableIndex(ctx, index, nativeIndexWithReadScope(tbl, untouched.FilePath, removed.FilePath()), constants.OlakeID))
+	expected := map[string]types.RowLocation{
+		"tail":    {FilePath: added[0].File.FilePath(), Position: 0},
+		"replace": {FilePath: added[0].File.FilePath(), Position: 1},
+	}
+	for row, key := range untouchedIDs {
+		expected[key] = types.RowLocation{FilePath: untouched.FilePath, Position: int64(row)}
+	}
+	requireNativeIndexMappings(t, index, tbl, expected)
+	requireNativeVisibleIDs(t, tbl, append(untouchedIDs, "tail", "replace")...)
+}
+
+func TestNativeIndexChangedDeletesSkipUntouchedNewerMappings(t *testing.T) {
+	for _, version := range []int{2, 3} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			ctx := context.Background()
+			tbl := appendNativeIndexRows(t, nativeIndexTestTable(t, version), nativeIndexRows("duplicate", "removed", "other", "tail"))
+			files, err := planNativeIndexFiles(ctx, tbl, tbl.CurrentSnapshot().SnapshotID)
+			require.NoError(t, err)
+			require.Len(t, files, 1)
+			affected := files[0].File.FilePath()
+			tbl = appendNativeIndexRows(t, tbl, nativeIndexRows("duplicate", "removed", "other", "untouched"))
+			index := openNativeTestIndex(t)
+			require.NoError(t, reconcileNativeTableIndex(ctx, index, tbl, constants.OlakeID))
+			newer, found, err := index.Lookup("duplicate")
+			require.NoError(t, err)
+			require.True(t, found)
+			expected := map[string]types.RowLocation{"tail": {FilePath: affected, Position: 3}}
+			for position, key := range []string{"duplicate", "removed", "other", "untouched"} {
+				expected[key] = types.RowLocation{FilePath: newer.FilePath, Position: int64(position)}
+			}
+			var previousDeletes []apacheiceberg.DataFile
+			for step := 1; step <= 2; step++ {
+				var deletes []apacheiceberg.DataFile
+				if version == 3 {
+					writer := dv.NewDVWriter(iceio.LocalFS{}, func(int32) *apacheiceberg.PartitionSpec { return apacheiceberg.UnpartitionedSpec })
+					positions := []int64{1}
+					if step == 2 {
+						positions = append(positions, 2)
+					}
+					require.NoError(t, writer.Add(affected, positions, 0, nil))
+					deletes, err = writer.Flush(ctx, filepath.Join(t.TempDir(), "changed.puffin"))
+					require.NoError(t, err)
+				} else {
+					deletes = []apacheiceberg.DataFile{writeNativeIndexDelete(t, apacheiceberg.PositionalDeleteSchema, fmt.Sprintf(`[{"file_path":%q,"pos":%d}]`, affected, step), false, 1)}
+				}
+				tx := tbl.NewTransaction()
+				delta := tx.NewRowDelta(nil).AddDeletes(deletes...)
+				if version == 3 {
+					delta.RemoveDeletes(previousDeletes...)
+				}
+				require.NoError(t, delta.Commit(ctx))
+				tbl, err = tx.Commit(ctx)
+				require.NoError(t, err)
+				previousDeletes = deletes
+				require.NoError(t, reconcileNativeTableIndex(ctx, index, nativeIndexWithReadScope(tbl, newer.FilePath), constants.OlakeID))
+				requireNativeIndexMappings(t, index, tbl, expected)
+				visible := []string{"duplicate", "tail", "duplicate", "removed", "other", "untouched"}
+				if step == 1 {
+					visible = append(visible, "other")
+				}
+				requireNativeVisibleIDs(t, tbl, visible...)
+			}
+		})
+	}
+}
+
+func TestNativeIndexPreservedSequenceRewriteRechecksPathRank(t *testing.T) {
+	ctx := context.Background()
+	tbl := nativeIndexTestTable(t, 2)
+	dir := t.TempDir()
+	key := func(int) string { return "k" }
+	a := writeNativeIndexData(t, tbl, filepath.Join(dir, "a.parquet"), 1, key)
+	b := writeNativeIndexData(t, tbl, filepath.Join(dir, "b.parquet"), 1, key)
+	c := writeNativeIndexData(t, tbl, filepath.Join(dir, "0-c.parquet"), 1, key)
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.ReplaceFiles(ctx, nil, []apacheiceberg.DataFile{a, b}, nil, nil))
+	tbl, err := tx.Commit(ctx)
+	require.NoError(t, err)
+	sequence := tbl.CurrentSnapshot().SequenceNumber
+	index := openNativeTestIndex(t)
+	require.NoError(t, reconcileNativeTableIndex(ctx, index, tbl, constants.OlakeID))
+	requireNativeIndexMappings(t, index, tbl, map[string]types.RowLocation{"k": {FilePath: b.FilePath(), Position: 0}})
+	tx = tbl.NewTransaction()
+	require.NoError(t, tx.NewRewrite(nil).DeleteFile(b).AddDataFile(c).DataSequenceNumber(sequence).Commit(ctx))
+	tbl, err = tx.Commit(ctx)
+	require.NoError(t, err)
+	require.NoError(t, reconcileNativeTableIndex(ctx, index, nativeIndexWithReadScope(tbl, b.FilePath()), constants.OlakeID))
+	cold := openNativeTestIndex(t)
+	require.NoError(t, reconcileNativeTableIndex(ctx, cold, tbl, constants.OlakeID))
+	expected := map[string]types.RowLocation{"k": {FilePath: a.FilePath(), Position: 0}}
+	requireNativeIndexMappings(t, cold, tbl, expected)
+	requireNativeIndexMappings(t, index, tbl, expected)
+}
+
+func TestNativeIndexShrinkingAndRemovedDeletesRestoreRowsWithoutReadingNewerFile(t *testing.T) {
+	for _, version := range []int{2, 3} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			ctx := context.Background()
+			tbl := appendNativeIndexRows(t, nativeIndexTestTable(t, version), nativeIndexRows("duplicate", "shrink", "restore", "tail"))
+			files, err := planNativeIndexFiles(ctx, tbl, tbl.CurrentSnapshot().SnapshotID)
+			require.NoError(t, err)
+			require.Len(t, files, 1)
+			affected := files[0].File.FilePath()
+			tbl = appendNativeIndexRows(t, tbl, nativeIndexRows("duplicate", "untouched"))
+			index := openNativeTestIndex(t)
+			var previousDeletes []apacheiceberg.DataFile
+			for step, positions := range [][]int64{{0, 1, 2}, {0, 2}, nil} {
+				var deletes []apacheiceberg.DataFile
+				if len(positions) != 0 {
+					if version == 3 {
+						writer := dv.NewDVWriter(iceio.LocalFS{}, func(int32) *apacheiceberg.PartitionSpec { return apacheiceberg.UnpartitionedSpec })
+						require.NoError(t, writer.Add(affected, positions, 0, nil))
+						deletes, err = writer.Flush(ctx, filepath.Join(t.TempDir(), "restored.puffin"))
+						require.NoError(t, err)
+					} else {
+						for _, position := range positions {
+							deletes = append(deletes, writeNativeIndexDelete(t, apacheiceberg.PositionalDeleteSchema, fmt.Sprintf(`[{"file_path":%q,"pos":%d}]`, affected, position), false, 1))
+						}
+					}
+				}
+				tx := tbl.NewTransaction()
+				if len(previousDeletes) == 0 {
+					require.NoError(t, tx.NewRowDelta(nil).AddDeletes(deletes...).Commit(ctx))
+				} else {
+					rewrite := tx.NewRewrite(nil)
+					for _, file := range previousDeletes {
+						rewrite.DeleteFile(file)
+					}
+					for _, file := range deletes {
+						rewrite.AddDeleteFile(file)
+					}
+					require.NoError(t, rewrite.Commit(ctx))
+				}
+				tbl, err = tx.Commit(ctx)
+				require.NoError(t, err)
+				previousDeletes = deletes
+				if step == 0 {
+					require.NoError(t, reconcileNativeTableIndex(ctx, index, tbl, constants.OlakeID))
+				}
+				newer, found, err := index.Lookup("duplicate")
+				require.NoError(t, err)
+				require.True(t, found)
+				if step != 0 {
+					require.NoError(t, reconcileNativeTableIndex(ctx, index, nativeIndexWithReadScope(tbl, newer.FilePath), constants.OlakeID))
+				}
+				expected := map[string]types.RowLocation{
+					"duplicate": newer,
+					"untouched": {FilePath: newer.FilePath, Position: 1},
+					"tail":      {FilePath: affected, Position: 3},
+				}
+				absent := []string{"shrink", "restore"}
+				visible := []string{"tail", "duplicate", "untouched"}
+				if step >= 1 {
+					expected["shrink"] = types.RowLocation{FilePath: affected, Position: 1}
+					absent = []string{"restore"}
+					visible = append(visible, "shrink")
+				}
+				if step == 2 {
+					expected["restore"] = types.RowLocation{FilePath: affected, Position: 2}
+					absent = nil
+					visible = append(visible, "duplicate", "restore")
+				}
+				requireNativeIndexMappings(t, index, tbl, expected, absent...)
+				requireNativeVisibleIDs(t, tbl, visible...)
+			}
+		})
+	}
+}
+
+func TestNativeIndexBulkInvalidationReadsSurvivingFileAtMostOnce(t *testing.T) {
+	ctx := context.Background()
+	tbl := appendNativeIndexRows(t, nativeIndexTestTable(t, 2), nativeIndexRows("survivor"))
+	files, err := planNativeIndexFiles(ctx, tbl, tbl.CurrentSnapshot().SnapshotID)
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	survivor := files[0].File.FilePath()
+	// More than two former 200k-key fallback chunks must not rescan survivor.
+	const invalidKeys = 400001
+	removed := writeNativeIndexData(t, tbl, filepath.Join(t.TempDir(), "invalidated.parquet"), invalidKeys, func(row int) string { return fmt.Sprintf("invalid-%06d", row) })
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.ReplaceFiles(ctx, nil, []apacheiceberg.DataFile{removed}, nil, nil))
+	tbl, err = tx.Commit(ctx)
+	require.NoError(t, err)
+	index := openNativeTestIndex(t)
+	require.NoError(t, reconcileNativeTableIndex(ctx, index, tbl, constants.OlakeID))
+	removedPaths := map[string]struct{}{removed.FilePath(): {}}
+	count := 0
+	require.NoError(t, index.RangeFiles(removedPaths, func(string, types.RowLocation) error { count++; return nil }))
+	require.Equal(t, invalidKeys, count)
+	tx = tbl.NewTransaction()
+	require.NoError(t, tx.ReplaceFiles(ctx, []apacheiceberg.DataFile{removed}, nil, nil, nil))
+	tbl, err = tx.Commit(ctx)
+	require.NoError(t, err)
+	fs := &nativeIndexReadScopeIO{IO: iceio.LocalFS{}, denied: map[string]bool{removed.FilePath(): true}, opens: make(map[string]int)}
+	scoped := table.New(tbl.Identifier(), tbl.Metadata(), tbl.MetadataLocation(), func(context.Context) (iceio.IO, error) { return fs, nil }, nil)
+	require.NoError(t, reconcileNativeTableIndex(ctx, index, scoped, constants.OlakeID))
+	fs.mu.Lock()
+	survivorOpens := fs.opens[survivor]
+	fs.mu.Unlock()
+	require.LessOrEqual(t, survivorOpens, 1, "bulk repair must not rescan surviving Parquet per invalid-key chunk")
+	count = 0
+	require.NoError(t, index.RangeFiles(removedPaths, func(string, types.RowLocation) error { count++; return nil }))
+	require.Zero(t, count)
+	requireNativeIndexMappings(t, index, tbl, map[string]types.RowLocation{"survivor": {FilePath: survivor, Position: 0}}, "invalid-000000", "invalid-200000", "invalid-400000")
+}
+
+func TestNativeIndexAffectedNewestFallsBackToSurvivingDuplicate(t *testing.T) {
+	for _, change := range []string{"removal", "position-delete", "deletion-vector"} {
+		t.Run(change, func(t *testing.T) {
+			ctx := context.Background()
+			version := 2
+			if change == "deletion-vector" {
+				version = 3
+			}
+			tbl := appendNativeIndexRows(t, nativeIndexTestTable(t, version), nativeIndexRows("untouched", "duplicate"))
+			index := openNativeTestIndex(t)
+			require.NoError(t, reconcileNativeTableIndex(ctx, index, tbl, constants.OlakeID))
+			older, found, err := index.Lookup("duplicate")
+			require.NoError(t, err)
+			require.True(t, found)
+			tbl = appendNativeIndexRows(t, tbl, nativeIndexRows("duplicate", "stale"))
+			require.NoError(t, reconcileNativeTableIndex(ctx, index, tbl, constants.OlakeID))
+			newest, found, err := index.Lookup("duplicate")
+			require.NoError(t, err)
+			require.True(t, found)
+			require.NotEqual(t, older.FilePath, newest.FilePath)
+			switch change {
+			case "removal":
+				files, err := planNativeIndexFiles(ctx, tbl, tbl.CurrentSnapshot().SnapshotID)
+				require.NoError(t, err)
+				var removed apacheiceberg.DataFile
+				for _, task := range files {
+					if task.File.FilePath() == newest.FilePath {
+						removed = task.File
+					}
+				}
+				require.NotNil(t, removed)
+				tx := tbl.NewTransaction()
+				require.NoError(t, tx.ReplaceFiles(ctx, []apacheiceberg.DataFile{removed}, nil, nil, nil))
+				tbl, err = tx.Commit(ctx)
+				require.NoError(t, err)
+			case "position-delete":
+				deleted := writeNativeIndexDelete(t, apacheiceberg.PositionalDeleteSchema, fmt.Sprintf(`[{"file_path":%q,"pos":0},{"file_path":%q,"pos":1}]`, newest.FilePath, newest.FilePath), false, 2)
+				tbl = commitNativeIndexDeletes(t, tbl, deleted)
+			case "deletion-vector":
+				writer := dv.NewDVWriter(iceio.LocalFS{}, func(int32) *apacheiceberg.PartitionSpec { return apacheiceberg.UnpartitionedSpec })
+				require.NoError(t, writer.Add(newest.FilePath, []int64{0, 1}, 0, nil))
+				deletes, err := writer.Flush(ctx, filepath.Join(t.TempDir(), "fallback.puffin"))
+				require.NoError(t, err)
+				tbl = commitNativeIndexDeletes(t, tbl, deletes...)
+			}
+			reconcileTable := tbl
+			if change == "removal" {
+				reconcileTable = nativeIndexWithReadScope(tbl, newest.FilePath)
+			}
+			require.NoError(t, reconcileNativeTableIndex(ctx, index, reconcileTable, constants.OlakeID))
+			requireNativeIndexMappings(t, index, tbl, map[string]types.RowLocation{
+				"duplicate": older,
+				"untouched": {FilePath: older.FilePath, Position: 0},
+			}, "stale")
+			requireNativeVisibleIDs(t, tbl, "untouched", "duplicate")
+		})
+	}
+}
+
 func TestNativeIndexNewestWinsAndPhysicalRows(t *testing.T) {
 	ctx := context.Background()
 	tbl := appendNativeIndexRows(t, nativeIndexTestTable(t, 2), nativeIndexRows("duplicate", "removed", "third", "duplicate", "tail"))
@@ -170,7 +573,7 @@ func TestNativeIndexNewestWinsAndPhysicalRows(t *testing.T) {
 	require.Equal(t, tbl.CurrentSnapshot().SnapshotID, checkpoint)
 }
 
-func TestNativeIndexRebuildRemovesPositionDeletedRows(t *testing.T) {
+func TestNativeIndexChangedPositionDeletesRemoveRows(t *testing.T) {
 	ctx := context.Background()
 	tbl := appendNativeIndexRows(t, nativeIndexTestTable(t, 2), nativeIndexRows("first", "removed", "tail"))
 	index := openNativeTestIndex(t)

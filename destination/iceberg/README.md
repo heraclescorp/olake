@@ -10,7 +10,7 @@ The destination uses upstream `github.com/apache/iceberg-go v0.7.0` without patc
 
 - Backfill appends data files.
 - CDC supports equality deletes, positional deletes, and Iceberg v3 deletion vectors. Deletes retain OLake's soft-delete rows.
-- Recovery metadata and data/delete files publish in the same catalog transaction. Positional/deletion-vector modes preserve the durable Pebble index, rebuild it from the committed snapshot when necessary, and recover unchanged PostgreSQL TOAST values.
+- Recovery metadata and data/delete files publish in the same catalog transaction. Positional/deletion-vector modes preserve the durable Pebble index and recover unchanged PostgreSQL TOAST values. Reconciliation reads added/replacement files, not the whole table merely because files were removed. Changed delete sets read only newly visible physical positions; stale mappings are removed through a local Pebble file-ID scan without reopening retired Parquet files.
 - A catalog-scoped per-table coordinator serializes local metadata mutations and reuses the latest successful commit response. Normal Close does not reload metadata; definite conflicts refresh it, while ambiguous outcomes retain staged files and require catalog reopen/recovery. Every writer setup loads authoritative metadata for external schema changes and REST credentials. Active writers verify table identity even after cache invalidation or replacement.
 - Each destination table must have one OLake process owner. The coordinator is not a distributed lock or a CAS on recovery properties; server snapshot/default-shape guards remain enabled for external data changes. Full-refresh file writes stay parallel, but table commits and index publication are serialized.
 - S3 Tables manages removal of unreferenced objects. Superseded staged files are excluded from commits and left for that maintenance; rewrite, abort, and rejected-commit cleanup never issue object DELETEs to reserved `--table-s3` buckets. Other storage backends retain physical cleanup and propagate rewrite cleanup errors.
@@ -24,11 +24,12 @@ The destination uses upstream `github.com/apache/iceberg-go v0.7.0` without patc
 
 - `skip / up_to_date`: reuse the durable checkpoint without scanning files.
 - `incremental / files_added`: index new files only; `snapshot_advanced_without_file_changes` advances only the checkpoint.
+- `incremental / files_removed`, `delete_sets_changed`, or `files_removed_and_delete_sets_changed`: repair affected mappings while preserving newer unchanged mappings. A bounded newest-first search handles invalidated keys or preserved-sequence replacements that could expose a surviving duplicate in another file; that search can read otherwise unchanged files.
 - `rebuild / missing_or_invalid_checkpoint`: no usable checkpoint; this alone does not distinguish deployment, lost storage, or an interrupted scan.
-- `rebuild / files_removed`, `delete_sets_changed`, or `files_removed_and_delete_sets_changed`: changed physical file layout/deletes require rebuilding the table index.
+- `rebuild / repair_key_limit`: at least 200,000 keys need duplicate resolution; use one streamed rebuild rather than repeatedly scanning the table or retaining unbounded key sets.
 - `error / checkpoint_not_ancestor`: an explicit reset is required; no automatic destructive reset occurs.
 
-Events include old/target snapshots, the target snapshot's operation, file-delta counts, selected rows/bytes, scanned/indexed/skipped rows, completed files, flushes, checkpoint invalidation/publication, duration, and failure stage. Selected row/byte counts come from file metadata; indexed rows count entries staged, not distinct keys. The target operation is not proof of which engine performed maintenance. No row values, identifiers, credentials, or object paths are emitted.
+Events include old/target snapshots, the target snapshot's operation, file-delta counts, selected rows/bytes, scanned/indexed/skipped rows, invalidated mappings, fallback files/rows, completed files, flushes, checkpoint invalidation/publication, duration, and failure stage. Selected row/byte counts are file-metadata upper bounds; delete-only repair can read fewer rows or none. Indexed rows count staged puts, not distinct keys. Partial durable flushes atomically invalidate the old checkpoint; an interrupted repair rebuilds safely on restart. A full reset is not part of ordinary file-replacement repair. The target operation is not proof of which engine performed maintenance. No row values, identifiers, credentials, or object paths are emitted.
 
 ## Build and Runtime
 

@@ -216,6 +216,72 @@ func (i *pebbleIndex) Lookup(key string) (types.RowLocation, bool, error) {
 	return types.RowLocation{FilePath: path, Position: position}, true, nil
 }
 
+// RangeFiles streams matching rows from one snapshot without resolving paths for
+// unrelated rows. No commit lock is held while invoking fn, which may Commit.
+func (i *pebbleIndex) RangeFiles(paths map[string]struct{}, fn func(string, types.RowLocation) error) (err error) {
+	if len(paths) == 0 {
+		return nil
+	}
+	snapshot := i.db.NewSnapshot()
+	defer snapshot.Close()
+	files := make(map[uint64]string, len(paths))
+	for path := range paths {
+		value, closer, err := snapshot.Get(fileByPathKey(path))
+		if errors.Is(err, pebble.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read file id for %s: %s", path, err)
+		}
+		if len(value) != 8 {
+			_ = closer.Close()
+			return fmt.Errorf("corrupt file id for %s: expected 8 bytes, got %d", path, len(value))
+		}
+		fileID := binary.BigEndian.Uint64(value)
+		if err := closer.Close(); err != nil {
+			return fmt.Errorf("failed to release file id for %s: %s", path, err)
+		}
+		files[fileID] = path
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	iter, err := snapshot.NewIter(&pebble.IterOptions{LowerBound: []byte{prefixRow}, UpperBound: []byte{prefixRow + 1}})
+	if err != nil {
+		return fmt.Errorf("failed to scan stream index %s: %s", i.dir, err)
+	}
+	defer func() {
+		if closeErr := iter.Close(); err == nil && closeErr != nil {
+			err = fmt.Errorf("failed to close stream index scan in %s: %s", i.dir, closeErr)
+		}
+	}()
+	for valid := iter.First(); valid; valid = iter.Next() {
+		value, err := iter.ValueAndErr()
+		if err != nil {
+			return fmt.Errorf("failed to read stream index scan in %s: %s", i.dir, err)
+		}
+		fileID, read := binary.Uvarint(value)
+		if read <= 0 {
+			return fmt.Errorf("corrupt stream index entry for key[%s]: unreadable file id", iter.Key()[1:])
+		}
+		path, matches := files[fileID]
+		if !matches {
+			continue
+		}
+		position, read := binary.Uvarint(value[read:])
+		if read <= 0 || position > math.MaxInt64 {
+			return fmt.Errorf("corrupt stream index position for key[%s]", iter.Key()[1:])
+		}
+		if err := fn(string(iter.Key()[1:]), types.RowLocation{FilePath: path, Position: int64(position)}); err != nil {
+			return err
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("failed to scan stream index %s: %s", i.dir, err)
+	}
+	return nil
+}
+
 // pebbleCommitStats belongs to a single Commit. Plain counters in the existing
 // staging pass avoid per-row timers, atomics, allocations or extra iteration.
 // Staging time includes file interning and its separately reported Sync time.
@@ -261,6 +327,15 @@ func (i *pebbleIndex) Commit(batch *types.StreamIndexThread, snapshotID *int64) 
 	}()
 
 	if batch != nil {
+		if err := batch.RangeDeletes(func(key string) error {
+			if err := pending.Delete(rowKey(key), nil); err != nil {
+				return fmt.Errorf("failed to stage stream index deletion for key[%s]: %s", key, err)
+			}
+			stats.mutations++
+			return nil
+		}); err != nil {
+			return err
+		}
 		err := batch.Range(func(key string, loc types.RowLocation) error {
 			if err := i.stageChange(pending, key, loc, &stats); err != nil {
 				return err
