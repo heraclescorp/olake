@@ -25,6 +25,9 @@ const (
 	MixedType StateType = "MIXED"
 	// constant key for chunks
 	ChunksKey = "chunks"
+	// ResumePlanKey holds the immutable chunk plan of the running full refresh. A restarted
+	// connector reuses it so chunk IDs stay identical and committed chunks keep skipping.
+	ResumePlanKey = "resume_plan"
 )
 
 type GlobalState struct {
@@ -191,8 +194,8 @@ func (s *State) SetCursor(stream *ConfiguredStream, key string, value any) {
 	s.LogState()
 }
 
-// GetStateChunks retrieves all chunks from the state.
-func (s *State) GetChunks(stream *ConfiguredStream) *Set[Chunk] {
+// streamValue returns the value stored for key on the stream's state, or nil when absent.
+func (s *State) streamValue(stream *ConfiguredStream, key string) any {
 	s.RLock()
 	defer s.RUnlock()
 
@@ -200,38 +203,56 @@ func (s *State) GetChunks(stream *ConfiguredStream) *Set[Chunk] {
 		return elem.Namespace == stream.Namespace() && elem.Stream == stream.Name()
 	})
 	if contains {
-		chunks, _ := s.Streams[index].State.Load(ChunksKey)
-		if chunks != nil {
-			chunksSet, converted := chunks.(*Set[Chunk])
-			if converted {
-				return chunksSet
-			}
-		}
+		value, _ := s.Streams[index].State.Load(key)
+		return value
 	}
 	return nil
 }
 
-// set chunks
-func (s *State) SetChunks(stream *ConfiguredStream, chunks *Set[Chunk]) {
-	if stream.GetSyncMode() == FULLREFRESH {
-		return
-	}
+func (s *State) chunkSet(stream *ConfiguredStream, key string) *Set[Chunk] {
+	chunksSet, _ := s.streamValue(stream, key).(*Set[Chunk])
+	return chunksSet
+}
 
+func (s *State) storeStreamValue(stream *ConfiguredStream, key string, value any) {
 	s.Lock()
 	defer s.Unlock()
+
 	index, contains := utils.ArrayContains(s.Streams, func(elem *StreamState) bool {
 		return elem.Namespace == stream.Namespace() && elem.Stream == stream.Name()
 	})
 	if contains {
-		s.Streams[index].State.Store(ChunksKey, chunks)
+		s.Streams[index].State.Store(key, value)
 		s.Streams[index].HoldsValue.Store(true)
 	} else {
 		newStream := s.initStreamState(stream)
-		newStream.State.Store(ChunksKey, chunks)
+		newStream.State.Store(key, value)
 		newStream.HoldsValue.Store(true)
 		s.Streams = append(s.Streams, newStream)
 	}
 	s.LogState()
+}
+
+// GetChunks retrieves the chunks still pending in the current full refresh.
+func (s *State) GetChunks(stream *ConfiguredStream) *Set[Chunk] {
+	return s.chunkSet(stream, ChunksKey)
+}
+
+// SetChunks records the chunks still pending. Full refresh streams keep this too: the
+// remaining set is what marks the full refresh as completed and retires the resume plan.
+func (s *State) SetChunks(stream *ConfiguredStream, chunks *Set[Chunk]) {
+	s.storeStreamValue(stream, ChunksKey, chunks)
+}
+
+// GetResumePlan retrieves the immutable chunk plan a restarted full refresh must reuse.
+func (s *State) GetResumePlan(stream *ConfiguredStream) *Set[Chunk] {
+	return s.chunkSet(stream, ResumePlanKey)
+}
+
+// SetResumePlan records the full refresh plan once, before any chunk runs, so a restart
+// reproduces the same chunk IDs and committed chunks keep skipping.
+func (s *State) SetResumePlan(stream *ConfiguredStream, chunks *Set[Chunk]) {
+	s.storeStreamValue(stream, ResumePlanKey, chunks)
 }
 
 // remove chunk returns remaining chunk count after removing the chunk
@@ -251,7 +272,12 @@ func (s *State) RemoveChunk(stream *ConfiguredStream, chunk Chunk) int {
 			castedStateChunks, _ := stateChunks.(*Set[Chunk])
 			castedStateChunks.Remove(chunk)
 			s.Streams[index].State.Store(ChunksKey, castedStateChunks)
-			return castedStateChunks.Len()
+			remaining := castedStateChunks.Len()
+			if remaining == 0 {
+				// The full refresh finished, so its plan must not leak into a later run.
+				s.Streams[index].State.Delete(ResumePlanKey)
+			}
+			return remaining
 		}
 	}
 	return -1
@@ -371,25 +397,33 @@ func (s *StreamState) UnmarshalJSON(data []byte) error {
 	if len(aux.State) > 0 {
 		s.HoldsValue.Store(true)
 	}
-	if rawChunks, exists := aux.State[ChunksKey]; exists {
-		if chunkList, ok := rawChunks.([]interface{}); ok {
-			chunksJSON, err := json.Marshal(chunkList)
-			if err != nil {
-				return err
-			}
-
-			var chunks []Chunk
-			decoder := json.NewDecoder(bytes.NewReader(chunksJSON))
-			decoder.UseNumber()
-			if err := decoder.Decode(&chunks); err != nil {
-				return err
-			}
-
-			// Create a new Set[Chunk] and add chunks to it
-			chunkSet := NewSet[Chunk](chunks...) // Assuming you have a NewSet function
-			// Store the *Set[Chunk] in State
-			s.State.Store(ChunksKey, chunkSet)
+	for _, key := range []string{ChunksKey, ResumePlanKey} {
+		chunkSet, err := decodeChunkSet(aux.State[key])
+		if err != nil {
+			return err
+		}
+		if chunkSet != nil {
+			s.State.Store(key, chunkSet)
 		}
 	}
 	return nil
+}
+
+// decodeChunkSet converts a JSON chunk list back into a set, ignoring absent keys.
+func decodeChunkSet(raw any) (*Set[Chunk], error) {
+	chunkList, ok := raw.([]interface{})
+	if !ok {
+		return nil, nil
+	}
+	chunksJSON, err := json.Marshal(chunkList)
+	if err != nil {
+		return nil, err
+	}
+	var chunks []Chunk
+	decoder := json.NewDecoder(bytes.NewReader(chunksJSON))
+	decoder.UseNumber()
+	if err := decoder.Decode(&chunks); err != nil {
+		return nil, err
+	}
+	return NewSet[Chunk](chunks...), nil
 }
