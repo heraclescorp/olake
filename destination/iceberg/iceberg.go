@@ -1170,6 +1170,7 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 			coordinated.invalidate(unknown)
 			if unknown {
 				w.uncertain = true
+				logger.Warnf("Thread[%s]: native Iceberg commit outcome unknown; retaining staged work data_files=%d position_deletes=%d staged_paths=%d ctx_err=%v", w.options.ThreadID, len(w.dataFiles), len(w.positions), len(w.paths), ctx.Err())
 				return fmt.Errorf("Iceberg commit outcome is unknown; staged files retained for recovery: %w", commitErr)
 			}
 			// Delete files belong to this rejected attempt. Only optimistic

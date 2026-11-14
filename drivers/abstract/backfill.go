@@ -22,15 +22,21 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 	if observability.Enabled() {
 		tableStart = time.Now()
 	}
-	chunksSet := a.state.GetChunks(stream.Self())
+	chunksSet := a.state.GetResumePlan(stream.Self())
 	var err error
 	if chunksSet == nil || chunksSet.Len() == 0 {
 		chunksSet, err = a.driver.GetOrSplitChunks(mainCtx, pool, stream)
 		if err != nil {
 			return fmt.Errorf("failed to get or split chunks: %w", err)
 		}
-		// set state chunks
-		a.state.SetChunks(stream.Self(), chunksSet)
+		// The plan is immutable for the whole full refresh: a restarted connector reuses
+		// these exact ranges so its chunk IDs still match the already committed ones.
+		a.state.SetResumePlan(stream.Self(), chunksSet)
+	}
+	// Pending chunks shrink as chunks commit; they are what marks the full refresh complete
+	// and retires the resume plan.
+	if remaining := a.state.GetChunks(stream.Self()); remaining == nil || remaining.Len() == 0 {
+		a.state.SetChunks(stream.Self(), types.NewSet(chunksSet.Array()...))
 	}
 	chunks := chunksSet.Array()
 	observability.AddChunks(mainCtx, "planned", int64(len(chunks)))
@@ -50,7 +56,7 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 
 	filterDataBySelectedColumnsFn := stream.RetainSelectedColumns()
 
-	chunkProcessor := func(gCtx context.Context, _ int, chunk types.Chunk) (err error) {
+	chunkProcessor := func(gCtx context.Context, chunkIndex int, chunk types.Chunk) (err error) {
 		gCtx = observability.WithTable(gCtx, stream.Namespace(), stream.Name())
 		observability.AddChunks(mainCtx, "active", 1)
 		var chunkStart time.Time
@@ -97,7 +103,10 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 
 		defer handleWriterCleanup(backfillCtx, backfillCtxCancel, &err, inserter, threadID, nil, nil)
 
-		if prevMetadataState != nil {
+		// The last chunk is open ended, so rows appended since the plan was cut land there.
+		// It always re-runs; skipping it would leave that growth unbackfilled.
+		isTailChunk := chunkIndex == len(chunks)-1
+		if prevMetadataState != nil && !isTailChunk {
 			if slices.Contains(prevMetadataState.FullRefreshCommittedIDs, threadID) {
 				skipped = true
 				logger.Infof("Thread[%s]: chunk min[%v] and max[%v] already committed, skipping", threadID, chunk.Min, chunk.Max)

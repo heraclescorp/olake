@@ -1267,11 +1267,69 @@ type nativeHTTPAttempt struct {
 	ExtendedRequestID string
 	RetryAfter        string
 	TransportError    bool
+	// ErrorClass names a transport failure without leaking the URL or address that
+	// net/http embeds in its error strings.
+	ErrorClass string
+	// ResponseCode carries a service error type when the response advertises one in
+	// headers; the transport never reads response bodies.
+	ResponseCode string
 }
 
 func (a nativeHTTPAttempt) String() string {
-	return fmt.Sprintf("iceberg_http attempt_id=%d method=%q host=%q path=%q status=%d duration_ms=%.3f aws_request_id=%q aws_extended_request_id=%q retry_after=%q transport_error=%t",
-		a.ID, a.Method, a.Host, a.Path, a.Status, float64(a.Duration)/float64(time.Millisecond), a.RequestID, a.ExtendedRequestID, a.RetryAfter, a.TransportError)
+	return fmt.Sprintf("iceberg_http attempt_id=%d method=%q host=%q path=%q status=%d duration_ms=%.3f aws_request_id=%q aws_extended_request_id=%q retry_after=%q transport_error=%t error_class=%q resp_code=%q",
+		a.ID, a.Method, a.Host, a.Path, a.Status, float64(a.Duration)/float64(time.Millisecond), a.RequestID, a.ExtendedRequestID, a.RetryAfter, a.TransportError, a.ErrorClass, a.ResponseCode)
+}
+
+// nativeTransportErrorClass names a transport failure without leaking the URL or
+// address that net/http embeds in its error strings.
+func nativeTransportErrorClass(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context_deadline"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "connection_reset"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection_refused"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof"
+	case errors.Is(err, io.EOF):
+		return "eof"
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "dns"
+	}
+	var verifyErr *tls.CertificateVerificationError
+	if errors.As(err, &verifyErr) {
+		return "tls_verify"
+	}
+	var recordErr *tls.RecordHeaderError
+	if errors.As(err, &recordErr) {
+		return "tls"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	return "unknown"
+}
+
+// nativeResponseErrorCode reports a service error type advertised in headers. The
+// diagnostic transport never reads response bodies, so nothing else is available.
+func nativeResponseErrorCode(resp *http.Response) string {
+	if resp == nil || resp.StatusCode < http.StatusBadRequest {
+		return ""
+	}
+	for _, header := range []string{"X-Amzn-Errortype", "X-Amz-Error-Code"} {
+		if value := resp.Header.Get(header); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 var nativeHTTPAttemptID atomic.Uint64
@@ -1306,6 +1364,9 @@ func (t *nativeDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response
 	response, err := t.base.RoundTrip(req)
 	attempt.Duration = time.Since(started)
 	attempt.TransportError = err != nil
+	if err != nil {
+		attempt.ErrorClass = nativeTransportErrorClass(err)
+	}
 	if response != nil {
 		attempt.Status = response.StatusCode
 		attempt.RequestID = response.Header.Get("X-Amz-Request-Id")
@@ -1314,6 +1375,7 @@ func (t *nativeDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response
 		}
 		attempt.ExtendedRequestID = response.Header.Get("X-Amz-Id-2")
 		attempt.RetryAfter = response.Header.Get("Retry-After")
+		attempt.ResponseCode = nativeResponseErrorCode(response)
 	}
 	t.emit(attempt)
 	return response, err
