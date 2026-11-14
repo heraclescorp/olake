@@ -83,7 +83,6 @@ require (
 	github.com/substrait-io/substrait-go/v8 v8.1.1 // indirect
 	github.com/substrait-io/substrait-protobuf/go v0.85.0 // indirect
 	github.com/tmthrgd/go-hex v0.0.0-20190904060850-447a3041c3bc // indirect
-	github.com/twmb/avro v1.8.0 // indirect
 	github.com/twmb/murmur3 v1.1.8 // indirect
 	github.com/uptrace/bun v1.2.18 // indirect
 	github.com/uptrace/bun/dialect/mssqldialect v1.2.18 // indirect
@@ -174,6 +173,7 @@ require (
 require (
 	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.4.1
 	github.com/paulmach/orb v0.12.0
+	github.com/twmb/avro v1.8.0
 )
 
 require (

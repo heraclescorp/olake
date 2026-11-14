@@ -44,6 +44,8 @@ type Socket struct {
 	ReplicationSlot string
 	// initialWaitTime is the duration to wait for first wal log catchup before timing out
 	initialWaitTime time.Duration
+	// TransactionOpen prevents publishing a pgoutput stream truncated before COMMIT.
+	TransactionOpen bool
 }
 
 // Replicator defines an abstraction over different logical decoding plugins.
@@ -54,7 +56,10 @@ type Replicator interface {
 	StreamChanges(ctx context.Context, db *sqlx.DB, insertFn abstract.CDCMsgFn) error
 }
 
-func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, recoveryLSN *pglogrepl.LSN, typeConverter func(value interface{}, columnType string) (interface{}, error), columnType func(columnType string) types.DataType) (Replicator, error) {
+func ConnectReplication(ctx context.Context, config *Config) (*pgconn.PgConn, error) {
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return nil, err
+	}
 	// Build PostgreSQL connection config
 	connURL := config.Connection
 	q := connURL.Query()
@@ -97,10 +102,19 @@ func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, re
 	if err != nil {
 		return nil, fmt.Errorf("failed to create postgres connection: %w", err)
 	}
+	return pgConn, nil
+}
+
+func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, recoveryLSN *pglogrepl.LSN, typeConverter func(value interface{}, columnType string) (interface{}, error), columnType func(columnType string) types.DataType) (Replicator, error) {
+	pgConn, err := ConnectReplication(ctx, config)
+	if err != nil {
+		return nil, err
+	}
 
 	// System identification
 	sysident, err := pglogrepl.IdentifySystem(ctx, pgConn)
 	if err != nil {
+		_ = pgConn.Close(ctx)
 		return nil, fmt.Errorf("failed to indentify system: %w", err)
 	}
 	logger.Infof("SystemID:%s Timeline:%d XLogPos:%s Database:%s",
@@ -124,6 +138,7 @@ func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, re
 		ReplicationSlot:    config.ReplicationSlotName,
 		initialWaitTime:    config.InitialWaitTime,
 	}
+	socket.changeFilter.replayAfter = config.ReplayAfter
 
 	plugin := strings.ToLower(strings.TrimSpace(slot.Plugin))
 	switch plugin {
@@ -146,8 +161,14 @@ func AdvanceLSN(ctx context.Context, db *sqlx.DB, slot, currentWalPos string) (p
 	defer cancel()
 	for {
 		var endLSN pglogrepl.LSN
-		if err := db.QueryRowContext(timeoutCtx, fmt.Sprintf(AdvanceLSNTemplate, slot, currentWalPos)).Scan(&endLSN); err != nil {
-			return 0, fmt.Errorf("failed to advance replication slot: %w", err)
+		if err := utils.CheckExecutionFence(timeoutCtx); err != nil {
+			return 0, err
+		}
+		settled := utils.BeginExecutionParticipant(timeoutCtx)
+		advanceErr := db.QueryRowContext(timeoutCtx, fmt.Sprintf(AdvanceLSNTemplate, slot, currentWalPos)).Scan(&endLSN)
+		settled(advanceErr == nil)
+		if advanceErr != nil {
+			return 0, fmt.Errorf("failed to advance replication slot: %w", advanceErr)
 		}
 		if endLSN >= target {
 			logger.Debugf("advanced LSN to %s", endLSN)
@@ -166,9 +187,16 @@ func AdvanceLSN(ctx context.Context, db *sqlx.DB, slot, currentWalPos string) (p
 
 // Confirm that Logs has been recorded
 // in fake ack prev confirmed flush lsn is sent
-func AcknowledgeLSN(ctx context.Context, db *sqlx.DB, socket *Socket, fakeAck bool) error {
+func AcknowledgeLSN(ctx context.Context, db *sqlx.DB, socket *Socket, fakeAck bool) (err error) {
 	walPosition := utils.Ternary(fakeAck, socket.ConfirmedFlushLSN, socket.ClientXLogPos).(pglogrepl.LSN)
-	err := pglogrepl.SendStandbyStatusUpdate(ctx, socket.pgConn, pglogrepl.StandbyStatusUpdate{
+	if !fakeAck {
+		if err := utils.CheckExecutionFence(ctx); err != nil {
+			return err
+		}
+		settled := utils.BeginExecutionParticipant(ctx)
+		defer func() { settled(err == nil) }()
+	}
+	err = pglogrepl.SendStandbyStatusUpdate(ctx, socket.pgConn, pglogrepl.StandbyStatusUpdate{
 		WALWritePosition: walPosition,
 		WALFlushPosition: walPosition,
 		ClientTime:       time.Now(),
@@ -211,10 +239,11 @@ func AcknowledgeLSN(ctx context.Context, db *sqlx.DB, socket *Socket, fakeAck bo
 }
 
 // cleanup replicator
-func Cleanup(ctx context.Context, socket *Socket) {
+func Cleanup(ctx context.Context, socket *Socket) error {
 	if socket.pgConn != nil {
-		_ = socket.pgConn.Close(ctx)
+		return socket.pgConn.Close(ctx)
 	}
+	return nil
 }
 
 func GetSlotPosition(ctx context.Context, db *sqlx.DB, replicationSlotName string) (ReplicationSlot, error) {

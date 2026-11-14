@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -91,4 +92,16 @@ func UploadFileToS3(ctx context.Context, localPath, bucket, key string) error {
 	}
 
 	return nil
+}
+
+// PutObjectIfAbsent publishes a complete immutable execution document.
+func PutObjectIfAbsent(ctx context.Context, bucket, key string, data []byte) error {
+	client, err := getS3Client()
+	if err != nil {
+		return err
+	}
+	_, err = client.PutObject(ctx, &awss3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(data), IfNoneMatch: aws.String("*"),
+	})
+	return err
 }

@@ -383,7 +383,7 @@ func SetupProcessLogger(processName string) (*ProcessOutputReader, *ProcessOutpu
 
 // SetupAndStartProcess creates and starts a process with stdout and stderr logged via the logger.
 // It handles the complete process lifecycle including starting the command and managing pipes.
-func SetupAndStartProcess(processName string, cmd *exec.Cmd) error {
+func SetupAndStartProcess(processName string, cmd *exec.Cmd) (<-chan error, error) {
 	// Readiness is observed by a reader goroutine, so this span is "child ready AND a reader got
 	// scheduled to notice"; the phases below separate that from the child's own startup cost.
 	defer TrackTiming(processName, "setup+start total")()
@@ -393,7 +393,7 @@ func SetupAndStartProcess(processName string, cmd *exec.Cmd) error {
 	stdoutReader, stderrReader, stdoutWriter, stderrWriter, err := SetupProcessLogger(processName)
 	stopPipes()
 	if err != nil {
-		return fmt.Errorf("failed to set up process output capture: %s", err)
+		return nil, fmt.Errorf("failed to set up process output capture: %s", err)
 	}
 
 	// Channels to coordinate readiness or early startup failure
@@ -422,7 +422,7 @@ func SetupAndStartProcess(processName string, cmd *exec.Cmd) error {
 		stderrReader.Close()
 		stdoutWriter.Close()
 		stderrWriter.Close()
-		return fmt.Errorf("failed to start process: %s", startErr)
+		return nil, fmt.Errorf("failed to start process: %s", startErr)
 	}
 
 	// Start reading from the process output
@@ -446,10 +446,13 @@ func SetupAndStartProcess(processName string, cmd *exec.Cmd) error {
 	defer cancel()
 
 	done := make(chan struct{})
+	exited := make(chan error, 1)
 	// Watch for early process exit before readiness
 	go func() {
 		// Wait will return when the child process exits (successfully or not)
 		wErr := cmd.Wait()
+		exited <- wErr
+		close(exited)
 		select {
 		case <-done:
 			// readiness already confirmed; ignore
@@ -478,10 +481,7 @@ func SetupAndStartProcess(processName string, cmd *exec.Cmd) error {
 	case <-readyCh:
 		stopAwait()
 		close(done)
-		// Clear notification channels to avoid further sends
-		stdoutReader.readinessCh = nil
-		stderrReader.readinessCh = nil
-		return nil
+		return exited, nil
 	case e := <-errCh:
 		stopAwait()
 		close(done)
@@ -492,9 +492,9 @@ func SetupAndStartProcess(processName string, cmd *exec.Cmd) error {
 		// Include captured error tail from stderr only
 		stderrTail := getFirstErrorLine(processName)
 		if stderrTail == "" {
-			return fmt.Errorf("failed to start iceberg writer: %s", e)
+			return nil, fmt.Errorf("failed to start iceberg writer: %s", e)
 		}
-		return fmt.Errorf("failed to start iceberg writer: %s: %s", e, stderrTail)
+		return nil, fmt.Errorf("failed to start iceberg writer: %s: %s", e, stderrTail)
 	case <-ctx.Done():
 		stopAwait()
 		close(done)
@@ -503,9 +503,9 @@ func SetupAndStartProcess(processName string, cmd *exec.Cmd) error {
 		}
 		stderrTail := getFirstErrorLine(processName)
 		if stderrTail == "" {
-			return fmt.Errorf("iceberg writer %s did not become ready within %d seconds", processName, timeoutSec)
+			return nil, fmt.Errorf("iceberg writer %s did not become ready within %d seconds", processName, timeoutSec)
 		}
-		return fmt.Errorf("iceberg writer %s did not become ready within %d seconds: %s", processName, timeoutSec, stderrTail)
+		return nil, fmt.Errorf("iceberg writer %s did not become ready within %d seconds: %s", processName, timeoutSec, stderrTail)
 	}
 }
 

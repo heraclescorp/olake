@@ -25,12 +25,14 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	apacheiceberg "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/catalog/rest"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/table/dv"
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/destination"
 	"github.com/datazip-inc/olake/destination/iceberg/internal"
+	"github.com/datazip-inc/olake/pkg/indexdb"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/errs"
@@ -48,6 +50,8 @@ type Iceberg struct {
 	catalog       catalog.Catalog
 	schema        map[string]string
 	writer        Writer
+	resyncMu      sync.Mutex
+	resync        *resyncControl
 	// unavailableValues recovers values the source could not send; nil unless the stream keeps a row index (pos or dv)
 	unavailableValues *unavailableValuesResolver
 	// syncStartColumns are columns added from the source catalog at sync start (see planSourceColumns).
@@ -455,7 +459,10 @@ func init() {
 	var mu sync.Mutex
 	var sharedCatalog catalog.Catalog
 	var sharedConfig *Config
-	destination.RegisteredWriters[types.Iceberg] = func(raw any) (destination.Writer, func(context.Context), error) {
+	destination.RegisteredWriters[types.Iceberg] = func(ctx context.Context, raw any) (destination.Writer, func(context.Context), error) {
+		if err := utils.CheckExecutionFence(ctx); err != nil {
+			return nil, nil, err
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		if sharedCatalog != nil {
@@ -468,8 +475,8 @@ func init() {
 		if err := config.Validate(); err != nil {
 			return nil, nil, err
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		cat, closeCatalog, err := openNativeCatalog(ctx, config)
+		catalogCtx, cancel := context.WithCancel(ctx)
+		cat, closeCatalog, err := openNativeCatalog(catalogCtx, config)
 		if err != nil {
 			cancel()
 			return nil, nil, err
@@ -506,6 +513,8 @@ type nativeTableState struct {
 	unknown    bool
 	closed     bool
 	generation uint64
+	resync     *resyncControl
+	sessions   int
 }
 
 type nativeTableLockKey struct{}
@@ -532,6 +541,9 @@ func (c *nativeTableCoordinator) entry(identifier table.Identifier) *nativeTable
 }
 
 func nativeTableEntry(cat catalog.Catalog, identifier table.Identifier) *nativeTableState {
+	if stage, ok := cat.(*nativeResyncCatalog); ok {
+		return stage.tables.entry(identifier)
+	}
 	if native, ok := cat.(*nativeCatalog); ok {
 		return native.tables.entry(identifier)
 	}
@@ -596,31 +608,55 @@ type nativeIndexRead struct {
 }
 
 type nativeWriter struct {
-	table        *table.Table
-	cat          catalog.Catalog
-	coordinator  *nativeTableState
-	generation   uint64
-	config       *Config
-	stream       types.StreamInterface
-	options      *destination.Options
-	indexThread  *types.StreamIndexThread
-	indexReads   map[string]nativeIndexRead
-	indexTouched map[string]struct{}
-	upsert       bool
-	deleteMode   types.UpdateType
-	dataFiles    []apacheiceberg.DataFile
-	dataSchemas  map[string]*apacheiceberg.Schema
-	positions    map[string][]int64
-	latest       map[string]types.RowLocation
-	paths        map[string]struct{}
-	closed       bool
-	uncertain    bool
-	failed       error
+	table                  *table.Table
+	cat                    catalog.Catalog
+	coordinator            *nativeTableState
+	generation             uint64
+	config                 *Config
+	stream                 types.StreamInterface
+	options                *destination.Options
+	indexThread            *types.StreamIndexThread
+	indexReads             map[string]nativeIndexRead
+	indexTouched           map[string]struct{}
+	upsert                 bool
+	deleteMode             types.UpdateType
+	dataFiles              []apacheiceberg.DataFile
+	dataSchemas            map[string]*apacheiceberg.Schema
+	positions              map[string][]int64
+	latest                 map[string]types.RowLocation
+	paths                  map[string]struct{}
+	backfillFiles          map[string]*nativeBackfillFile
+	backfillClock          uint64
+	backfillTargetBytes    int64
+	backfillPartitionLimit int
+	closed                 bool
+	uncertain              bool
+	failed                 error
+	releaseSession         func(bool)
 }
 
 func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInterface, options *destination.Options, cat catalog.Catalog, indexThread *types.StreamIndexThread) (_ *nativeWriter, _ *types.MetadataState, err error) {
-	ctx = nativeCatalogContext(ctx, cat)
+	ctx, finish, err := beginNativeWriterWork(ctx, config)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer finish()
 	identifier := catalog.ToIdentifier(stream.GetDestinationDatabase(&config.IcebergDatabase), stream.GetDestinationTable())
+	cat, release, err := routeNativeResyncWriter(ctx, cat, identifier)
+	if err != nil {
+		return nil, nil, err
+	}
+	var w *nativeWriter
+	defer func() {
+		if err != nil {
+			if w != nil {
+				w.Abort()
+			} else {
+				release(false)
+			}
+		}
+	}()
+	ctx = nativeCatalogContext(ctx, cat)
 	state := nativeTableEntry(cat, identifier)
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -636,12 +672,8 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 		return nil, nil, fmt.Errorf("load or create Iceberg table: %w", err)
 	}
 	state.latest = tbl
-	w := &nativeWriter{table: tbl, cat: cat, coordinator: state, generation: state.generation, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), positions: make(map[string][]int64), latest: make(map[string]types.RowLocation), paths: make(map[string]struct{})}
-	defer func() {
-		if err != nil {
-			w.Abort()
-		}
-	}()
+	w = &nativeWriter{table: tbl, cat: cat, coordinator: state, generation: state.generation, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), positions: make(map[string][]int64), latest: make(map[string]types.RowLocation), paths: make(map[string]struct{})}
+	w.releaseSession = release
 	if err := w.validateFormat(ctx); err != nil {
 		return nil, nil, err
 	}
@@ -656,6 +688,9 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 	// Reconcile and return recovery from the loaded metadata, or from the
 	// successful format/migration commit that replaced it. A no-op
 	// initialization must not issue another catalog GET.
+	if err := indexdb.ReconcileTable(options.TableIndex, w.table.Properties()[resyncGenerationProperty], w.table.Metadata().TableUUID().String()); err != nil {
+		return nil, nil, fmt.Errorf("reconcile stream index generation: %w", err)
+	}
 	if err := reconcileNativeTableIndex(ctx, options.TableIndex, w.table, constants.OlakeID); err != nil {
 		return nil, nil, err
 	}
@@ -673,6 +708,9 @@ func (w *nativeWriter) writable() error {
 	if w.uncertain {
 		return errors.New("Iceberg commit outcome is unknown; writer cannot be reused or cleaned up")
 	}
+	if w.options != nil && w.options.Backfill && w.failed != nil {
+		return fmt.Errorf("Iceberg writer has failed: %w", w.failed)
+	}
 	if w.closed {
 		return errors.New("Iceberg writer is closed")
 	}
@@ -680,6 +718,12 @@ func (w *nativeWriter) writable() error {
 		return fmt.Errorf("Iceberg writer has failed: %w", w.failed)
 	}
 	return nil
+}
+
+func (w *nativeWriter) mutationError(err error) {
+	if _, private := w.cat.(*nativeResyncCatalog); !private {
+		nativeExecutionMutationError(w.config, err)
+	}
 }
 
 func (w *nativeWriter) validateFormat(ctx context.Context) error {
@@ -719,12 +763,17 @@ func (w *nativeWriter) validateFormat(ctx context.Context) error {
 			w.table, state.latest = updated, updated
 			return nil
 		}
+		w.mutationError(err)
 		err = nativeCatalogError("upgrade Iceberg format", err)
 		w.logConflict("format-upgrade", attempt+1, fresh, err)
-		state.invalidate(!errors.Is(err, table.ErrCommitFailed))
-		if !errors.Is(err, table.ErrCommitFailed) {
+		unknown := !nativeMutationOutcomeKnown(err)
+		state.invalidate(unknown)
+		if unknown {
 			w.uncertain = true
 			return fmt.Errorf("Iceberg format upgrade outcome is unknown: %w", err)
+		}
+		if !errors.Is(err, table.ErrCommitFailed) {
+			return err
 		}
 	}
 	return fmt.Errorf("upgrade Iceberg format: %w", table.ErrCommitFailed)
@@ -737,6 +786,15 @@ type nativeWriteGroup struct {
 }
 
 func (w *nativeWriter) Write(ctx context.Context, records []types.RawRecord) (err error) {
+	ctx, finish, err := beginNativeWriterWork(ctx, w.config)
+	if err != nil {
+		if w.options.Backfill && ctx.Err() != nil && !w.closed {
+			w.failed = err
+			w.Abort()
+		}
+		return err
+	}
+	defer finish()
 	if err := w.writable(); err != nil {
 		return err
 	}
@@ -748,6 +806,9 @@ func (w *nativeWriter) Write(ctx context.Context, records []types.RawRecord) (er
 	}()
 	ctx = nativeCatalogContext(ctx, w.cat)
 	w.indexThread.SetObservabilityContext(ctx)
+	if w.options.Backfill {
+		return w.writeBackfill(ctx, records)
+	}
 	groups := make(map[string]*nativeWriteGroup)
 	rows := make([]map[string]any, len(records))
 	operations := make([]string, len(records))
@@ -881,6 +942,26 @@ func (w *nativeWriter) EnsureReadable(ctx context.Context, paths []string) error
 	if err := w.writable(); err != nil {
 		return err
 	}
+	if len(w.backfillFiles) != 0 {
+		ctx, finish, err := beginNativeWriterWork(ctx, w.config)
+		if err != nil {
+			if ctx.Err() != nil {
+				w.failed = err
+				w.Abort()
+			}
+			return err
+		}
+		defer finish()
+		for _, key := range slices.Sorted(maps.Keys(w.backfillFiles)) {
+			if slices.Contains(paths, w.backfillFiles[key].path) {
+				if err := w.finishBackfillFile(ctx, key); err != nil {
+					w.failed = err
+					w.Abort()
+					return err
+				}
+			}
+		}
+	}
 	fs, err := w.table.FS(nativeCatalogContext(ctx, w.cat))
 	if err != nil {
 		return err
@@ -889,8 +970,6 @@ func (w *nativeWriter) EnsureReadable(ctx context.Context, paths []string) error
 		if _, ours := w.paths[path]; !ours {
 			continue
 		}
-		// Write has already closed every footer and cloud upload. Opening it here
-		// verifies that a pending indexed location is actually recoverable.
 		file, err := fs.Open(path)
 		if err != nil {
 			return fmt.Errorf("open staged Iceberg recovery file: %w", err)
@@ -975,16 +1054,34 @@ func nativeSnapshotID(tbl *table.Table) int64 {
 }
 
 func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err error) {
+	ctx, finish, err := beginNativeWriterWork(ctx, w.config)
+	if err != nil {
+		if w.options.Backfill && ctx.Err() != nil && !w.closed {
+			w.failed = err
+			w.Abort()
+		}
+		return err
+	}
+	defer finish()
 	if err := w.writable(); err != nil {
 		return err
 	}
 	defer func() {
+		if err == nil && w.releaseSession != nil {
+			w.releaseSession(true)
+		}
 		w.indexThread.ReleaseObservability()
 		if err != nil {
+			if w.options.Backfill {
+				w.failed = err
+			}
 			w.Abort()
 		}
 	}()
 	ctx = nativeCatalogContext(ctx, w.cat)
+	if err := w.finishBackfillFiles(ctx); err != nil {
+		return fmt.Errorf("finish backfill Iceberg files: %w", err)
+	}
 	if err := w.compactStagedDataFiles(ctx); err != nil {
 		return fmt.Errorf("compact superseded staged Iceberg rows: %w", err)
 	}
@@ -1065,18 +1162,25 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		}
 		committed, commitErr := tx.Commit(ctx)
 		if commitErr != nil {
+			w.mutationError(commitErr)
 			commitErr = nativeCatalogError("commit Iceberg table", commitErr)
 			lastConflict = commitErr
 			w.logConflict("commit", attempt+1, fresh, commitErr)
-			coordinated.invalidate(!errors.Is(commitErr, table.ErrCommitFailed))
-			if !errors.Is(commitErr, table.ErrCommitFailed) {
+			unknown := !nativeMutationOutcomeKnown(commitErr)
+			coordinated.invalidate(unknown)
+			if unknown {
 				w.uncertain = true
+				logger.Warnf("Thread[%s]: native Iceberg commit outcome unknown; retaining staged work data_files=%d position_deletes=%d staged_paths=%d ctx_err=%v", w.options.ThreadID, len(w.dataFiles), len(w.positions), len(w.paths), ctx.Err())
 				return fmt.Errorf("Iceberg commit outcome is unknown; staged files retained for recovery: %w", commitErr)
 			}
-			// The attempt was definitively rejected: only its newly written
-			// delete files can be discarded; data is reused by the next attempt.
+			// Delete files belong to this rejected attempt. Only optimistic
+			// conflicts retry here; other known rejections return and Abort
+			// cleans the unpublished staged data without advancing recovery.
 			w.removeFiles(ctx, positionFiles)
 			w.removeFiles(ctx, equalityFiles)
+			if !errors.Is(commitErr, table.ErrCommitFailed) {
+				return commitErr
+			}
 			continue
 		}
 		w.table, w.closed = committed, true
@@ -1163,19 +1267,31 @@ func (w *nativeWriter) migrateEqualityDeletes(ctx context.Context) error {
 			clear(w.paths)
 			return nil
 		}
+		w.mutationError(commitErr)
 		commitErr = nativeCatalogError("migrate Iceberg equality deletes", commitErr)
 		w.logConflict("equality-migration", attempt+1, fresh, commitErr)
-		state.invalidate(!errors.Is(commitErr, table.ErrCommitFailed))
-		if !errors.Is(commitErr, table.ErrCommitFailed) {
+		unknown := !nativeMutationOutcomeKnown(commitErr)
+		state.invalidate(unknown)
+		if unknown {
 			w.uncertain = true
 			return fmt.Errorf("Iceberg equality migration outcome is unknown: %w", commitErr)
 		}
 		w.removeFiles(ctx, files)
+		if !errors.Is(commitErr, table.ErrCommitFailed) {
+			return commitErr
+		}
 	}
 	return fmt.Errorf("Iceberg equality migration retries exhausted: %w", table.ErrCommitFailed)
 }
 
 func nativeConflictClass(err error) string {
+	if errors.Is(err, rest.ErrCommitStateUnknown) {
+		return "commit_state_unknown"
+	}
+	var throttled *nativeRESTThrottleRejection
+	if errors.As(err, &throttled) {
+		return "catalog_throttled"
+	}
 	switch {
 	case errors.Is(err, table.ErrConflictingDataFiles):
 		return "concurrent_data"
@@ -1226,6 +1342,13 @@ func (w *nativeWriter) removeFiles(ctx context.Context, files []apacheiceberg.Da
 }
 
 func (w *nativeWriter) Abort() {
+	for _, f := range w.backfillFiles {
+		f.abort()
+	}
+	clear(w.backfillFiles)
+	if w.releaseSession != nil {
+		w.releaseSession(false)
+	}
 	w.indexThread.ReleaseObservability()
 	w.indexThread = nil
 	w.closed = true

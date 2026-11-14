@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"database/sql"
 	"encoding/binary"
 	"errors"
@@ -64,6 +65,15 @@ const (
 
 // TODO: add validation for each catalog properly
 type Config struct {
+	atomicResync      bool
+	executionID       string
+	executionFence    string
+	executionCommand  string
+	executionContext  context.Context
+	resyncLaunchID    string
+	resyncRecoverOnly bool
+	execution         *nativeExecution
+
 	// S3-compatible Storage Configuration
 	Region             string `json:"aws_region,omitempty"`
 	AccessKey          string `json:"aws_access_key,omitempty"`
@@ -236,11 +246,23 @@ func openNativeCatalog(ctx context.Context, config *Config) (catalog.Catalog, fu
 	if config == nil {
 		return nil, nil, errors.New("Iceberg catalog configuration is required")
 	}
+	execution := newNativeExecution(ctx, config)
+	config.execution = execution
+	opened := false
+	defer func() {
+		if !opened {
+			execution.drain()
+			execution.retired(nil)
+		}
+	}()
 	props, err := nativeStorageProperties(config)
 	if err != nil {
 		return nil, nil, err
 	}
-	client, closeHTTP := newNativeHTTPClient()
+	client, closeHTTP := newNativeHTTPClient(execution != nil)
+	if execution != nil {
+		client.Transport = newNativeAWSExecutionTransport(client.Transport, execution, config)
+	}
 	storageAWS, err := nativeAWSConfig(ctx, config, false, client)
 	if err != nil {
 		closeHTTP()
@@ -290,6 +312,11 @@ func openNativeCatalog(ctx context.Context, config *Config) (catalog.Catalog, fu
 				pingCtx, cancelPing := context.WithTimeout(ctx, nativeCatalogInitTimeout)
 				err = db.PingContext(pingCtx)
 				cancelPing()
+				if config.resyncRecoverOnly {
+					props["init_catalog_tables"] = "false"
+				} else if err == nil && execution != nil {
+					err = execution.writable(ctx)
+				}
 				if err == nil {
 					cat, err = icesql.NewCatalog(config.CatalogName, db, dialect, props)
 				}
@@ -306,7 +333,7 @@ func openNativeCatalog(ctx context.Context, config *Config) (catalog.Catalog, fu
 		closeHTTP()
 		return nil, nil, nativeCatalogError("open native Iceberg catalog", err)
 	}
-	wrapped := &nativeCatalog{Catalog: cat, storageAWS: storageAWS, closeOwned: func() error {
+	wrapped := &nativeCatalog{Catalog: cat, execution: execution, storageAWS: storageAWS, closeOwned: func() error {
 		var closeErr error
 		if closer, ok := cat.(catalog.Closer); ok {
 			closeErr = closer.Close()
@@ -322,6 +349,7 @@ func openNativeCatalog(ctx context.Context, config *Config) (catalog.Catalog, fu
 			logger.Warn(err.Error())
 		}
 	}
+	opened = true
 	return wrapped, cleanup, nil
 }
 
@@ -422,6 +450,11 @@ func openNativeRESTCatalog(ctx context.Context, config *Config, props apacheiceb
 	}
 	restClient := *client
 	restClient.Transport = newNativeRESTTransport(client.Transport)
+	restClient.Transport.(*nativeRESTThrottleTransport).execution = config.execution
+	restClient.Transport.(*nativeRESTThrottleTransport).catalogURL = uri
+	if config.RestOAuthURI != "" {
+		restClient.Transport.(*nativeRESTThrottleTransport).authURL, _ = url.Parse(config.RestOAuthURI)
+	}
 	opts := []rest.Option{rest.WithWarehouseLocation(config.IcebergS3Path), rest.WithAdditionalProps(props), rest.WithCustomTransport(restClient.Transport), rest.WithAwsConfig(cfg)}
 	headers := map[string]string{}
 	if config.GCPProjectID != "" {
@@ -620,6 +653,7 @@ func nativeSQLConnection(config *Config) (string, string, icesql.SupportedDialec
 // FileIO honors explicit/vended table properties ahead of these ambient defaults.
 type nativeCatalog struct {
 	catalog.Catalog
+	execution  *nativeExecution
 	tables     nativeTableCoordinator
 	storageAWS aws.Config
 	closeOnce  sync.Once
@@ -628,6 +662,9 @@ type nativeCatalog struct {
 }
 
 func nativeCatalogContext(ctx context.Context, cat catalog.Catalog) context.Context {
+	if stage, ok := cat.(*nativeResyncCatalog); ok {
+		return nativeCatalogContext(ctx, stage.Catalog)
+	}
 	if c, ok := cat.(*nativeCatalog); ok {
 		return iceutils.WithAwsConfig(ctx, &c.storageAWS)
 	}
@@ -635,7 +672,7 @@ func nativeCatalogContext(ctx context.Context, cat catalog.Catalog) context.Cont
 }
 
 func (c *nativeCatalog) ctx(ctx context.Context) context.Context {
-	return iceutils.WithAwsConfig(ctx, &c.storageAWS)
+	return iceutils.WithAwsConfig(c.execution.ctx(ctx), &c.storageAWS)
 }
 
 // A writer marks an already-held entry in its context so local catalog
@@ -662,8 +699,14 @@ func (c *nativeCatalog) PurgeTable(ctx context.Context, ident table.Identifier) 
 	if err := state.usable(); err != nil {
 		return err
 	}
-	err := nativeCatalogError("purge Iceberg table", purger.PurgeTable(c.ctx(ctx), ident))
-	state.invalidate(err != nil && !errors.Is(err, catalog.ErrNoSuchTable))
+	ctx, finish, err := c.execution.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	err = nativeCatalogError("purge Iceberg table", purger.PurgeTable(c.ctx(ctx), ident))
+	c.mutationResult(err)
+	state.invalidate(!nativeMutationOutcomeKnown(err))
 	if err == nil || errors.Is(err, catalog.ErrNoSuchTable) {
 		state.generation++
 	}
@@ -674,6 +717,7 @@ func (c *nativeCatalog) PurgeTable(ctx context.Context, ident table.Identifier) 
 // either public lifecycle API without double-closing pools or HTTP transports.
 func (c *nativeCatalog) Close() error {
 	c.closeOnce.Do(func() {
+		c.execution.drain()
 		c.tables.mu.Lock()
 		c.tables.closed = true
 		states := make([]*nativeTableState, 0, len(c.tables.tables))
@@ -694,6 +738,7 @@ func (c *nativeCatalog) Close() error {
 			c.closeErr = closer.Close()
 		}
 		c.closeErr = nativeCatalogError("close native Iceberg catalog", c.closeErr)
+		c.execution.retired(c.closeErr)
 	})
 	return c.closeErr
 }
@@ -734,10 +779,16 @@ func (c *nativeCatalog) CreateTable(ctx context.Context, ident table.Identifier,
 	if err := state.usable(); err != nil {
 		return nil, err
 	}
+	ctx, finish, err := c.execution.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
 	tbl, err := c.Catalog.CreateTable(c.ctx(ctx), ident, schema, opts...)
 	err = nativeCatalogError("create Iceberg table", err)
+	c.mutationResult(err)
 	if err != nil {
-		state.invalidate(!errors.Is(err, catalog.ErrTableAlreadyExists))
+		state.invalidate(!nativeMutationOutcomeKnown(err))
 		return nil, err
 	}
 	tbl = c.bindLocalTable(tbl)
@@ -760,16 +811,27 @@ func (c *nativeCatalog) CommitTable(ctx context.Context, ident table.Identifier,
 		}
 		requirements = validated
 	}
+	ctx, finish, err := c.execution.begin(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	defer finish()
 	metadata, location, err := c.Catalog.CommitTable(c.ctx(ctx), ident, requirements, updates)
 	err = nativeCatalogError("commit Iceberg table", err)
+	c.mutationResult(err)
 	if !writerOwned || err != nil {
 		// Only the SDK's returned Table preserves all catalog-specific state.
 		// Writer-owned commits publish that Table after tx.Commit returns.
-		state.invalidate(err != nil && !errors.Is(err, table.ErrCommitFailed))
+		state.invalidate(!nativeMutationOutcomeKnown(err))
 	}
 	return metadata, location, err
 }
 func (c *nativeCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	ctx, finish, err := c.execution.beginRead(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
 	ctx, state, unlock := c.lockTable(ctx, ident)
 	defer unlock()
 	if state.closed {
@@ -792,6 +854,12 @@ func (c *nativeCatalog) LoadTable(ctx context.Context, ident table.Identifier) (
 }
 func (c *nativeCatalog) ListTables(ctx context.Context, namespace table.Identifier) iter.Seq2[table.Identifier, error] {
 	return func(yield func(table.Identifier, error) bool) {
+		ctx, finish, err := c.execution.beginRead(ctx)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		defer finish()
 		for ident, err := range c.Catalog.ListTables(c.ctx(ctx), namespace) {
 			if !yield(ident, nativeCatalogError("list Iceberg tables", err)) {
 				return
@@ -805,8 +873,14 @@ func (c *nativeCatalog) DropTable(ctx context.Context, ident table.Identifier) e
 	if err := state.usable(); err != nil {
 		return err
 	}
-	err := nativeCatalogError("drop Iceberg table", c.Catalog.DropTable(c.ctx(ctx), ident))
-	state.invalidate(err != nil && !errors.Is(err, catalog.ErrNoSuchTable))
+	ctx, finish, err := c.execution.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	err = nativeCatalogError("drop Iceberg table", c.Catalog.DropTable(c.ctx(ctx), ident))
+	c.mutationResult(err)
+	state.invalidate(!nativeMutationOutcomeKnown(err))
 	if err == nil || errors.Is(err, catalog.ErrNoSuchTable) {
 		state.generation++
 	}
@@ -830,9 +904,15 @@ func (c *nativeCatalog) RenameTable(ctx context.Context, from, to table.Identifi
 	if err := toState.usable(); err != nil {
 		return nil, err
 	}
+	ctx, finish, err := c.execution.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
 	tbl, err := c.Catalog.RenameTable(c.ctx(ctx), from, to)
 	err = nativeCatalogError("rename Iceberg table", err)
-	unknown := err != nil && !errors.Is(err, catalog.ErrNoSuchTable) && !errors.Is(err, catalog.ErrTableAlreadyExists)
+	c.mutationResult(err)
+	unknown := !nativeMutationOutcomeKnown(err)
 	fromState.invalidate(unknown)
 	toState.invalidate(unknown)
 	if err != nil {
@@ -847,40 +927,81 @@ func (c *nativeCatalog) RenameTable(ctx context.Context, from, to table.Identifi
 	return tbl, nil
 }
 func (c *nativeCatalog) CheckTableExists(ctx context.Context, ident table.Identifier) (bool, error) {
+	ctx, finish, err := c.execution.beginRead(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer finish()
 	exists, err := c.Catalog.CheckTableExists(c.ctx(ctx), ident)
 	return exists, nativeCatalogError("check Iceberg table", err)
 }
 func (c *nativeCatalog) ListNamespaces(ctx context.Context, parent table.Identifier) ([]table.Identifier, error) {
+	ctx, finish, err := c.execution.beginRead(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
 	ids, err := c.Catalog.ListNamespaces(c.ctx(ctx), parent)
 	return ids, nativeCatalogError("list Iceberg namespaces", err)
 }
 func (c *nativeCatalog) CreateNamespace(ctx context.Context, namespace table.Identifier, props apacheiceberg.Properties) error {
-	return nativeCatalogError("create Iceberg namespace", c.Catalog.CreateNamespace(c.ctx(ctx), namespace, props))
+	ctx, finish, err := c.execution.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	err = nativeCatalogError("create Iceberg namespace", c.Catalog.CreateNamespace(c.ctx(ctx), namespace, props))
+	c.mutationResult(err)
+	return err
 }
 func (c *nativeCatalog) DropNamespace(ctx context.Context, namespace table.Identifier) error {
-	return nativeCatalogError("drop Iceberg namespace", c.Catalog.DropNamespace(c.ctx(ctx), namespace))
+	ctx, finish, err := c.execution.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	err = nativeCatalogError("drop Iceberg namespace", c.Catalog.DropNamespace(c.ctx(ctx), namespace))
+	c.mutationResult(err)
+	return err
 }
 func (c *nativeCatalog) CheckNamespaceExists(ctx context.Context, namespace table.Identifier) (bool, error) {
+	ctx, finish, err := c.execution.beginRead(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer finish()
 	exists, err := c.Catalog.CheckNamespaceExists(c.ctx(ctx), namespace)
 	return exists, nativeCatalogError("check Iceberg namespace", err)
 }
 func (c *nativeCatalog) LoadNamespaceProperties(ctx context.Context, namespace table.Identifier) (apacheiceberg.Properties, error) {
+	ctx, finish, err := c.execution.beginRead(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
 	props, err := c.Catalog.LoadNamespaceProperties(c.ctx(ctx), namespace)
 	return props, nativeCatalogError("load Iceberg namespace properties", err)
 }
 func (c *nativeCatalog) UpdateNamespaceProperties(ctx context.Context, namespace table.Identifier, removals []string, updates apacheiceberg.Properties) (catalog.PropertiesUpdateSummary, error) {
+	ctx, finish, err := c.execution.begin(ctx)
+	if err != nil {
+		return catalog.PropertiesUpdateSummary{}, err
+	}
+	defer finish()
 	summary, err := c.Catalog.UpdateNamespaceProperties(c.ctx(ctx), namespace, removals, updates)
+	c.mutationResult(err)
 	return summary, nativeCatalogError("update Iceberg namespace properties", err)
 }
 
 // Each Thrift client is single-flight; the pool preserves HiveClients rather
 // than sharing a non-thread-safe protocol across simultaneous catalog requests.
 type nativeHivePool struct {
-	clients chan *nativeHiveClient
-	all     []*nativeHiveClient
-	done    chan struct{}
-	once    sync.Once
-	mu      sync.Mutex
+	execution *nativeExecution
+	clients   chan *nativeHiveClient
+	all       []*nativeHiveClient
+	done      chan struct{}
+	once      sync.Once
+	mu        sync.Mutex
 }
 
 type nativeHiveClient struct {
@@ -894,7 +1015,7 @@ func newNativeHivePool(ctx context.Context, config *Config) (*nativeHivePool, er
 	if count <= 0 {
 		count = 2
 	}
-	pool := &nativeHivePool{clients: make(chan *nativeHiveClient, count), done: make(chan struct{})}
+	pool := &nativeHivePool{clients: make(chan *nativeHiveClient, count), done: make(chan struct{}), execution: config.execution}
 	endpoints := strings.Split(config.HiveURI, ",")
 	for index := range count {
 		sasl := config.HiveSaslEnabled
@@ -1041,6 +1162,10 @@ func (p *nativeHivePool) ensureConnected(ctx context.Context, client *nativeHive
 }
 
 func nativeHiveConnectionBroken(err error) bool {
+	var rejected *nativeMutationNotDispatched
+	if errors.As(err, &rejected) {
+		return false
+	}
 	if err == nil {
 		return false
 	}
@@ -1065,7 +1190,21 @@ func nativeHiveConnectionBroken(err error) bool {
 }
 
 func nativeHiveExec(ctx context.Context, p *nativeHivePool, call func(*nativeHiveClient) error) error {
-	_, err := nativeHiveCall(ctx, p, func(c *nativeHiveClient) (struct{}, error) { return struct{}{}, call(c) })
+	_, err := nativeHiveCall(ctx, p, func(c *nativeHiveClient) (struct{}, error) {
+		if p.execution == nil {
+			return struct{}{}, call(c)
+		}
+		_, finish, err := p.execution.begin(ctx)
+		if err != nil {
+			return struct{}{}, &nativeMutationNotDispatched{cause: err}
+		}
+		defer finish()
+		err = call(c)
+		if nativeHiveConnectionBroken(err) {
+			p.execution.markUnknown()
+		}
+		return struct{}{}, err
+	})
 	return err
 }
 
@@ -1128,11 +1267,69 @@ type nativeHTTPAttempt struct {
 	ExtendedRequestID string
 	RetryAfter        string
 	TransportError    bool
+	// ErrorClass names a transport failure without leaking the URL or address that
+	// net/http embeds in its error strings.
+	ErrorClass string
+	// ResponseCode carries a service error type when the response advertises one in
+	// headers; the transport never reads response bodies.
+	ResponseCode string
 }
 
 func (a nativeHTTPAttempt) String() string {
-	return fmt.Sprintf("iceberg_http attempt_id=%d method=%q host=%q path=%q status=%d duration_ms=%.3f aws_request_id=%q aws_extended_request_id=%q retry_after=%q transport_error=%t",
-		a.ID, a.Method, a.Host, a.Path, a.Status, float64(a.Duration)/float64(time.Millisecond), a.RequestID, a.ExtendedRequestID, a.RetryAfter, a.TransportError)
+	return fmt.Sprintf("iceberg_http attempt_id=%d method=%q host=%q path=%q status=%d duration_ms=%.3f aws_request_id=%q aws_extended_request_id=%q retry_after=%q transport_error=%t error_class=%q resp_code=%q",
+		a.ID, a.Method, a.Host, a.Path, a.Status, float64(a.Duration)/float64(time.Millisecond), a.RequestID, a.ExtendedRequestID, a.RetryAfter, a.TransportError, a.ErrorClass, a.ResponseCode)
+}
+
+// nativeTransportErrorClass names a transport failure without leaking the URL or
+// address that net/http embeds in its error strings.
+func nativeTransportErrorClass(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context_deadline"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "connection_reset"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection_refused"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof"
+	case errors.Is(err, io.EOF):
+		return "eof"
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "dns"
+	}
+	var verifyErr *tls.CertificateVerificationError
+	if errors.As(err, &verifyErr) {
+		return "tls_verify"
+	}
+	var recordErr *tls.RecordHeaderError
+	if errors.As(err, &recordErr) {
+		return "tls"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	return "unknown"
+}
+
+// nativeResponseErrorCode reports a service error type advertised in headers. The
+// diagnostic transport never reads response bodies, so nothing else is available.
+func nativeResponseErrorCode(resp *http.Response) string {
+	if resp == nil || resp.StatusCode < http.StatusBadRequest {
+		return ""
+	}
+	for _, header := range []string{"X-Amzn-Errortype", "X-Amz-Error-Code"} {
+		if value := resp.Header.Get(header); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 var nativeHTTPAttemptID atomic.Uint64
@@ -1167,6 +1364,9 @@ func (t *nativeDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response
 	response, err := t.base.RoundTrip(req)
 	attempt.Duration = time.Since(started)
 	attempt.TransportError = err != nil
+	if err != nil {
+		attempt.ErrorClass = nativeTransportErrorClass(err)
+	}
 	if response != nil {
 		attempt.Status = response.StatusCode
 		attempt.RequestID = response.Header.Get("X-Amz-Request-Id")
@@ -1175,6 +1375,7 @@ func (t *nativeDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response
 		}
 		attempt.ExtendedRequestID = response.Header.Get("X-Amz-Id-2")
 		attempt.RetryAfter = response.Header.Get("Retry-After")
+		attempt.ResponseCode = nativeResponseErrorCode(response)
 	}
 	t.emit(attempt)
 	return response, err
@@ -1182,7 +1383,7 @@ func (t *nativeDiagnosticTransport) RoundTrip(req *http.Request) (*http.Response
 
 // newNativeHTTPClient supplies the same diagnostic layer to REST, OAuth, Google
 // token refresh, Glue, and AWS's default credential chain. The caller owns it.
-func newNativeHTTPClient() (*http.Client, func()) {
+func newNativeHTTPClient(controlled bool) (*http.Client, func()) {
 	transport := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		DialContext:         (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -1196,21 +1397,37 @@ func newNativeHTTPClient() (*http.Client, func()) {
 		ResponseHeaderTimeout: 30 * time.Second,
 		ExpectContinueTimeout: time.Second,
 	}
-	return &http.Client{Transport: newNativeHTTPTransport(transport, nil)}, transport.CloseIdleConnections
+	if !controlled {
+		return &http.Client{Transport: newNativeHTTPTransport(transport, nil)}, transport.CloseIdleConnections
+	}
+	// A mutation uses a fresh HTTP/1 connection: neither net/http's reused
+	// connection retry nor HTTP/2 stream retries may replay it below our guard.
+	// Keep the ordinary pooled/HTTP2 path for reads and credential refresh.
+	mutations := transport.Clone()
+	mutations.DisableKeepAlives = true
+	mutations.ForceAttemptHTTP2 = false
+	mutations.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	wire := &nativeExecutionWireTransport{ordinary: transport, mutations: mutations}
+	return &http.Client{Transport: newNativeHTTPTransport(wire, nil)}, func() {
+		transport.CloseIdleConnections()
+		mutations.CloseIdleConnections()
+	}
 }
 
 const (
-	// The previous Java REST client allowed five retries. Only explicit
-	// throttling responses are retried here: 409 needs a metadata reload and
-	// an ambiguous POST failure must remain visible to commit recovery.
+	// Only explicit 429 rejections permit exact-body replay. All other
+	// controlled mutation failures remain single-dispatch and never redirect.
 	nativeRESTThrottleMaxAttempts = 6
 	nativeRESTThrottleMaxWait     = time.Minute
 )
 
 type nativeRESTThrottleTransport struct {
-	base http.RoundTripper
-	now  func() time.Time
-	wait func(context.Context, time.Duration) error
+	base       http.RoundTripper
+	now        func() time.Time
+	wait       func(context.Context, time.Duration) error
+	execution  *nativeExecution
+	catalogURL *url.URL
+	authURL    *url.URL
 }
 
 // newNativeRESTTransport wraps an already-instrumented transport. It is used
@@ -1221,6 +1438,13 @@ func newNativeRESTTransport(base http.RoundTripper) http.RoundTripper {
 }
 
 func (t *nativeRESTThrottleTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if t.execution != nil && t.mutates(request) {
+		return t.mutate(request, true)
+	}
+	return t.read(request)
+}
+
+func (t *nativeRESTThrottleTransport) readWithThrottle(request *http.Request) (*http.Response, error) {
 	ctx := request.Context()
 	current := request
 	var waited time.Duration
@@ -1330,7 +1554,12 @@ type nativeCatalogFailure struct {
 func (e *nativeCatalogFailure) Error() string {
 	category := nativeBackendErrorCategory(e.cause)
 	var configError nativeCatalogConfigError
+	var throttled *nativeRESTThrottleRejection
 	switch {
+	case errors.Is(e.cause, rest.ErrCommitStateUnknown):
+		category = "commit state unknown; inspect the table before retrying"
+	case errors.As(e.cause, &throttled):
+		category = "catalog mutation rejected after bounded throttling (HTTP 429)"
 	case errors.As(e.cause, &configError):
 		category = configError.Error()
 	case errors.Is(e.cause, context.Canceled):
@@ -1339,8 +1568,6 @@ func (e *nativeCatalogFailure) Error() string {
 		category = "deadline exceeded"
 	case errors.Is(e.cause, table.ErrCommitFailed), errors.Is(e.cause, rest.ErrCommitFailed):
 		category = "optimistic commit conflict"
-	case errors.Is(e.cause, rest.ErrCommitStateUnknown):
-		category = "commit state unknown; inspect the table before retrying"
 	case errors.Is(e.cause, rest.ErrUnauthorized):
 		category = "catalog authentication rejected (HTTP 401)"
 	case errors.Is(e.cause, rest.ErrForbidden):
@@ -1449,8 +1676,8 @@ func classify(err error) *errs.Failure {
 		category errs.Category
 		code     string
 	}{
-		{table.ErrCommitFailed, errs.ConcurrencyConflict, "iceberg.commit_conflict"},
 		{rest.ErrCommitStateUnknown, errs.CatalogError, "iceberg.commit_state_unknown"},
+		{table.ErrCommitFailed, errs.ConcurrencyConflict, "iceberg.commit_conflict"},
 		{catalog.ErrNoSuchTable, errs.ObjectNotFound, "iceberg.table_not_found"},
 		{catalog.ErrNoSuchNamespace, errs.ObjectNotFound, "iceberg.namespace_not_found"},
 		{rest.ErrUnauthorized, errs.AuthFailed, "iceberg.unauthorized"},
@@ -1464,6 +1691,10 @@ func classify(err error) *errs.Failure {
 		if errors.Is(err, rule.cause) {
 			return &errs.Failure{Category: rule.category, ClassifiedBy: errs.ClassifiedByVendor, Code: rule.code}
 		}
+	}
+	var throttled *nativeRESTThrottleRejection
+	if errors.As(err, &throttled) {
+		return &errs.Failure{Category: errs.ResourceExhausted, ClassifiedBy: errs.ClassifiedByVendor, Code: "iceberg.throttled"}
 	}
 	var vendor interface{ ErrorCode() string }
 	if errors.As(err, &vendor) {

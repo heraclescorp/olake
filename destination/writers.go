@@ -17,7 +17,7 @@ import (
 )
 
 type (
-	initWriter func(config any) (Writer, func(ctx context.Context), error)
+	initWriter func(ctx context.Context, config any) (Writer, func(ctx context.Context), error)
 
 	Options struct {
 		Backfill                 bool
@@ -33,6 +33,7 @@ type (
 		mu          sync.RWMutex
 		schema      any
 		streamIndex types.StreamIndex
+		needsIndex  bool
 	}
 
 	Stats struct {
@@ -44,11 +45,15 @@ type (
 	}
 
 	WriterPool struct {
-		stats        *Stats
-		initWriter   initWriter
-		shutdown     func(ctx context.Context)
-		writerSchema sync.Map
-		batchSize    int64
+		stats             *Stats
+		initWriter        initWriter
+		shutdown          func(ctx context.Context)
+		writerSchema      sync.Map
+		batchSize         int64
+		resync            resyncDestination
+		resyncTargetID    string
+		resyncOperationID string
+		resyncContext     context.Context
 	}
 
 	// writer thread used by reader
@@ -101,13 +106,19 @@ func WithKeepDeletesThroughFilter(keep bool) ThreadOptions {
 // NewWriterPool manages a destination's shared resources (e.g., Iceberg JVM) and connection health.
 // It initializes global state, runs checks, and provides thread-level writers. Call Close() to clean up.
 func NewWriterPool(ctx context.Context, config *types.WriterConfig, syncStreams []types.StreamInterface, batchSize int64) (*WriterPool, error) {
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return nil, err
+	}
 	initWriter, found := RegisteredWriters[config.Type]
 	if !found {
 		return nil, errs.Precondition(errs.ConfigInvalid, codeDestinationTypeInvalid,
 			fmt.Errorf("invalid destination type has been passed [%s]", config.Type))
 	}
 
-	adapter, shutdown, err := initWriter(config.WriterConfig)
+	if config.Type != types.Iceberg {
+		utils.BeginExecutionParticipant(ctx)(false)
+	}
+	adapter, shutdown, err := initWriter(ctx, config.WriterConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize destination: %w", err)
 	}
@@ -122,27 +133,23 @@ func NewWriterPool(ctx context.Context, config *types.WriterConfig, syncStreams 
 		shutdown:   shutdown,
 		batchSize:  batchSize,
 	}
+	pool.resync, _ = adapter.(resyncDestination)
 
 	stopCheck := logger.TrackTiming("destination", "check")
-	err = adapter.Check(ctx)
+	// Recovery-only must not run the ordinary connection test: it creates a test
+	// table and writes a row, while recovery is strictly read-only at destination.
+	if options, ok := types.ResyncFromContext(ctx); !ok || !options.RecoverOnly {
+		err = adapter.Check(ctx)
+	}
 	stopCheck()
 	if err != nil {
+		pool.Shutdown(ctx)
 		return nil, fmt.Errorf("failed to test destination: %w", err)
 	}
 
 	for _, stream := range syncStreams {
 		artifact := &writerSchema{
-			mu:     sync.RWMutex{},
-			schema: nil,
-		}
-
-		if !stream.AppendModeEnabled() && stream.GetUpdateType().NeedsTableIndex(config.Type) {
-			streamIndex, err := indexdb.Open(stream)
-			if err != nil {
-				pool.Shutdown(ctx)
-				return nil, err
-			}
-			artifact.streamIndex = streamIndex
+			needsIndex: !stream.AppendModeEnabled() && stream.GetUpdateType().NeedsTableIndex(config.Type),
 		}
 
 		pool.writerSchema.Store(stream.ID(), artifact)
@@ -176,6 +183,12 @@ func (w *WriterPool) GetStats() *Stats {
 }
 
 func (w *WriterPool) NewWriter(ctx context.Context, stream types.StreamInterface, options ...ThreadOptions) (*WriterThread, *types.MetadataState, error) {
+	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
+		return nil, nil, fmt.Errorf("recovery-only resync cannot open a data writer")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return nil, nil, err
+	}
 	ctx = observability.WithTable(ctx, stream.Namespace(), stream.Name())
 	w.stats.ThreadCount.Add(1)
 
@@ -194,14 +207,10 @@ func (w *WriterPool) NewWriter(ctx context.Context, stream types.StreamInterface
 		return nil, nil, fmt.Errorf("failed to convert raw stream artifact[%T] to *StreamArtifact struct", rawStreamArtifact)
 	}
 
-	// Threads of one stream share the stream's index; it is nil in equality mode.
-	// TODO: can we pass things through contexts like streamContext ?
-	opts.TableIndex = streamArtifact.streamIndex
-
 	writerThread, prevStreamState, err := func() (Writer, *types.MetadataState, error) {
 		// init writer and point it at the config parsed once at pool creation,
 		// shared read-only across all writer threads.
-		writerThread, _, err := w.initWriter(nil)
+		writerThread, _, err := w.initWriter(ctx, nil)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to initialize writer: %w", err)
 		}
@@ -209,6 +218,13 @@ func (w *WriterPool) NewWriter(ctx context.Context, stream types.StreamInterface
 		// setup table and schema
 		streamArtifact.mu.Lock()
 		defer streamArtifact.mu.Unlock()
+		if streamArtifact.needsIndex && streamArtifact.streamIndex == nil {
+			streamArtifact.streamIndex, err = indexdb.Open(stream)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		opts.TableIndex = streamArtifact.streamIndex
 
 		threadSchema, prevStreamState, err := writerThread.Setup(ctx, stream, streamArtifact.schema, opts)
 		if err != nil {
@@ -460,14 +476,26 @@ func (wt *WriterThread) Close(closeCtx context.Context, finalMetadataState any) 
 }
 
 func DropStreams(ctx context.Context, config *types.WriterConfig, dropStreams []types.StreamInterface) error {
+	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
+		return fmt.Errorf("recovery-only resync cannot drop destination streams")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
 	if len(dropStreams) == 0 {
 		return nil
+	}
+	if config.Type != types.Iceberg {
+		utils.BeginExecutionParticipant(ctx)(false)
 	}
 
 	// Always drop the stream index: dropStreams carry the new update type, not the one the
 	// index was built under, so a dv/pos -> eq clear would otherwise leave a stale index
 	// that outlives the recreated table. Dropping a missing index is a no-op.
 	for _, stream := range dropStreams {
+		if err := utils.CheckExecutionFence(ctx); err != nil {
+			return err
+		}
 		if err := indexdb.Drop(stream); err != nil {
 			return err
 		}
@@ -479,7 +507,7 @@ func DropStreams(ctx context.Context, config *types.WriterConfig, dropStreams []
 			fmt.Errorf("invalid destination type has been passed [%s]", config.Type))
 	}
 
-	adapter, shutdown, err := initWriter(config.WriterConfig)
+	adapter, shutdown, err := initWriter(ctx, config.WriterConfig)
 	if err != nil {
 		return fmt.Errorf("failed to initialize destination: %w", err)
 	}

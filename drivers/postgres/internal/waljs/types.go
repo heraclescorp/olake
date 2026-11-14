@@ -23,6 +23,8 @@ type Config struct {
 	Publication string
 	// PreserveToastValues marks columns Postgres could not send (unchanged TOAST) so the destination can recover them.
 	PreserveToastValues bool
+	// ReplayAfter excludes transactions already represented by each table's snapshot.
+	ReplayAfter map[string]pglogrepl.LSN
 }
 
 type WALState struct {

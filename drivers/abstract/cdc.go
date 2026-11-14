@@ -36,7 +36,6 @@ func (a *AbstractDriver) RunChangeStream(mainCtx context.Context, pool *destinat
 	// - Other streams signal after their backfill completes
 	// - waitForBackfillCompletion waits for all signals before starting CDC
 	backfillCompletionChannel := make(chan string, len(streams))
-	defer close(backfillCompletionChannel)
 	err := utils.ForEach(streams, func(stream types.StreamInterface) error {
 		isStrictCDC := stream.GetSyncMode() == types.STRICTCDC
 		if a.state.HasCompletedBackfill(stream.Self()) || isStrictCDC {
@@ -110,7 +109,24 @@ func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destinatio
 	defer cdcCtxCancel()
 
 	defer func() {
-		if postCDCErr := a.driver.PostCDC(cdcCtx, streamIndex); postCDCErr != nil {
+		if _, resync := types.ResyncFromContext(mainCtx); resync {
+			if err == nil && cdcCtx.Err() == nil {
+				a.resyncMu.Lock()
+				a.resyncPostCDC = append(a.resyncPostCDC, streamIndex)
+				a.resyncMu.Unlock()
+			}
+			return
+		}
+		if _, controlled := utils.ExecutionFromContext(cdcCtx); controlled {
+			if fenceErr := utils.CheckExecutionFence(cdcCtx); fenceErr != nil {
+				err = utils.Ternary(err == nil, fenceErr, fmt.Errorf("%w: source acknowledgement fenced: %w", err, fenceErr)).(error)
+				return
+			}
+		}
+		settled := utils.BeginExecutionParticipant(cdcCtx)
+		postCDCErr := a.driver.PostCDC(cdcCtx, streamIndex)
+		settled(postCDCErr == nil)
+		if postCDCErr != nil {
 			err = utils.Ternary(err == nil, fmt.Errorf("post cdc error: %w", postCDCErr), fmt.Errorf("%w: post cdc error: %w", err, postCDCErr)).(error)
 		}
 	}()

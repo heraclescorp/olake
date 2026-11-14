@@ -1123,6 +1123,7 @@ func TestNativeRESTCoordinatorRejectsDeletesAfterExternalCompaction(t *testing.T
 				rows[0], rows[1] = rows[1], rows[0]
 			}
 			require.NoError(t, compactor.Write(ctx, rows))
+			require.NoError(t, compactor.finishBackfillFiles(ctx))
 			entries, err := nativeLiveEntries(ctx, compactor.table)
 			require.NoError(t, err)
 			var removed []apacheiceberg.DataFile
@@ -1281,4 +1282,34 @@ func TestNativeRESTCoordinatorRecoversAfterCommittedIndexFailure(t *testing.T) {
 			require.Equal(t, nativeSnapshotID(recovered.table), index.snapshot)
 		})
 	}
+}
+
+func TestResyncGenerationForcesFullScanAndDropsOldPhysicalLocations(t *testing.T) {
+	ctx := context.Background()
+	tbl := appendNativeIndexRows(t, nativeIndexTestTable(t, 2), nativeIndexRows("live-row"))
+	index := openNativeTestIndex(t)
+	pending := types.NewStreamIndexThread(index)
+	pending.Put("deleted-old-row", types.RowLocation{FilePath: "old.parquet", Position: 3})
+	oldSnapshot := int64(11)
+	require.NoError(t, index.Commit(pending, &oldSnapshot))
+	require.NoError(t, indexdb.ReconcileGeneration(index, "completed-resync"))
+	require.NoError(t, reconcileNativeTableIndex(ctx, index, tbl, constants.OlakeID))
+	_, found, err := index.Lookup("deleted-old-row")
+	require.NoError(t, err)
+	require.False(t, found)
+	location, found, err := index.Lookup("live-row")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NotEqual(t, "old.parquet", location.FilePath)
+	require.Equal(t, int64(0), location.Position)
+	snapshot, err := index.LastCommittedSnapshot()
+	require.NoError(t, err)
+	require.Equal(t, nativeSnapshotID(tbl), snapshot)
+	// A second reconciliation must retain both generation and recovered rows.
+	require.NoError(t, indexdb.ReconcileGeneration(index, "completed-resync"))
+	require.NoError(t, reconcileNativeTableIndex(ctx, index, tbl, constants.OlakeID))
+	recovered, found, err := index.Lookup("live-row")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, location, recovered)
 }

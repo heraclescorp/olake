@@ -48,3 +48,24 @@ func TestSQLFilterBinary(t *testing.T) {
 		})
 	}
 }
+
+func TestPostgresChunkScanQueryBoundsAndFilter(t *testing.T) {
+	stream := types.NewStream("events", "public", nil).Wrap(0)
+	for _, test := range []struct {
+		name   string
+		chunk  types.Chunk
+		filter string
+		query  string
+	}{
+		{"unbounded", types.Chunk{}, "", `SELECT * FROM "public"."events"`},
+		{"filter only", types.Chunk{}, `"active" = true`, `SELECT * FROM "public"."events" WHERE "active" = true`},
+		{"lower bound", types.Chunk{Min: 10}, "", `SELECT * FROM "public"."events" WHERE "id" >= 10`},
+		{"upper bound", types.Chunk{Max: 20}, "", `SELECT * FROM "public"."events" WHERE "id" < 20`},
+		{"bounded", types.Chunk{Min: 10, Max: 20}, "", `SELECT * FROM "public"."events" WHERE "id" >= 10 AND "id" < 20`},
+		{"bounded filter", types.Chunk{Min: 10, Max: 20}, `"active" = true OR "id" = 11`, `SELECT * FROM "public"."events" WHERE ("id" >= 10 AND "id" < 20) AND ("active" = true OR "id" = 11)`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.query, PostgresChunkScanQuery(stream, "id", test.chunk, test.filter))
+		})
+	}
+}

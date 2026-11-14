@@ -168,8 +168,8 @@ func TestNativeSourceColumnsInitialDefaultsAndMissingValues(t *testing.T) {
 			cfg, stream, cat := nativeWriterFixture(t, mode, true, "")
 			seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "seed", true)
 			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("old", "r", 1, "one")}))
-			oldPath := seed.dataFiles[0].FilePath()
 			require.NoError(t, seed.Close(ctx, map[string]any{"state": "preserve-recovery"}))
+			oldPath := seed.dataFiles[0].FilePath()
 			originalSchema := seed.table.Schema()
 			originalSnapshot := nativeSnapshotID(seed.table)
 			recovery := seed.table.Properties()[nativeRecoveryProperty]
@@ -453,8 +453,8 @@ func TestNativeSourcePrimitiveDefaultsPersistAndReadOldRows(t *testing.T) {
 			cfg, stream, cat := nativeWriterFixture(t, mode, true, "")
 			seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "seed", true)
 			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("old", "r", 1, "one")}))
-			oldPath := seed.dataFiles[0].FilePath()
 			require.NoError(t, seed.Close(ctx, nil))
+			oldPath := seed.dataFiles[0].FilePath()
 			defaults := []struct {
 				name    string
 				iceType string

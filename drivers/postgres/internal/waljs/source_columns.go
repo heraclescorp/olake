@@ -136,6 +136,9 @@ func (p *pgoutputReplicator) emitRelationColumns(ctx context.Context, msg *pglog
 	if stream == nil {
 		return nil
 	}
+	if p.socket.changeFilter.skipTransaction(stream.ID(), p.txnFinalLSN) {
+		return nil
+	}
 
 	catalog, err := fetchCatalogColumns(ctx, p.db, "$1::oid", msg.RelationID)
 	if err != nil {

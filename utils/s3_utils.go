@@ -104,6 +104,9 @@ func ResolveS3Paths(ctx context.Context, flagPaths []*string, telemetryFiles []*
 	if err := s3util.Init(ctx); err != nil {
 		return err
 	}
+	if err := CheckExecutionFence(ctx); err != nil {
+		return err
+	}
 
 	for _, flagPath := range flagPaths {
 		if err := resolveS3PathFlag(ctx, flagPath); err != nil {

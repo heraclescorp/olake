@@ -8,6 +8,7 @@ import (
 
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/drivers/abstract"
+	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -39,6 +40,9 @@ func (w *wal2jsonReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, cal
 		tables = append(tables, key)
 	}
 	pluginArguments = append(pluginArguments, fmt.Sprintf("\"add-tables\" '%s'", strings.Join(tables, ",")))
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
 	if err := pglogrepl.StartReplication(
 		ctx,
 		w.socket.pgConn,

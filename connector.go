@@ -46,7 +46,7 @@ func RegisterDriver(driver abstract.DriverInterface) {
 				logger.Warnf("Go diagnostics shutdown failed: %v", err)
 			}
 		}()
-		return root.Execute()
+		return protocol.Execute(root)
 	}()
 	if err != nil {
 		protocol.ReportFailure(err)

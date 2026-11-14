@@ -55,6 +55,8 @@ type AbstractDriver struct { //nolint:gosec,revive
 	state           *types.State
 	GlobalConnGroup *utils.CxGroup
 	GlobalCtxGroup  *utils.CxGroup
+	resyncMu        sync.Mutex
+	resyncPostCDC   []int
 }
 
 var DefaultColumns = map[string]types.DataType{
@@ -305,7 +307,24 @@ func (a *AbstractDriver) ClearState(streams []types.StreamInterface) (*types.Sta
 	return a.state, nil
 }
 
-func (a *AbstractDriver) Read(ctx context.Context, pool *destination.WriterPool, backfillStreams, cdcStreams, incrementalStreams []types.StreamInterface) error {
+func (a *AbstractDriver) Read(ctx context.Context, pool *destination.WriterPool, backfillStreams, cdcStreams, incrementalStreams []types.StreamInterface) (err error) {
+	_, resync := types.ResyncFromContext(ctx)
+	readCtx, cancel := context.WithCancel(ctx)
+	ctx = readCtx
+	// Every read generation inherits the actual command's runtime fence. The
+	// groups created before CLI flags were parsed cannot authorize worker work.
+	a.GlobalCtxGroup = utils.NewCGroup(ctx)
+	a.GlobalConnGroup = utils.NewCGroup(ctx)
+	if resync {
+		a.resyncPostCDC = nil
+	}
+	defer func() {
+		cancel()
+		// A local read/TOAST error is not unsettled work: join all writers first,
+		// then report the drain independently of the operation's success status.
+		err = errors.Join(err, a.GlobalCtxGroup.Block(), a.GlobalConnGroup.Block())
+		utils.SourceDrained(ctx, nil)
+	}()
 	// set max read connections
 	if a.driver.MaxConnections() > 0 {
 		a.GlobalConnGroup = utils.NewCGroupWithLimit(ctx, a.driver.MaxConnections())
@@ -338,16 +357,7 @@ func (a *AbstractDriver) Read(ctx context.Context, pool *destination.WriterPool,
 		})
 	}
 
-	// wait for all threads to finish
-	if err := a.GlobalCtxGroup.Block(); err != nil {
-		return fmt.Errorf("error occurred while waiting for context groups: %w", err)
-	}
-
-	// wait for all threads to finish
-	if err := a.GlobalConnGroup.Block(); err != nil {
-		return fmt.Errorf("error occurred while waiting for connections: %w", err)
-	}
-	return nil
+	return a.completeRead(ctx, pool.PublishResync)
 }
 
 // waitForBackfillCompletion waits for all backfill processes to complete and processes each completed stream

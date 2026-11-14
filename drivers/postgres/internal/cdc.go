@@ -176,6 +176,10 @@ func (p *Postgres) PreCDC(ctx context.Context, streams []types.StreamInterface) 
 
 	globalState := p.state.GetGlobal()
 	if globalState == nil || globalState.State == nil {
+		if _, resync := types.ResyncFromContext(ctx); resync {
+			return errs.Precondition(errs.StateInvalid, codeGlobalLSNMissing,
+				fmt.Errorf("atomic resync CDC requires a saved global CDC checkpoint; refusing to initialize or advance the replication slot before publication"))
+		}
 		// advance before seeding state: AdvanceLSN returns the position the slot confirmed,
 		// so the state file and confirmed_flush_lsn agree by construction
 		confirmedLSN, err := waljs.AdvanceLSN(ctx, p.client, p.cdcConfig.ReplicationSlot, slot.CurrentLSN.String())
@@ -195,6 +199,9 @@ func (p *Postgres) StreamChanges(ctx context.Context, _ int, metadataStates map[
 	if err := utils.Unmarshal(rawGlobalState.State, &postgresGlobalState); err != nil {
 		return nil, errs.Precondition(errs.StateInvalid, codeGlobalStateUnreadable,
 			fmt.Errorf("failed to unmarshal global state: %w", err))
+	}
+	if _, resync := types.ResyncFromContext(ctx); resync {
+		return p.streamResyncChanges(ctx, postgresGlobalState, metadataStates, callback)
 	}
 
 	var metadataCommittedLSN string
@@ -316,10 +323,15 @@ func (p *Postgres) StreamChanges(ctx context.Context, _ int, metadataStates map[
 }
 
 func (p *Postgres) PostCDC(ctx context.Context, _ int) error {
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
 	if p.replicator == nil {
 		return nil
 	}
-	defer waljs.Cleanup(ctx, p.replicator.Socket())
+	if _, resync := types.ResyncFromContext(ctx); !resync {
+		defer waljs.Cleanup(ctx, p.replicator.Socket())
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()

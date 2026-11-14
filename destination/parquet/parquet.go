@@ -752,7 +752,7 @@ func (p *Parquet) clearRemoteFiles(ctx context.Context, paths []string) error {
 
 func init() {
 	var parquetConfig *Config
-	destination.RegisteredWriters[types.Parquet] = func(config any) (destination.Writer, func(ctx context.Context), error) {
+	destination.RegisteredWriters[types.Parquet] = func(_ context.Context, config any) (destination.Writer, func(ctx context.Context), error) {
 		if parquetConfig != nil {
 			// for already initialized writer, return the same config instance
 			return &Parquet{

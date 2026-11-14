@@ -39,7 +39,7 @@ func (p *Postgres) ChunkIterator(ctx context.Context, stream types.StreamInterfa
 	}
 	defer closeBackfillConn(conn)
 
-	tx, err := conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	tx, err := p.beginBackfillTx(ctx, conn, stream)
 	if err != nil {
 		return err
 	}
@@ -69,15 +69,24 @@ func (p *Postgres) GetOrSplitChunks(ctx context.Context, pool *destination.Write
 		return nil, err
 	}
 	defer closeBackfillConn(conn)
+	var planner sourceQuerier = conn
+	if p.resync != nil && p.resync.streamID == stream.ID() {
+		tx, err := p.beginBackfillTx(ctx, conn, stream)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = tx.Rollback() }()
+		planner = tx
+	}
 
 	var approxRowCount int64
 	approxRowCountQuery := jdbc.PostgresRowCountQuery(stream)
-	err = conn.QueryRowContext(ctx, approxRowCountQuery).Scan(&approxRowCount)
+	err = planner.QueryRowContext(ctx, approxRowCountQuery).Scan(&approxRowCount)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get approx row count: %w", err)
 	}
 	pool.AddRecordsToSyncStats(approxRowCount)
-	return p.splitTableIntoChunks(ctx, conn, stream)
+	return p.splitTableIntoChunks(ctx, planner, stream)
 }
 
 // TODO: add functional tests for splitTableIntoChunks, covering TOAST-heavy, partitioned and pre-PG 14 tables.
