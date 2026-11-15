@@ -121,11 +121,11 @@ func validateToastStreams(streams []types.StreamInterface) error {
 	for _, stream := range streams {
 		if stream.AppendModeEnabled() {
 			return errs.Precondition(errs.ConfigInvalid, codeAppendModeWithToast,
-				fmt.Errorf("stream %s: preserve_toast_values does not support append mode", stream.ID()))
+				fmt.Errorf("stream %s: destination TOAST recovery does not support append mode", stream.ID()))
 		}
 		if !stream.GetUpdateType().NeedsTableIndex(types.Iceberg) {
 			return errs.Precondition(errs.ConfigInvalid, codeUpdateTypeWithoutIndex,
-				fmt.Errorf("stream %s: preserve_toast_values supports only pos and dv update types, got %q", stream.ID(), stream.GetUpdateType()))
+				fmt.Errorf("stream %s: destination TOAST recovery supports only pos and dv update types, got %q", stream.ID(), stream.GetUpdateType()))
 		}
 	}
 	return nil
@@ -150,7 +150,7 @@ func (p *Postgres) prepareWALJSConfig(streams ...types.StreamInterface) (*waljs.
 		Tables:              types.NewSet(streams...),
 		TLSConfig:           tlsConfig,
 		Publication:         p.cdcConfig.Publication,
-		PreserveToastValues: p.cdcConfig.PreserveToastValues,
+		PreserveToastValues: true,
 	}, nil
 }
 
@@ -176,7 +176,7 @@ func (p *Postgres) PreCDC(ctx context.Context, streams []types.StreamInterface) 
 			return fmt.Errorf("source TOAST recovery requires a primary CDC host; standby reads are not replay-fenced")
 		}
 	}
-	if p.cdcConfig.PreserveToastValues && !p.cdcConfig.sourceToastRecovery() {
+	if !p.cdcConfig.sourceToastRecovery() {
 		if err := validateToastStreams(streams); err != nil {
 			return err
 		}

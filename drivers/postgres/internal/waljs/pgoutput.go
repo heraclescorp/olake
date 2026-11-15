@@ -197,7 +197,7 @@ func (p *pgoutputReplicator) tupleValuesToMap(rel *pglogrepl.RelationMessage, tu
 		if col.Data == nil {
 			if isUnchangedToast && !p.preserveToastValues {
 				// Writing the placeholder would replace the row's real value in the destination.
-				return nil, 0, nil, fmt.Errorf("%w: table[%s.%s] column[%s]: postgres did not send an unchanged TOAST value (replica identity is not FULL); enable preserve_toast_values to recover it from the destination",
+				return nil, 0, nil, fmt.Errorf("%w: table[%s.%s] column[%s]: postgres did not send an unchanged TOAST value (replica identity is not FULL); TOAST recovery must be enabled by the PostgreSQL driver",
 					constants.ErrNonRetryable, rel.Namespace, rel.RelationName, colName)
 			}
 			// If the column is a TOAST column, set the value to __olake_unavailable_value__ otherwise set it to nil

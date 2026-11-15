@@ -445,10 +445,10 @@ var ExpectedUpdatedData = map[string]interface{}{
 }
 
 // ExpectedCDCUpdatedData is the CDC update's row: "update" leaves col_toast unchanged, so Postgres
-// leaves it out of the change and OLake writes its placeholder (preserve_toast_values is off).
+// leaves it out of the change; mandatory recovery preserves the original value.
 var ExpectedCDCUpdatedData = func() map[string]interface{} {
 	data := maps.Clone(ExpectedUpdatedData)
-	data["col_toast"] = "__olake_unavailable_value__"
+	data["col_toast"] = ExpectedPostgresData["col_toast"]
 	return data
 }()
 

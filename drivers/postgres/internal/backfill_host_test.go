@@ -136,6 +136,8 @@ func TestSetupDoesNotUseConfiguredBackfillHost(t *testing.T) {
 			require.Len(t, streams, 1)
 			if mode == "cdc-only" {
 				stream := backfillTestStream()
+				mode := string(types.UpdateTypePosition)
+				stream.StreamMetadata.UpdateType = &mode
 				p.state = &types.State{RWMutex: &sync.RWMutex{}, Global: &types.GlobalState{State: waljs.WALState{LSN: "0/16B3748"}, Streams: types.NewSet(stream.ID())}}
 				writer.ExpectQuery(fmt.Sprintf(waljs.ReplicationSlotTempl, "olake_slot")).WillReturnRows(sqlmock.NewRows([]string{"plugin", "slot_type", "confirmed_flush_lsn", "current_lsn"}).AddRow("wal2json", "logical", "0/16B3748", "0/16B3780"))
 				require.NoError(t, p.PreCDC(context.Background(), []types.StreamInterface{stream}))

@@ -39,6 +39,11 @@ func (th *TestHandler) TestDiscover(t *testing.T) {
 	expectedCatalog, err := th.RenderCatalog("expected_discover_")
 	require.NoError(t, err, "failed to generate the expected discover catalog")
 
+	// Destination-based TOAST recovery is mandatory by default for PostgreSQL CDC.
+	if th.TestConfig.Driver == string(constants.Postgres) {
+		require.NoError(t, expectedCatalog.Edit(offerIndexUpdateTypesOnly))
+	}
+
 	// 3. Run discover against the driver image
 	code, out, err := testutils.RunOlake(ctx, t, th.TestConfig, testutils.DiscoverArgs()...)
 	if err != nil || code != 0 {

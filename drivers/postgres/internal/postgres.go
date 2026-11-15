@@ -248,7 +248,7 @@ func (p *Postgres) Spec() any {
 // replication_slot it is not CDC and nothing is recovered.
 func (p *Postgres) SupportedUpdateTypes() []types.UpdateType {
 	cdc := &CDC{}
-	if err := utils.Unmarshal(p.config.UpdateMethod, cdc); err != nil || cdc.ReplicationSlot == "" || !cdc.PreserveToastValues || cdc.sourceToastRecovery() {
+	if err := utils.Unmarshal(p.config.UpdateMethod, cdc); err != nil || cdc.ReplicationSlot == "" || cdc.sourceToastRecovery() {
 		return nil
 	}
 	return []types.UpdateType{types.UpdateTypePosition, types.UpdateTypeDeletionVector}

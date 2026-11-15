@@ -302,13 +302,16 @@ when managed S3 Tables compaction rewrites files:
      "type": "CDC",
      "replication_slot": "your_existing_slot",
      "publication": "your_existing_publication",
-     "preserve_toast_values": true,
      "toast_value_source": "source"
    }
    ```
 
    Keep the existing update-method type spelling and other settings in your job.
-   Omitting `toast_value_source` retains the previous destination-based behavior.
+   TOAST preservation is mandatory. Omitting `toast_value_source` selects
+   destination-based recovery (requiring `pos` or `dv`). The legacy
+   `preserve_toast_values` flag is ignored, including when set to false; it can no
+   longer disable recovery. Existing CDC jobs using equality mode must explicitly
+   select `"toast_value_source": "source"`.
 
 2. Rediscover streams so `available_update_types` reflects source recovery and
    your actual downstream query engines. In **each selected table's stream

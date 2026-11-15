@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"testing"
 
@@ -104,14 +105,19 @@ func TestSourceToastQuotesIdentifiersAndCompositeKeys(t *testing.T) {
 }
 
 func TestToastRecoveryConfiguration(t *testing.T) {
-	for _, c := range []CDC{{}, {PreserveToastValues: true}, {PreserveToastValues: true, ToastValueSource: "source"}, {ToastValueSource: "destination"}} {
+	for _, c := range []CDC{{}, {ToastValueSource: "source"}, {ToastValueSource: "destination"}} {
 		require.NoError(t, c.validateToastRecovery())
 	}
-	for _, c := range []CDC{{ToastValueSource: "source"}, {PreserveToastValues: true, ToastValueSource: "typo"}} {
+	for _, c := range []CDC{{ToastValueSource: "typo"}} {
 		require.Error(t, c.validateToastRecovery())
 	}
-	p := &Postgres{config: &Config{UpdateMethod: map[string]any{"replication_slot": "slot", "preserve_toast_values": true, "toast_value_source": "source"}}}
+	p := &Postgres{config: &Config{UpdateMethod: map[string]any{"replication_slot": "slot", "toast_value_source": "source"}}}
 	require.Nil(t, p.SupportedUpdateTypes())
+	p.CDCSupport = true
+	p.config.Connection, _ = url.Parse("postgres://localhost/test")
+	config, err := p.prepareWALJSConfig()
+	require.NoError(t, err)
+	require.True(t, config.PreserveToastValues, "WAL decoding must always preserve unavailable values")
 }
 
 type toastTestReplicator struct {
@@ -132,7 +138,7 @@ func (r *toastTestReplicator) StreamChanges(ctx context.Context, _ *sqlx.DB, cb 
 
 func TestSourceToastDoesNotFlushAfterReplicationError(t *testing.T) {
 	p, _ := newMockPostgres(t)
-	p.cdcConfig = CDC{PreserveToastValues: true, ToastValueSource: "source"}
+	p.cdcConfig = CDC{ToastValueSource: "source"}
 	p.replicator = &toastTestReplicator{changes: []abstract.CDCChange{toastChange(1)}, err: errors.New("WAL interrupted")}
 	require.ErrorContains(t, p.streamChangesWithToast(context.Background(), func(context.Context, abstract.CDCChange) error { t.Fatal("unexpected callback"); return nil }), "WAL interrupted")
 }
@@ -158,7 +164,7 @@ func TestSourceToastBinaryAndArrayConversion(t *testing.T) {
 
 func TestSourceToastCallbackFailureAndIncompleteTransaction(t *testing.T) {
 	p, _ := newMockPostgres(t)
-	p.cdcConfig = CDC{PreserveToastValues: true, ToastValueSource: "source"}
+	p.cdcConfig = CDC{ToastValueSource: "source"}
 	p.replicator = &toastTestReplicator{changes: []abstract.CDCChange{toastChange(1)}, socket: waljs.Socket{TransactionOpen: true}}
 	require.ErrorContains(t, p.streamChangesWithToast(context.Background(), func(context.Context, abstract.CDCChange) error { t.Fatal("unexpected emit"); return nil }), "incomplete")
 	c := toastChange(1)
@@ -234,7 +240,7 @@ func TestPreCDCSourceToastRejectsStandbyAndMissingKeys(t *testing.T) {
 	for _, tc := range []string{"standby", "missing keys", "invalid source"} {
 		t.Run(tc, func(t *testing.T) {
 			p, mock := newMockPostgres(t)
-			p.cdcConfig = CDC{PreserveToastValues: true, ToastValueSource: "source"}
+			p.cdcConfig = CDC{ToastValueSource: "source"}
 			c := toastChange(1)
 			switch tc {
 			case "standby":
