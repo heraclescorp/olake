@@ -502,7 +502,7 @@ func GetStreamsDelta(oldStreams, newStreams *Catalog, destinationType Destinatio
 			// sync mode change
 			// destination table change
 
-			// NOTE: delete mode changes keep the table, except dv -> other and pos -> dv (see dvDelta)
+			// NOTE: delete mode changes keep the table, except dv -> pos and pos -> dv (see dvDelta)
 			// TODO: log the differences for user reference
 			oldDestinationDatabase := resolveConfigurableField(oldMetadata.DestinationDatabase, oldStream.Stream.DestinationDatabase)
 			oldDestinationTable := resolveConfigurableField(oldMetadata.DestinationTable, oldStream.Stream.DestinationTable)
@@ -510,9 +510,10 @@ func GetStreamsDelta(oldStreams, newStreams *Catalog, destinationType Destinatio
 				oldConfigured := &ConfiguredStream{Stream: oldStream.Stream, StreamMetadata: oldMetadata}
 				newConfigured := &ConfiguredStream{Stream: newStream.Stream, StreamMetadata: newMetadata}
 
-				// leaving dv: v3 forbids the Parquet positional deletes eq/pos write; pos -> dv: not supported yet (only eq -> dv is migrated)
+				// Equality deletes are legal at v2 and v3; dv -> eq keeps existing DVs and table history.
+				// dv -> pos cannot write new positional files at v3; pos -> dv still needs a reset.
 				oldUpdateType, newUpdateType := oldConfigured.GetUpdateType(), newConfigured.GetUpdateType()
-				dvDelta := (oldUpdateType == UpdateTypeDeletionVector && newUpdateType != UpdateTypeDeletionVector) ||
+				dvDelta := (oldUpdateType == UpdateTypeDeletionVector && newUpdateType == UpdateTypePosition) ||
 					(oldUpdateType == UpdateTypePosition && newUpdateType == UpdateTypeDeletionVector)
 
 				oldSyncMode, newSyncMode := oldConfigured.GetSyncMode(), newConfigured.GetSyncMode()

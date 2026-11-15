@@ -159,7 +159,24 @@ func (p *Postgres) ChangeStreamConfig() (bool, bool, bool) {
 }
 
 func (p *Postgres) PreCDC(ctx context.Context, streams []types.StreamInterface) error {
-	if p.cdcConfig.PreserveToastValues {
+	if err := p.cdcConfig.validateToastRecovery(); err != nil {
+		return err
+	}
+	if p.cdcConfig.sourceToastRecovery() {
+		for _, stream := range streams {
+			if stream.GetStream().SourceDefinedPrimaryKey == nil || stream.GetStream().SourceDefinedPrimaryKey.Len() == 0 {
+				return fmt.Errorf("source TOAST recovery requires primary keys for stream %s", stream.ID())
+			}
+		}
+		var standby bool
+		if err := p.client.GetContext(ctx, &standby, "SELECT pg_is_in_recovery()"); err != nil {
+			return fmt.Errorf("validate source TOAST lookup host: %w", err)
+		}
+		if standby {
+			return fmt.Errorf("source TOAST recovery requires a primary CDC host; standby reads are not replay-fenced")
+		}
+	}
+	if p.cdcConfig.PreserveToastValues && !p.cdcConfig.sourceToastRecovery() {
 		if err := validateToastStreams(streams); err != nil {
 			return err
 		}
@@ -300,7 +317,7 @@ func (p *Postgres) StreamChanges(ctx context.Context, _ int, metadataStates map[
 	}
 
 	// choose replicator via factory based on OutputPlugin config (default wal2json)
-	err = p.replicator.StreamChanges(ctx, p.client, callback)
+	err = p.streamChangesWithToast(ctx, callback)
 	if err != nil {
 		return nil, err
 	}

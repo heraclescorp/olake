@@ -40,8 +40,11 @@ type CDC struct {
 	// Publications used when OutputPlugin is pgoutput
 	Publication string `json:"publication"`
 	// PreserveToastValues keeps the values Postgres leaves out of an UPDATE (unchanged TOAST) by
-	// reading the row's previous version from the destination. Iceberg with a row index (pos or dv) only.
+	// using ToastValueSource. The default destination mode requires Iceberg pos or dv.
 	PreserveToastValues bool `json:"preserve_toast_values"`
+	// ToastValueSource is destination (default, event-accurate) or source (current source
+	// values, permits equality deletes, deliberately not an event-time guarantee).
+	ToastValueSource string `json:"toast_value_source,omitempty"`
 }
 
 func (c *Config) Validate() error {

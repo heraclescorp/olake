@@ -735,8 +735,8 @@ func (w *nativeWriter) validateFormat(ctx context.Context) error {
 		return fmt.Errorf("unsupported Iceberg format version %d", version)
 	}
 	if w.deleteMode != types.UpdateTypeDeletionVector {
-		if version >= 3 {
-			return fmt.Errorf("Iceberg format v%d requires deletion vector update mode; reset the table before changing update mode", version)
+		if version >= 3 && w.deleteMode == types.UpdateTypePosition {
+			return fmt.Errorf("Iceberg format v%d requires equality or deletion vector update mode; positional delete files are not allowed", version)
 		}
 		if w.upsert && version < 2 {
 			return errors.New("Iceberg upserts require table format version 2 or later")
@@ -1782,7 +1782,7 @@ func (w *nativeWriter) writePositionDeletes(ctx context.Context, positions map[s
 	}
 	var prior map[string]*dv.RoaringPositionBitmap
 	var oldVectors map[string][]apacheiceberg.DataFile
-	if w.deleteMode == types.UpdateTypeDeletionVector {
+	if tbl.Metadata().Version() >= 3 {
 		prior, oldVectors, err = nativePriorPositionDeletes(ctx, tbl, entries, positions)
 		if err != nil {
 			return nil, nil, err
@@ -1809,7 +1809,7 @@ func (w *nativeWriter) writePositionDeletes(ctx context.Context, positions map[s
 				return nil, nil, errors.New("positional delete ordinal is outside its data file")
 			}
 		}
-		if w.deleteMode == types.UpdateTypeDeletionVector {
+		if tbl.Metadata().Version() >= 3 {
 			vector := dv.NewDVWriter(writeFS, func(id int32) *apacheiceberg.PartitionSpec { return tbl.Metadata().PartitionSpecByID(int(id)) })
 			if err := vector.Add(path, pending, file.SpecID(), file.Partition()); err != nil {
 				return nil, nil, err

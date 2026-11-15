@@ -290,3 +290,80 @@ You can save the state in a `state.json` file using the following format:
 ```
 
 Find more at [Postgres Docs](https://olake.io/docs/category/postgres)
+### Source-based TOAST recovery with equality deletes (S3 Tables)
+
+For a latest-state replica, avoid rebuilding an identifier-to-file/position index
+when managed S3 Tables compaction rewrites files:
+
+1. In the PostgreSQL source's `update_method`, opt in explicitly:
+
+   ```json
+   {
+     "type": "CDC",
+     "replication_slot": "your_existing_slot",
+     "publication": "your_existing_publication",
+     "preserve_toast_values": true,
+     "toast_value_source": "source"
+   }
+   ```
+
+   Keep the existing update-method type spelling and other settings in your job.
+   Omitting `toast_value_source` retains the previous destination-based behavior.
+
+2. Rediscover streams so `available_update_types` reflects source recovery and
+   your actual downstream query engines. In **each selected table's stream
+   metadata** set `"update_type": "eq"` and `"append_mode": false`. For example,
+   merge these fields into the existing `selected_streams` entry (do not replace
+   the rest of the catalog):
+
+   ```json
+   {"stream_name": "analytics_event", "update_type": "eq", "append_mode": false}
+   ```
+
+   Equality mode does not open a physical row index, so it skips index bootstrap
+   and compaction-driven index reconciliation. Source recovery also works with
+   the existing indexed modes, but those still incur index maintenance.
+
+3. Deploy the new connector before changing a running job's settings. Switch at
+   a stopped, committed sync boundary; retain the job's source state and slot.
+   Do **not** reset/recreate the destination table merely to switch `dv` to `eq`.
+   Existing v2 tables stay v2; existing v3 tables stay v3, keep existing DVs, and
+   accept new equality deletes. Same-write positional removals use DVs on v3.
+   The `dv` → `eq` catalog transition no longer requests a table clear.
+
+**No PostgreSQL `ALTER TABLE ... REPLICA IDENTITY FULL`, Iceberg format downgrade,
+`write.delete.mode` property change, or S3 maintenance change is required.** Keep
+managed compaction enabled. The replication role needs SELECT permission on the
+primary-key and recovered columns. The configured CDC `host` must provide fresh
+source reads (normally the primary/writer); the optional `backfill_host` is never
+used for hydration. Source recovery rejects standby CDC hosts because their reads are not replay-fenced.
+All downstream readers must support equality deletes **and** the existing table
+format/DVs. The query-engine discovery restrictions remain enforced; for example,
+do not select equality for readers that only support positional deletes/DVs.
+
+#### Semantics and performance
+
+- This is **not event-time/audit-accurate reconstruction**. Ordinary source SELECTs
+  can return values newer than the WAL event, including values beyond a bounded
+  recovery/resync endpoint. Snapshot history records the hydrated rows OLake
+  actually wrote, not guaranteed source row images at those LSNs.
+- Only columns explicitly marked unavailable are filled. Explicit WAL values,
+  SQL NULLs, binary data, and ordinary full-image events retain their meanings.
+- Lookups are parameterized primary-key queries, grouped by table and missing
+  column projection, deduplicated within each group, with at most 128 buffered
+  events per batch (or 4 MiB of WAL payload before hydration). Large TOAST values
+  can exceed that payload bound; it is not a hard process-memory bound. Queries
+  execute serially with a 30-second timeout and caller cancellation.
+- Output stays in WAL order. Pending events flush before schema notifications,
+  at the batch bound, and after successful WAL completion. Failed hydration or
+  downstream writes fail the sync before its normal durable acknowledgement.
+- Missing source rows (including rows deleted or rekeyed since the event) fail
+  closed instead of silently inserting NULLs or skipping an update. A persistent
+  missing row can block catch-up and requires reconciliation/resync or using
+  destination-based recovery/full source row images. No automatic skip policy
+  is implemented. Query failures can be retried by normal sync retry handling.
+- The feature adds SELECT load and large-value transfer on affected source keys.
+  Benchmark source load and query latency with real TOAST-heavy traffic before
+  broad rollout. Equality deletes also add reader work until compaction applies
+  them. Partition changes remain handled by the existing equality writer, which
+  scopes deletes across live partitions and historical partition specs.

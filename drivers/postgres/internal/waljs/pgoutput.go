@@ -50,7 +50,7 @@ func (p *pgoutputReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, ins
 
 	logger.Infof("pgoutput starting from lsn=%s target=%s", p.socket.ConfirmedFlushLSN, p.socket.CurrentWalPosition)
 	if p.preserveToastValues {
-		logger.Info("preserve_toast_values enabled: column values postgres omits from an update are recovered from the destination, for iceberg streams using positional deletes or deletion vectors")
+		logger.Info("preserve_toast_values enabled: unavailable columns are marked for recovery by the configured TOAST value source")
 	}
 
 	cdcStartTime := time.Now()
