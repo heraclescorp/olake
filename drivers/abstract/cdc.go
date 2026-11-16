@@ -24,6 +24,9 @@ import (
 //   - Parallel: Process all streams simultaneously after all backfills complete
 //   - Concurrent: Start each stream's CDC immediately after its backfill completes (can overlap)
 func (a *AbstractDriver) RunChangeStream(mainCtx context.Context, pool *destination.WriterPool, streams ...types.StreamInterface) error {
+	// Read-only destination diagnostics must precede slot initialization, which
+	// can time out before ordinary CDC writer setup ever reads table metadata.
+	pool.LogMetadataPositions(mainCtx, streams)
 	// run pre cdc of drivers
 	if err := a.driver.PreCDC(mainCtx, streams); err != nil {
 		return fmt.Errorf("failed in pre cdc run for driver[%s]: %w", a.driver.Type(), err)

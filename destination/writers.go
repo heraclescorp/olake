@@ -45,15 +45,16 @@ type (
 	}
 
 	WriterPool struct {
-		stats             *Stats
-		initWriter        initWriter
-		shutdown          func(ctx context.Context)
-		writerSchema      sync.Map
-		batchSize         int64
-		resync            resyncDestination
-		resyncTargetID    string
-		resyncOperationID string
-		resyncContext     context.Context
+		stats               *Stats
+		metadataDiagnostics MetadataDiagnostics
+		initWriter          initWriter
+		shutdown            func(ctx context.Context)
+		writerSchema        sync.Map
+		batchSize           int64
+		resync              resyncDestination
+		resyncTargetID      string
+		resyncOperationID   string
+		resyncContext       context.Context
 	}
 
 	// writer thread used by reader
@@ -134,6 +135,7 @@ func NewWriterPool(ctx context.Context, config *types.WriterConfig, syncStreams 
 		batchSize:  batchSize,
 	}
 	pool.resync, _ = adapter.(resyncDestination)
+	pool.metadataDiagnostics, _ = adapter.(MetadataDiagnostics)
 
 	stopCheck := logger.TrackTiming("destination", "check")
 	// Recovery-only must not run the ordinary connection test: it creates a test

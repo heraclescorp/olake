@@ -12,9 +12,10 @@ import (
 )
 
 type metadataWriterHooks struct {
-	Setup func(context.Context, types.StreamInterface, *destination.Options) (*types.MetadataState, error)
-	Write func(context.Context, types.StreamInterface, *destination.Options, []types.RawRecord) error
-	Close func(context.Context, types.StreamInterface, *destination.Options, any) error
+	Diagnostics func(context.Context, types.StreamInterface)
+	Setup       func(context.Context, types.StreamInterface, *destination.Options) (*types.MetadataState, error)
+	Write       func(context.Context, types.StreamInterface, *destination.Options, []types.RawRecord) error
+	Close       func(context.Context, types.StreamInterface, *destination.Options, any) error
 }
 
 var metadataWriterPoolID atomic.Uint64
@@ -84,4 +85,10 @@ func (w *metadataTestWriter) Close(ctx context.Context, metadata any) error {
 		return w.hooks.Close(ctx, w.stream, w.opts, metadata)
 	}
 	return nil
+}
+
+func (w *metadataTestWriter) LogMetadataPosition(ctx context.Context, stream types.StreamInterface) {
+	if w.hooks.Diagnostics != nil {
+		w.hooks.Diagnostics(ctx, stream)
+	}
 }

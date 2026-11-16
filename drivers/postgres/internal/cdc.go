@@ -197,7 +197,7 @@ func (p *Postgres) PreCDC(ctx context.Context, streams []types.StreamInterface) 
 			return errs.Precondition(errs.StateInvalid, codeGlobalLSNMissing,
 				fmt.Errorf("atomic resync CDC requires a saved global CDC checkpoint; refusing to initialize or advance the replication slot before publication"))
 		}
-		logger.Warnf("postgres_cdc_slot_initialization slot=%q slot_confirmed_lsn=%q target_lsn=%q global_checkpoint=missing destination_metadata=not_loaded phase=pre_cdc; destination recovery metadata has not been inspected before this slot advance", p.cdcConfig.ReplicationSlot, slot.LSN.String(), slot.CurrentLSN.String())
+		logger.Warnf("postgres_cdc_slot_initialization slot=%q slot_confirmed_lsn=%q target_lsn=%q global_checkpoint=missing destination_metadata=diagnostics_only phase=pre_cdc; destination metadata diagnostics do not seed the global checkpoint or change slot initialization", p.cdcConfig.ReplicationSlot, slot.LSN.String(), slot.CurrentLSN.String())
 		// advance before seeding state: AdvanceLSN returns the position the slot confirmed,
 		// so the state file and confirmed_flush_lsn agree by construction
 		confirmedLSN, err := waljs.AdvanceLSN(ctx, p.client, p.cdcConfig.ReplicationSlot, slot.CurrentLSN.String())
