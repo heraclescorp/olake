@@ -39,8 +39,8 @@ type CDC struct {
 	InitialWaitTime int    `json:"initial_wait_time"`
 	// Publications used when OutputPlugin is pgoutput
 	Publication string `json:"publication"`
-	// ToastValueSource is destination (default, event-accurate) or source (current source
-	// values, permits equality deletes, deliberately not an event-time guarantee).
+	// ToastValueSource defaults to source (current source values, permits equality
+	// deletes, not an event-time guarantee). Explicit destination uses indexed recovery.
 	ToastValueSource string `json:"toast_value_source,omitempty"`
 }
 

@@ -106,6 +106,7 @@ func TestSourceToastQuotesIdentifiersAndCompositeKeys(t *testing.T) {
 
 func TestToastRecoveryConfiguration(t *testing.T) {
 	for _, c := range []CDC{{}, {ToastValueSource: "source"}, {ToastValueSource: "destination"}} {
+		require.Equal(t, c.ToastValueSource != "destination", c.sourceToastRecovery())
 		require.NoError(t, c.validateToastRecovery())
 	}
 	for _, c := range []CDC{{ToastValueSource: "typo"}} {
@@ -138,7 +139,8 @@ func (r *toastTestReplicator) StreamChanges(ctx context.Context, _ *sqlx.DB, cb 
 
 func TestSourceToastDoesNotFlushAfterReplicationError(t *testing.T) {
 	p, _ := newMockPostgres(t)
-	p.cdcConfig = CDC{ToastValueSource: "source"}
+	// Omitted methodology must enter the hydration path, not forward placeholders.
+	p.cdcConfig = CDC{}
 	p.replicator = &toastTestReplicator{changes: []abstract.CDCChange{toastChange(1)}, err: errors.New("WAL interrupted")}
 	require.ErrorContains(t, p.streamChangesWithToast(context.Background(), func(context.Context, abstract.CDCChange) error { t.Fatal("unexpected callback"); return nil }), "WAL interrupted")
 }

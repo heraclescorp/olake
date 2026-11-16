@@ -188,8 +188,8 @@
                             "type": "string",
                             "title": "TOAST Value Source",
                             "enum": ["destination", "source"],
-                            "default": "destination",
-                            "description": "TOAST preservation is always enabled. Choose the recovery method. Destination preserves previously committed values through a positional index. Source batches primary-key lookups against the CDC host (not backfill_host), enabling index-free equality deletes. Source values may be newer than the WAL event; suitable only for eventually consistent latest-state replication. Missing rows fail the sync."
+                            "default": "source",
+                            "description": "TOAST preservation is always enabled. Source is the default, including for existing configs that omit toast_value_source. Choose destination explicitly for indexed recovery. Destination preserves previously committed values through a positional index. Source batches primary-key lookups against the CDC host (not backfill_host), enabling index-free equality deletes. Source values may be newer than the WAL event; suitable only for eventually consistent latest-state replication. Missing rows fail the sync."
                         }
 
                     },

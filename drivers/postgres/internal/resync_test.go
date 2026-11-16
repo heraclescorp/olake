@@ -179,6 +179,7 @@ func TestResyncPreCDCWithoutGlobalCheckpointNeverAdvancesSlot(t *testing.T) {
 			if missing == "global-state" {
 				p.state.Global = &types.GlobalState{Streams: types.NewSet("public.unrelated")}
 			}
+			mock.ExpectQuery("SELECT pg_is_in_recovery()").WillReturnRows(sqlmock.NewRows([]string{"pg_is_in_recovery"}).AddRow(false))
 			originalGlobal := p.state.Global
 			unrelated := &types.StreamState{Namespace: "public", Stream: "unrelated"}
 			unrelated.HoldsValue.Store(true)

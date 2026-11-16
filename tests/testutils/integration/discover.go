@@ -39,11 +39,6 @@ func (th *TestHandler) TestDiscover(t *testing.T) {
 	expectedCatalog, err := th.RenderCatalog("expected_discover_")
 	require.NoError(t, err, "failed to generate the expected discover catalog")
 
-	// Destination-based TOAST recovery is mandatory by default for PostgreSQL CDC.
-	if th.TestConfig.Driver == string(constants.Postgres) {
-		require.NoError(t, expectedCatalog.Edit(offerIndexUpdateTypesOnly))
-	}
-
 	// 3. Run discover against the driver image
 	code, out, err := testutils.RunOlake(ctx, t, th.TestConfig, testutils.DiscoverArgs()...)
 	if err != nil || code != 0 {
@@ -52,7 +47,7 @@ func (th *TestHandler) TestDiscover(t *testing.T) {
 
 	verifyDiscoveredStreams(t, expectedCatalog, th.Catalog())
 
-	// 4. With preserve_toast_values on, only the update types that keep a row index (pos, dv) are offered
+	// 4. Explicit destination recovery offers only indexed update types (pos, dv).
 	if th.TestConfig.Driver == string(constants.Postgres) {
 		require.NoError(t, enablePreserveToastValues(th.TestConfig), "failed enabling preserve_toast_values")
 		require.NoError(t, expectedCatalog.Edit(offerIndexUpdateTypesOnly),

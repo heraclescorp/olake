@@ -305,14 +305,14 @@ func (th *TestHandler) TestUnchangedToastRecovery(t *testing.T) {
 	th.ExecuteQuery(ctx, t, th.TestConfig, "drop")
 }
 
-// enablePreserveToastValues turns preserve_toast_values on in the suite's own copy of source.json.
+// enablePreserveToastValues selects indexed destination recovery in the suite's source.json.
 func enablePreserveToastValues(config *testutils.TestConfig) error {
 	return testutils.EditJSONFile(config.GetFilePath("source.json"), func(doc map[string]interface{}) error {
 		updateMethod, ok := doc["update_method"].(map[string]interface{})
 		if !ok {
 			return fmt.Errorf("no update_method object in source config")
 		}
-		updateMethod["preserve_toast_values"] = true
+		updateMethod["toast_value_source"] = "destination"
 		return nil
 	})
 }

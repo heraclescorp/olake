@@ -19,7 +19,7 @@ const sourceToastBatchRows = 128
 const sourceToastBatchBytes = 4 * 1024 * 1024
 
 func (c CDC) sourceToastRecovery() bool {
-	return c.ToastValueSource == "source"
+	return c.ToastValueSource == "" || c.ToastValueSource == "source"
 }
 
 func (c CDC) validateToastRecovery() error {
