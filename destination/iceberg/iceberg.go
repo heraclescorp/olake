@@ -672,6 +672,7 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 		return nil, nil, fmt.Errorf("load or create Iceberg table: %w", err)
 	}
 	state.latest = tbl
+	logNativeMetadataLSN(stream.ID(), tbl.Metadata().TableUUID().String(), nativeSnapshotID(tbl), tbl.Properties()[nativeRecoveryProperty])
 	w = &nativeWriter{table: tbl, cat: cat, coordinator: state, generation: state.generation, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), positions: make(map[string][]int64), latest: make(map[string]types.RowLocation), paths: make(map[string]struct{})}
 	w.releaseSession = release
 	if err := w.validateFormat(ctx); err != nil {
