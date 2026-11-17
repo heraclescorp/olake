@@ -373,3 +373,9 @@ do not select equality for readers that only support positional deletes/DVs.
   broad rollout. Equality deletes also add reader work until compaction applies
   them. Partition changes remain handled by the existing equality writer, which
   scopes deletes across live partitions and historical partition specs.
+
+### Inspect CDC replay progress
+
+Filter connector INFO logs for `postgres_cdc_progress`. They are emitted at stream start, every 30 seconds, and stream exit for pgoutput and wal2json. Compare `read_lsn`, `decoded_commit_lsn`, and the fixed `target_lsn`; inspect `transaction_open`, `wal_messages`, `wal_payload_bytes`, and `wal_data_idle_seconds` for stalls. `server_wal_end_lsn` is the server-advertised position, not replay progress. `wal_address_bytes_remaining` is an address-space difference, not a selected-record count or ETA.
+
+Do not restore state or acknowledge WAL using these diagnostic positions: decoded source COMMITs can still have rows buffered in TOAST recovery or destination writers. `durable_ack_baseline_lsn` remains the starting acknowledged checkpoint during streaming. After final destination commit/ack, look for `postgres_cdc_ack_confirmed`. A `stream_exit` log alone does not prove success or destination durability.

@@ -25,8 +25,9 @@ type pgoutputReplicator struct {
 	txnCommitTime       time.Time // transaction commit time
 	txnFinalLSN         pglogrepl.LSN
 	relationIDToMsgMap  map[uint32]*pglogrepl.RelationMessage // map to store relation id
-	preserveToastValues bool                                  // mark columns Postgres left out of an UPDATE so the destination can recover them
-	db                  *sqlx.DB                              // regular connection for catalog reads; the replication connection cannot run queries mid-stream
+	progress            *replicationProgress
+	preserveToastValues bool     // mark columns Postgres left out of an UPDATE so the destination can recover them
+	db                  *sqlx.DB // regular connection for catalog reads; the replication connection cannot run queries mid-stream
 }
 
 func (p *pgoutputReplicator) Socket() *Socket {
@@ -49,6 +50,9 @@ func (p *pgoutputReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, ins
 	}
 
 	logger.Infof("pgoutput starting from lsn=%s target=%s", p.socket.ConfirmedFlushLSN, p.socket.CurrentWalPosition)
+	progress, stopProgress := startReplicationProgress(p.socket, "pgoutput")
+	p.progress = progress
+	defer func() { stopProgress(); p.progress = nil }()
 	if p.preserveToastValues {
 		logger.Info("preserve_toast_values enabled: unavailable columns are marked for recovery by the configured TOAST value source")
 	}
@@ -98,6 +102,7 @@ func (p *pgoutputReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, ins
 				if err != nil {
 					return fmt.Errorf("failed to parse XLogData: %w", err)
 				}
+				progress.received(xld.WALStart, xld.ServerWALEnd, len(xld.WALData))
 				p.socket.ClientXLogPos = xld.WALStart
 				if err := p.processPgoutputWAL(ctx, xld.WALData, insertFn); err != nil {
 					return err
@@ -108,6 +113,7 @@ func (p *pgoutputReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, ins
 				if err != nil {
 					return fmt.Errorf("failed to parse primary keepalive message: %w", err)
 				}
+				progress.serverEnd.Store(uint64(pkm.ServerWALEnd))
 				p.socket.ClientXLogPos = pkm.ServerWALEnd
 				if pkm.ReplyRequested {
 					if err := AcknowledgeLSN(ctx, db, p.socket, true); err != nil {
@@ -141,6 +147,9 @@ func (p *pgoutputReplicator) processPgoutputWAL(ctx context.Context, walData []b
 		return p.emitRelationColumns(ctx, msg, insertFn)
 	case *pglogrepl.BeginMessage:
 		p.socket.TransactionOpen = true
+		if p.progress != nil {
+			p.progress.transactionOpen.Store(true)
+		}
 		p.txnCommitTime = msg.CommitTime
 		p.txnFinalLSN = msg.FinalLSN
 		return nil
@@ -153,6 +162,9 @@ func (p *pgoutputReplicator) processPgoutputWAL(ctx context.Context, walData []b
 	case *pglogrepl.CommitMessage:
 		p.socket.TransactionOpen = false
 		p.socket.ClientXLogPos = msg.TransactionEndLSN
+		if p.progress != nil {
+			p.progress.committed(msg.TransactionEndLSN)
+		}
 		return nil
 	default:
 		return nil
