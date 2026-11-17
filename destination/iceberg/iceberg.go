@@ -1154,6 +1154,9 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		if err != nil {
 			return err
 		}
+		if len(equalityFiles) > 0 {
+			logger.Infof("iceberg_equality_delete event=staged table=%q thread_id=%q attempt=%d base_snapshot=%d keys=%d delete_files=%d data_files=%d", strings.Join(fresh.Identifier(), "."), w.options.ThreadID, attempt+1, nativeSnapshotID(fresh), len(w.latest), len(equalityFiles), len(w.dataFiles))
+		}
 		if hasFiles {
 			delta := tx.NewRowDelta(apacheiceberg.Properties{"olake.thread-id": w.options.ThreadID})
 			delta.AddRows(w.dataFiles...).AddDeletes(equalityFiles...).AddDeletes(positionFiles...).RemoveDeletes(replaced...)
@@ -1186,6 +1189,13 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		}
 		w.table, w.closed = committed, true
 		coordinated.latest = committed
+		if len(equalityFiles) > 0 {
+			event := "commit_confirmed"
+			if _, private := w.cat.(*nativeResyncCatalog); private {
+				event = "private_resync_commit"
+			}
+			logger.Infof("iceberg_equality_delete event=%s table=%q thread_id=%q attempt=%d snapshot=%d keys=%d delete_files=%d data_files=%d", event, strings.Join(committed.Identifier(), "."), w.options.ThreadID, attempt+1, nativeSnapshotID(committed), len(w.latest), len(equalityFiles), len(w.dataFiles))
+		}
 		// A successful metadata commit owns all staged files from now on.
 		// Never delete them, including when the local index checkpoint fails.
 		clear(w.paths)
