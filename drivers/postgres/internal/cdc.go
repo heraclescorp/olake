@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -341,15 +342,22 @@ func (p *Postgres) StreamChanges(ctx context.Context, _ int, metadataStates map[
 	return waljs.WALState{LSN: finalLSN}, nil
 }
 
-func (p *Postgres) PostCDC(ctx context.Context, _ int) error {
+func (p *Postgres) PostCDC(ctx context.Context, _ int) (err error) {
+	if p.replicator != nil {
+		if _, resync := types.ResyncFromContext(ctx); !resync {
+			defer func() {
+				err = errors.Join(err, waljs.Cleanup(ctx, p.replicator.Socket()))
+				p.replicator = nil
+			}()
+		}
+	}
+	// Cleanup must be registered before checking cancellation or the execution fence:
+	// writer failures cancel this context, but still own a live replication slot.
 	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return err
 	}
 	if p.replicator == nil {
 		return nil
-	}
-	if _, resync := types.ResyncFromContext(ctx); !resync {
-		defer waljs.Cleanup(ctx, p.replicator.Socket())
 	}
 	select {
 	case <-ctx.Done():

@@ -115,7 +115,7 @@ func (i *Iceberg) Write(ctx context.Context, records []types.RawRecord) error {
 		// a fixed overhead for the record, plus the size of every value it holds
 		recordSize := carryEntryOverhead
 		for _, value := range records[idx].Data {
-			recordSize += valueSize(value)
+			recordSize += types.ValueSize(value)
 		}
 		if idx > start && size+recordSize > constants.MaxDestinationBatchBytes {
 			if err := i.writer.Write(ctx, records[start:idx]); err != nil {
@@ -1564,6 +1564,27 @@ func nativeRecordPartition(schema *apacheiceberg.Schema, spec apacheiceberg.Part
 	return fmt.Sprintf("%#v", partition), values, nil
 }
 
+// Arrow checks data-page and dictionary sizes only after a column minibatch.
+// Its default of 1,024 values can therefore produce pages larger than the
+// reader's safety limits when CDC has hydrated large string/binary values.
+// Check after every value in both streaming and one-shot writers. The 1 MiB
+// targets remain soft: Parquet cannot split an individual oversized value,
+// which can still exceed reader limits; values are never truncated.
+func nativeParquetWriterProperties() *parquet.WriterProperties {
+	const pageBytes = 1024 * 1024
+	return parquet.NewWriterProperties(
+		parquet.WithCompression(compress.Codecs.Zstd),
+		parquet.WithCompressionLevel(3),
+		parquet.WithStats(true),
+		parquet.WithMaxRowGroupLength(64*1024),
+		parquet.WithBatchSize(1),
+		parquet.WithDataPageSize(pageBytes),
+		parquet.WithDictionaryPageSizeLimit(pageBytes),
+		parquet.WithRootName("table"),
+		parquet.WithPageIndexEnabled(true),
+	)
+}
+
 // Files are streamed directly through the catalog's native FileIO. The Parquet
 // footer and the object itself are closed before a RowLocation is made visible.
 func (w *nativeWriter) writeNativeParquet(ctx context.Context, schema *apacheiceberg.Schema, spec apacheiceberg.PartitionSpec, partition map[int]any, batch arrow.RecordBatch, content apacheiceberg.ManifestEntryContent, equalityIDs []int, referenced *string) (_ apacheiceberg.DataFile, err error) {
@@ -1601,7 +1622,7 @@ func (w *nativeWriter) writeNativeParquetStream(ctx context.Context, schema *apa
 		return nil, err
 	}
 	counter := &nativeCountingWriter{writer: file}
-	props := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Zstd), parquet.WithCompressionLevel(3), parquet.WithStats(true), parquet.WithMaxRowGroupLength(64*1024), parquet.WithRootName("table"), parquet.WithPageIndexEnabled(true))
+	props := nativeParquetWriterProperties()
 	writer, err := pqarrow.NewFileWriter(arrowSchema, counter, props, pqarrow.DefaultWriterProps())
 	if err != nil {
 		return nil, errors.Join(err, file.Close())

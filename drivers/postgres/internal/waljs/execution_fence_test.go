@@ -3,13 +3,19 @@ package waljs
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jmoiron/sqlx"
 	"github.com/stretchr/testify/require"
 )
@@ -84,5 +90,55 @@ func TestOrdinaryRetirementTracksAcknowledgedAndAmbiguousSlotAdvance(t *testing.
 			}
 			require.NoError(t, mock.ExpectationsWereMet())
 		})
+	}
+}
+
+func TestCleanupCanceledContextClosesConnection(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+	require.NoError(t, server.SetDeadline(time.Now().Add(10*time.Second)))
+	backendDone := make(chan error, 1)
+	go func() {
+		backendDone <- func() error {
+			backend := pgproto3.NewBackend(server, server)
+			if _, err := backend.ReceiveStartupMessage(); err != nil {
+				return err
+			}
+			backend.Send(&pgproto3.AuthenticationOk{})
+			backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+			if err := backend.Flush(); err != nil {
+				return err
+			}
+			msg, err := backend.Receive()
+			if err != nil {
+				return err
+			}
+			if _, ok := msg.(*pgproto3.Terminate); !ok {
+				return fmt.Errorf("expected connection termination, got %T", msg)
+			}
+			var buf [1]byte
+			_, err = server.Read(buf[:])
+			if err != io.EOF {
+				return fmt.Errorf("connection remains open after termination: %v", err)
+			}
+			return nil
+		}()
+	}()
+	config, err := pgconn.ParseConfig("postgres://test@localhost/test?sslmode=disable")
+	require.NoError(t, err)
+	config.DialFunc = func(context.Context, string, string) (net.Conn, error) { return client, nil }
+	connectCtx, stopConnect := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stopConnect()
+	conn, err := pgconn.ConnectConfig(connectCtx, config)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.NoError(t, Cleanup(ctx, &Socket{pgConn: conn, ClientXLogPos: 0x300, ConfirmedFlushLSN: 0x100}))
+	require.True(t, conn.IsClosed())
+	select {
+	case err := <-backendDone:
+		require.NoError(t, err)
+	case <-connectCtx.Done():
+		t.Fatal("replication peer did not observe connection closure")
 	}
 }

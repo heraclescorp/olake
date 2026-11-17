@@ -9,6 +9,9 @@ Scope: source-based TOAST/equality branch. This is a design assessment, not impl
 - `AbstractDriver.streamChanges` returns a single final WAL state. Its deferred `handleWriterCleanup` joins all writers, closing them with that state. Only afterwards does `PostCDC` acknowledge the slot and update in-memory global state. Protocol/worker then persist the run state.
 - `nativeWriter.Close` is terminal: completes files, reconciles staged superseded rows, commits an Iceberg transaction with `olake_2pc`, updates index/coordinator state, and releases resources. It cannot just be called every minute while Push continues.
 - Keepalive replies send the original confirmed position. The new 30-second progress logs observe decoder positions only; they do not introduce durable checkpointing.
+- Destination buffers independently track original source bytes and approximate decoded payload bytes. Hydrated values count toward the payload budget without inflating WAL-byte statistics; indivisible oversized rows flush alone. The source hydrator still materializes up to 128 fetched rows before emission, so this is not a strict process-memory cap.
+- Native Parquet writes check page/dictionary targets after each value, including staged rewrites and backfill. The 1 MiB targets remain soft: a single large value can exceed the unchanged reader limits. Per-value checks trade throughput for bounded multi-value page overshoot.
+- Ordinary CDC completion closes its replication connection even after cancellation or fence rejection, using a bounded uncanceled teardown context without authorizing acknowledgement. Resync retains separate connection ownership.
 
 ## Recommended first implementation: bounded microbatches
 

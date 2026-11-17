@@ -84,7 +84,7 @@ type carryRow struct {
 func (row *carryRow) size(olakeID string) int64 {
 	size := int64(len(olakeID)) + carryEntryOverhead
 	for _, value := range row.values {
-		size += valueSize(value)
+		size += types.ValueSize(value)
 	}
 	return size
 }
@@ -146,7 +146,7 @@ func (r *unavailableValuesResolver) InvalidateColumns(columns []string) {
 			continue
 		}
 		for _, column := range sources {
-			r.account(-valueSize(row.values[column]))
+			r.account(-types.ValueSize(row.values[column]))
 			delete(row.values, column)
 		}
 		if len(row.values) == 0 {
@@ -192,7 +192,7 @@ func (r *unavailableValuesResolver) Resolve(ctx context.Context, records []types
 				if value, carried := row.values[column]; carried {
 					record.Data[column] = value
 					r.recovered++
-					r.filledBytes += valueSize(value)
+					r.filledBytes += types.ValueSize(value)
 					continue
 				}
 			}
@@ -386,7 +386,7 @@ func (r *unavailableValuesResolver) remember(olakeID, column string, value any) 
 		r.carry[olakeID] = row
 	}
 
-	r.account(valueSize(value) - valueSize(row.values[column]))
+	r.account(types.ValueSize(value) - types.ValueSize(row.values[column]))
 	row.values[column] = value
 	row.batch = r.batch
 }
@@ -395,7 +395,7 @@ func (r *unavailableValuesResolver) remember(olakeID, column string, value any) 
 func (r *unavailableValuesResolver) tombstone(olakeID string) {
 	if row := r.carry[olakeID]; row != nil {
 		for _, value := range row.values {
-			r.account(-valueSize(value))
+			r.account(-types.ValueSize(value))
 		}
 	} else {
 		r.account(int64(len(olakeID)) + carryEntryOverhead)
@@ -448,27 +448,6 @@ func (r *unavailableValuesResolver) Close() {
 
 	logger.Infof("Thread[%s]: recovered %d unavailable column value(s), read %d from the destination table, %d could not be recovered",
 		r.threadID, r.recovered, r.fromTable, r.unresolved)
-}
-
-func valueSize(value any) int64 {
-	switch typed := value.(type) {
-	case nil:
-		return 0
-	case string:
-		return int64(len(typed))
-	case json.RawMessage:
-		return int64(len(typed))
-	case []byte:
-		return int64(len(typed))
-	case []any: // Postgres arrays
-		size := int64(0)
-		for _, element := range typed {
-			size += valueSize(element)
-		}
-		return size
-	default:
-		return 16
-	}
 }
 
 func isUnavailable(value any) bool {

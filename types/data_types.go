@@ -1,6 +1,7 @@
 package types
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/datazip-inc/olake/constants"
@@ -177,6 +178,55 @@ func CreateRawRecord(data map[string]any, olakeColumns map[string]any, unavailab
 		Data:               data,
 		OlakeColumns:       olakeColumns,
 		UnavailableColumns: unavailableColumns,
+	}
+}
+
+// PayloadSize estimates the bytes retained by the destination row without encoding
+// or copying its values. It is a batching budget, not a source read statistic.
+func (r RawRecord) PayloadSize() int64 {
+	size := int64(96) // fixed per-row bookkeeping
+	for _, value := range r.Data {
+		size += ValueSize(value)
+	}
+	for _, value := range r.OlakeColumns {
+		size += ValueSize(value)
+	}
+	return size
+}
+
+// ValueSize estimates a decoded value's payload bytes without materializing JSON.
+func ValueSize(value any) int64 {
+	switch typed := value.(type) {
+	case nil:
+		return 0
+	case string:
+		return int64(len(typed))
+	case json.RawMessage:
+		return int64(len(typed))
+	case []byte:
+		return int64(len(typed))
+	case []any:
+		var size int64
+		for _, element := range typed {
+			size += ValueSize(element)
+		}
+		return size
+	case []string:
+		var size int64
+		for _, element := range typed {
+			size += int64(len(element))
+		}
+		return size
+	case map[string]any:
+		var size int64
+		for key, element := range typed {
+			size += int64(len(key)) + ValueSize(element)
+		}
+		return size
+	case Record:
+		return ValueSize(map[string]any(typed))
+	default:
+		return 16
 	}
 }
 
