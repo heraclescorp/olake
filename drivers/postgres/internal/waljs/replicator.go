@@ -25,7 +25,8 @@ const (
 	ReplicationSlotTempl = "SELECT plugin, slot_type, confirmed_flush_lsn, " +
 		"CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END as current_lsn " +
 		"FROM pg_replication_slots WHERE slot_name = '%s'"
-	CDCLSN = "_cdc_lsn" // Postgres LSN
+	CDCLSN                    = "_cdc_lsn" // Postgres LSN
+	replicationCleanupTimeout = 5 * time.Second
 )
 
 // Socket represents a connection to PostgreSQL's logical replication stream
@@ -114,7 +115,7 @@ func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, re
 	// System identification
 	sysident, err := pglogrepl.IdentifySystem(ctx, pgConn)
 	if err != nil {
-		_ = pgConn.Close(ctx)
+		_ = closeReplicationConnection(ctx, pgConn)
 		return nil, fmt.Errorf("failed to indentify system: %w", err)
 	}
 	logger.Infof("SystemID:%s Timeline:%d XLogPos:%s Database:%s",
@@ -239,12 +240,19 @@ func AcknowledgeLSN(ctx context.Context, db *sqlx.DB, socket *Socket, fakeAck bo
 	}
 }
 
-// cleanup replicator
+// Cleanup releases the WAL sender even when a failed sync has canceled its context.
+// It never acknowledges WAL; only connection teardown may outlive the caller.
 func Cleanup(ctx context.Context, socket *Socket) error {
 	if socket.pgConn != nil {
-		return socket.pgConn.Close(ctx)
+		return closeReplicationConnection(ctx, socket.pgConn)
 	}
 	return nil
+}
+
+func closeReplicationConnection(ctx context.Context, conn *pgconn.PgConn) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), replicationCleanupTimeout)
+	defer cancel()
+	return conn.Close(cleanupCtx)
 }
 
 func GetSlotPosition(ctx context.Context, db *sqlx.DB, replicationSlotName string) (ReplicationSlot, error) {

@@ -97,6 +97,7 @@ func pgTypeToDataTypes() map[string]types.DataType {
 		"int2[]":        types.Array,
 		"int4[]":        types.Array,
 		"text[]":        types.Array,
+		"varchar[]":     types.Array,
 		"bytea[]":       types.Array,
 		"int8[]":        types.Array,
 		"float4[]":      types.Array,

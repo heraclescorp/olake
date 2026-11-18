@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -2296,6 +2298,94 @@ func TestNativeStagedRewriteAbortCleansReplacementFiles(t *testing.T) {
 	}
 	require.Empty(t, index.rows)
 	require.Zero(t, index.snapshot)
+}
+
+func TestNativeStagedRewriteLargeHydratedValues(t *testing.T) {
+	for _, payloadType := range []types.DataType{types.String, types.Binary} {
+		t.Run(string(payloadType), func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
+			stream.Stream.UpsertField("hydrated", payloadType, true, false)
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "large-hydrated", false)
+			t.Cleanup(writer.Abort)
+			asValue := func(data []byte) any {
+				if payloadType == types.String {
+					return base64.StdEncoding.EncodeToString(data)
+				}
+				return slices.Clone(data)
+			}
+			digest := func(value any) [sha256.Size]byte {
+				if text, ok := value.(string); ok {
+					return sha256.Sum256([]byte(text))
+				}
+				return sha256.Sum256(value.([]byte))
+			}
+			// The native writer receives values after TOAST hydration. Distinct,
+			// incompressible 1 MiB values model documents/attachments and exceed
+			// Arrow's default 64 MiB compressed-page guard in one 1,024-value
+			// minibatch. Base64 keeps the string case valid UTF-8. Keep only 66
+			// values (and hashes for readback), not a production-sized CDC batch.
+			const count = 66
+			data := make([]byte, 1024*1024)
+			records := make([]types.RawRecord, 0, count+1)
+			expected := make(map[string][sha256.Size]byte, count)
+			for row := range count {
+				_, err := rand.Read(data)
+				require.NoError(t, err)
+				id := strconv.Itoa(row)
+				record := nativeTestRecord(id, "u", int64(row), "one")
+				record.Data["hydrated"] = asValue(data)
+				expected[id] = digest(record.Data["hydrated"])
+				records = append(records, record)
+			}
+			latest := nativeTestRecord("0", "u", count, "one")
+			latest.Data["hydrated"] = asValue([]byte("latest hydrated value"))
+			expected["0"] = digest(latest.Data["hydrated"])
+			records = append(records, latest)
+			// Supersede a key inside this very Write, not via a second call or
+			// resolver wiring. Close must read the staged file to remove row 0.
+			require.NoError(t, writer.Write(ctx, records))
+			records = nil
+			staged := nativePendingLocation(t, writer, "0")
+			require.Equal(t, int64(count), staged.Position)
+			require.Equal(t, []int64{0}, writer.positions[staged.FilePath])
+			require.Len(t, writer.dataFiles, 1)
+			require.NoError(t, writer.Close(ctx, map[string]any{"state": "large-hydrated"}))
+			require.NotEqual(t, staged.FilePath, writer.latest["0"].FilePath, "Close must compact the superseded staged row")
+			require.Contains(t, writer.table.Properties()[nativeRecoveryProperty], "large-hydrated")
+			entries, err := nativeLiveEntries(ctx, writer.table)
+			require.NoError(t, err)
+			require.Len(t, entries, 1)
+			require.Equal(t, apacheiceberg.EntryContentData, entries[0].DataFile().ContentType())
+			require.Equal(t, int64(count), entries[0].DataFile().Count())
+			fs, err := writer.table.FS(ctx)
+			require.NoError(t, err)
+			seen := make(map[string]struct{}, count)
+			// Use the same default-guarded physical reader as staged compaction,
+			// hashing complete values to detect truncation without huge failures.
+			err = readNativePhysicalBatches(ctx, fs, writer.table, entries[0].DataFile().FilePath(), writer.table.Schema(), nil, func(_ int64, batch arrow.RecordBatch) (bool, error) {
+				ids := batch.Column(batch.Schema().FieldIndices(constants.OlakeID)[0]).(*array.String)
+				values := batch.Column(batch.Schema().FieldIndices("value")[0]).(*array.Int64)
+				payloads := batch.Column(batch.Schema().FieldIndices("hydrated")[0])
+				for row := range int(batch.NumRows()) {
+					id := ids.Value(row)
+					require.NotContains(t, seen, id, "same-write supersession must leave only the latest key")
+					require.Contains(t, expected, id)
+					require.Equal(t, expected[id], digest(nativeIndexValue(payloads, row)), "complete hydrated payload for key %s", id)
+					value, err := strconv.ParseInt(id, 10, 64)
+					require.NoError(t, err)
+					if id == "0" {
+						value = count
+					}
+					require.Equal(t, value, values.Value(row))
+					seen[id] = struct{}{}
+				}
+				return true, nil
+			})
+			require.NoError(t, err)
+			require.Len(t, seen, count)
+		})
+	}
 }
 
 func TestNativeStagedRewriteStreamsAcrossPhysicalBatches(t *testing.T) {

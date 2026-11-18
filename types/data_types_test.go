@@ -1,6 +1,7 @@
 package types
 
 import (
+	"encoding/json"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -13,6 +14,30 @@ import (
 	"github.com/parquet-go/parquet-go"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDecodedPayloadSize(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value any
+		want  int64
+	}{
+		{name: "NULL", value: nil, want: 0},
+		{name: "text", value: "abc", want: 3},
+		{name: "binary", value: []byte{0, 255}, want: 2},
+		{name: "JSON", value: json.RawMessage(`{"x":1}`), want: 7},
+		{name: "array", value: []any{"abc", nil, []byte{1, 2}, int64(1)}, want: 21},
+		{name: "text array", value: []string{"a", "bc"}, want: 3},
+		{name: "object", value: map[string]any{"x": []any{"abc", nil}}, want: 4},
+		{name: "record", value: Record{"x": "abc"}, want: 4},
+		{name: "scalar", value: int64(1), want: 16},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, ValueSize(tc.value))
+		})
+	}
+	row := CreateRawRecord(map[string]any{"doc": "abc", "explicit": nil}, map[string]any{"metadata": []byte{1, 2}}, nil)
+	require.Equal(t, int64(96+3+2), row.PayloadSize())
+}
 
 func TestToIceberg(t *testing.T) {
 	testCases := []struct {

@@ -861,7 +861,7 @@ func TestInvalidateColumnsPreservesOtherCarryAndTombstones(t *testing.T) {
 	resolver.tombstone("deleted")
 	tombstone := resolver.carry["deleted"]
 	retained := resolver.carry["mixed"]
-	removed := valueSize("dropped bytes") + resolver.carry["changed-only"].size("changed-only") + resolver.carry["null-only"].size("null-only")
+	removed := types.ValueSize("dropped bytes") + resolver.carry["changed-only"].size("changed-only") + resolver.carry["null-only"].size("null-only")
 	previousBytes := resolver.carryBytes
 
 	// The public callback supplies destination names, while carry and tracked

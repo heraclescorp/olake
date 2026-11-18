@@ -123,12 +123,19 @@ func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destinatio
 		if _, controlled := utils.ExecutionFromContext(cdcCtx); controlled {
 			if fenceErr := utils.CheckExecutionFence(cdcCtx); fenceErr != nil {
 				err = utils.Ternary(err == nil, fenceErr, fmt.Errorf("%w: source acknowledgement fenced: %w", err, fenceErr)).(error)
-				return
+				// PostCDC also releases source connections. Keep it reachable, but
+				// cancel its context so a closed fence cannot authorize acknowledgement.
+				cdcCtxCancel()
 			}
 		}
-		settled := utils.BeginExecutionParticipant(cdcCtx)
+		var settled func(bool)
+		if cdcCtx.Err() == nil {
+			settled = utils.BeginExecutionParticipant(cdcCtx)
+		}
 		postCDCErr := a.driver.PostCDC(cdcCtx, streamIndex)
-		settled(postCDCErr == nil)
+		if settled != nil {
+			settled(postCDCErr == nil)
+		}
 		if postCDCErr != nil {
 			err = utils.Ternary(err == nil, fmt.Errorf("post cdc error: %w", postCDCErr), fmt.Errorf("%w: post cdc error: %w", err, postCDCErr)).(error)
 		}

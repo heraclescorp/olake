@@ -5,10 +5,12 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/datazip-inc/olake/constants"
+	"github.com/datazip-inc/olake/destination"
 	"github.com/datazip-inc/olake/drivers/abstract"
 	"github.com/datazip-inc/olake/drivers/postgres/internal/waljs"
 	"github.com/datazip-inc/olake/types"
@@ -202,6 +204,106 @@ func TestSourceToastFlushesAtSchemaBoundaryAndBatchLimit(t *testing.T) {
 		})
 	}
 }
+
+// Exercise hydration and the real destination buffer together: tiny WAL events
+// expand beyond the payload budget, without inflating source-byte statistics.
+func TestSourceToastExpandedPayloadBoundsDestinationFlushes(t *testing.T) {
+	p, mock := newMockPostgres(t)
+	p.typeMapping = pgTypeToDataTypes()
+	part := strings.Repeat("p", int(constants.MaxDestinationBatchBytes*2/5))
+	oversized := strings.Repeat("x", int(constants.MaxDestinationBatchBytes+1))
+	mock.ExpectQuery(`SELECT "id", "doc" FROM "public"."users" WHERE ("id" = $1) OR ("id" = $2) OR ("id" = $3) OR ("id" = $4)`).WithArgs(int64(1), int64(2), int64(3), int64(4)).WillReturnRows(sqlmock.NewRowsWithColumnDefinition(sqlmock.NewColumn("id").OfType("INT8", int64(0)), sqlmock.NewColumn("doc").OfType("TEXT", "")).AddRow(int64(4), nil).AddRow(int64(3), oversized).AddRow(int64(2), part).AddRow(int64(1), part))
+
+	ctx := context.Background()
+	sink := &toastPayloadWriter{}
+	writerType := types.DestinationType("source-toast-payload-test")
+	destination.RegisteredWriters[writerType] = func(context.Context, any) (destination.Writer, func(context.Context), error) {
+		return sink, nil, nil
+	}
+	t.Cleanup(func() { delete(destination.RegisteredWriters, writerType) })
+	stream := toastChange(1).Stream
+	pool, err := destination.NewWriterPool(ctx, &types.WriterConfig{Type: writerType}, []types.StreamInterface{stream}, 1000)
+	require.NoError(t, err)
+	t.Cleanup(func() { pool.Shutdown(ctx) })
+	writer, _, err := pool.NewWriter(ctx, stream)
+	require.NoError(t, err)
+	batch := &sourceToastBatch{postgres: p, callback: func(ctx context.Context, change abstract.CDCChange) error {
+		require.Equal(t, int64(11), change.Bytes, "hydration must not replace WAL read sizes")
+		return writer.Push(ctx, types.CreateRawRecord(change.Data, nil, change.UnavailableColumns), change.Bytes)
+	}}
+	walValue := toastChange(1)
+	walValue.UnavailableColumns = nil
+	walValue.Data["doc"] = "explicit WAL"
+	afterNull := toastChange(4)
+	afterNull.UnavailableColumns = nil
+	afterNull.Data["doc"] = "after source NULL"
+	changes := []abstract.CDCChange{toastChange(1), walValue, toastChange(2), toastChange(1), toastChange(3), toastChange(4), afterNull}
+	for _, change := range changes {
+		change.Bytes = 11
+		require.NoError(t, batch.push(ctx, change))
+	}
+	require.NoError(t, batch.flush(ctx))
+	require.NoError(t, writer.Close(ctx, nil))
+
+	var batchLengths []int
+	var emitted []types.RawRecord
+	for _, records := range sink.batches {
+		batchLengths = append(batchLengths, len(records))
+		var payloadBytes int64
+		for _, record := range records {
+			payloadBytes += record.PayloadSize()
+			require.Empty(t, record.UnavailableColumns)
+			require.Nil(t, record.Data["explicit"], "explicit WAL NULL must survive hydration")
+		}
+		if payloadBytes > constants.MaxDestinationBatchBytes {
+			require.Len(t, records, 1, "an indivisible oversized row must be flushed alone")
+			require.Equal(t, int64(3), records[0].Data["id"])
+		}
+		emitted = append(emitted, records...)
+	}
+	require.Equal(t, []int{3, 1, 1, 2}, batchLengths)
+	var ids []int64
+	for _, record := range emitted {
+		ids = append(ids, record.Data["id"].(int64))
+	}
+	require.Equal(t, []int64{1, 1, 2, 1, 3, 4, 4}, ids)
+	require.Len(t, emitted[0].Data["doc"], len(part))
+	require.Equal(t, "explicit WAL", emitted[1].Data["doc"])
+	require.Len(t, emitted[2].Data["doc"], len(part))
+	require.Len(t, emitted[3].Data["doc"], len(part))
+	require.Len(t, emitted[4].Data["doc"], len(oversized))
+	require.Nil(t, emitted[5].Data["doc"])
+	require.Equal(t, "after source NULL", emitted[6].Data["doc"])
+	require.Equal(t, int64(len(changes)), pool.GetStats().ReadCount.Load())
+	require.Equal(t, int64(11*len(changes)), pool.GetStats().BytesRead.Load())
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+type toastPayloadWriter struct {
+	batches [][]types.RawRecord
+}
+
+func (*toastPayloadWriter) Spec() any                   { return nil }
+func (*toastPayloadWriter) Type() string                { return "source-toast-payload-test" }
+func (*toastPayloadWriter) Check(context.Context) error { return nil }
+func (*toastPayloadWriter) Setup(context.Context, types.StreamInterface, any, *destination.Options) (any, *types.MetadataState, error) {
+	return struct{}{}, nil, nil
+}
+func (w *toastPayloadWriter) Write(_ context.Context, records []types.RawRecord) error {
+	w.batches = append(w.batches, records)
+	return nil
+}
+func (*toastPayloadWriter) FlattenAndCleanData(_ context.Context, records []types.RawRecord) (bool, []types.RawRecord, any, error) {
+	return false, records, nil, nil
+}
+func (*toastPayloadWriter) EvolveSchema(_ context.Context, schema, _ any) (any, error) {
+	return schema, nil
+}
+func (*toastPayloadWriter) ApplySourceColumns(_ context.Context, schema any, _ types.SourceColumnsChange) (any, error) {
+	return schema, nil
+}
+func (*toastPayloadWriter) DropStreams(context.Context, []types.StreamInterface) error { return nil }
+func (*toastPayloadWriter) Close(context.Context, any) error                           { return nil }
 
 // Runs only against an explicitly supplied disposable database, never production.
 func TestSourceToastPostgresIntegration(t *testing.T) {

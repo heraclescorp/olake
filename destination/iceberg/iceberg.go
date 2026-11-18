@@ -115,7 +115,7 @@ func (i *Iceberg) Write(ctx context.Context, records []types.RawRecord) error {
 		// a fixed overhead for the record, plus the size of every value it holds
 		recordSize := carryEntryOverhead
 		for _, value := range records[idx].Data {
-			recordSize += valueSize(value)
+			recordSize += types.ValueSize(value)
 		}
 		if idx > start && size+recordSize > constants.MaxDestinationBatchBytes {
 			if err := i.writer.Write(ctx, records[start:idx]); err != nil {
@@ -1154,6 +1154,9 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		if err != nil {
 			return err
 		}
+		if len(equalityFiles) > 0 {
+			logger.Infof("iceberg_equality_delete event=staged table=%q thread_id=%q attempt=%d base_snapshot=%d keys=%d delete_files=%d data_files=%d", strings.Join(fresh.Identifier(), "."), w.options.ThreadID, attempt+1, nativeSnapshotID(fresh), len(w.latest), len(equalityFiles), len(w.dataFiles))
+		}
 		if hasFiles {
 			delta := tx.NewRowDelta(apacheiceberg.Properties{"olake.thread-id": w.options.ThreadID})
 			delta.AddRows(w.dataFiles...).AddDeletes(equalityFiles...).AddDeletes(positionFiles...).RemoveDeletes(replaced...)
@@ -1186,6 +1189,13 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		}
 		w.table, w.closed = committed, true
 		coordinated.latest = committed
+		if len(equalityFiles) > 0 {
+			event := "commit_confirmed"
+			if _, private := w.cat.(*nativeResyncCatalog); private {
+				event = "private_resync_commit"
+			}
+			logger.Infof("iceberg_equality_delete event=%s table=%q thread_id=%q attempt=%d snapshot=%d keys=%d delete_files=%d data_files=%d", event, strings.Join(committed.Identifier(), "."), w.options.ThreadID, attempt+1, nativeSnapshotID(committed), len(w.latest), len(equalityFiles), len(w.dataFiles))
+		}
 		// A successful metadata commit owns all staged files from now on.
 		// Never delete them, including when the local index checkpoint fails.
 		clear(w.paths)
@@ -1564,6 +1574,27 @@ func nativeRecordPartition(schema *apacheiceberg.Schema, spec apacheiceberg.Part
 	return fmt.Sprintf("%#v", partition), values, nil
 }
 
+// Arrow checks data-page and dictionary sizes only after a column minibatch.
+// Its default of 1,024 values can therefore produce pages larger than the
+// reader's safety limits when CDC has hydrated large string/binary values.
+// Check after every value in both streaming and one-shot writers. The 1 MiB
+// targets remain soft: Parquet cannot split an individual oversized value,
+// which can still exceed reader limits; values are never truncated.
+func nativeParquetWriterProperties() *parquet.WriterProperties {
+	const pageBytes = 1024 * 1024
+	return parquet.NewWriterProperties(
+		parquet.WithCompression(compress.Codecs.Zstd),
+		parquet.WithCompressionLevel(3),
+		parquet.WithStats(true),
+		parquet.WithMaxRowGroupLength(64*1024),
+		parquet.WithBatchSize(1),
+		parquet.WithDataPageSize(pageBytes),
+		parquet.WithDictionaryPageSizeLimit(pageBytes),
+		parquet.WithRootName("table"),
+		parquet.WithPageIndexEnabled(true),
+	)
+}
+
 // Files are streamed directly through the catalog's native FileIO. The Parquet
 // footer and the object itself are closed before a RowLocation is made visible.
 func (w *nativeWriter) writeNativeParquet(ctx context.Context, schema *apacheiceberg.Schema, spec apacheiceberg.PartitionSpec, partition map[int]any, batch arrow.RecordBatch, content apacheiceberg.ManifestEntryContent, equalityIDs []int, referenced *string) (_ apacheiceberg.DataFile, err error) {
@@ -1601,7 +1632,7 @@ func (w *nativeWriter) writeNativeParquetStream(ctx context.Context, schema *apa
 		return nil, err
 	}
 	counter := &nativeCountingWriter{writer: file}
-	props := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Zstd), parquet.WithCompressionLevel(3), parquet.WithStats(true), parquet.WithMaxRowGroupLength(64*1024), parquet.WithRootName("table"), parquet.WithPageIndexEnabled(true))
+	props := nativeParquetWriterProperties()
 	writer, err := pqarrow.NewFileWriter(arrowSchema, counter, props, pqarrow.DefaultWriterProps())
 	if err != nil {
 		return nil, errors.Join(err, file.Close())

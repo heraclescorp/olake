@@ -4,7 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,6 +17,7 @@ import (
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/destination"
 	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/errs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -415,4 +420,53 @@ func TestCDCCleanupInvalidMetadataAbortsCommits(t *testing.T) {
 	assert.False(t, unsafeCommit.Load())
 	assert.False(t, acknowledged.Load())
 	assert.EqualValues(t, len(streams), closed.Load())
+}
+
+func TestCDCFencedCompletionStillReleasesSource(t *testing.T) {
+	for _, outcome := range []string{"writer_failure", "closed_fence"} {
+		t.Run(outcome, func(t *testing.T) {
+			fence := filepath.Join(t.TempDir(), "execution-fence.json")
+			require.NoError(t, os.WriteFile(fence, []byte(`{"version":1,"execution_id":"runtime","state":"open"}`), 0600))
+			ctx := utils.WithExecution(context.Background(), &utils.ExecutionOptions{ID: "runtime", Fence: fence})
+			streams := cleanupTestStreams(1)
+			source, peer := net.Pipe()
+			t.Cleanup(func() { _ = source.Close(); _ = peer.Close() })
+			failure := errors.New("writer commit failed")
+			var writerClosed, acknowledged atomic.Bool
+			pool := newMetadataWriterPool(t, streams, metadataWriterHooks{
+				Close: func(context.Context, types.StreamInterface, *destination.Options, any) error {
+					writerClosed.Store(true)
+					if outcome == "writer_failure" {
+						return failure
+					}
+					return os.WriteFile(fence, []byte(`{"version":1,"execution_id":"runtime","state":"closed"}`), 0600)
+				},
+			})
+			driver := NewAbstractDriver(ctx, cleanupBarrierDriver{
+				stubDriver: stubDriver{typ: "postgres", cdcSupported: true},
+				metadata:   "0/300",
+				postCDC: func(postCtx context.Context) error {
+					defer source.Close()
+					if !writerClosed.Load() {
+						return errors.New("source cleanup preceded writer close")
+					}
+					if postCtx.Err() == nil {
+						acknowledged.Store(true)
+					}
+					return postCtx.Err()
+				},
+			})
+			require.NoError(t, peer.SetReadDeadline(time.Now().Add(10*time.Second)))
+			err := driver.streamChanges(ctx, pool, 0, streams)
+			require.Error(t, err)
+			if outcome == "writer_failure" {
+				require.ErrorIs(t, err, failure)
+			}
+			require.ErrorIs(t, err, context.Canceled)
+			require.False(t, acknowledged.Load(), "cancellation or a closed fence must not acknowledge source progress")
+			var buf [1]byte
+			_, err = peer.Read(buf[:])
+			require.ErrorIs(t, err, io.EOF, "fenced completion leaked the source connection")
+		})
+	}
 }

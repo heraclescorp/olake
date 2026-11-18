@@ -10,8 +10,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/apache/arrow-go/v18/parquet"
-	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	apacheiceberg "github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
@@ -214,7 +212,7 @@ func (w *nativeWriter) openBackfillFile(ctx context.Context, partition map[int]a
 	if err != nil {
 		return nil, err
 	}
-	props := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Zstd), parquet.WithCompressionLevel(3), parquet.WithStats(true), parquet.WithMaxRowGroupLength(64*1024), parquet.WithRootName("table"), parquet.WithPageIndexEnabled(true))
+	props := nativeParquetWriterProperties()
 	fileState.parquet, err = pqarrow.NewFileWriter(arrowSchema, out, props, pqarrow.DefaultWriterProps())
 	if err != nil {
 		return nil, err
@@ -355,10 +353,10 @@ func (w *nativeWriter) writeBackfill(ctx context.Context, records []types.RawRec
 		for end < len(records) && end-start < nativeBackfillBatchRows {
 			size := carryEntryOverhead
 			for _, value := range records[end].Data {
-				size += valueSize(value)
+				size += types.ValueSize(value)
 			}
 			for _, value := range records[end].OlakeColumns {
-				size += valueSize(value)
+				size += types.ValueSize(value)
 			}
 			if end > start && bytes+size > nativeBackfillBatchBytes {
 				break

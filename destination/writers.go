@@ -71,11 +71,12 @@ type (
 		// stats. The stats are updated live as records are read; if the chunk/run
 		// fails (or is retried), Close rolls these contributions back so the stats —
 		// and the RPS derived from them — reflect only committed data.
-		recordsPushed   atomic.Int64
-		recordsFiltered atomic.Int64
-		bytesPushed     atomic.Int64
-		bufferBytes     int64 // source bytes currently held in buffer (for byte-based flush)
-		metricsContext  context.Context
+		recordsPushed      atomic.Int64
+		recordsFiltered    atomic.Int64
+		bytesPushed        atomic.Int64
+		bufferBytes        int64 // source bytes currently held in buffer
+		bufferPayloadBytes int64 // post-hydration payload bytes, independent of source stats
+		metricsContext     context.Context
 	}
 )
 
@@ -261,9 +262,9 @@ func (w *WriterPool) NewWriter(ctx context.Context, stream types.StreamInterface
 }
 
 // Push appends a record to the thread buffer and updates the live stats. sourceBytes
-// is the record's source read size (0 if the driver does not report it). Buffer batching
-// flushes when buffered source bytes would exceed MaxDestinationBatchBytes. sourceBytes
-// is added live to stats and rolled back by Close if the chunk/run fails (see rollbackStats).
+// is the record's source read size (0 if the driver does not report it). Source and
+// post-hydration payload bytes independently bound batching; a single oversized row
+// is flushed alone. Only sourceBytes contributes to stats and rollbackStats.
 func (wt *WriterThread) Push(ctx context.Context, record types.RawRecord, sourceBytes int64) error {
 	select {
 	case <-ctx.Done():
@@ -272,6 +273,10 @@ func (wt *WriterThread) Push(ctx context.Context, record types.RawRecord, source
 		// if group context is done, return the group err (retry error as there can be rate limits on s3)
 		return wt.group.Block()
 	default:
+		payloadBytes := record.PayloadSize()
+		if len(wt.buffer) > 0 && payloadBytes > constants.MaxDestinationBatchBytes-wt.bufferPayloadBytes {
+			wt.flushBuffer()
+		}
 		wt.stats.ReadCount.Add(1)
 		wt.recordsPushed.Add(1)
 		if sourceBytes != 0 {
@@ -280,25 +285,30 @@ func (wt *WriterThread) Push(ctx context.Context, record types.RawRecord, source
 		}
 		wt.buffer = append(wt.buffer, record)
 		wt.bufferBytes += sourceBytes
-		if len(wt.buffer) >= int(wt.batchSize) || wt.bufferBytes >= constants.MaxDestinationBatchBytes {
-			buf := make([]types.RawRecord, len(wt.buffer))
-			copy(buf, wt.buffer)
-			clear(wt.buffer)
-			wt.buffer = wt.buffer[:0]
-			wt.bufferBytes = 0
-			var queuedAt time.Time
-			if observability.Enabled() {
-				queuedAt = time.Now()
-			}
-			wt.group.Add(func(ctx context.Context) error {
-				if !queuedAt.IsZero() {
-					observability.RecordDuration(ctx, "flush_queue", time.Since(queuedAt))
-				}
-				return wt.flush(ctx, buf)
-			})
+		wt.bufferPayloadBytes += payloadBytes
+		if len(wt.buffer) >= int(wt.batchSize) || wt.bufferBytes >= constants.MaxDestinationBatchBytes || wt.bufferPayloadBytes >= constants.MaxDestinationBatchBytes {
+			wt.flushBuffer()
 		}
 		return nil
 	}
+}
+
+func (wt *WriterThread) flushBuffer() {
+	buf := make([]types.RawRecord, len(wt.buffer))
+	copy(buf, wt.buffer)
+	clear(wt.buffer)
+	wt.buffer = wt.buffer[:0]
+	wt.bufferBytes, wt.bufferPayloadBytes = 0, 0
+	var queuedAt time.Time
+	if observability.Enabled() {
+		queuedAt = time.Now()
+	}
+	wt.group.Add(func(ctx context.Context) error {
+		if !queuedAt.IsZero() {
+			observability.RecordDuration(ctx, "flush_queue", time.Since(queuedAt))
+		}
+		return wt.flush(ctx, buf)
+	})
 }
 
 // ApplySourceColumns applies a source schema change after every record pushed before it: the
@@ -314,7 +324,7 @@ func (wt *WriterThread) ApplySourceColumns(ctx context.Context, change types.Sou
 		copy(buf, wt.buffer)
 		clear(wt.buffer)
 		wt.buffer = wt.buffer[:0]
-		wt.bufferBytes = 0
+		wt.bufferBytes, wt.bufferPayloadBytes = 0, 0
 		wt.group.Add(func(ctx context.Context) error {
 			if err := wt.flush(ctx, buf); err != nil {
 				return err

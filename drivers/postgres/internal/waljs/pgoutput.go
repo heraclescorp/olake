@@ -26,6 +26,7 @@ type pgoutputReplicator struct {
 	txnFinalLSN         pglogrepl.LSN
 	relationIDToMsgMap  map[uint32]*pglogrepl.RelationMessage // map to store relation id
 	progress            *replicationProgress
+	typeMap             *pgtype.Map
 	preserveToastValues bool     // mark columns Postgres left out of an UPDATE so the destination can recover them
 	db                  *sqlx.DB // regular connection for catalog reads; the replication connection cannot run queries mid-stream
 }
@@ -138,7 +139,11 @@ func (p *pgoutputReplicator) processPgoutputWAL(ctx context.Context, walData []b
 	case *pglogrepl.RelationMessage:
 		prev, relationVisited := p.relationIDToMsgMap[msg.RelationID]
 		if !relationVisited && msg.ReplicaIdentity != 'f' {
-			logger.Warnf("table[%s.%s] replica identity is not FULL, unchanged TOAST column values may be lost during CDC UPDATE events; set REPLICA IDENTITY FULL to avoid data loss", msg.Namespace, msg.RelationName)
+			if p.preserveToastValues {
+				logger.Infof("table[%s.%s] replica identity is not FULL; PostgreSQL may omit unchanged TOAST values, which are marked for recovery by the configured TOAST value source", msg.Namespace, msg.RelationName)
+			} else {
+				logger.Warnf("table[%s.%s] replica identity is not FULL and TOAST recovery is disabled; UPDATE events with omitted unchanged TOAST values will fail the sync", msg.Namespace, msg.RelationName)
+			}
 		}
 		p.relationIDToMsgMap[msg.RelationID] = msg
 		if !relationColumnsChanged(prev, msg) {
@@ -222,7 +227,21 @@ func (p *pgoutputReplicator) tupleValuesToMap(rel *pglogrepl.RelationMessage, tu
 
 		typeName := oidToString(colType)
 		var value any
-		if colType == pgtype.ByteaOID && utils.IsBinarySupported() {
+		if colType == pgtype.VarcharArrayOID {
+			if p.typeMap == nil {
+				p.typeMap = pgtype.NewMap()
+			}
+			var format int16 = pgtype.TextFormatCode
+			if col.DataType == pglogrepl.TupleDataTypeBinary {
+				format = pgtype.BinaryFormatCode
+			}
+			var err error
+			arrayType, _ := p.typeMap.TypeForOID(colType)
+			value, err = arrayType.Codec.DecodeValue(p.typeMap, colType, format, col.Data)
+			if err != nil {
+				return nil, 0, nil, fmt.Errorf("failed to decode varchar array column[%s]: %w", colName, err)
+			}
+		} else if colType == pgtype.ByteaOID && utils.IsBinarySupported() {
 			var format int16 = pgtype.TextFormatCode
 			if col.DataType == pglogrepl.TupleDataTypeBinary {
 				format = pgtype.BinaryFormatCode
@@ -339,6 +358,7 @@ var oidToTypeName = map[uint32]string{
 	pgtype.Int2ArrayOID:        "int2[]",
 	pgtype.Int4ArrayOID:        "int4[]",
 	pgtype.TextArrayOID:        "text[]",
+	pgtype.VarcharArrayOID:     "varchar[]",
 	pgtype.ByteaArrayOID:       "bytea[]",
 	pgtype.Int8ArrayOID:        "int8[]",
 	pgtype.Float4ArrayOID:      "float4[]",
