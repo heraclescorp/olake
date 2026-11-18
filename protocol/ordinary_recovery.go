@@ -57,7 +57,7 @@ func validateOrdinaryRecoveryFlags(cmd *cobra.Command) error {
 	if filepath.Base(origin) != "ordinary-recovery-origin.json" || filepath.Base(result) != "ordinary-recovery-result.json" {
 		return fmt.Errorf("ordinary recovery artifacts must be named ordinary-recovery-origin.json and ordinary-recovery-result.json")
 	}
-	return utils.CheckExecutionFence(cmd.Context())
+	return nil
 }
 
 func strictRecoveryJSON(data []byte, out any) error {

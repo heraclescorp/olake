@@ -5,7 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -106,6 +112,8 @@ func TestOrdinaryRecoveryOnlyFrozenCompleteCDCSelection(t *testing.T) {
 }
 
 func TestOrdinaryRecoveryFlagsNeverReopenOriginalFence(t *testing.T) {
+	t.Setenv(constants.EnvStorageMode, "nfs")
+	t.Setenv(constants.EnvS3ConfigFolder, "")
 	oldOrigin, oldResult, oldExecution, oldLaunch, oldFence, oldState, oldSave, oldDiscover, oldPrefix := ordinaryRecoveryOriginPath, ordinaryRecoveryResultPath, executionID, executionLaunchID, executionFence, statePath, noSave, discoverSchema, destinationDatabasePrefix
 	t.Cleanup(func() {
 		ordinaryRecoveryOriginPath, ordinaryRecoveryResultPath, executionID, executionLaunchID, executionFence, statePath, noSave, discoverSchema, destinationDatabasePrefix = oldOrigin, oldResult, oldExecution, oldLaunch, oldFence, oldState, oldSave, oldDiscover, oldPrefix
@@ -117,13 +125,72 @@ func TestOrdinaryRecoveryFlagsNeverReopenOriginalFence(t *testing.T) {
 	cmd := &cobra.Command{Use: "sync"}
 	cmd.SetContext(utils.WithExecution(context.Background(), &utils.ExecutionOptions{ID: executionID, LaunchID: executionLaunchID, Fence: executionFence}))
 	require.NoError(t, validateOrdinaryRecoveryFlags(cmd))
+	require.NoError(t, utils.ResolveS3Paths(cmd.Context(), nil, nil))
 	require.NoError(t, os.WriteFile(executionFence, []byte(`{"version":1,"execution_id":"recovery","state":"closed"}`), 0600))
-	require.Error(t, validateOrdinaryRecoveryFlags(cmd))
+	require.Error(t, utils.ResolveS3Paths(cmd.Context(), nil, nil))
 	unchanged, err := os.ReadFile(executionFence)
 	require.NoError(t, err)
 	require.Contains(t, string(unchanged), `"state":"closed"`)
 	cmd.Use = "resync"
 	require.Error(t, validateOrdinaryRecoveryFlags(cmd))
+}
+
+func TestOrdinaryRecoveryColdS3StartupPublishesNoStartReceipt(t *testing.T) {
+	if os.Getenv("OLAKE_TEST_COLD_S3_RECOVERY") != "1" {
+		child := exec.Command(os.Args[0], "-test.run=^TestOrdinaryRecoveryColdS3StartupPublishesNoStartReceipt$", "-test.count=1")
+		child.Env = append(os.Environ(), "OLAKE_TEST_COLD_S3_RECOVERY=1")
+		output, err := child.CombinedOutput()
+		require.NoError(t, err, "%s", output)
+		return
+	}
+	dir := t.TempDir()
+	receipts := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/execution-fence.json"):
+			fmt.Fprint(w, `{"version":1,"execution_id":"recovery","state":"open"}`)
+		case r.Method == http.MethodGet:
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodPut && r.URL.Path == "/test-bucket/runtime/execution-result.json":
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			receipts <- data
+		default:
+			http.Error(w, "unexpected storage mutation", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	t.Setenv(constants.EnvStorageMode, constants.StorageModeS3)
+	t.Setenv(constants.EnvS3ConfigFolder, "s3://test-bucket/runtime")
+	t.Setenv("TMPDIR", dir)
+	t.Setenv(constants.EnvS3Endpoint, server.URL)
+	t.Setenv(constants.EnvS3Region, "us-east-2")
+	t.Setenv(constants.EnvS3AccessKeyID, "test")
+	t.Setenv(constants.EnvS3SecretAccessKey, "test")
+	ordinaryRecoveryOriginPath, ordinaryRecoveryResultPath = filepath.Join(dir, "ordinary-recovery-origin.json"), filepath.Join(dir, "ordinary-recovery-result.json")
+	executionID, executionLaunchID, executionFence = "recovery", "original", "s3://test-bucket/runtime/execution-fence.json"
+	configPath, destinationConfigPath, statePath = filepath.Join(dir, "source.json"), filepath.Join(dir, "destination.json"), filepath.Join(dir, "state.json")
+	noSave, discoverSchema, destinationDatabasePrefix = false, false, ""
+	stopped := errors.New("stop before source and destination setup")
+	root := &cobra.Command{Use: "olake", PersistentPreRunE: RootCmd.PersistentPreRunE, SilenceErrors: true, SilenceUsage: true}
+	root.AddCommand(&cobra.Command{Use: "sync", RunE: func(*cobra.Command, []string) error { return stopped }})
+	root.SetArgs([]string{"sync"})
+	require.ErrorIs(t, Execute(root), stopped)
+	var data []byte
+	select {
+	case data = <-receipts:
+	default:
+		t.Fatal("cold S3 startup did not publish its execution receipt")
+	}
+	var receipt utils.ExecutionResult
+	require.NoError(t, json.Unmarshal(data, &receipt))
+	require.Equal(t, "not_started", receipt.Outcome)
+	require.Equal(t, "recovery", receipt.ExecutionID)
+	require.Equal(t, "original", receipt.LaunchID)
+	require.Empty(t, receipt.StateSHA256)
 }
 
 func TestOrdinaryRecoveryServerPinSurvivesInterruptedEpochAndRejectsDrift(t *testing.T) {
