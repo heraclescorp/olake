@@ -1812,6 +1812,18 @@ func TestGetStreamsDelta(t *testing.T) {
 			},
 		},
 		{
+			name:            "iceberg: dv to equality preserves the table",
+			destinationType: Iceberg,
+			oldCatalog: &Catalog{
+				Streams:         []*ConfiguredStream{{Stream: &Stream{Name: "users", Namespace: "public"}}},
+				SelectedStreams: map[string][]StreamMetadata{"public": {{StreamName: "users", UpdateType: new(string(UpdateTypeDeletionVector))}}},
+			},
+			newCatalog: &Catalog{
+				Streams:         []*ConfiguredStream{{Stream: &Stream{Name: "users", Namespace: "public"}}},
+				SelectedStreams: map[string][]StreamMetadata{"public": {{StreamName: "users", UpdateType: new(string(UpdateTypeEquality))}}},
+			},
+		},
+		{
 			name:            "iceberg: update_type pos -> dv is a delta",
 			destinationType: Iceberg,
 			oldCatalog: &Catalog{

@@ -47,7 +47,7 @@ func (th *TestHandler) TestDiscover(t *testing.T) {
 
 	verifyDiscoveredStreams(t, expectedCatalog, th.Catalog())
 
-	// 4. With preserve_toast_values on, only the update types that keep a row index (pos, dv) are offered
+	// 4. Explicit destination recovery offers only indexed update types (pos, dv).
 	if th.TestConfig.Driver == string(constants.Postgres) {
 		require.NoError(t, enablePreserveToastValues(th.TestConfig), "failed enabling preserve_toast_values")
 		require.NoError(t, expectedCatalog.Edit(offerIndexUpdateTypesOnly),

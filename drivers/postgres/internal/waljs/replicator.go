@@ -232,6 +232,7 @@ func AcknowledgeLSN(ctx context.Context, db *sqlx.DB, socket *Socket, fakeAck bo
 			}
 
 			if slot.LSN == walPosition {
+				logger.Infof("postgres_cdc_ack_confirmed slot=%q confirmed_flush_lsn=%s", socket.ReplicationSlot, walPosition)
 				return nil
 			}
 		}

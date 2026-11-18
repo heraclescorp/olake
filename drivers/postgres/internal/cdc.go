@@ -121,11 +121,11 @@ func validateToastStreams(streams []types.StreamInterface) error {
 	for _, stream := range streams {
 		if stream.AppendModeEnabled() {
 			return errs.Precondition(errs.ConfigInvalid, codeAppendModeWithToast,
-				fmt.Errorf("stream %s: preserve_toast_values does not support append mode", stream.ID()))
+				fmt.Errorf("stream %s: destination TOAST recovery does not support append mode", stream.ID()))
 		}
 		if !stream.GetUpdateType().NeedsTableIndex(types.Iceberg) {
 			return errs.Precondition(errs.ConfigInvalid, codeUpdateTypeWithoutIndex,
-				fmt.Errorf("stream %s: preserve_toast_values supports only pos and dv update types, got %q", stream.ID(), stream.GetUpdateType()))
+				fmt.Errorf("stream %s: destination TOAST recovery supports only pos and dv update types, got %q", stream.ID(), stream.GetUpdateType()))
 		}
 	}
 	return nil
@@ -150,7 +150,7 @@ func (p *Postgres) prepareWALJSConfig(streams ...types.StreamInterface) (*waljs.
 		Tables:              types.NewSet(streams...),
 		TLSConfig:           tlsConfig,
 		Publication:         p.cdcConfig.Publication,
-		PreserveToastValues: p.cdcConfig.PreserveToastValues,
+		PreserveToastValues: true,
 	}, nil
 }
 
@@ -159,7 +159,24 @@ func (p *Postgres) ChangeStreamConfig() (bool, bool, bool) {
 }
 
 func (p *Postgres) PreCDC(ctx context.Context, streams []types.StreamInterface) error {
-	if p.cdcConfig.PreserveToastValues {
+	if err := p.cdcConfig.validateToastRecovery(); err != nil {
+		return err
+	}
+	if p.cdcConfig.sourceToastRecovery() {
+		for _, stream := range streams {
+			if stream.GetStream().SourceDefinedPrimaryKey == nil || stream.GetStream().SourceDefinedPrimaryKey.Len() == 0 {
+				return fmt.Errorf("source TOAST recovery requires primary keys for stream %s", stream.ID())
+			}
+		}
+		var standby bool
+		if err := p.client.GetContext(ctx, &standby, "SELECT pg_is_in_recovery()"); err != nil {
+			return fmt.Errorf("validate source TOAST lookup host: %w", err)
+		}
+		if standby {
+			return fmt.Errorf("source TOAST recovery requires a primary CDC host; standby reads are not replay-fenced")
+		}
+	}
+	if !p.cdcConfig.sourceToastRecovery() {
 		if err := validateToastStreams(streams); err != nil {
 			return err
 		}
@@ -180,6 +197,7 @@ func (p *Postgres) PreCDC(ctx context.Context, streams []types.StreamInterface) 
 			return errs.Precondition(errs.StateInvalid, codeGlobalLSNMissing,
 				fmt.Errorf("atomic resync CDC requires a saved global CDC checkpoint; refusing to initialize or advance the replication slot before publication"))
 		}
+		logger.Warnf("postgres_cdc_slot_initialization slot=%q slot_confirmed_lsn=%q target_lsn=%q global_checkpoint=missing destination_metadata=diagnostics_only phase=pre_cdc; destination metadata diagnostics do not seed the global checkpoint or change slot initialization", p.cdcConfig.ReplicationSlot, slot.LSN.String(), slot.CurrentLSN.String())
 		// advance before seeding state: AdvanceLSN returns the position the slot confirmed,
 		// so the state file and confirmed_flush_lsn agree by construction
 		confirmedLSN, err := waljs.AdvanceLSN(ctx, p.client, p.cdcConfig.ReplicationSlot, slot.CurrentLSN.String())
@@ -230,6 +248,7 @@ func (p *Postgres) StreamChanges(ctx context.Context, _ int, metadataStates map[
 				return nil, errs.Precondition(errs.StateInvalid, codeGlobalLSNUnparseable,
 					fmt.Errorf("failed to parse global state LSN %q: %w", postgresGlobalState.LSN, err))
 			}
+			logger.Infof("postgres_cdc_metadata_position stream=%q metadata_lsn=%q global_state_lsn=%q metadata_ahead=%t", streamID, parsedMetaLSN.String(), parsedStateLSN.String(), parsedMetaLSN > parsedStateLSN)
 			if parsedMetaLSN > parsedStateLSN {
 				// metadata ahead of state: genuine crash-recovery path
 				metadataCommittedLSN = mtState.LSN
@@ -300,7 +319,7 @@ func (p *Postgres) StreamChanges(ctx context.Context, _ int, metadataStates map[
 	}
 
 	// choose replicator via factory based on OutputPlugin config (default wal2json)
-	err = p.replicator.StreamChanges(ctx, p.client, callback)
+	err = p.streamChangesWithToast(ctx, callback)
 	if err != nil {
 		return nil, err
 	}

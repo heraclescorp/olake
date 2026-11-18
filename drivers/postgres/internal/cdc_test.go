@@ -50,10 +50,12 @@ func TestSupportedUpdateTypes(t *testing.T) {
 		{name: "no update method has no restriction"},
 		{name: "standard replication has no restriction", updateMethod: map[string]any{"type": "standard"}},
 		{name: "preserve_toast_values without cdc has no restriction", updateMethod: map[string]any{"type": "standard", "preserve_toast_values": true}},
-		{name: "cdc without preserve_toast_values has no restriction", updateMethod: map[string]any{"replication_slot": "olake_slot"}},
+		{name: "cdc defaults to mandatory source recovery", updateMethod: map[string]any{"replication_slot": "olake_slot"}},
+		{name: "legacy false cannot disable preservation", updateMethod: map[string]any{"replication_slot": "olake_slot", "preserve_toast_values": false}},
+		{name: "source recovery permits equality", updateMethod: map[string]any{"replication_slot": "olake_slot", "toast_value_source": "source"}},
 		{
-			name:         "preserve_toast_values offers only the indexed formats",
-			updateMethod: map[string]any{"replication_slot": "olake_slot", "preserve_toast_values": true},
+			name:         "explicit destination recovery offers only the indexed formats",
+			updateMethod: map[string]any{"replication_slot": "olake_slot", "toast_value_source": "destination"},
 			expected:     []types.UpdateType{types.UpdateTypePosition, types.UpdateTypeDeletionVector},
 		},
 	}

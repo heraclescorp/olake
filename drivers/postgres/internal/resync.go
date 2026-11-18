@@ -191,7 +191,7 @@ func (p *Postgres) streamResyncChanges(ctx context.Context, saved waljs.WALState
 	if err != nil {
 		return nil, err
 	}
-	if err := p.replicator.StreamChanges(ctx, p.client, callback); err != nil {
+	if err := p.streamChangesWithToast(ctx, callback); err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {

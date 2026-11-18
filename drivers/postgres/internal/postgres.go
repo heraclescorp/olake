@@ -158,6 +158,9 @@ func (p *Postgres) setup(ctx context.Context, requireCDCPrerequisites bool) erro
 			return err
 		}
 
+		if err := cdc.validateToastRecovery(); err != nil {
+			return err
+		}
 		if cdc.InitialWaitTime < minCDCInitialWaitTime {
 			logger.Warnf("initial_wait_time %d is below the minimum of %d seconds; using default %d", cdc.InitialWaitTime, minCDCInitialWaitTime, defaultCDCInitialWaitTime)
 			cdc.InitialWaitTime = defaultCDCInitialWaitTime
@@ -239,13 +242,13 @@ func (p *Postgres) Spec() any {
 	return Config{}
 }
 
-// SupportedUpdateTypes excludes equality when preserve_toast_values is on: unchanged TOAST values
-// are read back through the destination's table index, which only pos and dv maintain. Discover
+// SupportedUpdateTypes excludes equality only for destination-based TOAST recovery.
+// Source recovery needs no physical row index. Discover
 // calls it before Setup, so it reads update_method directly, as Setup does: without a
 // replication_slot it is not CDC and nothing is recovered.
 func (p *Postgres) SupportedUpdateTypes() []types.UpdateType {
 	cdc := &CDC{}
-	if err := utils.Unmarshal(p.config.UpdateMethod, cdc); err != nil || cdc.ReplicationSlot == "" || !cdc.PreserveToastValues {
+	if err := utils.Unmarshal(p.config.UpdateMethod, cdc); err != nil || cdc.ReplicationSlot == "" || cdc.sourceToastRecovery() {
 		return nil
 	}
 	return []types.UpdateType{types.UpdateTypePosition, types.UpdateTypeDeletionVector}

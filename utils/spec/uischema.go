@@ -158,13 +158,13 @@ const PostgresUISchema = `{
       },
       "update_method": {
         "ui:widget": "radio",
-        "ui:grid": [{ "replication_slot": 12, "publication": 12 }, { "initial_wait_time": 12, "preserve_toast_values": 12 }],
+        "ui:grid": [{ "replication_slot": 12, "publication": 12 }, { "initial_wait_time": 12, "toast_value_source": 12 }],
         "ui:options": {
           "title": false,
           "description": false
         },
-        "preserve_toast_values": {
-          "ui:widget": "boolean"
+        "toast_value_source": {
+          "ui:widget": "select"
         },
         "type": {
           "ui:widget": "hidden"

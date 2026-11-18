@@ -53,6 +53,8 @@ func (w *wal2jsonReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, cal
 		return fmt.Errorf("starting replication slot failed: %w", err)
 	}
 	logger.Infof("Started logical replication for slot[%s] from lsn[%s] to lsn[%s]", w.socket.ReplicationSlot, w.socket.ConfirmedFlushLSN, w.socket.CurrentWalPosition)
+	progress, stopProgress := startReplicationProgress(w.socket, "wal2json")
+	defer stopProgress()
 	messageReceived := false
 	cdcStartTime := time.Now()
 	for {
@@ -90,6 +92,7 @@ func (w *wal2jsonReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, cal
 				if err != nil {
 					return fmt.Errorf("failed to parse primary keepalive message: %w", err)
 				}
+				progress.serverEnd.Store(uint64(pkm.ServerWALEnd))
 				w.socket.ClientXLogPos = pkm.ServerWALEnd
 				if pkm.ReplyRequested {
 					logger.Debugf("keep alive message received: %v", pkm)
@@ -105,6 +108,7 @@ func (w *wal2jsonReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, cal
 				if err != nil {
 					return fmt.Errorf("failed to parse XLogData: %w", err)
 				}
+				progress.received(xld.WALStart, xld.ServerWALEnd, len(xld.WALData))
 				// Process change with the provided callback.
 				nextLSN, records, err := w.socket.changeFilter.FilterWalJsChange(ctx, xld.WALData, callback)
 				if err != nil {
@@ -112,6 +116,7 @@ func (w *wal2jsonReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, cal
 				}
 				messageReceived = records > 0 || messageReceived
 				w.socket.ClientXLogPos = *nextLSN
+				progress.committed(*nextLSN)
 			default:
 				logger.Warnf("received unhandled message type: %v", copyData.Data[0])
 			}
