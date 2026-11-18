@@ -39,6 +39,7 @@ import (
 	icesql "github.com/apache/iceberg-go/catalog/sql"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
+	"github.com/apache/iceberg-go/table/dv"
 	iceutils "github.com/apache/iceberg-go/utils"
 	"github.com/apache/thrift/lib/go/thrift"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -1670,7 +1671,7 @@ func nativeTestRecord(id, operation string, value int64, partition string) types
 
 func nativeVisibleValues(t *testing.T, tbl *table.Table) map[string]int64 {
 	t.Helper()
-	scan := tbl.Scan()
+	scan := tbl.Scan(table.WithSelectedFields(constants.OlakeID, "value"))
 	defer scan.Close()
 	schema, records, err := scan.ToArrowRecords(context.Background())
 	require.NoError(t, err)
@@ -2160,7 +2161,7 @@ func nativePendingLocation(t *testing.T, writer *nativeWriter, id string) types.
 	return location
 }
 
-func TestNativeStagedRewritePreservesSchemaPartitionAndIndex(t *testing.T) {
+func TestNativeSameWriteDeletesPreserveSchemaPartitionAndIndex(t *testing.T) {
 	for _, mode := range []types.UpdateType{types.UpdateTypeEquality, types.UpdateTypePosition, types.UpdateTypeDeletionVector} {
 		t.Run(string(mode), func(t *testing.T) {
 			ctx := context.Background()
@@ -2169,13 +2170,12 @@ func TestNativeStagedRewritePreservesSchemaPartitionAndIndex(t *testing.T) {
 			if mode != types.UpdateTypeEquality {
 				index = &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
 			}
-			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "staged-rewrite", false)
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "same-write", false)
 			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 1, "one"), nativeTestRecord("b", "u", 2, "one"), nativeTestRecord("c", "u", 3, "two")}))
 			originalB := nativePendingLocation(t, writer, "b")
 			originalC := nativePendingLocation(t, writer, "c")
 			require.Equal(t, int64(1), originalB.Position)
-			// TOAST recovery can read an earlier write before Close. Compaction
-			// must not alter that path or its ordinals during Write/evolution.
+			// TOAST recovery and the eventual index retain physical staged ordinals.
 			require.NoError(t, writer.EnsureReadable(ctx, []string{originalB.FilePath, originalC.FilePath}))
 			rows, err := writer.ReadRows(ctx, originalB.FilePath, []int64{0, originalB.Position}, []string{"value", "blob"})
 			require.NoError(t, err)
@@ -2184,50 +2184,135 @@ func TestNativeStagedRewritePreservesSchemaPartitionAndIndex(t *testing.T) {
 			columns := writer.schemaMap()
 			columns["later"] = "string"
 			require.NoError(t, writer.EvolveSchema(ctx, columns))
+			// Evolve the default spec while older-spec files are still staged.
+			specTx := writer.table.NewTransaction()
+			require.NoError(t, specTx.UpdateSpec(true).RemoveField("part").Commit())
+			writer.table, err = specTx.Commit(ctx)
+			require.NoError(t, err)
+			writer.coordinator.latest = writer.table
 			a := nativeTestRecord("a", "u", 4, "one")
 			a.Data["later"] = "new-schema"
 			require.NoError(t, writer.Write(ctx, []types.RawRecord{a, nativeTestRecord("c", "u", 5, "three")}))
+			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("c", "d", 6, "four")}))
 			require.NoError(t, writer.EnsureReadable(ctx, []string{originalB.FilePath}))
-			require.NoError(t, writer.Close(ctx, map[string]any{"state": "compacted"}))
-			require.Equal(t, map[string]int64{"a": 4, "b": 2, "c": 5}, nativeVisibleValues(t, writer.table))
+			latestC := nativePendingLocation(t, writer, "c")
+			expectedPositions := maps.Clone(writer.positions)
+			originalFiles := slices.Clone(writer.dataFiles)
+			originalByPath := make(map[string]apacheiceberg.DataFile, len(originalFiles))
+			for _, file := range originalFiles {
+				originalByPath[file.FilePath()] = file
+			}
+			fs, err := writer.table.FS(ctx)
+			require.NoError(t, err)
+			guard := &nativeSameWriteFS{WriteFileIO: fs.(iceio.WriteFileIO), blocked: make(map[string]struct{})}
+			for _, file := range originalFiles {
+				guard.blocked[file.FilePath()] = struct{}{}
+			}
+			writer.table = table.New(writer.table.Identifier(), writer.table.Metadata(), writer.table.MetadataLocation(), func(context.Context) (iceio.IO, error) { return guard, nil }, cat)
+			writer.coordinator.latest = writer.table
+			require.NoError(t, writer.Close(ctx, map[string]any{"state": "same-write"}))
+			require.Zero(t, guard.stagedReads, "Close must never download staged data")
+			require.Equal(t, originalFiles, writer.dataFiles, "Close must not replace staged data")
+			clear(guard.blocked)
+			require.Equal(t, map[string]int64{"a": 4, "b": 2, "c": 6}, nativeVisibleValues(t, writer.table))
 			finalB := writer.latest["b"]
 			if index != nil {
 				finalB = index.rows["b"]
 				require.Equal(t, nativeSnapshotID(writer.table), index.snapshot)
 			}
-			require.NotEqual(t, originalB.FilePath, finalB.FilePath)
-			require.Zero(t, finalB.Position)
+			require.Equal(t, originalB, finalB)
 			rows, err = writer.ReadRows(ctx, finalB.FilePath, []int64{finalB.Position}, []string{"value", "blob", "later"})
 			require.NoError(t, err)
-			require.Equal(t, int64(2), rows[0]["value"])
-			require.Equal(t, []byte{0, 1, 2, 3}, rows[0]["blob"])
-			require.Nil(t, rows[0]["later"])
-			fs, err := writer.table.FS(ctx)
+			require.Equal(t, int64(2), rows[1]["value"])
+			require.Equal(t, []byte{0, 1, 2, 3}, rows[1]["blob"])
+			require.Nil(t, rows[1]["later"])
+			if index != nil {
+				require.Equal(t, latestC, index.rows["c"])
+			} else {
+				require.Equal(t, latestC, writer.latest["c"])
+			}
+			rows, err = writer.ReadRows(ctx, latestC.FilePath, []int64{latestC.Position}, []string{constants.OpType})
 			require.NoError(t, err)
-			for _, path := range []string{originalB.FilePath, originalC.FilePath} {
-				_, err := fs.Open(path)
-				require.Error(t, err)
+			require.Equal(t, "d", rows[latestC.Position][constants.OpType])
+			for _, file := range originalFiles {
+				input, err := fs.Open(file.FilePath())
+				require.NoError(t, err)
+				require.NoError(t, input.Close())
 			}
 			entries, err := nativeLiveEntries(ctx, writer.table)
 			require.NoError(t, err)
+			var dataCount, deleteCount int
+			seenTargets := make(map[string]struct{})
 			for _, entry := range entries {
-				require.Equal(t, apacheiceberg.EntryContentData, entry.DataFile().ContentType(), "own superseded rows require no delete file")
+				file := entry.DataFile()
+				if file.ContentType() == apacheiceberg.EntryContentData {
+					dataCount++
+					continue
+				}
+				deleteCount++
+				require.Equal(t, apacheiceberg.EntryContentPosDeletes, file.ContentType())
+				require.Equal(t, mode == types.UpdateTypeDeletionVector, table.IsDeletionVector(file))
+				var target string
+				var actualPositions []int64
+				if table.IsDeletionVector(file) {
+					require.NotNil(t, file.ReferencedDataFile(), "v3 DVs must persist their explicit target")
+					target = *file.ReferencedDataFile()
+					bitmap, err := dv.ReadDV(fs, file)
+					require.NoError(t, err)
+					for position := range bitmap.Positions() {
+						actualPositions = append(actualPositions, int64(position))
+					}
+				} else {
+					// V2 manifests do not persist referenced_data_file. Verify the
+					// physical file_path/pos columns consumed by independent readers.
+					encoded, err := readNativePositionDeletes(ctx, writer.table, file.FilePath())
+					require.NoError(t, err)
+					require.Len(t, encoded, 1)
+					for path, positions := range encoded {
+						target, actualPositions = path, positions
+					}
+				}
+				want, found := expectedPositions[target]
+				require.True(t, found, "delete must target an original staged data file")
+				require.Equal(t, want, actualPositions)
+				require.NotContains(t, seenTargets, target)
+				seenTargets[target] = struct{}{}
+				original := originalByPath[target]
+				require.Equal(t, original.SpecID(), file.SpecID())
+				require.Len(t, file.Partition(), len(original.Partition()))
+				for fieldID, value := range original.Partition() {
+					require.Equal(t, value, file.Partition()[fieldID])
+				}
 			}
+			require.Equal(t, len(originalFiles), dataCount)
+			require.Equal(t, 3, deleteCount)
+			require.Len(t, seenTargets, len(expectedPositions))
+			require.Contains(t, writer.table.Properties()[nativeRecoveryProperty], "same-write")
 		})
 	}
 }
 
-type nativeRewriteFaultFS struct {
+type nativeSameWriteFS struct {
 	iceio.WriteFileIO
-	failAt  int
-	creates int
-	created []string
+	failAt      int
+	creates     int
+	created     []string
+	blocked     map[string]struct{}
+	stagedReads int
 }
 
-func (fs *nativeRewriteFaultFS) Create(path string) (iceio.FileWriter, error) {
+func (fs *nativeSameWriteFS) Open(path string) (iceio.File, error) {
+	if _, blocked := fs.blocked[path]; blocked {
+		fs.stagedReads++
+		return nil, errors.New("staged data read forbidden during Close")
+	}
+	return fs.WriteFileIO.Open(path)
+}
+
+func (fs *nativeSameWriteFS) Create(path string) (iceio.FileWriter, error) {
 	fs.creates++
 	if fs.creates == fs.failAt {
-		return nil, errors.New("injected staged rewrite upload failure")
+		return nil, errors.New("injected same-write delete upload failure")
 	}
 	writer, err := fs.WriteFileIO.Create(path)
 	if err == nil {
@@ -2236,11 +2321,11 @@ func (fs *nativeRewriteFaultFS) Create(path string) (iceio.FileWriter, error) {
 	return writer, err
 }
 
-func TestNativeStagedRewriteFailureKeepsPendingIndexAtomic(t *testing.T) {
+func TestNativeSameWriteDeleteFailureKeepsPendingIndexAtomic(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypePosition, true, "/{part, identity}")
 	index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "rewrite-fails", false)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "delete-fails", false)
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 1, "one"), nativeTestRecord("x", "u", 2, "one"), nativeTestRecord("b", "u", 3, "two"), nativeTestRecord("y", "u", 4, "two")}))
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 5, "three"), nativeTestRecord("b", "u", 6, "three")}))
 	pending := writer.indexThread
@@ -2251,11 +2336,12 @@ func TestNativeStagedRewriteFailureKeepsPendingIndexAtomic(t *testing.T) {
 	require.NoError(t, err)
 	writeFS, ok := baseFS.(iceio.WriteFileIO)
 	require.True(t, ok)
-	fault := &nativeRewriteFaultFS{WriteFileIO: writeFS, failAt: 2}
+	fault := &nativeSameWriteFS{WriteFileIO: writeFS, failAt: 2}
 	writer.table = table.New(writer.table.Identifier(), writer.table.Metadata(), writer.table.MetadataLocation(), func(context.Context) (iceio.IO, error) { return fault, nil }, cat)
+	writer.coordinator.latest = writer.table
 	err = writer.Close(ctx, map[string]any{"state": "must-not-commit"})
-	require.ErrorContains(t, err, "injected staged rewrite upload failure")
-	require.Len(t, fault.created, 1, "first replacement must succeed before the injected failure")
+	require.ErrorContains(t, err, "injected same-write delete upload failure")
+	require.Len(t, fault.created, 1, "first delete file must succeed before the injected failure")
 	afterX, found, err := pending.Lookup("x")
 	require.NoError(t, err)
 	require.True(t, found)
@@ -2276,19 +2362,19 @@ func TestNativeStagedRewriteFailureKeepsPendingIndexAtomic(t *testing.T) {
 	require.NotContains(t, fresh.Properties()[nativeRecoveryProperty], "must-not-commit")
 }
 
-func TestNativeStagedRewriteAbortCleansReplacementFiles(t *testing.T) {
+func TestNativeSameWriteAbortCleansStagedDataAndDeletes(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypePosition, true, "")
 	index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "rewrite-abort", false)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "delta-abort", false)
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 1, "one"), nativeTestRecord("b", "u", 2, "one"), nativeTestRecord("a", "u", 3, "one")}))
 	original := nativePendingLocation(t, writer, "b")
-	require.NoError(t, writer.compactStagedDataFiles(ctx))
-	location := nativePendingLocation(t, writer, "b")
-	require.NotEqual(t, original.FilePath, location.FilePath)
-	require.Zero(t, location.Position)
+	deletes, _, err := writer.writePositionDeletes(ctx, writer.positions, writer.table)
+	require.NoError(t, err)
+	require.Len(t, deletes, 1)
+	require.Equal(t, original, nativePendingLocation(t, writer, "b"))
 	paths := slices.Collect(maps.Keys(writer.paths))
-	require.NotEmpty(t, paths)
+	require.Len(t, paths, 2)
 	writer.Abort()
 	fs, err := writer.table.FS(ctx)
 	require.NoError(t, err)
@@ -2300,7 +2386,7 @@ func TestNativeStagedRewriteAbortCleansReplacementFiles(t *testing.T) {
 	require.Zero(t, index.snapshot)
 }
 
-func TestNativeStagedRewriteLargeHydratedValues(t *testing.T) {
+func TestNativeSameWriteDeletesPreserveLargeHydratedValues(t *testing.T) {
 	for _, payloadType := range []types.DataType{types.String, types.Binary} {
 		t.Run(string(payloadType), func(t *testing.T) {
 			ctx := context.Background()
@@ -2342,8 +2428,8 @@ func TestNativeStagedRewriteLargeHydratedValues(t *testing.T) {
 			latest.Data["hydrated"] = asValue([]byte("latest hydrated value"))
 			expected["0"] = digest(latest.Data["hydrated"])
 			records = append(records, latest)
-			// Supersede a key inside this very Write, not via a second call or
-			// resolver wiring. Close must read the staged file to remove row 0.
+			// Supersede a key inside one Write. Close must publish a delete without
+			// downloading or rewriting any of the large hydrated values.
 			require.NoError(t, writer.Write(ctx, records))
 			records = nil
 			staged := nativePendingLocation(t, writer, "0")
@@ -2351,19 +2437,22 @@ func TestNativeStagedRewriteLargeHydratedValues(t *testing.T) {
 			require.Equal(t, []int64{0}, writer.positions[staged.FilePath])
 			require.Len(t, writer.dataFiles, 1)
 			require.NoError(t, writer.Close(ctx, map[string]any{"state": "large-hydrated"}))
-			require.NotEqual(t, staged.FilePath, writer.latest["0"].FilePath, "Close must compact the superseded staged row")
+			require.Equal(t, staged, writer.latest["0"], "physical staged ordinals are immutable")
 			require.Contains(t, writer.table.Properties()[nativeRecoveryProperty], "large-hydrated")
 			entries, err := nativeLiveEntries(ctx, writer.table)
 			require.NoError(t, err)
-			require.Len(t, entries, 1)
-			require.Equal(t, apacheiceberg.EntryContentData, entries[0].DataFile().ContentType())
-			require.Equal(t, int64(count), entries[0].DataFile().Count())
-			fs, err := writer.table.FS(ctx)
-			require.NoError(t, err)
+			require.Len(t, entries, 2)
+			require.Equal(t, int64(count+1), writer.dataFiles[0].Count())
+			require.Len(t, nativeVisibleValues(t, writer.table), count)
 			seen := make(map[string]struct{}, count)
-			// Use the same default-guarded physical reader as staged compaction,
-			// hashing complete values to detect truncation without huge failures.
-			err = readNativePhysicalBatches(ctx, fs, writer.table, entries[0].DataFile().FilePath(), writer.table.Schema(), nil, func(_ int64, batch arrow.RecordBatch) (bool, error) {
+			// Independent scan applies the committed position delete, then hashes
+			// complete values to detect truncation without huge failure messages.
+			scan := writer.table.Scan()
+			defer scan.Close()
+			_, batches, err := scan.ToArrowRecords(ctx)
+			require.NoError(t, err)
+			for batch, err := range batches {
+				require.NoError(t, err)
 				ids := batch.Column(batch.Schema().FieldIndices(constants.OlakeID)[0]).(*array.String)
 				values := batch.Column(batch.Schema().FieldIndices("value")[0]).(*array.Int64)
 				payloads := batch.Column(batch.Schema().FieldIndices("hydrated")[0])
@@ -2380,19 +2469,18 @@ func TestNativeStagedRewriteLargeHydratedValues(t *testing.T) {
 					require.Equal(t, value, values.Value(row))
 					seen[id] = struct{}{}
 				}
-				return true, nil
-			})
-			require.NoError(t, err)
+				batch.Release()
+			}
 			require.Len(t, seen, count)
 		})
 	}
 }
 
-func TestNativeStagedRewriteStreamsAcrossPhysicalBatches(t *testing.T) {
+func TestNativeSameWriteDeletesAcrossPhysicalBatchBoundaries(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypePosition, true, "")
 	index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "rewrite-batches", false)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "delta-batches", false)
 	const count = 9000
 	records := make([]types.RawRecord, count)
 	for row := range records {
@@ -2415,8 +2503,9 @@ func TestNativeStagedRewriteStreamsAcrossPhysicalBatches(t *testing.T) {
 	require.NoError(t, err)
 	var total int64
 	for _, entry := range entries {
-		require.Equal(t, apacheiceberg.EntryContentData, entry.DataFile().ContentType())
-		total += entry.DataFile().Count()
+		if entry.DataFile().ContentType() == apacheiceberg.EntryContentData {
+			total += entry.DataFile().Count()
+		}
 	}
 	fs, err := writer.table.FS(ctx)
 	require.NoError(t, err)
@@ -2425,47 +2514,56 @@ func TestNativeStagedRewriteStreamsAcrossPhysicalBatches(t *testing.T) {
 		require.NoError(t, err)
 		reader, err := parquetfile.NewParquetReader(input)
 		require.NoError(t, err)
-		require.Equal(t, 1, reader.NumRowGroups(), "9,000-row rewrites must not inherit 8,192-row scan batch boundaries")
+		require.Equal(t, 1, reader.NumRowGroups(), "original staged row groups must remain unchanged")
 		require.NoError(t, reader.Close())
 	}
-	require.Equal(t, int64(count), total)
+	require.Equal(t, int64(count+4), total, "superseded rows remain physically immutable")
+	visible := nativeVisibleValues(t, writer.table)
+	require.Len(t, visible, count)
+	for _, position := range []int{0, 8191, 8192, count - 1} {
+		require.Equal(t, int64(count+position), visible[fmt.Sprint(position)])
+	}
 	require.Len(t, index.rows, count)
 }
 
-func TestNativeStagedRewriteUnknownCommitKeepsPublishedReplacements(t *testing.T) {
-	ctx := context.Background()
-	cfg, stream, realCatalog := nativeWriterFixture(t, types.UpdateTypeDeletionVector, true, "")
-	index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
-	seed := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, index, "create", true)
-	seed.Abort()
-	cat := &nativeCommitFaultCatalog{Catalog: realCatalog}
-	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "rewrite-unknown", false)
-	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 1, "one"), nativeTestRecord("b", "u", 2, "one"), nativeTestRecord("a", "u", 3, "one")}))
-	original := nativePendingLocation(t, writer, "b")
-	cat.fault = func(ctx context.Context, id table.Identifier, reqs []table.Requirement, updates []table.Update) (bool, error) {
-		_, _, err := realCatalog.CommitTable(ctx, id, reqs, updates)
-		require.NoError(t, err)
-		return true, errors.New("connection reset after publishing compacted data")
+func TestNativeSameWriteUnknownCommitRetainsDataDeletesAndRecovery(t *testing.T) {
+	for _, mode := range []types.UpdateType{types.UpdateTypePosition, types.UpdateTypeDeletionVector} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, realCatalog := nativeWriterFixture(t, mode, true, "")
+			index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
+			seed := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, index, "create", true)
+			seed.Abort()
+			cat := &nativeCommitFaultCatalog{Catalog: realCatalog}
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "delta-unknown", false)
+			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 1, "one"), nativeTestRecord("b", "u", 2, "one"), nativeTestRecord("a", "u", 3, "one")}))
+			original := nativePendingLocation(t, writer, "b")
+			cat.fault = func(ctx context.Context, id table.Identifier, reqs []table.Requirement, updates []table.Update) (bool, error) {
+				_, _, err := realCatalog.CommitTable(ctx, id, reqs, updates)
+				require.NoError(t, err)
+				return true, errors.New("connection reset after publishing row delta")
+			}
+			require.Error(t, writer.Close(ctx, map[string]any{"state": "published"}))
+			require.True(t, writer.uncertain)
+			writer.Abort()
+			fs, err := writer.table.FS(ctx)
+			require.NoError(t, err)
+			require.Equal(t, original.FilePath, writer.dataFiles[0].FilePath())
+			for path := range writer.paths {
+				input, err := fs.Open(path)
+				require.NoError(t, err)
+				require.NoError(t, input.Close())
+			}
+			require.Empty(t, index.rows)
+			require.Zero(t, index.snapshot, "unknown outcomes must not checkpoint the local index")
+			recovered := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, index, "recover", false)
+			require.Equal(t, map[string]int64{"a": 3, "b": 2}, nativeVisibleValues(t, recovered.table))
+			require.Equal(t, original, index.rows["b"])
+			require.Equal(t, nativeSnapshotID(recovered.table), index.snapshot)
+			require.Contains(t, recovered.table.Properties()[nativeRecoveryProperty], "published")
+			recovered.Abort()
+		})
 	}
-	require.Error(t, writer.Close(ctx, map[string]any{"state": "published"}))
-	require.True(t, writer.uncertain)
-	writer.Abort()
-	fs, err := writer.table.FS(ctx)
-	require.NoError(t, err)
-	for _, file := range writer.dataFiles {
-		require.NotEqual(t, original.FilePath, file.FilePath())
-		input, err := fs.Open(file.FilePath())
-		require.NoError(t, err)
-		require.NoError(t, input.Close())
-	}
-	require.Empty(t, index.rows)
-	require.Zero(t, index.snapshot, "unknown outcomes must not checkpoint the local index")
-	recovered := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, index, "recover", false)
-	require.Equal(t, map[string]int64{"a": 3, "b": 2}, nativeVisibleValues(t, recovered.table))
-	require.Equal(t, int64(0), index.rows["b"].Position)
-	require.Equal(t, nativeSnapshotID(recovered.table), index.snapshot)
-	require.Contains(t, recovered.table.Properties()[nativeRecoveryProperty], "published")
-	recovered.Abort()
 }
 
 type nativeDeleteDeniedFS struct {
@@ -2519,7 +2617,7 @@ func nativeDeleteDeniedStorage(ctx context.Context, t *testing.T, mode types.Upd
 	return cfg, stream, &nativeCommitFaultCatalog{Catalog: base, fs: storage}, storage
 }
 
-func TestNativeManagedStorageRewriteRetryAndAbort(t *testing.T) {
+func TestNativeManagedStorageSameWriteRetryAndAbort(t *testing.T) {
 	for _, mode := range []types.UpdateType{types.UpdateTypeEquality, types.UpdateTypePosition, types.UpdateTypeDeletionVector} {
 		t.Run(string(mode), func(t *testing.T) {
 			ctx := context.Background()
@@ -2528,7 +2626,7 @@ func TestNativeManagedStorageRewriteRetryAndAbort(t *testing.T) {
 			if mode != types.UpdateTypeEquality {
 				index = &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
 			}
-			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "managed-rewrite", false)
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "managed-delta", false)
 			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 1, "one"), nativeTestRecord("b", "u", 2, "one")}))
 			originalB := nativePendingLocation(t, writer, "b")
 			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 3, "two"), nativeTestRecord("a", "d", 4, "two"), nativeTestRecord("c", "c", 5, "one")}))
@@ -2536,16 +2634,17 @@ func TestNativeManagedStorageRewriteRetryAndAbort(t *testing.T) {
 			require.Equal(t, map[string]int64{"a": 4, "b": 2, "c": 5}, nativeVisibleValues(t, writer.table))
 			require.Contains(t, writer.table.Properties()[nativeRecoveryProperty], "managed-committed")
 			_, err := os.Stat(storage.local(originalB.FilePath))
-			require.NoError(t, err, "obsolete bytes are retained for managed maintenance")
+			require.NoError(t, err, "original staged bytes become immutable committed data")
 			entries, err := nativeLiveEntries(ctx, writer.table)
 			require.NoError(t, err)
+			var originalCommitted bool
 			for _, entry := range entries {
-				require.NotEqual(t, originalB.FilePath, entry.DataFile().FilePath(), "obsolete staged files must not be committed")
+				originalCommitted = originalCommitted || entry.DataFile().FilePath() == originalB.FilePath
 			}
+			require.True(t, originalCommitted)
 			if index != nil {
 				location := index.rows["b"]
-				require.NotEqual(t, originalB.FilePath, location.FilePath)
-				require.Zero(t, location.Position)
+				require.Equal(t, originalB, location)
 				rows, err := writer.ReadRows(ctx, location.FilePath, []int64{location.Position}, []string{"value"})
 				require.NoError(t, err)
 				require.Equal(t, int64(2), rows[location.Position]["value"])
@@ -2553,12 +2652,13 @@ func TestNativeManagedStorageRewriteRetryAndAbort(t *testing.T) {
 			}
 			updater := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "managed-conflict", false)
 			require.NoError(t, updater.Write(ctx, []types.RawRecord{nativeTestRecord("b", "u", 6, "two")}))
+			require.NoError(t, updater.Write(ctx, []types.RawRecord{nativeTestRecord("b", "u", 7, "three")}))
 			cat.fault = func(context.Context, table.Identifier, []table.Requirement, []table.Update) (bool, error) {
 				cat.fault = nil
 				return true, table.ErrCommitFailed
 			}
 			require.NoError(t, updater.Close(ctx, map[string]any{"state": "managed-retried"}))
-			require.Equal(t, map[string]int64{"a": 4, "b": 6, "c": 5}, nativeVisibleValues(t, updater.table))
+			require.Equal(t, map[string]int64{"a": 4, "b": 7, "c": 5}, nativeVisibleValues(t, updater.table))
 			require.Contains(t, updater.table.Properties()[nativeRecoveryProperty], "managed-retried")
 			aborted := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "managed-abort", false)
 			require.NoError(t, aborted.Write(ctx, []types.RawRecord{nativeTestRecord("unpublished", "c", 7, "one")}))
@@ -2568,27 +2668,27 @@ func TestNativeManagedStorageRewriteRetryAndAbort(t *testing.T) {
 			require.NoError(t, err)
 			fresh, err := cat.LoadTable(ctx, updater.table.Identifier())
 			require.NoError(t, err)
-			require.Equal(t, map[string]int64{"a": 4, "b": 6, "c": 5}, nativeVisibleValues(t, fresh))
+			require.Equal(t, map[string]int64{"a": 4, "b": 7, "c": 5}, nativeVisibleValues(t, fresh))
 			require.Zero(t, storage.deletes.Load(), "S3 Tables must never receive object DELETE requests")
 		})
 	}
 }
 
-func TestNativeOrdinaryStorageDeleteFailurePreventsCommit(t *testing.T) {
+func TestNativeSameWriteCommitRequiresNoStagedObjectDeletion(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat, storage := nativeDeleteDeniedStorage(ctx, t, types.UpdateTypePosition, "ordinary-bucket")
 	index := &nativeMemoryIndex{rows: make(map[string]types.RowLocation)}
 	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "ordinary-denied", false)
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("a", "u", 1, "one"), nativeTestRecord("a", "u", 2, "one")}))
-	err := writer.Close(ctx, map[string]any{"state": "must-not-commit"})
-	require.ErrorIs(t, err, os.ErrPermission)
-	require.Positive(t, storage.deletes.Load())
+	original := nativePendingLocation(t, writer, "a")
+	require.NoError(t, writer.Close(ctx, map[string]any{"state": "committed-without-delete"}))
+	require.Zero(t, storage.deletes.Load())
 	fresh, err := cat.LoadTable(ctx, writer.table.Identifier())
 	require.NoError(t, err)
-	require.Nil(t, fresh.CurrentSnapshot())
-	require.NotContains(t, fresh.Properties()[nativeRecoveryProperty], "must-not-commit")
-	require.Empty(t, index.rows)
-	require.Zero(t, index.snapshot)
+	require.Equal(t, map[string]int64{"a": 2}, nativeVisibleValues(t, fresh))
+	require.Contains(t, fresh.Properties()[nativeRecoveryProperty], "committed-without-delete")
+	require.Equal(t, original, index.rows["a"])
+	require.Equal(t, nativeSnapshotID(fresh), index.snapshot)
 }
 
 // This boundary executes real REST requests and real Hadoop metadata commits.
