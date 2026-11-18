@@ -138,7 +138,11 @@ func (p *pgoutputReplicator) processPgoutputWAL(ctx context.Context, walData []b
 	case *pglogrepl.RelationMessage:
 		prev, relationVisited := p.relationIDToMsgMap[msg.RelationID]
 		if !relationVisited && msg.ReplicaIdentity != 'f' {
-			logger.Warnf("table[%s.%s] replica identity is not FULL, unchanged TOAST column values may be lost during CDC UPDATE events; set REPLICA IDENTITY FULL to avoid data loss", msg.Namespace, msg.RelationName)
+			if p.preserveToastValues {
+				logger.Infof("table[%s.%s] replica identity is not FULL; PostgreSQL may omit unchanged TOAST values, which are marked for recovery by the configured TOAST value source", msg.Namespace, msg.RelationName)
+			} else {
+				logger.Warnf("table[%s.%s] replica identity is not FULL and TOAST recovery is disabled; UPDATE events with omitted unchanged TOAST values will fail the sync", msg.Namespace, msg.RelationName)
+			}
 		}
 		p.relationIDToMsgMap[msg.RelationID] = msg
 		if !relationColumnsChanged(prev, msg) {
