@@ -621,7 +621,6 @@ type nativeWriter struct {
 	upsert                 bool
 	deleteMode             types.UpdateType
 	dataFiles              []apacheiceberg.DataFile
-	dataSchemas            map[string]*apacheiceberg.Schema
 	positions              map[string][]int64
 	latest                 map[string]types.RowLocation
 	paths                  map[string]struct{}
@@ -885,10 +884,6 @@ func (w *nativeWriter) Write(ctx context.Context, records []types.RawRecord) (er
 			return err
 		}
 		w.dataFiles = append(w.dataFiles, file)
-		if w.dataSchemas == nil {
-			w.dataSchemas = make(map[string]*apacheiceberg.Schema)
-		}
-		w.dataSchemas[file.FilePath()] = w.table.Schema()
 		for position, idx := range group.indices {
 			locations[idx] = types.RowLocation{FilePath: file.FilePath(), Position: int64(position)}
 		}
@@ -1082,9 +1077,6 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 	ctx = nativeCatalogContext(ctx, w.cat)
 	if err := w.finishBackfillFiles(ctx); err != nil {
 		return fmt.Errorf("finish backfill Iceberg files: %w", err)
-	}
-	if err := w.compactStagedDataFiles(ctx); err != nil {
-		return fmt.Errorf("compact superseded staged Iceberg rows: %w", err)
 	}
 	ctx, coordinated, err := w.lockTable(ctx)
 	if err != nil {

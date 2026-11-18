@@ -294,10 +294,6 @@ func (w *nativeWriter) finishBackfillFile(ctx context.Context, key string) (err 
 		return err
 	}
 	w.dataFiles = append(w.dataFiles, file)
-	if w.dataSchemas == nil {
-		w.dataSchemas = make(map[string]*apacheiceberg.Schema)
-	}
-	w.dataSchemas[f.path] = f.schema
 	delete(w.backfillFiles, key)
 	return nil
 }

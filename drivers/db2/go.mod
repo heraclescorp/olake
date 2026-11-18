@@ -3,6 +3,7 @@ module github.com/datazip-inc/olake/drivers/db2
 go 1.26.11
 
 replace (
+	github.com/apache/iceberg-go => ../../third_party/iceberg-go
 	cloud.google.com/go/compute => cloud.google.com/go/compute v1.23.3
 	github.com/datazip-inc/olake => ../../
 	github.com/ibmdb/go_ibm_db => github.com/datazip-inc/go_ibm_db v0.0.1
