@@ -140,10 +140,14 @@ func (p *pgoutputReplicator) emitRelationColumns(ctx context.Context, msg *pglog
 		return nil
 	}
 
-	catalog, err := fetchCatalogColumns(ctx, p.db, "$1::oid", msg.RelationID)
-	if err != nil {
-		logger.Warnf("table[%s.%s]: failed to read column catalog, values of existing rows for added columns are unknown: %s", msg.Namespace, msg.RelationName, err)
-		catalog = nil
+	var catalog []catalogColumn
+	if !p.socket.StrictRecovery {
+		var err error
+		catalog, err = fetchCatalogColumns(ctx, p.db, "$1::oid", msg.RelationID)
+		if err != nil {
+			logger.Warnf("table[%s.%s]: failed to read column catalog, values of existing rows for added columns are unknown: %s", msg.Namespace, msg.RelationName, err)
+			catalog = nil
+		}
 	}
 	change, err := p.socket.changeFilter.relationSourceColumns(msg, catalog)
 	if err != nil {

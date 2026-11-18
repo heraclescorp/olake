@@ -43,15 +43,16 @@ import (
 )
 
 type Iceberg struct {
-	options       *destination.Options
-	config        *Config
-	stream        types.StreamInterface
-	partitionInfo []internal.PartitionInfo // ordered slice to preserve partition column order
-	catalog       catalog.Catalog
-	schema        map[string]string
-	writer        Writer
-	resyncMu      sync.Mutex
-	resync        *resyncControl
+	options          *destination.Options
+	config           *Config
+	stream           types.StreamInterface
+	partitionInfo    []internal.PartitionInfo // ordered slice to preserve partition column order
+	catalog          catalog.Catalog
+	schema           map[string]string
+	writer           Writer
+	resyncMu         sync.Mutex
+	resync           *resyncControl
+	ordinaryRecovery map[string]*ordinaryRecoveryTable
 	// unavailableValues recovers values the source could not send; nil unless the stream keeps a row index (pos or dv)
 	unavailableValues *unavailableValuesResolver
 	// syncStartColumns are columns added from the source catalog at sync start (see planSourceColumns).
@@ -472,6 +473,9 @@ func init() {
 		if err := utils.Unmarshal(raw, config); err != nil {
 			return nil, nil, fmt.Errorf("decode native Iceberg config: %w", err)
 		}
+		if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery && config.CatalogType != RestCatalog && config.CatalogType != CatalogType("s3tables") {
+			return nil, nil, errors.New("ordinary recovery supports only native REST/S3 Tables catalogs")
+		}
 		if err := config.Validate(); err != nil {
 			return nil, nil, err
 		}
@@ -508,13 +512,14 @@ type nativeTableCoordinator struct {
 }
 
 type nativeTableState struct {
-	mu         sync.Mutex
-	latest     *table.Table
-	unknown    bool
-	closed     bool
-	generation uint64
-	resync     *resyncControl
-	sessions   int
+	mu               sync.Mutex
+	latest           *table.Table
+	unknown          bool
+	closed           bool
+	generation       uint64
+	resync           *resyncControl
+	sessions         int
+	ordinaryRecovery *ordinaryRecoveryTable
 }
 
 type nativeTableLockKey struct{}
@@ -599,6 +604,9 @@ func (w *nativeWriter) currentTable(ctx context.Context, state *nativeTableState
 	if state.latest.Metadata().TableUUID() != w.table.Metadata().TableUUID() {
 		return nil, errors.New("Iceberg table identity changed while this writer was active")
 	}
+	if err := validateOrdinaryRecoveryWriter(ctx, state, state.latest, w.stream); err != nil {
+		return nil, err
+	}
 	return state.latest, nil
 }
 
@@ -640,6 +648,11 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 		return nil, nil, err
 	}
 	defer finish()
+	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery || config.ordinaryRecovery {
+		if !recovery || options.Backfill {
+			return nil, nil, errors.New("ordinary recovery cannot open fresh or backfill writers")
+		}
+	}
 	identifier := catalog.ToIdentifier(stream.GetDestinationDatabase(&config.IcebergDatabase), stream.GetDestinationTable())
 	cat, release, err := routeNativeResyncWriter(ctx, cat, identifier)
 	if err != nil {
@@ -669,6 +682,9 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 	tbl, err := loadOrCreateNativeTable(ctx, config, stream, cat)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load or create Iceberg table: %w", err)
+	}
+	if err := validateOrdinaryRecoveryWriter(ctx, state, tbl, stream); err != nil {
+		return nil, nil, err
 	}
 	state.latest = tbl
 	logNativeMetadataLSN(stream.ID(), tbl.Metadata().TableUUID().String(), nativeSnapshotID(tbl), tbl.Properties()[nativeRecoveryProperty])

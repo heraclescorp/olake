@@ -25,6 +25,10 @@ type Config struct {
 	PreserveToastValues bool
 	// ReplayAfter excludes transactions already represented by each table's snapshot.
 	ReplayAfter map[string]pglogrepl.LSN
+	// StrictRecovery never emits a transaction past the explicit target and
+	// never treats the server's live WAL end as decoded recovery progress.
+	StrictRecovery         bool
+	ExpectedSourceIdentity string
 }
 
 type WALState struct {

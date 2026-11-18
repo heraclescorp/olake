@@ -445,6 +445,9 @@ func (w *nativeWriter) AlterSourceColumns(ctx context.Context, added []*nativeSo
 			w.table = fresh
 			return nil
 		}
+		if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+			return errors.New("ordinary recovery cannot change the frozen destination shape")
+		}
 		if err := update.Commit(); err != nil {
 			return fmt.Errorf("alter Iceberg source columns: %w", err)
 		}
@@ -472,6 +475,9 @@ func (w *nativeWriter) AlterSourceColumns(ctx context.Context, added []*nativeSo
 func (w *nativeWriter) EvolveSchema(ctx context.Context, columns map[string]string) error {
 	if err := w.writable(); err != nil {
 		return err
+	}
+	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+		return errors.New("ordinary recovery cannot evolve the frozen destination shape")
 	}
 	ctx, finish, err := beginNativeWriterWork(ctx, w.config)
 	if err != nil {
@@ -559,6 +565,12 @@ func loadOrCreateNativeTable(ctx context.Context, config *Config, stream types.S
 	}
 	if !errors.Is(err, catalog.ErrNoSuchTable) {
 		return nil, err
+	}
+	if config.ordinaryRecovery {
+		return nil, errors.New("ordinary recovery cannot create a missing destination table")
+	}
+	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+		return nil, errors.New("ordinary recovery cannot create a missing destination table")
 	}
 	columns, err := nativeStreamColumns(stream)
 	if err != nil {

@@ -160,6 +160,12 @@ func (p *Postgres) ChangeStreamConfig() (bool, bool, bool) {
 }
 
 func (p *Postgres) PreCDC(ctx context.Context, streams []types.StreamInterface) error {
+	if options, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+		if err := p.requireOrdinaryRecoveryPlan(ctx, options.Plan); err != nil {
+			return err
+		}
+		return p.validateOrdinaryRecoveryCatalog(streams, options.Plan.LowerLSN)
+	}
 	if err := p.cdcConfig.validateToastRecovery(); err != nil {
 		return err
 	}
@@ -213,6 +219,9 @@ func (p *Postgres) PreCDC(ctx context.Context, streams []types.StreamInterface) 
 }
 
 func (p *Postgres) StreamChanges(ctx context.Context, _ int, metadataStates map[string]any, callback abstract.CDCMsgFn) (any, error) {
+	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+		return p.streamOrdinaryRecoveryChanges(ctx, metadataStates, callback)
+	}
 	var postgresGlobalState waljs.WALState
 	rawGlobalState := p.state.GetGlobal()
 	if err := utils.Unmarshal(rawGlobalState.State, &postgresGlobalState); err != nil {
@@ -343,6 +352,9 @@ func (p *Postgres) StreamChanges(ctx context.Context, _ int, metadataStates map[
 }
 
 func (p *Postgres) PostCDC(ctx context.Context, _ int) (err error) {
+	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+		return fmt.Errorf("ordinary recovery requires explicit acknowledgement after all destination proofs")
+	}
 	if p.replicator != nil {
 		if _, resync := types.ResyncFromContext(ctx); !resync {
 			defer func() {

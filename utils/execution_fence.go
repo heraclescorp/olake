@@ -16,6 +16,7 @@ import (
 // The fence is read fresh at every mutation boundary, never downloaded as config.
 type ExecutionOptions struct {
 	ID         string
+	LaunchID   string
 	Fence      string
 	Command    string
 	retirement *executionRetirement

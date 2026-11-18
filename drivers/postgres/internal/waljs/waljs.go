@@ -93,7 +93,7 @@ func (w *wal2jsonReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, cal
 					return fmt.Errorf("failed to parse primary keepalive message: %w", err)
 				}
 				progress.serverEnd.Store(uint64(pkm.ServerWALEnd))
-				w.socket.ClientXLogPos = pkm.ServerWALEnd
+				w.socket.observeKeepalive(pkm.ServerWALEnd)
 				if pkm.ReplyRequested {
 					logger.Debugf("keep alive message received: %v", pkm)
 					// send fake acknowledgement

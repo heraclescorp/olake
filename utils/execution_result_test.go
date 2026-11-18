@@ -99,3 +99,14 @@ func TestExecutionResultImmutableAgainstLateClosedWriter(t *testing.T) {
 		t.Fatal("late writer replaced evidence")
 	}
 }
+
+func TestOrdinaryRecoveryRetainsDataLaunchInGenericReceipt(t *testing.T) {
+	ctx := WithExecution(context.Background(), &ExecutionOptions{ID: "recovery-runtime", LaunchID: "original-launch", Fence: "fence"})
+	BeginOrdinaryExecution(ctx, "sync")
+	BeginExecutionParticipant(ctx)(true)
+	SourceDrained(ctx, nil)
+	result, ok := OrdinaryExecutionResult(ctx)
+	if !ok || result.ExecutionID != "recovery-runtime" || result.LaunchID != "original-launch" || result.Outcome != "settled" {
+		t.Fatalf("recovery receipt lost retained launch: %+v", result)
+	}
+}

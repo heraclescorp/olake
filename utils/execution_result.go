@@ -87,7 +87,11 @@ func OrdinaryExecutionResult(ctx context.Context) (ExecutionResult, bool) {
 	} else if t.pending == 0 && !t.unknown && t.drained {
 		outcome = "settled"
 	}
-	return ExecutionResult{Version: 1, ExecutionID: e.ID, LaunchID: e.ID, Command: e.Command, Outcome: outcome}, true
+	launchID := e.LaunchID
+	if launchID == "" {
+		launchID = e.ID
+	}
+	return ExecutionResult{Version: 1, ExecutionID: e.ID, LaunchID: launchID, Command: e.Command, Outcome: outcome}, true
 }
 
 // CanonicalStateSHA256 hashes the complete saved JSON object without float64
@@ -119,6 +123,11 @@ func PublishExecutionResult(ctx context.Context, localPath, uri string, result E
 	if err != nil {
 		return err
 	}
+	return PublishImmutableArtifact(ctx, localPath, uri, data)
+}
+
+// PublishImmutableArtifact never replaces an artifact from an earlier runtime.
+func PublishImmutableArtifact(ctx context.Context, localPath, uri string, data []byte) error {
 	if uri != "" {
 		bucket, key, err := parseS3URI(uri)
 		if err != nil {
@@ -146,5 +155,13 @@ func PublishExecutionResult(ctx context.Context, localPath, uri string, result E
 	if err := file.Close(); err != nil {
 		return err
 	}
-	return os.Link(file.Name(), localPath)
+	if err := os.Link(file.Name(), localPath); err != nil {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(localPath))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }

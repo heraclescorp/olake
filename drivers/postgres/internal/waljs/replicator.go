@@ -47,6 +47,14 @@ type Socket struct {
 	initialWaitTime time.Duration
 	// TransactionOpen prevents publishing a pgoutput stream truncated before COMMIT.
 	TransactionOpen bool
+	StrictRecovery  bool
+}
+
+func (s *Socket) BackendPID() uint32 {
+	if s.pgConn == nil {
+		return 0
+	}
+	return s.pgConn.PID()
 }
 
 // Replicator defines an abstraction over different logical decoding plugins.
@@ -107,6 +115,9 @@ func ConnectReplication(ctx context.Context, config *Config) (*pgconn.PgConn, er
 }
 
 func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, recoveryLSN *pglogrepl.LSN, typeConverter func(value interface{}, columnType string) (interface{}, error), columnType func(columnType string) types.DataType) (Replicator, error) {
+	if config.StrictRecovery && (recoveryLSN == nil || config.ExpectedSourceIdentity == "") {
+		return nil, fmt.Errorf("strict ordinary recovery requires an explicit target and pinned source identity")
+	}
 	pgConn, err := ConnectReplication(ctx, config)
 	if err != nil {
 		return nil, err
@@ -117,6 +128,13 @@ func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, re
 	if err != nil {
 		_ = closeReplicationConnection(ctx, pgConn)
 		return nil, fmt.Errorf("failed to indentify system: %w", err)
+	}
+	if config.ExpectedSourceIdentity != "" {
+		identity, identityErr := SourceIdentity(sysident, config.ReplicationSlotName, slot.Plugin)
+		if identityErr != nil || identity != config.ExpectedSourceIdentity {
+			_ = closeReplicationConnection(ctx, pgConn)
+			return nil, fmt.Errorf("ordinary recovery source identity differs from the pre-barrier source")
+		}
 	}
 	logger.Infof("SystemID:%s Timeline:%d XLogPos:%s Database:%s",
 		sysident.SystemID, sysident.Timeline, sysident.XLogPos, sysident.DBName)
@@ -138,8 +156,12 @@ func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, re
 		CurrentWalPosition: targetWalPos,
 		ReplicationSlot:    config.ReplicationSlotName,
 		initialWaitTime:    config.InitialWaitTime,
+		StrictRecovery:     config.StrictRecovery,
 	}
 	socket.changeFilter.replayAfter = config.ReplayAfter
+	if config.StrictRecovery {
+		socket.changeFilter.replayThrough = recoveryLSN
+	}
 
 	plugin := strings.ToLower(strings.TrimSpace(slot.Plugin))
 	switch plugin {

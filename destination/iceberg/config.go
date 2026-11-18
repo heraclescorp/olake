@@ -41,6 +41,7 @@ import (
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/destination"
 	"github.com/datazip-inc/olake/pkg/objstorage"
+	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/errs"
 	"github.com/datazip-inc/olake/utils/logger"
@@ -73,6 +74,7 @@ type Config struct {
 	resyncLaunchID    string
 	resyncRecoverOnly bool
 	execution         *nativeExecution
+	ordinaryRecovery  bool
 
 	// S3-compatible Storage Configuration
 	Region             string `json:"aws_region,omitempty"`
@@ -246,6 +248,12 @@ func openNativeCatalog(ctx context.Context, config *Config) (catalog.Catalog, fu
 	if config == nil {
 		return nil, nil, errors.New("Iceberg catalog configuration is required")
 	}
+	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+		if config.CatalogType != RestCatalog {
+			return nil, nil, errors.New("ordinary recovery supports only native REST/S3 Tables catalogs")
+		}
+		config.ordinaryRecovery = true
+	}
 	execution := newNativeExecution(ctx, config)
 	config.execution = execution
 	opened := false
@@ -312,7 +320,7 @@ func openNativeCatalog(ctx context.Context, config *Config) (catalog.Catalog, fu
 				pingCtx, cancelPing := context.WithTimeout(ctx, nativeCatalogInitTimeout)
 				err = db.PingContext(pingCtx)
 				cancelPing()
-				if config.resyncRecoverOnly {
+				if config.resyncRecoverOnly || config.ordinaryRecovery {
 					props["init_catalog_tables"] = "false"
 				} else if err == nil && execution != nil {
 					err = execution.writable(ctx)

@@ -49,6 +49,7 @@ var (
 	targetQueryEngines             []string
 	executionID                    string
 	executionFence                 string
+	executionLaunchID              string
 )
 
 // RootCmd represents the base command when called without any subcommands
@@ -57,14 +58,17 @@ var RootCmd = &cobra.Command{
 	Short: "root command",
 	PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 		if executionID != "" || executionFence != "" || cmd.Flags().Changed("execution-id") || cmd.Flags().Changed("execution-fence") || cmd.InheritedFlags().Changed("execution-id") || cmd.InheritedFlags().Changed("execution-fence") {
-			cmd.SetContext(utils.WithExecution(cmd.Context(), &utils.ExecutionOptions{ID: executionID, Fence: executionFence}))
+			cmd.SetContext(utils.WithExecution(cmd.Context(), &utils.ExecutionOptions{ID: executionID, LaunchID: executionLaunchID, Fence: executionFence}))
+		}
+		if err := validateOrdinaryRecoveryFlags(cmd); err != nil {
+			return err
 		}
 		utils.BeginOrdinaryExecution(cmd.Context(), cmd.Name())
 		// Resolve now as configPaths are needed by logger.Init(), but the error is handled later because the logger is not initialized yet.
 		s3Err := utils.ResolveS3Paths(cmd.Context(), []*string{
 			&configPath, &destinationConfigPath, &streamsPath, &statePath, &differencePath,
 			&availableStreamsPath, &selectedStreamsPath, &differenceAvailableStreamsPath, &differenceSelectedStreamsPath,
-			&enrollmentPolicyPath,
+			&enrollmentPolicyPath, &ordinaryRecoveryOriginPath,
 		}, telemetry.PropsFiles())
 		if s3Err == nil && cmd.Name() == "discover-new-tables" {
 			enrollmentResultPath, enrollmentResultURI, s3Err = utils.ResolveArtifactOutput(enrollmentResultPath, "enrollment-result.json", configPath)
@@ -211,6 +215,7 @@ func init() {
 	RootCmd.PersistentFlags().StringVarP(&statePath, "state", "", "", "(Required) State for connector")
 	RootCmd.PersistentFlags().StringVar(&executionID, "execution-id", "", "Controlled runtime identity; requires --execution-fence")
 	RootCmd.PersistentFlags().StringVar(&executionFence, "execution-fence", "", "Positive runtime fence local path or s3:// URI; must remain OPEN")
+	RootCmd.PersistentFlags().StringVar(&executionLaunchID, "execution-launch-id", "", "Retained data launch identity for controlled ordinary recovery")
 	RootCmd.PersistentFlags().Int64VarP(&batchSize, "destination-buffer-size", "", 10000, "(Optional) Batch size for destination")
 	RootCmd.PersistentFlags().IntVarP(&maxDiscoverThreads, "max-discover-threads", "", 50, "(Optional) Max number of parallel threads for discovery of table in database")
 	RootCmd.PersistentFlags().BoolVar(&discoverSchema, "discover-schema", false, "(Optional) Re-discover source schema during sync and validate sync mode, primary keys, and cursor fields")

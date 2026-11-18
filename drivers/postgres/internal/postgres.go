@@ -100,6 +100,7 @@ type Postgres struct {
 	backfillClosed  bool
 	poolOpener      func(context.Context, *url.URL, *tls.Config) (*sqlx.DB, error)
 	resync          *resyncSnapshot
+	ordinary        *ordinaryRecovery
 }
 
 func (p *Postgres) CDCSupported() bool {

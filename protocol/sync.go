@@ -35,7 +35,7 @@ type StreamClassification struct {
 var syncCmd = &cobra.Command{
 	Use:   "sync",
 	Short: "Olake sync command",
-	PersistentPreRunE: func(_ *cobra.Command, _ []string) (err error) {
+	PersistentPreRunE: func(cmd *cobra.Command, _ []string) (err error) {
 		if configPath == "" {
 			return errs.Precondition(errs.ConfigInvalid, codeFlagMissing, fmt.Errorf("--config not passed"))
 		} else if err := validateCatalogFlags(true); err != nil {
@@ -67,7 +67,12 @@ var syncCmd = &cobra.Command{
 			Type: types.StreamType,
 		}
 		if statePath != "" {
-			if err := utils.UnmarshalFile(statePath, state, false); err != nil {
+			if ordinaryRecoveryOriginPath != "" {
+				err = loadOrdinaryRecoveryState(statePath, state)
+			} else {
+				err = utils.UnmarshalFile(statePath, state, false)
+			}
+			if err != nil {
 				return err
 			}
 		} else {
@@ -89,9 +94,12 @@ var syncCmd = &cobra.Command{
 
 		stateBytes, _ := state.MarshalJSON()
 		logger.Infof("Running sync with state: %s", stateBytes)
-		return nil
+		return prepareOrdinaryRecovery(cmd)
 	},
 	RunE: func(cmd *cobra.Command, _ []string) (err error) {
+		if _, recovering := types.OrdinaryRecoveryFromContext(cmd.Context()); recovering {
+			return runOrdinaryRecovery(cmd)
+		}
 		sourceReading := false
 		defer func() {
 			if !sourceReading {
