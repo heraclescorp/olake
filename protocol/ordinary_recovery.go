@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/smithy-go"
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/destination"
 	"github.com/datazip-inc/olake/types"
@@ -81,6 +82,9 @@ func validateOrdinaryRecoveryOrigin(origin types.OrdinaryRecoveryOrigin) error {
 		"source_sha256":           origin.SourceSHA256, "destination_sha256": origin.DestinationSHA256,
 		"catalog_sha256": origin.CatalogSHA256, "baseline_state_sha256": origin.BaselineStateSHA256,
 	} {
+		if name == "original_receipt_sha256" && digest == "" {
+			continue
+		}
 		decoded, err := hex.DecodeString(digest)
 		if err != nil || len(decoded) != sha256.Size || digest != strings.ToLower(digest) {
 			return fmt.Errorf("ordinary recovery origin has invalid %s", name)
@@ -287,22 +291,30 @@ type ordinaryRecoveryServer struct {
 	SlotName         string `json:"slot_name"`
 }
 
-func pinOrdinaryRecoveryServer(ctx context.Context, origin types.OrdinaryRecoveryOrigin, identity, slot string) error {
+func checkOrdinaryRecoveryServer(ctx context.Context, origin types.OrdinaryRecoveryOrigin, identity, slot string, publish bool) error {
 	if strings.TrimSpace(identity) == "" || strings.TrimSpace(slot) == "" {
 		return fmt.Errorf("ordinary recovery source identity or replication slot is missing")
 	}
 	pin := ordinaryRecoveryServer{1, origin.OriginalLaunchID, origin.SourceSHA256, identity, slot}
-	data, err := json.Marshal(pin)
-	if err != nil {
-		return err
-	}
 	local, uri, err := utils.ResolveArtifactOutput(filepath.Join(filepath.Dir(ordinaryRecoveryOriginPath), "ordinary-recovery-server.json"), "ordinary-recovery-server.json", configPath)
 	if err != nil {
 		return err
 	}
-	publishErr := utils.PublishImmutableArtifact(ctx, local, uri, data)
+	var publishErr error
+	if publish {
+		data, err := json.Marshal(pin)
+		if err != nil {
+			return err
+		}
+		publishErr = utils.PublishImmutableArtifact(ctx, local, uri, data)
+	}
 	stored, err := utils.ReadImmutableArtifact(ctx, local, uri)
 	if err != nil {
+		var apiError smithy.APIError
+		missing := os.IsNotExist(err) || (errors.As(err, &apiError) && (apiError.ErrorCode() == "NoSuchKey" || apiError.ErrorCode() == "NotFound"))
+		if !publish && missing {
+			return nil
+		}
 		return errors.Join(publishErr, err)
 	}
 	var observed ordinaryRecoveryServer
@@ -350,7 +362,7 @@ func runOrdinaryRecovery(cmd *cobra.Command) (err error) {
 	if err := utils.UnmarshalFile(configPath, &source, true); err != nil {
 		return err
 	}
-	if err := pinOrdinaryRecoveryServer(ctx, options.Origin, identity, source.UpdateMethod.ReplicationSlot); err != nil {
+	if err := checkOrdinaryRecoveryServer(ctx, options.Origin, identity, source.UpdateMethod.ReplicationSlot, false); err != nil {
 		return err
 	}
 	options.SourceIdentity = identity
@@ -361,6 +373,9 @@ func runOrdinaryRecovery(cmd *cobra.Command) (err error) {
 	defer pool.Shutdown(context.WithoutCancel(ctx))
 	proofs, err := pool.PrepareOrdinaryRecovery(ctx, selected, lower)
 	if err != nil {
+		return err
+	}
+	if err := checkOrdinaryRecoveryServer(ctx, options.Origin, identity, source.UpdateMethod.ReplicationSlot, true); err != nil {
 		return err
 	}
 	positions := make(map[string]string, len(proofs))

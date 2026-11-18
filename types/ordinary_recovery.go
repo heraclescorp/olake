@@ -4,6 +4,7 @@ import "context"
 
 // OrdinaryRecoveryOrigin binds recovery to immutable artifacts from one retired
 // controlled sync. Configuration digests hash exact bytes; state uses canonical JSON.
+// OriginalReceiptSHA256 is empty only when no original receipt was available.
 type OrdinaryRecoveryOrigin struct {
 	Version               int    `json:"version"`
 	OriginalExecutionID   string `json:"original_execution_id"`

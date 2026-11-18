@@ -6,9 +6,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/datazip-inc/olake/constants"
+	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -73,5 +75,58 @@ func TestExecuteReportsUnknownRetirementAfterSuccessfulRun(t *testing.T) {
 	}
 	if result.Outcome != "unknown" || result.StateSHA256 != "" {
 		t.Fatalf("unknown retirement published invalid evidence: %+v", result)
+	}
+}
+
+func TestExecutePreservesPublishedRecoveryCheckpoint(t *testing.T) {
+	folder := t.TempDir()
+	t.Setenv(constants.EnvS3ConfigFolder, "")
+	previousFolder, previousPath, previousState := viper.Get(constants.ConfigFolder), viper.Get(constants.StatePath), state
+	viper.Set(constants.ConfigFolder, folder)
+	stateFile := filepath.Join(folder, "state.json")
+	viper.Set(constants.StatePath, stateFile)
+	t.Cleanup(func() {
+		viper.Set(constants.ConfigFolder, previousFolder)
+		viper.Set(constants.StatePath, previousPath)
+		state = previousState
+	})
+	state = &types.State{RWMutex: &sync.RWMutex{}, Type: types.GlobalType, Global: &types.GlobalState{State: map[string]any{"lsn": "0/100"}, Streams: types.NewSet("public.a")}}
+	published := `{"type":"GLOBAL","global":{"state":{"lsn":"0/200","large":9007199254740993},"streams":["public.a"]},"streams":[]}`
+	if err := os.WriteFile(stateFile, []byte(published), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := utils.WithExecution(context.Background(), &utils.ExecutionOptions{ID: "recovery", LaunchID: "original", Fence: "fence"})
+	utils.BeginOrdinaryExecution(ctx, "sync")
+	ctx = types.WithOrdinaryRecovery(ctx, &types.OrdinaryRecoveryOptions{})
+	cmd := &cobra.Command{Use: "sync", SilenceErrors: true, SilenceUsage: true,
+		RunE: func(*cobra.Command, []string) error {
+			utils.BeginExecutionParticipant(ctx)(true)
+			utils.SourceDrained(ctx, nil)
+			return nil
+		},
+	}
+	cmd.SetContext(ctx)
+	cmd.SetArgs([]string{})
+	if err := Execute(cmd); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(stateFile)
+	if err != nil || string(saved) != published {
+		t.Fatalf("finalization replaced the proof-bound checkpoint: %s %v", saved, err)
+	}
+	digest, err := utils.CanonicalStateSHA256(saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(folder, "execution-result.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt utils.ExecutionResult
+	if err := json.Unmarshal(data, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Outcome != "settled" || receipt.StateSHA256 != digest {
+		t.Fatalf("receipt does not bind the published checkpoint: %+v", receipt)
 	}
 }

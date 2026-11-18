@@ -82,12 +82,19 @@ func TestOrdinaryRecoveryRejectsOriginAndConfigDrift(t *testing.T) {
 		require.Error(t, verifyOrdinaryRecoveryConfig(origin))
 		require.NoError(t, os.WriteFile(path, []byte("{}"), 0600))
 	}
-	changed := origin
-	changed.OriginalReceiptSHA256 = strings.Repeat("b", 64)
-	encoded, err = json.Marshal(changed)
+	for _, receiptHash := range []string{"", strings.Repeat("b", 64)} {
+		changed := origin
+		changed.OriginalReceiptSHA256 = receiptHash
+		encoded, err = json.Marshal(changed)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(ordinaryRecoveryOriginPath, encoded, 0600))
+		require.ErrorContains(t, verifyOrdinaryRecoveryConfig(origin), "receipt binding changed")
+	}
+	origin.OriginalReceiptSHA256 = ""
+	encoded, err = json.Marshal(origin)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(ordinaryRecoveryOriginPath, encoded, 0600))
-	require.ErrorContains(t, verifyOrdinaryRecoveryConfig(origin), "receipt binding changed")
+	require.NoError(t, verifyOrdinaryRecoveryConfig(origin))
 }
 
 func TestOrdinaryRecoveryOnlyFrozenCompleteCDCSelection(t *testing.T) {
@@ -199,11 +206,32 @@ func TestOrdinaryRecoveryServerPinSurvivesInterruptedEpochAndRejectsDrift(t *tes
 	t.Cleanup(func() { ordinaryRecoveryOriginPath = oldOrigin })
 	ordinaryRecoveryOriginPath = filepath.Join(t.TempDir(), "ordinary-recovery-origin.json")
 	origin := recoveryTestOrigin()
-	require.NoError(t, pinOrdinaryRecoveryServer(context.Background(), origin, "system-one", "slot"))
-	require.NoError(t, pinOrdinaryRecoveryServer(context.Background(), origin, "system-one", "slot"), "same immutable pin reused in successor")
-	require.Error(t, pinOrdinaryRecoveryServer(context.Background(), origin, "system-two", "slot"))
-	origin.SourceSHA256 = strings.Repeat("b", 64)
-	require.Error(t, pinOrdinaryRecoveryServer(context.Background(), origin, "system-one", "slot"))
+	pinPath := filepath.Join(filepath.Dir(ordinaryRecoveryOriginPath), "ordinary-recovery-server.json")
+	require.NoError(t, checkOrdinaryRecoveryServer(context.Background(), origin, "system-one", "slot", false))
+	_, err := os.Stat(pinPath)
+	require.True(t, os.IsNotExist(err), "preflight must not publish the first durable identity binding")
+	require.NoError(t, checkOrdinaryRecoveryServer(context.Background(), origin, "system-one", "slot", true))
+	stored, err := os.ReadFile(pinPath)
+	require.NoError(t, err)
+	for _, publish := range []bool{false, true} {
+		require.NoError(t, checkOrdinaryRecoveryServer(context.Background(), origin, "system-one", "slot", publish), "same immutable pin reused in successor")
+		require.Error(t, checkOrdinaryRecoveryServer(context.Background(), origin, "system-two", "slot", publish))
+		require.Error(t, checkOrdinaryRecoveryServer(context.Background(), origin, "system-one", "other-slot", publish))
+		changed := origin
+		changed.SourceSHA256 = strings.Repeat("b", 64)
+		require.Error(t, checkOrdinaryRecoveryServer(context.Background(), changed, "system-one", "slot", publish))
+		changed = origin
+		changed.OriginalLaunchID = "foreign-launch"
+		require.Error(t, checkOrdinaryRecoveryServer(context.Background(), changed, "system-one", "slot", publish))
+	}
+	unchanged, err := os.ReadFile(pinPath)
+	require.NoError(t, err)
+	require.Equal(t, stored, unchanged)
+	require.NoError(t, os.WriteFile(pinPath, []byte(`{"version":1,"unknown":true}`), 0600))
+	require.Error(t, checkOrdinaryRecoveryServer(context.Background(), origin, "system-one", "slot", false))
+	require.NoError(t, os.Remove(pinPath))
+	require.NoError(t, os.Mkdir(pinPath, 0700))
+	require.Error(t, checkOrdinaryRecoveryServer(context.Background(), origin, "system-one", "slot", false), "unreadable is not absent")
 }
 
 func TestOrdinaryRecoverySeparateResultBindsExactCommonBoundaryAndFullState(t *testing.T) {
@@ -220,6 +248,7 @@ func TestOrdinaryRecoverySeparateResultBindsExactCommonBoundaryAndFullState(t *t
 	require.NoError(t, os.WriteFile(originalReceipt, []byte("immutable original receipt"), 0600))
 	checkpoint := &types.State{RWMutex: &sync.RWMutex{}, Type: types.GlobalType, Global: &types.GlobalState{State: map[string]any{"lsn": "0/300", "large": json.Number("9007199254740993")}, Streams: types.NewSet("public.a", "public.b", "public.unrelated")}, SuppressPersistence: true}
 	result := types.OrdinaryRecoveryResult{OrdinaryRecoveryOrigin: recoveryTestOrigin(), ExecutionID: "recovery", LaunchID: "original", LowerLSN: "0/100", TargetLSN: "0/300", ServerIdentity: "system-one", SlotName: "slot", ToastValueSemantics: "current_source_lookup", Tables: []types.OrdinaryRecoveryTableProof{{Stream: "public.a", TableUUID: "00000000-0000-0000-0000-000000000001", FenceSnapshotID: 10, CommittedLSN: "0/300"}, {Stream: "public.b", TableUUID: "00000000-0000-0000-0000-000000000002", FenceSnapshotID: 20, CommittedLSN: "0/300"}}}
+	result.OriginalReceiptSHA256 = ""
 	result.Tables[1].CommittedLSN = "0/200"
 	require.Error(t, writeOrdinaryRecoveryArtifacts(context.Background(), checkpoint, result))
 	_, err := os.Stat(stateFile)
@@ -240,6 +269,7 @@ func TestOrdinaryRecoverySeparateResultBindsExactCommonBoundaryAndFullState(t *t
 	require.NoError(t, err)
 	require.Equal(t, digest, observed.StateSHA256)
 	require.Equal(t, "original", observed.LaunchID)
+	require.Equal(t, result.OrdinaryRecoveryOrigin, observed.OrdinaryRecoveryOrigin)
 	original, err := os.ReadFile(originalReceipt)
 	require.NoError(t, err)
 	require.Equal(t, "immutable original receipt", string(original))
@@ -248,11 +278,15 @@ func TestOrdinaryRecoverySeparateResultBindsExactCommonBoundaryAndFullState(t *t
 func TestOrdinaryRecoveryOriginRequiresCompleteImmutableBindings(t *testing.T) {
 	origin := recoveryTestOrigin()
 	require.NoError(t, validateOrdinaryRecoveryOrigin(origin))
+	origin.OriginalReceiptSHA256 = ""
+	require.NoError(t, validateOrdinaryRecoveryOrigin(origin), "a missing original receipt is not a fabricated digest")
 	for _, mutate := range []func(*types.OrdinaryRecoveryOrigin){
 		func(o *types.OrdinaryRecoveryOrigin) { o.Version = 2 },
 		func(o *types.OrdinaryRecoveryOrigin) { o.OriginalExecutionID = "" },
 		func(o *types.OrdinaryRecoveryOrigin) { o.OriginalLaunchID = " " },
-		func(o *types.OrdinaryRecoveryOrigin) { o.OriginalReceiptSHA256 = "" },
+		func(o *types.OrdinaryRecoveryOrigin) { o.OriginalReceiptSHA256 = " " },
+		func(o *types.OrdinaryRecoveryOrigin) { o.OriginalReceiptSHA256 = strings.Repeat("A", 64) },
+		func(o *types.OrdinaryRecoveryOrigin) { o.SourceSHA256 = "" },
 		func(o *types.OrdinaryRecoveryOrigin) { o.SourceSHA256 = strings.Repeat("A", 64) },
 		func(o *types.OrdinaryRecoveryOrigin) { o.DestinationSHA256 = "not-a-hash" },
 		func(o *types.OrdinaryRecoveryOrigin) { o.CatalogSHA256 = strings.Repeat("a", 63) },

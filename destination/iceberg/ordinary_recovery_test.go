@@ -137,6 +137,108 @@ func TestOrdinaryRecoveryRepeatedEpochRebarriersAndBindsImmutableEvidence(t *tes
 	}
 }
 
+func TestOrdinaryRecoveryOptionalOriginalReceiptRemainsImmutable(t *testing.T) {
+	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, false, "")
+	ordinaryTestSeed(t, cfg, stream, cat, "0/10")
+	cfg.CatalogType = RestCatalog
+	streams := []types.StreamInterface{stream}
+	ctx, options := ordinaryTestContext(t, "recovery-1")
+	options.Origin.OriginalReceiptSHA256 = ""
+	first, err := (&Iceberg{config: cfg, catalog: cat}).PrepareOrdinaryRecovery(ctx, streams, "0/10")
+	require.NoError(t, err)
+	nextCtx, nextOptions := ordinaryTestContext(t, "recovery-2")
+	nextOptions.Origin = options.Origin
+	next, err := (&Iceberg{config: cfg, catalog: cat}).PrepareOrdinaryRecovery(nextCtx, streams, "0/10")
+	require.NoError(t, err)
+	require.NotEqual(t, first[0].FenceSnapshotID, next[0].FenceSnapshotID)
+	fault := &nativeCommitFaultCatalog{Catalog: cat}
+	nextOptions.Origin.OriginalReceiptSHA256 = strings.Repeat("b", 64)
+	_, err = (&Iceberg{config: cfg, catalog: fault}).PrepareOrdinaryRecovery(nextCtx, streams, "0/10")
+	require.ErrorContains(t, err, "immutable origin")
+	require.Zero(t, fault.calls, "a late receipt cannot rewrite an unbound immutable origin")
+	nextOptions.Origin = options.Origin
+	nextOptions.Origin.SourceSHA256 = ""
+	_, err = (&Iceberg{config: cfg, catalog: fault}).PrepareOrdinaryRecovery(nextCtx, streams, "0/10")
+	require.ErrorContains(t, err, "invalid artifact digest")
+	require.Zero(t, fault.calls, "only the original receipt digest is optional")
+}
+
+func TestOrdinaryRecoveryPreflightsEveryMarkerBeforeAnyMutation(t *testing.T) {
+	for _, mutation := range []string{"empty", "null", "malformed", "unknown_field", "trailing_json", "version", "missing_epoch", "original_epoch", "launch", "origin_launch", "origin_execution", "receipt", "source_config", "destination_config", "catalog", "baseline", "source_identity", "uuid", "shape", "stream", "lower"} {
+		t.Run(mutation, func(t *testing.T) {
+			cfg, first, cat := nativeWriterFixture(t, types.UpdateTypeEquality, false, "")
+			second := ordinarySecondStream(first)
+			ordinaryTestSeed(t, cfg, first, cat, "0/10")
+			original := ordinaryTestSeed(t, cfg, second, cat, "0/20")
+			cfg.CatalogType = RestCatalog
+			ctx, _ := ordinaryTestContext(t, "recovery-1")
+			streams := []types.StreamInterface{first, second}
+			_, err := (&Iceberg{config: cfg, catalog: cat}).PrepareOrdinaryRecovery(ctx, streams, "0/10")
+			require.NoError(t, err)
+			current, err := cat.LoadTable(ctx, original.Identifier())
+			require.NoError(t, err)
+			var marker ordinaryRecoveryMarker
+			require.NoError(t, json.Unmarshal([]byte(current.Properties()[ordinaryRecoveryProperty]), &marker))
+			switch mutation {
+			case "version":
+				marker.Version++
+			case "missing_epoch":
+				marker.ExecutionID = ""
+			case "original_epoch":
+				marker.ExecutionID = marker.Origin.OriginalExecutionID
+			case "launch":
+				marker.LaunchID = "foreign-launch"
+			case "origin_launch":
+				marker.Origin.OriginalLaunchID = "foreign-launch"
+			case "origin_execution":
+				marker.Origin.OriginalExecutionID = "foreign-original"
+			case "receipt":
+				marker.Origin.OriginalReceiptSHA256 = ""
+			case "source_config":
+				marker.Origin.SourceSHA256 = strings.Repeat("b", 64)
+			case "destination_config":
+				marker.Origin.DestinationSHA256 = strings.Repeat("b", 64)
+			case "catalog":
+				marker.Origin.CatalogSHA256 = strings.Repeat("b", 64)
+			case "baseline":
+				marker.Origin.BaselineStateSHA256 = strings.Repeat("b", 64)
+			case "source_identity":
+				marker.SourceIdentity = "other-system"
+			case "uuid":
+				marker.TableUUID = "00000000-0000-0000-0000-000000000001"
+			case "shape":
+				marker.ShapeSHA256 = strings.Repeat("b", 64)
+			case "stream":
+				marker.Stream = first.ID()
+			case "lower":
+				marker.LowerLSN = "0/F"
+			}
+			encoded, err := json.Marshal(marker)
+			require.NoError(t, err)
+			stored := string(encoded)
+			switch mutation {
+			case "empty":
+				stored = ""
+			case "null":
+				stored = "null"
+			case "malformed":
+				stored = "{"
+			case "unknown_field":
+				stored = strings.TrimSuffix(stored, "}") + `,"unexpected":true}`
+			case "trailing_json":
+				stored += " {}"
+			}
+			_, _, err = cat.CommitTable(ctx, current.Identifier(), nil, []table.Update{table.NewSetPropertiesUpdate(apacheiceberg.Properties{ordinaryRecoveryProperty: stored})})
+			require.NoError(t, err)
+			nextCtx, _ := ordinaryTestContext(t, "recovery-2")
+			fault := &nativeCommitFaultCatalog{Catalog: cat}
+			_, err = (&Iceberg{config: cfg, catalog: fault}).PrepareOrdinaryRecovery(nextCtx, streams, "0/10")
+			require.Error(t, err)
+			require.Zero(t, fault.calls, "the first selected table must not be rebarriered before rejecting the second")
+		})
+	}
+}
+
 func TestOrdinaryRecoveryMissingInvalidAndBehindMetadataNeverWrites(t *testing.T) {
 	for _, metadata := range []string{"", "{", `{}`, `{"state":"{}"}`, `{"state":"{\"lsn\":\"0/F\"}"}`} {
 		t.Run(metadata, func(t *testing.T) {
@@ -331,6 +433,12 @@ func TestOrdinaryRecoveryInterruptedPreparationRebarriersEveryTable(t *testing.T
 	require.NoError(t, err)
 	require.NotEqual(t, nativeSnapshotID(originalFirst), nativeSnapshotID(interrupted))
 	fault.fault = nil
+	conflictingCtx, conflictingOptions := ordinaryTestContext(t, "recovery-conflicting")
+	conflictingOptions.SourceIdentity = "changed-postgres-system"
+	before := fault.calls
+	_, err = (&Iceberg{config: cfg, catalog: &nativeCatalog{Catalog: fault}}).PrepareOrdinaryRecovery(conflictingCtx, streams, "0/10")
+	require.ErrorContains(t, err, "source identity")
+	require.Equal(t, before, fault.calls, "the interrupted barrier is durable source identity evidence without helper artifacts")
 	nextCtx, _ := ordinaryTestContext(t, "recovery-2")
 	proofs, err := (&Iceberg{config: cfg, catalog: &nativeCatalog{Catalog: fault}}).PrepareOrdinaryRecovery(nextCtx, streams, "0/10")
 	require.NoError(t, err)

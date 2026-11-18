@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 
@@ -103,7 +104,10 @@ func ordinaryRecoveryContext(ctx context.Context) (*types.OrdinaryRecoveryOption
 		execution.ID == origin.OriginalExecutionID || execution.ID == origin.OriginalLaunchID || execution.LaunchID != origin.OriginalLaunchID || options.SourceIdentity == "" {
 		return nil, nil, errors.New("ordinary recovery requires the retired origin and a validated live source identity")
 	}
-	for _, value := range []string{origin.OriginalReceiptSHA256, origin.SourceSHA256, origin.DestinationSHA256, origin.CatalogSHA256, origin.BaselineStateSHA256} {
+	for index, value := range []string{origin.OriginalReceiptSHA256, origin.SourceSHA256, origin.DestinationSHA256, origin.CatalogSHA256, origin.BaselineStateSHA256} {
+		if index == 0 && value == "" {
+			continue
+		}
 		decoded, err := hex.DecodeString(value)
 		if err != nil || len(decoded) != sha256.Size || value != strings.ToLower(value) {
 			return nil, nil, errors.New("ordinary recovery origin contains an invalid artifact digest")
@@ -246,16 +250,21 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 }
 
 func (r *ordinaryRecoveryTable) previousMarker(tbl *table.Table) error {
-	stored := tbl.Properties()[ordinaryRecoveryProperty]
-	if stored == "" {
+	stored, exists := tbl.Properties()[ordinaryRecoveryProperty]
+	if !exists {
 		return nil
 	}
 	var previous ordinaryRecoveryMarker
-	if err := json.Unmarshal([]byte(stored), &previous); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(stored))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&previous); err != nil {
+		return errors.New("ordinary recovery table has a malformed previous marker")
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF || strings.TrimSpace(previous.ExecutionID) == "" || previous.ExecutionID == previous.Origin.OriginalExecutionID || previous.ExecutionID == previous.Origin.OriginalLaunchID {
 		return errors.New("ordinary recovery table has a malformed previous marker")
 	}
 	// Epochs may change, immutable evidence and source identity may not.
-	previous.ExecutionID, previous.LaunchID = r.marker.ExecutionID, r.marker.LaunchID
+	previous.ExecutionID = r.marker.ExecutionID
 	if previous != r.marker {
 		return errors.New("ordinary recovery table marker differs from immutable origin, source identity or shape")
 	}
