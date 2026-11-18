@@ -35,6 +35,27 @@ Published common-checkpoint bytes bind both recovery proof and final runtime rec
 
 Acknowledgement follows writer drain and authoritative common-boundary confirmation. A separate identity/hash-bound recovery result and a new settled runtime receipt authorize the worker's atomic checkpoint-plus-settlement transaction. The schedule remains paused until explicit resume. If acknowledgement or artifact publication is interrupted, ownership remains retained; a fresh recovery epoch restores the immutable baseline, rechecks table/slot coverage, and rebarriers before recovery. Relaunching the failed runtime directly is unsupported. Never force an unknown receipt to settled, clear owner fields, or advance a slot based only on process exit or logs.
 
+## Creation-time table sort policy
+
+An optional catalog-wide sort default and explicit per-table overrides configure
+new normalized native Iceberg tables. The UI's opt-in `created_at ASC NULLS LAST`
+default skips streams without a compatible selected field. A missing per-stream
+override inherits that policy; an empty override explicitly requests unsorted
+tables. Custom ordered keys must identify distinct supported selected fields.
+
+The connector resolves source names to actual Iceberg schema field IDs and sets
+sort metadata at table creation. Existing tables retain their sort order even when
+the requested policy differs; changing the policy does not trigger clear, resync,
+source backfill or an existing-table migration. Sort-only policy changes therefore
+do not count as destructive catalog differences. Existing recovery shape checks
+remain intact, including their binding to actual sort metadata.
+
+This policy does not claim incoming Parquet files are physically sorted. Files
+written without sorting remain marked unsorted; S3 Tables auto/sort compaction can
+apply the declared table order later. Previously compacted history may require a
+separate rewrite. A new job pointing to an existing table keeps that table's layout;
+use a distinct namespace when a separate physical dataset is intended.
+
 ## Recommended first implementation: bounded microbatches
 
 Start with a configurable soft interval (for example 60–300 seconds), off by default until failure tests pass. Stop admitting the next transaction after the interval expires, finish the current transaction, flush all TOAST rows, drain/join destination writes, close/commit the batch, checkpoint/ack safely, then reopen writers and replication from the confirmed batch position within the same worker execution. Keep the original run target fixed so scheduling semantics do not change. A transaction or destination commit can exceed the interval: never cut one to meet a wall-clock deadline.

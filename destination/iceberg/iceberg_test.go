@@ -3256,3 +3256,87 @@ func TestNativeRESTCoordinatorRejectsOldIdentityAfterFailedSetup(t *testing.T) {
 	require.Contains(t, fresh.Properties()[nativeRecoveryProperty], "new-table-checkpoint")
 	require.NotContains(t, fresh.Properties()[nativeRecoveryProperty], "must-not-resurrect")
 }
+
+// Uses the production SQLCatalog, local FileIO, native table creation and Parquet writer.
+func TestNativeSQLSortOrderCreationPostgres(t *testing.T) {
+	connection := os.Getenv("OLAKE_NATIVE_POSTGRES_URL")
+	if connection == "" {
+		t.Skip("requires disposable PostgreSQL via OLAKE_NATIVE_POSTGRES_URL")
+	}
+	ctx := context.Background()
+	config := nativeTestConfig(t)
+	config.CatalogType, config.JDBCUrl = JDBCCatalog, connection
+	config.CatalogName = "olake_sort_test_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	config.IcebergS3Path, config.IcebergDatabase = t.TempDir(), "db"
+	cat, cleanup, err := openNativeCatalog(ctx, config)
+	require.NoError(t, err)
+	defer cleanup(ctx)
+	ctx = nativeCatalogContext(ctx, cat)
+	defer func() { _ = cat.DropNamespace(ctx, table.Identifier{"db"}) }()
+	preset := types.SortOrder{{Column: "created_at", Direction: "asc", NullOrder: "nulls-last"}}
+	for _, name := range []string{"inherited", "custom", "unsorted"} {
+		t.Run(name, func(t *testing.T) {
+			stream := types.NewStream(name, "db", nil)
+			stream.UpsertField(constants.OlakeID, types.String, false, true)
+			stream.UpsertField(constants.OpType, types.String, false, true)
+			stream.UpsertField(constants.OlakeTimestamp, types.TimestampMicro, false, true)
+			stream.UpsertField("value", types.Int64, true, false)
+			stream.UpsertField("part", types.String, true, false)
+			stream.UpsertField("blob", types.FixedBinaryOf(4), true, false)
+			stream.UpsertField("created_at", types.TimestampMicro, true, false)
+			configured := &types.ConfiguredStream{
+				Stream: stream, DefaultSortOrder: preset,
+				StreamMetadata: types.StreamMetadata{Normalization: new(true), AppendMode: new(true)},
+			}
+			if name == "custom" {
+				configured.StreamMetadata.SortOrder = types.SortOrder{{Column: "value", Direction: "desc", NullOrder: "nulls-first"}, {Column: "created_at", Direction: "asc", NullOrder: "nulls-last"}}
+			} else if name == "unsorted" {
+				configured.StreamMetadata.SortOrder = types.SortOrder{}
+			}
+			writer := openNativeTestWriter(ctx, t, config, configured, cat, nil, "sql-sort-smoke", true)
+			defer func() { _ = cat.DropTable(ctx, writer.table.Identifier()) }()
+			first, second := nativeTestRecord("first", "r", 1, "one"), nativeTestRecord("second", "r", 9, "one")
+			first.Data["created_at"] = time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
+			second.Data["created_at"] = time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+			require.NoError(t, writer.Write(ctx, []types.RawRecord{first, second}))
+			require.NoError(t, writer.Close(ctx, nil))
+			persisted, err := cat.LoadTable(ctx, writer.table.Identifier())
+			require.NoError(t, err)
+			resolved, err := configured.ResolveSortOrder(types.Iceberg)
+			require.NoError(t, err)
+			order := persisted.SortOrder()
+			require.Equal(t, len(resolved), order.Len())
+			if len(resolved) == 0 {
+				assert.Zero(t, persisted.Metadata().DefaultSortOrder())
+			} else {
+				assert.Positive(t, persisted.Metadata().DefaultSortOrder())
+			}
+			for idx, requested := range resolved {
+				field, found := persisted.Schema().FindFieldByName(requested.Column)
+				require.True(t, found)
+				sortField := order.Field(idx)
+				assert.Equal(t, []int{field.ID}, sortField.SourceIDs)
+				assert.Equal(t, "identity", sortField.Transform.String())
+				assert.Equal(t, requested.Direction, string(sortField.Direction))
+				assert.Equal(t, requested.NullOrder, string(sortField.NullOrder))
+			}
+			entries, err := nativeLiveEntries(ctx, persisted)
+			require.NoError(t, err)
+			require.NotEmpty(t, entries)
+			for _, entry := range entries {
+				orderID := entry.DataFile().SortOrderID()
+				assert.True(t, orderID == nil || *orderID == 0)
+			}
+			assert.Equal(t, map[string]int64{"first": 1, "second": 9}, nativeVisibleValues(t, persisted))
+			before, err := json.Marshal(persisted.Metadata())
+			require.NoError(t, err)
+			configured.StreamMetadata.SortOrder = types.SortOrder{{Column: "part", Direction: "desc", NullOrder: "nulls-first"}}
+			reopened, err := loadOrCreateNativeTable(ctx, config, configured, cat)
+			require.NoError(t, err)
+			after, err := json.Marshal(reopened.Metadata())
+			require.NoError(t, err)
+			assert.JSONEq(t, string(before), string(after))
+			assert.Equal(t, persisted.MetadataLocation(), reopened.MetadataLocation())
+		})
+	}
+}

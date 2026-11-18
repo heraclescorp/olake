@@ -220,6 +220,27 @@ func nativePartitionSpec(stream types.StreamInterface, schema *apacheiceberg.Sch
 	return apacheiceberg.NewPartitionSpec(fields...), nil
 }
 
+func nativeSortOrder(order types.SortOrder, schema *apacheiceberg.Schema) (table.SortOrder, error) {
+	if len(order) == 0 {
+		return table.UnsortedSortOrder, nil
+	}
+	fields := make([]table.SortField, 0, len(order))
+	for _, key := range order {
+		field, found := schema.FindFieldByName(key.Column)
+		if !found {
+			return table.SortOrder{}, fmt.Errorf("sort column %q is absent from table schema", key.Column)
+		}
+		if _, primitive := field.Type.(apacheiceberg.PrimitiveType); !primitive {
+			return table.SortOrder{}, fmt.Errorf("sort column %q must be primitive", key.Column)
+		}
+		fields = append(fields, table.SortField{
+			SourceIDs: []int{field.ID}, Transform: apacheiceberg.IdentityTransform{},
+			Direction: table.SortDirection(key.Direction), NullOrder: table.NullOrder(key.NullOrder),
+		})
+	}
+	return table.NewSortOrder(1, fields)
+}
+
 func (w *nativeWriter) schemaMap() map[string]string {
 	columns := make(map[string]string, w.table.Schema().NumFields())
 	for _, field := range w.table.Schema().Fields() {
@@ -558,6 +579,10 @@ func (w *nativeWriter) EvolveSchema(ctx context.Context, columns map[string]stri
 }
 
 func loadOrCreateNativeTable(ctx context.Context, config *Config, stream types.StreamInterface, cat catalog.Catalog) (*table.Table, error) {
+	order, err := stream.Self().ResolveSortOrder(types.Iceberg)
+	if err != nil {
+		return nil, err
+	}
 	identifier := catalog.ToIdentifier(stream.GetDestinationDatabase(&config.IcebergDatabase), stream.GetDestinationTable())
 	tbl, err := cat.LoadTable(ctx, identifier)
 	if err == nil {
@@ -584,6 +609,10 @@ func loadOrCreateNativeTable(ctx context.Context, config *Config, stream types.S
 	if err != nil {
 		return nil, err
 	}
+	sortOrder, err := nativeSortOrder(order, schema)
+	if err != nil {
+		return nil, err
+	}
 	if err := cat.CreateNamespace(ctx, identifier[:len(identifier)-1], nil); err != nil && !errors.Is(err, catalog.ErrNamespaceAlreadyExists) {
 		return nil, err
 	}
@@ -601,7 +630,7 @@ func loadOrCreateNativeTable(ctx context.Context, config *Config, stream types.S
 	// properties inside iceberg-go would overwrite another thread's 2PC state.
 	props["commit.retry.num-retries"] = "0"
 	// The catalog owns table locations, including managed S3 Tables/Unity warehouses.
-	tbl, err = cat.CreateTable(ctx, identifier, schema, catalog.WithPartitionSpec(&spec), catalog.WithProperties(props))
+	tbl, err = cat.CreateTable(ctx, identifier, schema, catalog.WithPartitionSpec(&spec), catalog.WithSortOrder(sortOrder), catalog.WithProperties(props))
 	if errors.Is(err, catalog.ErrTableAlreadyExists) {
 		return cat.LoadTable(ctx, identifier)
 	}

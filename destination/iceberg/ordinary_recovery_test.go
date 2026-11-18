@@ -487,7 +487,7 @@ func TestOrdinaryRecoverySQLCatalogSmoke(t *testing.T) {
 	if connection == "" {
 		t.Skip("requires disposable PostgreSQL via OLAKE_NATIVE_POSTGRES_URL")
 	}
-	cfg, stream, _ := nativeWriterFixture(t, types.UpdateTypeEquality, false, "")
+	cfg, stream, _ := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
 	cfg.CatalogType, cfg.JDBCUrl, cfg.CatalogName = JDBCCatalog, connection, "ordinary_recovery_"+strings.ReplaceAll(t.Name(), "/", "_")
 	cat, cleanup, err := openNativeCatalog(context.Background(), cfg)
 	require.NoError(t, err)

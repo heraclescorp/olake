@@ -205,3 +205,43 @@ func TestClassifyStreamsMix(t *testing.T) {
 		})
 	}
 }
+
+func TestClassifyStreamsBindsAndValidatesSortPolicy(t *testing.T) {
+	discardStrayLogs(t)
+	preset := types.SortOrder{{Column: "created_at", Direction: "asc", NullOrder: "nulls-last"}}
+	catalog := catalogOf(stream{name: "eligible", mode: types.FULLREFRESH, normalized: true}, stream{name: "missing", mode: types.FULLREFRESH, normalized: true}, stream{name: "raw", mode: types.FULLREFRESH})
+	catalog.DefaultSortOrder = preset
+	for _, configured := range catalog.Streams {
+		configured.Stream.Schema = types.NewTypeSchema()
+		if configured.Name() != "missing" {
+			configured.Stream.UpsertField("created_at", types.TimestampMicro, true, false)
+		}
+	}
+	classified, err := classifyStreams(catalog, nil, &types.State{}, types.Iceberg)
+	require.NoError(t, err)
+	require.Len(t, classified.SelectedStreams, 3)
+	for _, selected := range classified.SelectedStreams {
+		resolved, err := selected.Self().ResolveSortOrder(types.Iceberg)
+		require.NoError(t, err)
+		if selected.Name() == "eligible" {
+			assert.Equal(t, preset, resolved)
+		} else {
+			assert.Empty(t, resolved)
+		}
+		assert.Nil(t, selected.Self().StreamMetadata.SortOrder)
+	}
+	classified, err = classifyStreams(catalog, nil, &types.State{}, types.Parquet)
+	require.NoError(t, err)
+	require.Len(t, classified.SelectedStreams, 3)
+	for _, selected := range classified.SelectedStreams {
+		resolved, err := selected.Self().ResolveSortOrder(types.Parquet)
+		require.NoError(t, err)
+		assert.Empty(t, resolved)
+	}
+	metadata := catalog.SelectedStreams["public"]
+	metadata[1].SortOrder = preset
+	catalog.SelectedStreams["public"] = metadata
+	_, err = classifyStreams(catalog, nil, &types.State{}, types.Iceberg)
+	require.ErrorContains(t, err, "absent")
+	assert.Equal(t, "catalog.sort_order_invalid", errs.From(errs.Classify(err)).Code)
+}

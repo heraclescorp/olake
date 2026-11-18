@@ -38,6 +38,8 @@ type Stream struct {
 	// can write. Empty means none qualifies, so the stream can only append; nil means the
 	// catalog predates target query engines. Not omitempty: empty must not read back as nil.
 	AvailableUpdateTypes []UpdateType `json:"available_update_types"`
+	// Fresh discovery proves this connector understands creation-only Iceberg sort policies.
+	SupportsIcebergSortOrder bool `json:"supports_iceberg_sort_order,omitempty"`
 	// Primary key if available
 	SourceDefinedPrimaryKey *Set[string] `json:"source_defined_primary_key,omitempty"`
 	// Available cursor fields supported by driver

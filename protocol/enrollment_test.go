@@ -33,6 +33,7 @@ func (s *enrollmentTestSource) ProduceSchema(_ context.Context, id types.StreamI
 	stream := types.NewStream(id.Name, id.Namespace, nil)
 	stream.UpsertField("id", types.Int64, false, false)
 	stream.UpsertField("payload", types.String, true, false)
+	stream.UpsertField("created_at", types.TimestampMicro, true, false)
 	stream.WithSyncMode(types.CDC, types.FULLREFRESH, types.INCREMENTAL)
 	if !s.noPK[id.Name] {
 		stream.WithPrimaryKey("id")
@@ -48,11 +49,12 @@ func (s *enrollmentTestSource) ValidateTableEnrollment(_ context.Context, stream
 
 const enrollmentSavedFixture = `{
  "future_root":{"keep":true},
+ "default_sort_order":[{"column":"created_at","direction":"asc","null_order":"nulls-last"}],
  "streams":[
   {"future_stream":7,"stream":{"name":"kept","namespace":"public","sync_mode":"cdc","destination_database":"warehouse:public","destination_table":"kept","default_stream_properties":{"normalization":false,"append_mode":true,"update_type":"eq"},"type_schema":{"properties":{"old":{"type":["string"]}}}}},
   {"stream":{"name":"excluded","namespace":"public","sync_mode":"cdc","destination_database":"warehouse:public","destination_table":"excluded"}}
  ],
- "selected_streams":{"public":[{"stream_name":"kept","normalization":false,"append_mode":true,"update_type":"eq","selected_columns":{"columns":["old"],"sync_new_columns":false},"future_override":{"exact":123}}]}
+ "selected_streams":{"public":[{"stream_name":"kept","sort_order":[],"normalization":false,"append_mode":true,"update_type":"eq","selected_columns":{"columns":["old"],"sync_new_columns":false},"future_override":{"exact":123}}]}
 }`
 
 func enrollmentTestCatalog(t *testing.T, split bool, input string) *enrollmentCatalog {
@@ -74,6 +76,10 @@ func enrollmentTestCatalog(t *testing.T, split bool, input string) *enrollmentCa
 		t.Fatal(err)
 	}
 	selected := map[string]json.RawMessage{"selected_streams": document["selected_streams"], "future_selection_root": json.RawMessage(`true`)}
+	if policy, present := document["default_sort_order"]; present {
+		selected["default_sort_order"] = policy
+		delete(document, "default_sort_order")
+	}
 	delete(document, "selected_streams")
 	availableBytes, err := json.Marshal(document)
 	if err != nil {
@@ -209,6 +215,9 @@ func testEnrollmentApprovedSubset(t *testing.T, split bool, dropRemovedColumns *
 	if err := json.Unmarshal(saved.selections["public"][1], &metadata); err != nil {
 		t.Fatal(err)
 	}
+	if _, present := metadata["sort_order"]; present {
+		t.Fatal("new tables must inherit rather than pin a sort override")
+	}
 	if string(metadata["append_mode"]) != "false" {
 		t.Fatal("new append default must be explicit, including false")
 	}
@@ -245,12 +254,22 @@ func testEnrollmentApprovedSubset(t *testing.T, split bool, dropRemovedColumns *
 		t.Fatal("ordinary reader lost selection or definitions")
 	}
 	selection := loaded.SelectedStreams["public"][1]
-	stream := &types.ConfiguredStream{Stream: loaded.Streams[2].Stream, StreamMetadata: selection}
+	stream := &types.ConfiguredStream{Stream: loaded.Streams[2].Stream, StreamMetadata: selection, DefaultSortOrder: loaded.DefaultSortOrder}
+	if !stream.Stream.SupportsIcebergSortOrder {
+		t.Fatal("newly discovered stream did not advertise sort-aware connector support")
+	}
 	if stream.GetSyncMode() != types.CDC || stream.GetDestinationDatabase(nil) != "warehouse_public" || stream.GetDestinationTable() != "valid" {
 		t.Fatal("ordinary reader resolved different destination or sync mode")
 	}
 	if stream.GetUpdateType() != types.UpdateTypePosition || stream.AppendModeEnabled() || !stream.NormalizationEnabled() {
 		t.Fatal("ordinary reader lost explicit defaults")
+	}
+	resolvedSort, err := stream.ResolveSortOrder(types.Iceberg)
+	if err != nil || !reflect.DeepEqual(resolvedSort, loaded.DefaultSortOrder) || len(resolvedSort) != 1 {
+		t.Fatalf("new table did not inherit the saved default: %v, %v", resolvedSort, err)
+	}
+	if loaded.SelectedStreams["public"][0].SortOrder == nil || len(loaded.SelectedStreams["public"][0].SortOrder) != 0 {
+		t.Fatal("existing explicit unsorted override was lost")
 	}
 	wantDrop := dropRemovedColumns != nil && *dropRemovedColumns
 	if stream.DropRemovedColumnsEnabled() != wantDrop {

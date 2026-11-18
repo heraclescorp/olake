@@ -2260,3 +2260,190 @@ func TestToLegacyStreamMetadataUpdateType(t *testing.T) {
 		})
 	}
 }
+
+func TestCatalogSortPolicyRoundTrip(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		t.Run(fmt.Sprintf("split=%v", split), func(t *testing.T) {
+			preset := SortOrder{{Column: "created_at", Direction: "asc", NullOrder: "nulls-last"}}
+			custom := SortOrder{{Column: "id", Direction: "desc", NullOrder: "nulls-first"}, {Column: "name", Direction: "asc", NullOrder: "nulls-last"}}
+			catalog := GetWrappedCatalog([]*Stream{
+				{Name: "inherit", Namespace: "public", Schema: oldSchema()},
+				{Name: "unsorted", Namespace: "public", Schema: oldSchema()},
+				{Name: "custom", Namespace: "public", Schema: oldSchema()},
+			})
+			catalog.DefaultSortOrder = preset
+			catalog.SelectedStreams["public"][1].SortOrder = SortOrder{}
+			catalog.SelectedStreams["public"][2].SortOrder = custom
+			dir := t.TempDir()
+			legacyPath, availablePath, selectedPath := filepath.Join(dir, "streams.json"), filepath.Join(dir, "available.json"), filepath.Join(dir, "selected.json")
+			load := func() *Catalog {
+				var loaded *Catalog
+				var err error
+				if split {
+					require.NoError(t, catalog.WriteSplitToFiles(availablePath, selectedPath))
+					var available map[string]json.RawMessage
+					data, readErr := os.ReadFile(availablePath)
+					require.NoError(t, readErr)
+					require.NoError(t, json.Unmarshal(data, &available))
+					assert.NotContains(t, available, "default_sort_order")
+					// Available schema metadata never owns or validates the selected policy.
+					available["default_sort_order"] = json.RawMessage(`null`)
+					data, readErr = json.Marshal(available)
+					require.NoError(t, readErr)
+					require.NoError(t, os.WriteFile(availablePath, data, 0600))
+					loaded, err = ResolveCatalog("", availablePath, selectedPath)
+				} else {
+					require.NoError(t, toLegacyCatalog(catalog).WriteToFile(legacyPath))
+					loaded, err = ResolveCatalog(legacyPath, "", "")
+				}
+				require.NoError(t, err)
+				return loaded
+			}
+			assertOrders := func(loaded *Catalog) {
+				byName := map[string]SortOrder{}
+				for _, metadata := range loaded.SelectedStreams["public"] {
+					byName[metadata.StreamName] = metadata.SortOrder
+				}
+				assert.Nil(t, byName["inherit"])
+				require.NotNil(t, byName["unsorted"])
+				assert.Empty(t, byName["unsorted"])
+				assert.Equal(t, custom, byName["custom"])
+				for _, configured := range loaded.Streams {
+					assert.True(t, configured.Stream.SupportsIcebergSortOrder)
+				}
+			}
+			loaded := load()
+			assert.Equal(t, preset, loaded.DefaultSortOrder)
+			assertOrders(loaded)
+			catalog.DefaultSortOrder = nil
+			loaded = load()
+			assert.Empty(t, loaded.DefaultSortOrder)
+			assertOrders(loaded)
+		})
+	}
+}
+
+func TestCatalogDiscoveryPreservesInheritedSortPolicyWithoutResync(t *testing.T) {
+	preset := SortOrder{{Column: "created_at", Direction: "asc", NullOrder: "nulls-last"}}
+	stream := func(name string) *Stream {
+		return &Stream{Name: name, Namespace: "public", Schema: oldSchema()}
+	}
+	old := GetWrappedCatalog([]*Stream{stream("kept")})
+	old.DefaultSortOrder = preset
+	merged := mergeCatalogs(old, GetWrappedCatalog([]*Stream{stream("kept"), stream("new")}), nil)
+	assert.Equal(t, preset, merged.DefaultSortOrder)
+	assert.Nil(t, merged.SelectedStreams["public"][0].SortOrder)
+	// Selecting a newly discovered stream does not pin a copy of the default.
+	merged.SelectedStreams["public"] = append(merged.SelectedStreams["public"], StreamMetadata{StreamName: "new"})
+	assert.Nil(t, merged.SelectedStreams["public"][1].SortOrder)
+	changed := GetWrappedCatalog([]*Stream{old.Streams[0].Stream})
+	changed.DefaultSortOrder = nil
+	changed.SelectedStreams["public"][0].SortOrder = SortOrder{{Column: "id", Direction: "desc", NullOrder: "nulls-first"}}
+	for _, delta := range []*Catalog{GetStreamsDelta(old, changed, Iceberg), GetStreamsDelta(changed, old, Iceberg)} {
+		assert.Empty(t, delta.Streams, "creation-only sort policy must not trigger destructive resync")
+		assert.Empty(t, delta.SelectedStreams)
+		encoded, err := json.Marshal(delta)
+		require.NoError(t, err)
+		assert.JSONEq(t, `{}`, string(encoded), "policy-only differences must not invoke clear-destination consumers")
+	}
+}
+
+func TestResolveSortOrderEligibilityAndExplicitValidation(t *testing.T) {
+	preset := SortOrder{{Column: "created_at", Direction: "asc", NullOrder: "nulls-last"}}
+	for _, tc := range []struct {
+		name        string
+		column      string
+		dataType    DataType
+		selected    []string
+		syncNew     bool
+		preserve    bool
+		normalized  bool
+		destination DestinationType
+		override    SortOrder
+		want        SortOrder
+		wantError   string
+	}{
+		{name: "inherited temporal", column: "created_at", dataType: TimestampMicro, normalized: true, want: preset},
+		{name: "normalized source name", column: "Created At", dataType: TimestampMilli, selected: []string{"Created At"}, normalized: true, want: preset},
+		{name: "normalized selection with sync new columns", column: "Created At", dataType: TimestampMilli, selected: []string{"Created At"}, syncNew: true, normalized: true, want: preset},
+		{name: "preserved source name does not match default", column: "Created At", dataType: TimestampMilli, preserve: true, normalized: true},
+		{name: "missing default field", column: "other", dataType: TimestampMicro, normalized: true},
+		{name: "incompatible default field", column: "created_at", dataType: String, normalized: true},
+		{name: "unselected default field", column: "created_at", dataType: TimestampMicro, selected: []string{"id"}, normalized: true},
+		{name: "excluded known field with sync new columns", column: "created_at", dataType: TimestampMicro, selected: []string{"id"}, syncNew: true, normalized: true},
+		{name: "raw stream ignores default", column: "created_at", dataType: TimestampMicro},
+		{name: "parquet ignores default", column: "created_at", dataType: TimestampMicro, normalized: true, destination: Parquet},
+		{name: "empty override opts out", column: "created_at", dataType: TimestampMicro, normalized: true, override: SortOrder{}},
+		{name: "custom primitive", column: "created_at", dataType: String, normalized: true, override: preset, want: preset},
+		{name: "unknown explicit field", column: "other", dataType: String, normalized: true, override: preset, wantError: "absent"},
+		{name: "excluded explicit field", column: "created_at", dataType: TimestampMicro, selected: []string{"id"}, normalized: true, override: preset, wantError: "not selected"},
+		{name: "complex explicit field", column: "created_at", dataType: Object, normalized: true, override: preset, wantError: "primitive"},
+		{name: "array explicit field", column: "created_at", dataType: Array, normalized: true, override: preset, wantError: "primitive"},
+		{name: "unknown type explicit field", column: "created_at", dataType: Unknown, normalized: true, override: preset, wantError: "primitive"},
+		{name: "raw explicit sort rejected", column: "created_at", dataType: TimestampMicro, override: preset, wantError: "normalized Iceberg"},
+		{name: "parquet explicit sort rejected", column: "created_at", dataType: TimestampMicro, normalized: true, destination: Parquet, override: preset, wantError: "normalized Iceberg"},
+		{name: "duplicate normalized key", column: "Created At", dataType: TimestampMicro, normalized: true, override: SortOrder{{Column: "Created At", Direction: "asc", NullOrder: "nulls-last"}, {Column: "created_at", Direction: "desc", NullOrder: "nulls-first"}}, wantError: "duplicate destination"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			schema := NewTypeSchema()
+			schema.AddTypes(tc.column, false, tc.dataType, Null)
+			schema.AddTypes("id", false, Int64)
+			stream := &ConfiguredStream{
+				Stream: &Stream{Schema: schema}, DefaultSortOrder: preset,
+				StreamMetadata: StreamMetadata{Normalization: &tc.normalized, UseSourceColumnNames: tc.preserve, SortOrder: tc.override, SelectedColumns: &SelectedColumns{Columns: tc.selected, SyncNewColumns: tc.syncNew}},
+			}
+			destination := tc.destination
+			if destination == "" {
+				destination = Iceberg
+			}
+			actual, err := stream.ResolveSortOrder(destination)
+			if tc.wantError != "" {
+				require.ErrorContains(t, err, tc.wantError)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, actual)
+			}
+			assert.Equal(t, tc.override, stream.StreamMetadata.SortOrder, "resolution must not pin inherited values")
+		})
+	}
+}
+
+func TestSortOrderRejectsMalformedWireValues(t *testing.T) {
+	for _, value := range []string{
+		`null`, `{}`, `[null]`, `[{"column":"id","direction":"ASC","null_order":"nulls-last"}]`,
+		`[{"column":"id","direction":"asc"}]`, `[{"column":" ","direction":"asc","null_order":"nulls-last"}]`,
+		`[{"column":"id","direction":"asc","null_order":"nulls-last"},{"column":"id","direction":"desc","null_order":"nulls-first"}]`,
+	} {
+		t.Run(value, func(t *testing.T) {
+			var metadata StreamMetadata
+			require.Error(t, json.Unmarshal([]byte(`{"sort_order":`+value+`}`), &metadata))
+			var legacy LegacyStreamMetadata
+			require.Error(t, json.Unmarshal([]byte(`{"sort_order":`+value+`}`), &legacy))
+		})
+	}
+}
+
+func TestSortOrderAmbiguousSchemasAndDefaultPreset(t *testing.T) {
+	preset := SortOrder{{Column: "created_at", Direction: "asc", NullOrder: "nulls-last"}}
+	require.NoError(t, preset.ValidateDefault())
+	require.NoError(t, (SortOrder{}).ValidateDefault())
+	require.Error(t, (SortOrder{{Column: "other", Direction: "asc", NullOrder: "nulls-last"}}).ValidateDefault())
+	require.Error(t, (SortOrder{{Column: "created_at", Direction: "desc", NullOrder: "nulls-last"}}).ValidateDefault())
+	schema := NewTypeSchema()
+	schema.AddTypes("created_at", false, TimestampMicro)
+	schema.AddTypes("Created At", false, TimestampMicro)
+	stream := &ConfiguredStream{Stream: &Stream{Schema: schema}, DefaultSortOrder: preset, StreamMetadata: StreamMetadata{Normalization: new(true)}}
+	order, err := stream.ResolveSortOrder(Iceberg)
+	require.NoError(t, err)
+	assert.Empty(t, order, "ambiguous inherited names are ineligible")
+	stream.StreamMetadata.SortOrder = preset
+	_, err = stream.ResolveSortOrder(Iceberg)
+	require.ErrorContains(t, err, "ambiguous")
+	schema.Properties.Delete("Created At")
+	schema.AddTypes("created_at", false, String)
+	_, err = stream.ResolveSortOrder(Iceberg)
+	require.ErrorContains(t, err, "primitive", "mixed source types must not claim a stable primitive sort key")
+	var old Stream
+	require.NoError(t, json.Unmarshal([]byte(`{"name":"old"}`), &old))
+	assert.False(t, old.SupportsIcebergSortOrder, "old discover output must not imply connector support")
+}
