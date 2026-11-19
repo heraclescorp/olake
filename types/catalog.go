@@ -103,6 +103,7 @@ type StreamMetadata struct {
 	CursorField         string           `json:"cursor_field,omitempty"`
 	DestinationDatabase string           `json:"destination_database,omitempty"`
 	DestinationTable    string           `json:"destination_table,omitempty"`
+	SortOrder           SortOrder        `json:"sort_order,omitempty"`
 }
 
 // resolveConfigurableField returns the first non-zero value.
@@ -112,8 +113,9 @@ func resolveConfigurableField[T comparable](values ...T) T {
 }
 
 type Catalog struct {
-	SelectedStreams map[string][]StreamMetadata `json:"selected_streams,omitempty"`
-	Streams         []*ConfiguredStream         `json:"streams,omitempty"`
+	SelectedStreams  map[string][]StreamMetadata `json:"selected_streams,omitempty"`
+	Streams          []*ConfiguredStream         `json:"streams,omitempty"`
+	DefaultSortOrder SortOrder                   `json:"default_sort_order,omitempty"`
 }
 
 // StreamMix is the per-sync breakdown of the streams a run actually syncs. Only streams that
@@ -136,10 +138,13 @@ type StreamMix struct {
 // Callers validate the flags first, so the new-format paths are either both set or both empty.
 func ResolveCatalog(streamsFilePath, availableStreamsFilePath, selectedStreamsFilePath string) (*Catalog, error) {
 	if availableStreamsFilePath != "" && selectedStreamsFilePath != "" {
-		catalog := &Catalog{}
-		if err := utils.UnmarshalFile(availableStreamsFilePath, catalog, false); err != nil {
+		available := struct {
+			Streams []*ConfiguredStream `json:"streams"`
+		}{}
+		if err := utils.UnmarshalFile(availableStreamsFilePath, &available, false); err != nil {
 			return nil, fmt.Errorf("failed to read streams from %s: %w", availableStreamsFilePath, err)
 		}
+		catalog := &Catalog{Streams: available.Streams}
 		if len(catalog.Streams) == 0 {
 			return nil, errs.Precondition(errs.CatalogError, codeAvailableStreamsEmpty,
 				fmt.Errorf("available_streams file %s has no streams[]", availableStreamsFilePath))
@@ -152,6 +157,7 @@ func ResolveCatalog(streamsFilePath, availableStreamsFilePath, selectedStreamsFi
 		// An empty selected_streams file selects nothing, like an explicit {} in streams.json.
 		// Keep that non-nil: a nil selection reads as "no prior selection" and discover re-selects every stream.
 		catalog.SelectedStreams = selectedCatalog.SelectedStreams
+		catalog.DefaultSortOrder = selectedCatalog.DefaultSortOrder
 		if catalog.SelectedStreams == nil {
 			catalog.SelectedStreams = map[string][]StreamMetadata{}
 		}
@@ -196,7 +202,7 @@ func (c *Catalog) WriteSplitToFiles(availablePath, selectedPath string) error {
 	if err := (&Catalog{Streams: c.Streams}).WriteToFile(availablePath); err != nil {
 		return fmt.Errorf("failed to create available_streams file: %w", err)
 	}
-	if err := (&Catalog{SelectedStreams: c.SelectedStreams}).WriteToFile(selectedPath); err != nil {
+	if err := (&Catalog{SelectedStreams: c.SelectedStreams, DefaultSortOrder: c.DefaultSortOrder}).WriteToFile(selectedPath); err != nil {
 		return fmt.Errorf("failed to create selected_streams file: %w", err)
 	}
 	return nil
@@ -216,6 +222,7 @@ func GetWrappedCatalog(streams []*Stream) *Catalog {
 	}
 
 	for _, stream := range streams {
+		stream.SupportsIcebergSortOrder = true
 		stream.RefreshSelectableColumns()
 		catalog.Streams = append(catalog.Streams, &ConfiguredStream{
 			Stream: stream,
@@ -251,6 +258,8 @@ func mergeCatalogs(oldCatalog, newCatalog *Catalog, available []UpdateType) *Cat
 	if oldCatalog == nil {
 		return newCatalog
 	}
+
+	newCatalog.DefaultSortOrder = oldCatalog.DefaultSortOrder
 
 	oldStreams := streamMapByID(oldCatalog.Streams)
 

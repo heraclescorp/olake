@@ -55,6 +55,8 @@ type (
 		resyncTargetID      string
 		resyncOperationID   string
 		resyncContext       context.Context
+		ordinaryRecovery    ordinaryRecoveryDestination
+		ordinaryPrepared    bool
 	}
 
 	// writer thread used by reader
@@ -137,11 +139,12 @@ func NewWriterPool(ctx context.Context, config *types.WriterConfig, syncStreams 
 	}
 	pool.resync, _ = adapter.(resyncDestination)
 	pool.metadataDiagnostics, _ = adapter.(MetadataDiagnostics)
+	pool.ordinaryRecovery, _ = adapter.(ordinaryRecoveryDestination)
 
 	stopCheck := logger.TrackTiming("destination", "check")
-	// Recovery-only must not run the ordinary connection test: it creates a test
-	// table and writes a row, while recovery is strictly read-only at destination.
-	if options, ok := types.ResyncFromContext(ctx); !ok || !options.RecoverOnly {
+	// Recovery must never create the ordinary connection-test table.
+	_, ordinaryRecovery := types.OrdinaryRecoveryFromContext(ctx)
+	if options, ok := types.ResyncFromContext(ctx); !ordinaryRecovery && (!ok || !options.RecoverOnly) {
 		err = adapter.Check(ctx)
 	}
 	stopCheck()
@@ -188,6 +191,14 @@ func (w *WriterPool) GetStats() *Stats {
 func (w *WriterPool) NewWriter(ctx context.Context, stream types.StreamInterface, options ...ThreadOptions) (*WriterThread, *types.MetadataState, error) {
 	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
 		return nil, nil, fmt.Errorf("recovery-only resync cannot open a data writer")
+	}
+	if recovery, ok := types.OrdinaryRecoveryFromContext(ctx); ok {
+		if !w.ordinaryPrepared || recovery.Plan == nil {
+			return nil, nil, fmt.Errorf("ordinary recovery writers require prepared barriers and a bounded replay plan")
+		}
+		if _, selected := recovery.Plan.ReplayAfter[stream.ID()]; !selected {
+			return nil, nil, fmt.Errorf("ordinary recovery writer stream is outside the replay plan")
+		}
 	}
 	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return nil, nil, err

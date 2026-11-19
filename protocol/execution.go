@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/datazip-inc/olake/constants"
+	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/logger"
 	s3util "github.com/datazip-inc/olake/utils/s3"
@@ -37,7 +38,8 @@ func Execute(root *cobra.Command) error {
 		stateFile := viper.GetString(constants.StatePath)
 		// Read has joined before SourceDrained; persist its complete acknowledged
 		// checkpoint even when RunE returned a local record-processing error.
-		if cmd.Name() == "sync" && state != nil {
+		_, recovering := types.OrdinaryRecoveryFromContext(cmd.Context())
+		if cmd.Name() == "sync" && state != nil && !recovering {
 			proofErr = logger.FileLoggerWithPath(state, stateFile)
 		}
 		var saved []byte

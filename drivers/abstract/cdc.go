@@ -26,6 +26,20 @@ import (
 func (a *AbstractDriver) RunChangeStream(mainCtx context.Context, pool *destination.WriterPool, streams ...types.StreamInterface) error {
 	// Read-only destination diagnostics must precede slot initialization, which
 	// can time out before ordinary CDC writer setup ever reads table metadata.
+	if options, recovery := types.OrdinaryRecoveryFromContext(mainCtx); recovery {
+		if options.Plan == nil {
+			return fmt.Errorf("ordinary recovery requires a prepared bounded replay plan")
+		}
+		if err := a.driver.PreCDC(mainCtx, streams); err != nil {
+			return fmt.Errorf("ordinary recovery pre CDC: %w", err)
+		}
+		// No backfill, membership mutation, retries into a new ingestion generation,
+		// or PostCDC: all selected writers must close before protocol confirmation.
+		a.GlobalConnGroup.Add(func(ctx context.Context) error {
+			return a.streamChanges(ctx, pool, 0, streams)
+		})
+		return nil
+	}
 	pool.LogMetadataPositions(mainCtx, streams)
 	// run pre cdc of drivers
 	if err := a.driver.PreCDC(mainCtx, streams); err != nil {
@@ -112,6 +126,9 @@ func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destinatio
 	defer cdcCtxCancel()
 
 	defer func() {
+		if _, recovery := types.OrdinaryRecoveryFromContext(mainCtx); recovery {
+			return
+		}
 		if _, resync := types.ResyncFromContext(mainCtx); resync {
 			if err == nil && cdcCtx.Err() == nil {
 				a.resyncMu.Lock()

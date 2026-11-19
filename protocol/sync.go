@@ -35,7 +35,7 @@ type StreamClassification struct {
 var syncCmd = &cobra.Command{
 	Use:   "sync",
 	Short: "Olake sync command",
-	PersistentPreRunE: func(_ *cobra.Command, _ []string) (err error) {
+	PersistentPreRunE: func(cmd *cobra.Command, _ []string) (err error) {
 		if configPath == "" {
 			return errs.Precondition(errs.ConfigInvalid, codeFlagMissing, fmt.Errorf("--config not passed"))
 		} else if err := validateCatalogFlags(true); err != nil {
@@ -67,7 +67,12 @@ var syncCmd = &cobra.Command{
 			Type: types.StreamType,
 		}
 		if statePath != "" {
-			if err := utils.UnmarshalFile(statePath, state, false); err != nil {
+			if ordinaryRecoveryOriginPath != "" {
+				err = loadOrdinaryRecoveryState(statePath, state)
+			} else {
+				err = utils.UnmarshalFile(statePath, state, false)
+			}
+			if err != nil {
 				return err
 			}
 		} else {
@@ -89,9 +94,12 @@ var syncCmd = &cobra.Command{
 
 		stateBytes, _ := state.MarshalJSON()
 		logger.Infof("Running sync with state: %s", stateBytes)
-		return nil
+		return prepareOrdinaryRecovery(cmd)
 	},
 	RunE: func(cmd *cobra.Command, _ []string) (err error) {
+		if _, recovering := types.OrdinaryRecoveryFromContext(cmd.Context()); recovering {
+			return runOrdinaryRecovery(cmd)
+		}
 		sourceReading := false
 		defer func() {
 			if !sourceReading {
@@ -202,6 +210,9 @@ var syncCmd = &cobra.Command{
 }
 
 func classifyStreams(catalog *types.Catalog, streams []*types.Stream, state *types.State, destinationType types.DestinationType) (*StreamClassification, error) {
+	if err := catalog.DefaultSortOrder.ValidateDefault(); err != nil {
+		return nil, errs.Precondition(errs.ConfigInvalid, "catalog.default_sort_order_invalid", err)
+	}
 	// stream-specific classifications
 	classifications := &StreamClassification{
 		SelectedStreams:    []types.StreamInterface{},
@@ -238,6 +249,12 @@ func classifyStreams(catalog *types.Catalog, streams []*types.Stream, state *typ
 		}
 
 		elem.StreamMetadata = sMetadata
+		elem.DefaultSortOrder = catalog.DefaultSortOrder
+		if _, err := elem.ResolveSortOrder(destinationType); err != nil {
+			failure = errs.Precondition(errs.ConfigInvalid, "catalog.sort_order_invalid",
+				fmt.Errorf("stream %s has an invalid sort order: %w", elem.ID(), err))
+			return true
+		}
 
 		if streams != nil {
 			source, found := types.StreamsToMap(streams...)[elem.ID()]

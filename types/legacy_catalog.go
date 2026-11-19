@@ -27,13 +27,15 @@ type LegacyStreamMetadata struct {
 	FilterConfig         *FilterConfig    `json:"filter_config,omitempty"`
 	SelectedColumns      *SelectedColumns `json:"selected_columns"`
 	DedupKeys            []string         `json:"dedup_keys,omitempty"`
+	SortOrder            SortOrder        `json:"sort_order,omitempty"`
 }
 
 // LegacyCatalog is the streams.json ([]streams + selected_streams)
 // Deprecated: Use Catalog instead
 type LegacyCatalog struct {
-	SelectedStreams map[string][]LegacyStreamMetadata `json:"selected_streams,omitempty"`
-	Streams         []*ConfiguredStream               `json:"streams,omitempty"`
+	SelectedStreams  map[string][]LegacyStreamMetadata `json:"selected_streams,omitempty"`
+	Streams          []*ConfiguredStream               `json:"streams,omitempty"`
+	DefaultSortOrder SortOrder                         `json:"default_sort_order,omitempty"`
 }
 
 // ResolveLegacyCatalog loads a self-contained streams.json (streams[] + selected_streams[]) from disk.
@@ -69,6 +71,7 @@ func legacyToStreamMetadata(streamMetadata LegacyStreamMetadata) StreamMetadata 
 		FilterConfig:         streamMetadata.FilterConfig,
 		SelectedColumns:      streamMetadata.SelectedColumns,
 		DedupKeys:            streamMetadata.DedupKeys,
+		SortOrder:            streamMetadata.SortOrder,
 	}
 }
 
@@ -76,7 +79,7 @@ func legacyToStreamMetadata(streamMetadata LegacyStreamMetadata) StreamMetadata 
 func legacyToCanonical(legacy *LegacyCatalog) *Catalog {
 	// Missing selected_streams stays nil, which sync reads as "all streams"; an explicit {} selects nothing.
 	if legacy.SelectedStreams == nil {
-		return &Catalog{Streams: legacy.Streams}
+		return &Catalog{Streams: legacy.Streams, DefaultSortOrder: legacy.DefaultSortOrder}
 	}
 	selectedStreams := make(map[string][]StreamMetadata, len(legacy.SelectedStreams))
 	for namespace, metadataList := range legacy.SelectedStreams {
@@ -88,8 +91,9 @@ func legacyToCanonical(legacy *LegacyCatalog) *Catalog {
 	}
 
 	return &Catalog{
-		Streams:         legacy.Streams,
-		SelectedStreams: selectedStreams,
+		Streams:          legacy.Streams,
+		SelectedStreams:  selectedStreams,
+		DefaultSortOrder: legacy.DefaultSortOrder,
 	}
 }
 
@@ -114,8 +118,9 @@ func (c *LegacyCatalog) WriteToFile(path string) error {
 func toLegacyCatalog(canonical *Catalog) *LegacyCatalog {
 	canonical.sortByNamespaceStreamName()
 	legacy := &LegacyCatalog{
-		Streams:         canonical.Streams,
-		SelectedStreams: make(map[string][]LegacyStreamMetadata, len(canonical.SelectedStreams)),
+		Streams:          canonical.Streams,
+		SelectedStreams:  make(map[string][]LegacyStreamMetadata, len(canonical.SelectedStreams)),
+		DefaultSortOrder: canonical.DefaultSortOrder,
 	}
 
 	configuredByID := streamMapByID(canonical.Streams)
@@ -169,5 +174,6 @@ func toLegacyStreamMetadata(metadata StreamMetadata, stream *Stream) LegacyStrea
 		FilterConfig:         metadata.FilterConfig,
 		SelectedColumns:      selectedColumns,
 		DedupKeys:            metadata.DedupKeys,
+		SortOrder:            metadata.SortOrder,
 	}
 }

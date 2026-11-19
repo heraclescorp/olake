@@ -2,6 +2,7 @@ package iceberg
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
 	"time"
@@ -585,4 +586,84 @@ func TestNativeCoordinatorSetupObservesExternalSchemaReplacement(t *testing.T) {
 	persisted, err := admin.LoadTable(ctx, seed.table.Identifier())
 	require.NoError(t, err)
 	require.Equal(t, map[string]any{"seed": nil, "after": int64(42)}, nativeSourceValues(t, persisted, "value"))
+}
+
+func TestNativeSortOrderCreationMetadataAndUnsortedFiles(t *testing.T) {
+	for _, backfill := range []bool{false, true} {
+		name := "cdc"
+		if backfill {
+			name = "backfill"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
+			stream.StreamMetadata.UseSourceColumnNames = false
+			stream.Stream.UpsertField("Created At", types.TimestampMicro, true, false)
+			stream.StreamMetadata.SortOrder = types.SortOrder{
+				{Column: "Created At", Direction: "desc", NullOrder: "nulls-first"},
+				{Column: "value", Direction: "asc", NullOrder: "nulls-last"},
+			}
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "sorted-metadata", backfill)
+			first, second := nativeTestRecord("first", "r", 9, "one"), nativeTestRecord("second", "r", 2, "one")
+			first.Data["created_at"] = time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+			second.Data["created_at"] = time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
+			require.NoError(t, writer.Write(ctx, []types.RawRecord{first, second}))
+			require.NoError(t, writer.Close(ctx, nil))
+			persisted, err := cat.(*nativeCatalog).Catalog.LoadTable(ctx, writer.table.Identifier())
+			require.NoError(t, err)
+			require.Greater(t, persisted.Metadata().DefaultSortOrder(), 0)
+			order := persisted.SortOrder()
+			require.Equal(t, 2, order.Len())
+			for idx, column := range []string{"created_at", "value"} {
+				field, found := persisted.Schema().FindFieldByName(column)
+				require.True(t, found)
+				sortField := order.Field(idx)
+				assert.Equal(t, []int{field.ID}, sortField.SourceIDs)
+				assert.Equal(t, "identity", sortField.Transform.String())
+				assert.Equal(t, stream.StreamMetadata.SortOrder[idx].Direction, string(sortField.Direction))
+				assert.Equal(t, stream.StreamMetadata.SortOrder[idx].NullOrder, string(sortField.NullOrder))
+			}
+			entries, err := nativeLiveEntries(ctx, persisted)
+			require.NoError(t, err)
+			require.NotEmpty(t, entries)
+			for _, entry := range entries {
+				orderID := entry.DataFile().SortOrderID()
+				assert.True(t, orderID == nil || *orderID == 0, "unsorted writes must not claim the table sort order")
+			}
+			assert.Equal(t, map[string]int64{"first": 9, "second": 2}, nativeVisibleValues(t, persisted))
+		})
+	}
+}
+
+func TestNativeSortPolicyLeavesExistingTableUntouched(t *testing.T) {
+	for _, sorted := range []bool{false, true} {
+		name := "unsorted"
+		if sorted {
+			name = "sorted"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeDeletionVector, true, "/{part, identity}")
+			if sorted {
+				stream.StreamMetadata.SortOrder = types.SortOrder{{Column: "value", Direction: "desc", NullOrder: "nulls-first"}}
+			}
+			seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "original-layout", true)
+			require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeTestRecord("old", "r", 42, "one")}))
+			require.NoError(t, seed.Close(ctx, nil))
+			original, err := cat.(*nativeCatalog).Catalog.LoadTable(ctx, seed.table.Identifier())
+			require.NoError(t, err)
+			before, err := json.Marshal(original.Metadata())
+			require.NoError(t, err)
+			stream.StreamMetadata.SortOrder = types.SortOrder{{Column: "part", Direction: "asc", NullOrder: "nulls-last"}}
+			loaded, err := loadOrCreateNativeTable(ctx, cfg, stream, cat)
+			require.NoError(t, err)
+			persisted, err := cat.(*nativeCatalog).Catalog.LoadTable(ctx, loaded.Identifier())
+			require.NoError(t, err)
+			after, err := json.Marshal(persisted.Metadata())
+			require.NoError(t, err)
+			assert.JSONEq(t, string(before), string(after), "UUID, snapshots, schema/spec/order and properties must all stay unchanged")
+			assert.Equal(t, original.MetadataLocation(), persisted.MetadataLocation(), "a sort-policy-only change must not commit table metadata")
+			assert.Equal(t, map[string]int64{"old": 42}, nativeVisibleValues(t, persisted))
+		})
+	}
 }

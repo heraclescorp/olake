@@ -10,8 +10,9 @@ import (
 
 // Input/Processed object for Stream
 type ConfiguredStream struct {
-	StreamMetadata StreamMetadata `json:"-"`
-	Stream         *Stream        `json:"stream,omitempty"`
+	StreamMetadata   StreamMetadata `json:"-"`
+	Stream           *Stream        `json:"stream,omitempty"`
+	DefaultSortOrder SortOrder      `json:"-"`
 }
 
 type FilterConfig struct {

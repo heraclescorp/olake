@@ -22,6 +22,10 @@ type enrollmentCatalog struct {
 	implicit          bool
 }
 
+// Suppress LegacyStreamMetadata's marshaler so the enrollment append_mode override
+// remains explicit even when false. New selections always inherit sort_order.
+type enrollmentLegacyMetadata types.LegacyStreamMetadata
+
 func readEnrollmentDocument(path string) (map[string]json.RawMessage, string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -105,6 +109,7 @@ func (c *enrollmentCatalog) add(stream *types.Stream, defaults enrollmentDefault
 	if err := c.materializeImplicitSelection(); err != nil {
 		return err
 	}
+	stream.SupportsIcebergSortOrder = true
 	definition, err := json.Marshal(&types.ConfiguredStream{Stream: stream})
 	if err != nil {
 		return err
@@ -124,10 +129,10 @@ func (c *enrollmentCatalog) add(stream *types.Stream, defaults enrollmentDefault
 	}
 	if c.legacy {
 		metadata = struct {
-			types.LegacyStreamMetadata
+			enrollmentLegacyMetadata
 			AppendMode bool `json:"append_mode"`
 		}{
-			LegacyStreamMetadata: types.LegacyStreamMetadata{
+			enrollmentLegacyMetadata: enrollmentLegacyMetadata{
 				StreamName:         stream.Name,
 				Normalization:      *defaults.Normalization,
 				UpdateType:         string(defaults.UpdateType),

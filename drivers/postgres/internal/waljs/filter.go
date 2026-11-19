@@ -17,8 +17,9 @@ type ChangeFilter struct {
 	tables    map[string]types.StreamInterface
 	converter func(value interface{}, columnType string) (interface{}, error)
 	// columnType maps a source type name to the type its converted values have
-	columnType  func(columnType string) types.DataType
-	replayAfter map[string]pglogrepl.LSN
+	columnType    func(columnType string) types.DataType
+	replayAfter   map[string]pglogrepl.LSN
+	replayThrough *pglogrepl.LSN
 }
 
 func NewChangeFilter(typeConverter func(value interface{}, columnType string) (interface{}, error), columnType func(columnType string) types.DataType, streams ...types.StreamInterface) ChangeFilter {
@@ -47,6 +48,9 @@ func (c ChangeFilter) FilterWalJsChange(ctx context.Context, change []byte, OnFi
 	nextLSN, err := pglogrepl.ParseLSN(changes.NextLSN)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to parse received lsn: %w", err)
+	}
+	if c.replayThrough != nil && nextLSN > *c.replayThrough {
+		return nil, 0, fmt.Errorf("ordinary recovery transaction %s exceeds target %s", nextLSN, *c.replayThrough)
 	}
 
 	if len(changes.Change) == 0 {

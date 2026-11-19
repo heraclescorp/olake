@@ -17,6 +17,45 @@ Scope: source-based TOAST/equality branch. This is a design assessment, not impl
 - PostgreSQL `varchar[]` (OID 1015) uses the pgx array codec for text/binary CDC tuples and maps to the array conversion path, preserving escaped strings, empty arrays, NULL elements and SQL NULL arrays instead of treating the array literal as a generic string.
 - `third_party/iceberg-go` contains the production sources and focused RowDelta tests from Apache Iceberg Go v0.7.0, with LICENSE/NOTICE retained. Its scoped RowDelta patch permits explicit delete references to genuinely new files added in that same delta; it rejects duplicate/colliding paths and duplicate DVs and retains existence checks for committed targets, isolation checks, and snapshot/shape fences. Root and standalone driver modules use this local replacement. Remove the replacement only after an upstream release provides equivalent validated behavior.
 
+## Retained ordinary-sync reconciliation
+
+The worker/UI Reconcile action resets the same retained operation, not a new data sync. A recovery epoch first proves the old Temporal run terminal, seals admission, closes its positive fence, and retires the exact provider resource. Original `execution-result.json` evidence is never rewritten. Only controlled PostgreSQL-to-native-REST ordinary syncs with a frozen all-CDC/strict-CDC catalog, primary keys, complete GLOBAL backfill membership, and existing table checkpoints are supported; unsupported or inconsistent evidence stays locked.
+
+The connector requires paired `--ordinary-recovery-origin` and `--ordinary-recovery-result` flags plus a fresh controlled execution identity/fence and the retained launch identity. Origin hashes bind the source/destination files, legacy-or-split catalog, and an immutable complete baseline checkpoint. If an original execution receipt was observed when the origin was frozen, its exact bytes remain hash-bound; otherwise its digest is empty and later receipt publication does not change that origin. Source/destination files use raw SHA256. Catalog hashing frames each present file in fixed `streams.json`, `available_streams.json`, `selected_streams.json` order as filename, NUL, decimal byte length, NUL, raw bytes; mixed/partial catalog forms are rejected. Checkpoint canonicalization preserves large JSON numbers.
+
+S3 recovery initializes storage before reading its positive execution fence. The normal storage resolver validates that fence before downloading inputs or starting source/destination work. After exact old-runtime retirement, missing helper receipts or server-pin files do not prevent a fresh catalog-based recovery epoch. They do not prove settlement either: ownership remains retained until the new runtime confirms the common committed checkpoint and publishes complete settlement evidence.
+
+Live PostgreSQL server/slot identity is validated before destination mutations. Any existing standalone server pin remains binding. The connector preflights every selected table's committed checkpoint and recovery marker before writing any new barrier; prior markers must bind the same origin, original launch, source identity, stream, table UUID and frozen shape. Each fresh empty-append barrier commits that source identity in table metadata, guarded by UUID, current snapshot and default shape. The companion server-pin file is published after all barriers succeed and before CDC replay. Interrupted barrier preparation therefore recovers identity from committed catalog markers without relying on a helper receipt. Old ordinary artifacts do not prove historical server identity; the first recovery binding is to the validated live source. Barriers preserve data/deletes/history while making late old snapshot-fenced mutations conflict; a property-only marker is not a barrier.
+
+The recovery target is the deterministic maximum authoritative selected-table checkpoint, never a log-derived LSN. Missing or below-baseline table metadata fails closed. Tables behind that boundary replay only their own missing transaction prefix; completed writers publish a common checkpoint. Logical keepalives are not decoded transactions, crossing/future transactions are withheld, and slot/server/WAL-floor validation precedes replay. Existing source TOAST hydration retains latest-state semantics: values fetched from the current source can be newer than the bounded WAL target; missing/deleted/rekeyed rows still fail closed.
+
+Recovery is not unconditional replay of the last batch. Iceberg does not enforce primary-key uniqueness, and replaying older changes over a table already ahead can duplicate or regress rows unless the full upsert/delete sequence completes. Per-table committed CDC positions determine which transaction prefixes are skipped. Source WAL must cover every missing range, and the final boundary must be common to every selected table before acknowledgement. No table or checkpoint is reset merely because a prior client lost its commit response.
+
+Published common-checkpoint bytes bind both recovery proof and final runtime receipt; finalization hashes those persisted bytes instead of reserializing an unordered in-memory stream set. Recovery preserves OLake's existing soft-delete representation: deleted keys retain `_op_type = 'd'` tombstones, rather than being resurrected by older replayed changes.
+
+Acknowledgement follows writer drain and authoritative common-boundary confirmation. A separate identity/hash-bound recovery result and a new settled runtime receipt authorize the worker's atomic checkpoint-plus-settlement transaction. The schedule remains paused until explicit resume. If acknowledgement or artifact publication is interrupted, ownership remains retained; a fresh recovery epoch restores the immutable baseline, rechecks table/slot coverage, and rebarriers before recovery. Relaunching the failed runtime directly is unsupported. Never force an unknown receipt to settled, clear owner fields, or advance a slot based only on process exit or logs.
+
+## Creation-time table sort policy
+
+An optional catalog-wide sort default and explicit per-table overrides configure
+new normalized native Iceberg tables. The UI's opt-in `created_at ASC NULLS LAST`
+default skips streams without a compatible selected field. A missing per-stream
+override inherits that policy; an empty override explicitly requests unsorted
+tables. Custom ordered keys must identify distinct supported selected fields.
+
+The connector resolves source names to actual Iceberg schema field IDs and sets
+sort metadata at table creation. Existing tables retain their sort order even when
+the requested policy differs; changing the policy does not trigger clear, resync,
+source backfill or an existing-table migration. Sort-only policy changes therefore
+do not count as destructive catalog differences. Existing recovery shape checks
+remain intact, including their binding to actual sort metadata.
+
+This policy does not claim incoming Parquet files are physically sorted. Files
+written without sorting remain marked unsorted; S3 Tables auto/sort compaction can
+apply the declared table order later. Previously compacted history may require a
+separate rewrite. A new job pointing to an existing table keeps that table's layout;
+use a distinct namespace when a separate physical dataset is intended.
+
 ## Recommended first implementation: bounded microbatches
 
 Start with a configurable soft interval (for example 60–300 seconds), off by default until failure tests pass. Stop admitting the next transaction after the interval expires, finish the current transaction, flush all TOAST rows, drain/join destination writes, close/commit the batch, checkpoint/ack safely, then reopen writers and replication from the confirmed batch position within the same worker execution. Keep the original run target fixed so scheduling semantics do not change. A transaction or destination commit can exceed the interval: never cut one to meet a wall-clock deadline.

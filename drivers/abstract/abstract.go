@@ -308,6 +308,11 @@ func (a *AbstractDriver) ClearState(streams []types.StreamInterface) (*types.Sta
 }
 
 func (a *AbstractDriver) Read(ctx context.Context, pool *destination.WriterPool, backfillStreams, cdcStreams, incrementalStreams []types.StreamInterface) (err error) {
+	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+		if _, resync := types.ResyncFromContext(ctx); resync || len(backfillStreams) != 0 || len(incrementalStreams) != 0 || len(cdcStreams) == 0 {
+			return fmt.Errorf("ordinary recovery requires only the frozen nonempty CDC catalog")
+		}
+	}
 	_, resync := types.ResyncFromContext(ctx)
 	readCtx, cancel := context.WithCancel(ctx)
 	ctx = readCtx
