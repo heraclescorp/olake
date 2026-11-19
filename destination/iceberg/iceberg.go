@@ -608,6 +608,11 @@ func (w *nativeWriter) currentTable(ctx context.Context, state *nativeTableState
 	if err := validateOrdinaryRecoveryWriter(ctx, state, state.latest, w.stream); err != nil {
 		return nil, err
 	}
+	if w.cow != nil {
+		if err := validateNativeCOWTable(ctx, state.latest); err != nil {
+			return nil, err
+		}
+	}
 	return state.latest, nil
 }
 
@@ -699,11 +704,8 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 	w = &nativeWriter{table: tbl, cat: cat, coordinator: state, generation: state.generation, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), paths: make(map[string]struct{})}
 	w.releaseSession = release
 	if stream.Self().CopyOnWriteEnabled() {
-		w.cow, err = newNativeCOW(stream)
-		if err != nil {
-			return nil, nil, err
-		}
-		if err := w.prepareCopyOnWrite(ctx); err != nil {
+		w.cow = &nativeCOW{}
+		if err := validateNativeCOWTable(ctx, w.table); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -770,9 +772,6 @@ func (w *nativeWriter) validateFormat(ctx context.Context) error {
 	// migration, index reconciliation and recovery-state publication.
 	state := w.coordinator
 	if w.cow != nil {
-		if w.table.Metadata().Version() < 2 || w.table.Metadata().Version() > 3 {
-			return errors.New("copy-on-write requires Iceberg format v2 or v3")
-		}
 		return nil
 	}
 	version := w.table.Metadata().Version()
@@ -1123,9 +1122,6 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		}
 	}()
 	ctx = nativeCatalogContext(ctx, w.cat)
-	if w.cow != nil && !w.options.Backfill {
-		return w.closeCopyOnWrite(ctx, finalMetadataState)
-	}
 	if err := w.finishBackfillFiles(ctx); err != nil {
 		return fmt.Errorf("finish backfill Iceberg files: %w", err)
 	}
@@ -1134,7 +1130,7 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		return err
 	}
 	defer coordinated.mu.Unlock()
-	hasFiles := len(w.dataFiles) > 0 || len(w.positions) > 0
+	hasFiles := len(w.dataFiles) > 0 || len(w.positions) > 0 || w.cow != nil && w.cow.segments > 0
 	var lastConflict error
 	for attempt := range nativeCommitAttempts {
 		if err := ctx.Err(); err != nil {
@@ -1143,6 +1139,19 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		fresh, err := w.currentTable(ctx, coordinated)
 		if err != nil {
 			return err
+		}
+		if w.cow != nil {
+			baseShape, err := ordinaryRecoveryShape(w.table.Metadata())
+			if err != nil {
+				return err
+			}
+			shape, err := ordinaryRecoveryShape(fresh.Metadata())
+			if err != nil {
+				return err
+			}
+			if shape != baseShape {
+				return errors.New("copy-on-write table shape changed; refresh source schema before retry")
+			}
 		}
 		var indexBase int64
 		if hasFiles && w.indexThread != nil {
@@ -1200,7 +1209,11 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		if len(equalityFiles) > 0 {
 			logger.Infof("iceberg_equality_delete event=staged table=%q thread_id=%q attempt=%d base_snapshot=%d keys=%d delete_files=%d data_files=%d", strings.Join(fresh.Identifier(), "."), w.options.ThreadID, attempt+1, nativeSnapshotID(fresh), len(w.latest), len(equalityFiles), len(w.dataFiles))
 		}
-		if hasFiles {
+		if w.cow != nil && !w.options.Backfill {
+			if err := w.replayCopyOnWrite(ctx, tx); err != nil {
+				return err
+			}
+		} else if hasFiles {
 			delta := tx.NewRowDelta(apacheiceberg.Properties{"olake.thread-id": w.options.ThreadID})
 			delta.AddRows(w.dataFiles...).AddDeletes(equalityFiles...).AddDeletes(positionFiles...).RemoveDeletes(replaced...)
 			if err := delta.Commit(ctx); err != nil {
@@ -1242,6 +1255,9 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		// A successful metadata commit owns all staged files from now on.
 		// Never delete them, including when the local index checkpoint fails.
 		clear(w.paths)
+		if w.cow != nil {
+			w.cow.cleanup(false)
+		}
 		if hasFiles && w.indexThread != nil {
 			snapshot := committed.CurrentSnapshot()
 			parent := int64(0)

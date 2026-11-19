@@ -1,21 +1,21 @@
 # PostgreSQL time-based CDC commit triage
 
-Scope: PostgreSQL source-TOAST/native Iceberg. Copy-on-write uses complete-transaction microbatches; existing merge-on-read jobs retain their end-of-run commit lifecycle.
+Scope: PostgreSQL source-TOAST/native Iceberg. COW reuses the existing end-of-run lifecycle; the time-based checkpoint sections below are design assessment, not implemented periodic checkpointing.
 
 ## Current behavior
 
 - `waljs.NewReplicator` captures `IDENTIFY_SYSTEM.XLogPos` once as the run target. `pgoutput.StreamChanges` returns after reaching it outside an open transaction.
 - Rows flow through source TOAST buffering and asynchronous `WriterThread.Push`/flush. A "successfully wrote" batch log is not proof of Iceberg snapshot publication.
-- Without active COW, `AbstractDriver.streamChanges` returns a single final WAL state. Its deferred `handleWriterCleanup` joins all writers, closing them with that state. Only afterwards does `PostCDC` acknowledge the slot and update in-memory global state. Protocol/worker then persist the run state.
-- Merge-on-read `nativeWriter.Close` completes files and publishes configured equality/position/DV deletes with `olake_2pc`. COW instead calls the SDK's exact-key filtered `Transaction.Overwrite`, publishing replacement data files and checkpoint together. Snapshot backfill retains the append-only writer and chunk-completion markers; it does not rewrite prior chunks or create a row index.
-- COW distinguishes advertised WAL end from processed complete-COMMIT positions. Progress logs and batch uploads do not authorize acknowledgement. Regular COW microbatches keep the replication socket open; ordinary recovery and atomic resync retain terminal-only acknowledgement.
+- `AbstractDriver.streamChanges` returns a single final WAL state. Its deferred `handleWriterCleanup` joins all writers, closing them with that state. Only afterwards does `PostCDC` acknowledge the slot and update in-memory global state. Protocol/worker then persist the run state.
+- MOR `nativeWriter.Close` is terminal: completes files, writes same-write superseded-row position deletes (v2) or deletion vectors (v3), and publishes them with the original immutable data files and `olake_2pc` in one table transaction. It does not reread/rewrite staged Parquet data or remap its ordinals. It cannot just be called every minute while Push continues.
+- Keepalive replies send the original confirmed position. The new 30-second progress logs observe decoder positions only; they do not introduce durable checkpointing.
 - Destination buffers independently track original source bytes and approximate decoded payload bytes. Hydrated values count toward the payload budget without inflating WAL-byte statistics; indivisible oversized rows flush alone. The source hydrator still materializes up to 128 fetched rows before emission, so this is not a strict process-memory cap.
-- Backfill/MOR native Parquet writes check page/dictionary targets after each value, including delete-file writes. The 1 MiB targets remain soft: a single large value can exceed the unchanged reader limits. COW overwrite reads/writes use the SDK's existing defaults and table properties, not these per-value writer controls.
+- Native Parquet writes check page/dictionary targets after each value, including backfill and delete-file writes. The 1 MiB targets remain soft: a single large value can exceed the unchanged reader limits. Per-value checks trade throughput for bounded multi-value page overshoot.
 - Ordinary CDC completion closes its replication connection even after cancellation or fence rejection, using a bounded uncanceled teardown context without authorizing acknowledgement. Resync retains separate connection ownership.
 - `iceberg_equality_delete` logs actual nonempty equality-delete file usage: `staged` records attempt-local files before commit, `commit_confirmed` records successful public table publication, and `private_resync_commit` records only a private resync-stage commit. Events include table/thread, attempt, snapshot, distinct key count and delete/data file counts, never key values. These are per-table events, not global WAL acknowledgement; retries can emit multiple staging events.
 - Non-FULL replica identity emits INFO when the decoder marks omitted TOAST values for configured recovery, not a data-loss warning. Without recovery it emits WARN that affected updates fail; the decoder's fail-closed behavior is unchanged. Relation metadata does not prove an individual value was omitted or successfully recovered.
 - PostgreSQL `varchar[]` (OID 1015) uses the pgx array codec for text/binary CDC tuples and maps to the array conversion path, preserving escaped strings, empty arrays, NULL elements and SQL NULL arrays instead of treating the array literal as a generic string.
-- `third_party/iceberg-go` contains Apache Iceberg Go v0.7.0 sources with LICENSE/NOTICE retained. Scoped RowDelta fixes validate same-delta references. COW uses the existing filtered `Overwrite` and concurrency options, without COW-specific SDK extensions. Root and standalone drivers retain the local replacement for the existing fixes until an upstream release supplies equivalent behavior.
+- `third_party/iceberg-go` contains the production sources and focused RowDelta tests from Apache Iceberg Go v0.7.0, with LICENSE/NOTICE retained. Its scoped RowDelta patch permits explicit delete references to genuinely new files added in that same delta; it rejects duplicate/colliding paths and duplicate DVs and retains existence checks for committed targets, isolation checks, and snapshot/shape fences. Root and standalone driver modules use this local replacement. Remove the replacement only after an upstream release provides equivalent validated behavior.
 
 ## Retained ordinary-sync reconciliation
 
@@ -35,58 +35,43 @@ Published common-checkpoint bytes bind both recovery proof and final runtime rec
 
 Acknowledgement follows writer drain and authoritative common-boundary confirmation. A separate identity/hash-bound recovery result and a new settled runtime receipt authorize the worker's atomic checkpoint-plus-settlement transaction. The schedule remains paused until explicit resume. If acknowledgement or artifact publication is interrupted, ownership remains retained; a fresh recovery epoch restores the immutable baseline, rechecks table/slot coverage, and rebarriers before recovery. Relaunching the failed runtime directly is unsupported. Never force an unknown receipt to settled, clear owner fields, or advance a slot based only on process exit or logs.
 
-## Index-free copy-on-write
+## Index-free copy-on-write writer
 
-Selected stream metadata accepts `merge_strategy: "copy-on-write"` or
-`"merge-on-read"`. Omission retains MOR for saved/low-level configurations. New
-eligible PostgreSQL/native-Iceberg job selections in the UI explicitly select COW;
-editing an existing job does not switch its mode. MOR remains available for
-write-heavy/scattered updates when consumers support its delete representation.
-An Iceberg table property alone cannot change OLake's explicit RowDelta calls.
+Selected-stream `merge_strategy: "copy-on-write"` uses the SDK's stock filtered
+`Transaction.Overwrite`, matching OLake's existing canonical string `_olake_id`.
+MOR remains explicit; omitted strategy preserves saved/CLI behavior. New eligible
+PostgreSQL/native normalized upsert selections in the UI explicitly default to COW.
+Append ignores the saved policy. Matching connector/UI builds are required.
 
-COW requires normalized CDC/strict-CDC, actual selected nonnull source primary
-keys, compatible exact-filter key types, pgoutput, and source TOAST hydration.
-Primary-key-changing updates and destination/index TOAST recovery fail closed.
-Fresh PostgreSQL discovery advertises `supports_iceberg_copy_on_write`; runtime
-validation checks the actual source/configuration, not trust in that saved marker.
+For composite keys, the existing `_olake_id` hashes source values joined by `|`.
+This encoding is not collision-proof: values containing that delimiter can form
+the same encoded input. COW inherits this MOR identity limitation; validate the
+source keys before rollout. Iceberg does not enforce primary-key uniqueness.
 
-The writer deduplicates bounded incoming typed segments and replays them in source
-order through filtered SDK Overwrite calls in one fenced catalog transaction.
-Composite predicates match exact tuples, including explicit nonnull guards;
-unrelated rows, including null-key bystanders, are preserved. Later segments win
-over earlier versions. A large transaction can spill without acknowledging any
-partial source transaction. Replay uses Arrow IPC in 0600 files under 0700 temporary
-directories because payloads can contain sensitive financial/TOAST values. There
-is no persistent table-wide key-to-file/position index or index rebuild in COW.
+The existing terminal `nativeWriter.Close` transaction publishes data and
+`olake_2pc` together, using its existing snapshot/shape fences, conflict refresh
+and unknown-outcome protocol. Initial snapshots keep the existing append/chunk
+path. COW adds no source transaction controls, periodic checkpoints, mid-run state
+publication or recovery lifecycle. Quiet tables use existing metadata-only commits.
 
-New COW tables use format v2, even if an inactive saved delete preference is DV.
-Existing v3 metadata is not downgraded. A clean current snapshot contains data
-files only; historical snapshots can retain deletes. OLake source-delete
-tombstones (`_op_type = 'd'`) remain ordinary after-images and require the existing
-consumer filtering convention. Data-only snapshots do not prove a particular
-engine's catalog or table-format compatibility.
+Each existing WriterThread buffer is deduplicated by canonical ID and staged as
+typed Arrow IPC; segments replay in source order, so later versions win. Private
+0600 files under 0700 directories may contain sensitive financial/TOAST values;
+they bound incoming memory and permit recreating consumed readers on commit retry.
+Unknown publication retains replay input. COW never opens a persistent row index;
+destination TOAST/index recovery is unsupported, so use source TOAST hydration.
 
-Existing live equality, position, or Puffin deletes require explicit
-`cow_options.materialize_existing_deletes: true`. Otherwise setup fails before
-row writes. Authorized setup reads the complete current logical view with deletes
-applied, then uses the SDK's fenced pure-rewrite builder to replace data and retire
-all live delete entries. It preserves checkpoint, UUID, schema, sort/partition
-metadata and applicable v3 row lineage; it does not reread PostgreSQL, reset the
-slot, or physically remove retained history. The committed snapshot is checked
-again for remaining live deletes. This permission is not a performance promise.
+Existing live equality/position/Puffin deletes fail before mutation: clean them
+through a separate explicit maintenance rewrite before switching. This writer
+does not migrate existing tables, reset checkpoints/slots or reread the source.
+New COW tables use v2; existing v3, UUID, schema and sort/partition metadata remain
+unchanged. Source deletes retain the existing OLake tombstone representation.
 
-Known publication conflicts refresh metadata/checkpoint and rebuild the overwrite
-from private typed input; stale file replacements are never blindly retried.
-Uncertain publication retains both private replay and destination artifacts and
-keeps execution ownership unresolved. Authoritative checkpoint/batch identity
-recognizes landed work. No cleanup may delete potentially committed files.
-
-SDK overwrite outputs are not enumerated by OLake. Files from rejected or
-interrupted overwrite attempts are left for orphan-file lifecycle cleanup rather
-than guessed at or deleted by OLake. This can retain unreferenced objects and
-incur storage cost; no orphan-cleanup job or AWS maintenance setting is configured
-by selecting COW. Explicitly owned migration outputs retain their existing safe
-cleanup rules.
+No SDK changes are required beyond the base's existing patches. Overwrite output
+paths are not enumerated or deleted by OLake; orphan maintenance owns rejected
+attempt artifacts. Incoming buffer limits do not cap SDK survivor-read/write
+memory or guarantee latency. Pilot representative updates and reader versions; no
+production integration or performance result is claimed.
 
 ## Creation-time table sort policy
 
@@ -109,56 +94,39 @@ apply the declared table order later. Previously compacted history may require a
 separate rewrite. A new job pointing to an existing table keeps that table's layout;
 use a distinct namespace when a separate physical dataset is intended.
 
-## Transaction-aligned COW microbatches
+## Recommended first implementation: bounded microbatches
 
-`cow_options` defaults are 300 seconds, 100,000 incoming rows, 67,108,864 decoded
-payload bytes and rewrite concurrency 2. Interval, row/byte budgets and concurrency
-must be positive integers; interval seconds cannot exceed 9,223,372,036. These are
-soft limits on incoming staging/materialization, not a latency or total-process-
-memory guarantee. SDK overwrite internals use their existing defaults/table
-properties; these options do not independently cap survivor-read batches, output
-queues, row groups or partition fanout. Concatenation can temporarily retain
-input/output, hydration buffers independently, and an indivisible large row can
-exceed the byte target without truncation.
+Start with a configurable soft interval (for example 60–300 seconds), off by default until failure tests pass. Stop admitting the next transaction after the interval expires, finish the current transaction, flush all TOAST rows, drain/join destination writes, close/commit the batch, checkpoint/ack safely, then reopen writers and replication from the confirmed batch position within the same worker execution. Keep the original run target fixed so scheduling semantics do not change. A transaction or destination commit can exceed the interval: never cut one to meet a wall-clock deadline.
 
-After the next complete COMMIT and source-hydration barrier, a due batch blocks
-the producer, drains/closes every selected writer at the same explicit checkpoint,
-including quiet tables, and reopens from current metadata. It atomically writes
-the full GLOBAL state with membership using local fsync/rename and, when remote
-storage is configured, verifies uploaded state bytes. Only then can the fenced
-source acknowledgement advance. Terminal metadata can retire overlap flags even
-when its source LSN already committed in a microbatch.
+This reuses terminal Close instead of introducing a new concurrent FlushAndCommit API. Costs: repeated replication startup, relation/schema initialization, writer setup, catalog reads and table-index reconciliation. Equality mode avoids physical-index rebuilds but not catalog overhead. Commit all selected tables initially for a uniform boundary; optimize to touched tables only once per-table high-watermark recovery exists. With ~1,081 tables, even a one-minute interval could mean ~64,860 table metadata commits/hour; commit duration can dominate. No performance benchmark has established the best interval.
 
-The original finite run target remains fixed. Idle periods do not create empty
-timer commits; a transaction or rewrite can exceed the interval. Configure
-`wal_sender_timeout` for the longest checkpoint pause (or disable it), since the
-interval is not an upper bound on rewrite duration.
+Timer design: record a pending checkpoint request, stop at the next COMMIT. Wake a blocked receive with a separate short polling deadline while preserving the configured no-data/initial wait deadline. If there is no new completed transaction, no-op the checkpoint. Do not cancel the entire execution or treat a network timeout as a successful batch end. Source hydration, schema notifications and cancellation must retain their fail-closed ordering.
 
-All-table boundaries preserve a uniform acknowledged watermark, but Iceberg
-publication remains table-atomic, not cross-table atomic. A partial/unknown batch
-does not authorize source acknowledgement or owner release. Existing retained
-ordinary recovery uses the immutable baseline and deterministic per-table
-high-watermarks to complete missing transaction prefixes; bounded recovery and
-atomic resync do not emit normal intermediate COW checkpoints.
+## Required correctness work (not optional)
 
-Every boundary incurs catalog/writer setup overhead, even for quiet tables. Mixed
-jobs can still reconcile MOR indexes; COW tables never do. Large transactions
-split into replay segments may rewrite a hot file more than once. Smaller files
-reduce rewrite granularity but increase metadata/object overhead. No AWS S3 Tables
-maintenance settings are changed by selecting COW. Pilot representative update
-patterns before broad rollout; no throughput or best-interval benchmark is claimed.
+1. **Define a source boundary event.** The current callback carries rows/schema, not transaction begin/commit or checkpoint barriers. Expose an explicit complete-transaction/batch result with a known processed LSN. `decoded_commit_lsn` in diagnostics is not itself safe: TOAST and writer queues can still contain rows.
+2. **Do not use advertised WAL end as a commit boundary.** Current pgoutput keepalives assign `ServerWALEnd` to `ClientXLogPos`; isolate server WAL end from actually decoded/processed transaction positions. Review termination and sparse-publication behavior with live PostgreSQL tests before reusing that field in timers. Progress logs intentionally keep those values separate without changing current replication behavior.
+3. **Barrier before durability.** Finish hydration, stop the producer, join all writes, publish destination data and each table's recovery LSN, and validate success for the entire boundary. Never ack on read, batch upload, timer firing, or one table finishing.
+4. **Partial multi-table commits.** Iceberg offers table-level, not cross-table atomic commits. Current ordinary recovery picks one ahead metadata LSN while iterating a Go map and skips ahead tables as a group. Multiple ahead positions can therefore not be assumed safe for rolling checkpoints. Generalize deterministic per-table high-watermarks/replay filtering (or a durable batch manifest) before enabling them. Existing resync has per-table replay boundaries but is a different staged-publication lifecycle, not a drop-in solution.
+5. **Durable handoff.** Persist the full batch checkpoint and completion markers to the execution's authoritative artifact store, with checksum/identity/fencing, before acknowledging newer WAL where possible. Recovery must handle both destination-ahead-of-state and state-ahead-of-slot windows. Existing normal validation expects exact slot/state equality, and PostCDC currently acks before state durability; changing just the ordering creates a different mismatch window. Resolve that protocol explicitly. A worker DB write only at final retirement is insufficient for mid-run crash recovery unless startup selects the latest verified artifact.
+6. **Atomic artifacts and cancellation.** Use atomic local replacement plus verified remote publication. Preserve the most recent committed boundary on cancellation; never let cleanup replace it with the initial `{}` input or a partially written candidate. Fix/verify the historical empty-state handoff separately.
+7. **Same worker execution.** Distinguish committing a microbatch from releasing the job owner, closing source execution fences, or publishing terminal retirement receipts. Those happen only when the whole worker run settles. Retain resync-specific acknowledgement/publication restrictions.
+8. **Writer restart.** Reset per-batch counters, buffered files, same-key overlay, pending equality/position deletes and source hydration state; keep table UUID, generation, filters, dedup-insert overlap state and configured schema behavior correct. Ensure quiet tables and explicit source NULLs are handled.
 
-## Verification and rollout limits
+## Delivery slices
 
-Focused local-file/Hadoop-catalog cases exercise exact composite keys above 2^53,
-repeated updates, null bystanders, every delete-file kind, same-file compaction
-conflicts, lost commit responses, typed decimal/binary/timestamp replay, partition
-evolution, backfill chunks, and same-LSN terminal metadata. Source-focused cases
-exercise quiet-table/no-ACK failure, transaction controls, source hydration and
-complete checkpoint serialization. A local UI control smoke exercises the new
-default, permission/options, MOR preference restoration and index derivation.
+- A: periodic progress instrumentation (implemented separately, no checkpoint semantics change).
+- B: transaction barrier + soft batch deadline + bounded receive wakeup tests; no periodic ack.
+- C: destination drain/close/reopen and per-table partial-commit recovery, uniform logical boundary tests.
+- D: atomic verified mid-run artifact + slot/state reconciliation + worker retry/cleanup semantics.
+- E: opt-in end-to-end failure injection and performance trials; only then rollout/config defaults.
 
-These are not live PostgreSQL/S3 Tables/Snowflake/ClickHouse integration or
-performance results. Real pgoutput, remote-state failure injection, WAL retention,
-engine/version compatibility, catalog throttling and rewrite amplification still
-require rollout-environment verification. Keep the first pilot table small.
+This is a connector + destination + worker lifecycle change, not a logging/config-only patch. A continuously reusable destination Commit API could reduce reopen overhead later, but is a larger first implementation.
+
+## Acceptance tests
+
+- Real pgoutput: interval between transactions, inside a long transaction, sparse publication/no relevant rows, idle source, blocked hydration/writer, reconnect and bounded original run target.
+- Crash at every boundary: before/after table N commit, remote state publication, slot ack, worker persistence; retry must neither skip changes nor lose committed progress.
+- Multiple tables with different ahead LSNs, unchanged/quiet tables, conflicting compaction, same-PK repeated updates, equality v2/v3 plus historical DVs, explicit NULL vs missing TOAST.
+- Cancellation, unknown remote outcome, stale worker ownership/fences, and atomic resync coexistence.
+- Measure commit latency, snapshots/hour, catalog throttling, small-file count, repeat setup/index time, throughput and actual replay window. WAL address-byte lag is not selected-row or wall-clock progress.

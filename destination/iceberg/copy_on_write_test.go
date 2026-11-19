@@ -29,9 +29,6 @@ func nativeCOWFixture(t *testing.T, mode types.UpdateType) (*Config, *types.Conf
 	stream.Stream.UpsertField("tenant", types.String, false, false)
 	stream.StreamMetadata.AppendMode = new(false)
 	stream.StreamMetadata.MergeStrategy = types.CopyOnWrite
-	options := types.DefaultCOWOptions()
-	options.MaxBatchRows, options.MaxBatchBytes = 2, 2048
-	stream.StreamMetadata.CowOptions = &options
 	return cfg, stream, cat
 }
 
@@ -42,7 +39,7 @@ func nativeCOWRecord(label, operation string, key int64, tenant string, value in
 }
 
 // Tiny, real local-file/Hadoop-catalog smoke; no services or production access.
-func TestNativeCopyOnWriteBoundedExactTuples(t *testing.T) {
+func TestNativeCopyOnWriteCanonicalIDsAcrossFlushes(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeCOWFixture(t, types.UpdateTypeDeletionVector)
 	seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "seed", true)
@@ -50,13 +47,16 @@ func TestNativeCopyOnWriteBoundedExactTuples(t *testing.T) {
 	require.NoError(t, seed.Write(ctx, []types.RawRecord{
 		nativeCOWRecord("1a", "r", 9007199254740993, "a", 1), nativeCOWRecord("1b", "r", 9007199254740993, "b", 2),
 		nativeCOWRecord("2a", "r", 9007199254740994, "a", 3), nativeCOWRecord("2b", "r", 9007199254740994, "b", 4),
+		nativeCOWRecord("", "r", 0, "", 5),
 	}))
 	require.NoError(t, seed.Close(ctx, map[string]any{"state": "start"}))
 	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "cdc", false)
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{
-		nativeCOWRecord("first", "u", 9007199254740993, "a", 10), nativeCOWRecord("latest", "u", 9007199254740993, "a", 11),
-		nativeCOWRecord("new2b", "u", 9007199254740994, "b", 40), nativeCOWRecord("tombstone", "d", 9007199254740993, "a", 12),
+		nativeCOWRecord("1a", "u", 9007199254740993, "a", 10), nativeCOWRecord("1a", "u", 9007199254740993, "a", 11),
+		nativeCOWRecord("2b", "u", 9007199254740994, "b", 40),
+		nativeCOWRecord("", "u", 0, "", 50),
 	}))
+	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeCOWRecord("1a", "d", 9007199254740993, "a", 12)}))
 	privateDirectory := writer.cow.directory
 	info, err := os.Stat(privateDirectory)
 	require.NoError(t, err)
@@ -64,18 +64,18 @@ func TestNativeCopyOnWriteBoundedExactTuples(t *testing.T) {
 	info, err = os.Stat(filepath.Join(privateDirectory, "0.arrow"))
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0600), info.Mode().Perm())
-	require.Equal(t, map[string]int64{"1a": 1, "1b": 2, "2a": 3, "2b": 4}, nativeVisibleValues(t, writer.table), "Write is private until Close")
+	require.Equal(t, map[string]int64{"1a": 1, "1b": 2, "2a": 3, "2b": 4, "": 5}, nativeVisibleValues(t, writer.table), "Write is private until Close")
 	require.NoError(t, writer.Close(ctx, map[string]any{"state": "end", "dedup_inserts": false}))
-	require.Equal(t, map[string]int64{"tombstone": 12, "1b": 2, "2a": 3, "new2b": 40}, nativeVisibleValues(t, writer.table))
-	deletes, _, err := nativeCOWLiveFiles(ctx, writer.table)
+	require.Equal(t, map[string]int64{"1a": 12, "1b": 2, "2a": 3, "2b": 40, "": 50}, nativeVisibleValues(t, writer.table))
+	hasDeletes, err := nativeCOWHasDeletes(ctx, writer.table)
 	require.NoError(t, err)
-	require.Empty(t, deletes)
+	require.False(t, hasDeletes)
 	_, err = os.Stat(privateDirectory)
 	require.True(t, os.IsNotExist(err))
 	before := nativeSnapshotID(writer.table)
 	quiet := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "quiet", false)
 	require.NoError(t, quiet.Close(ctx, map[string]any{"state": "quiet-end", "dedup_inserts": true}))
-	require.NotEqual(t, before, nativeSnapshotID(quiet.table), "quiet checkpoint is snapshot-fenced")
+	require.Equal(t, before, nativeSnapshotID(quiet.table), "quiet checkpoint uses the common property-only commit")
 	require.Contains(t, quiet.table.Properties()[nativeRecoveryProperty], "quiet-end")
 	terminal := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "terminal", false)
 	require.NoError(t, terminal.Close(ctx, map[string]any{"state": "quiet-end", "dedup_inserts": false}))
@@ -96,12 +96,12 @@ func TestNativeCopyOnWritePreservesNullBystanders(t *testing.T) {
 	require.NoError(t, seed.Close(ctx, map[string]any{"state": "start"}))
 	stream.StreamMetadata.MergeStrategy = types.CopyOnWrite
 	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "cow", false)
-	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeCOWRecord("replacement", "u", 1, "a", 2)}))
+	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeCOWRecord("old", "u", 1, "a", 2)}))
 	require.NoError(t, writer.Close(ctx, map[string]any{"state": "end"}))
-	require.Equal(t, map[string]int64{"replacement": 2, "null-bystander": 8}, nativeVisibleValues(t, writer.table))
+	require.Equal(t, map[string]int64{"old": 2, "null-bystander": 8}, nativeVisibleValues(t, writer.table))
 }
 
-func TestNativeCopyOnWriteMaterializesEveryDeleteKind(t *testing.T) {
+func TestNativeCopyOnWriteRejectsEveryLiveDeleteKindWithoutMutation(t *testing.T) {
 	for _, mode := range []types.UpdateType{types.UpdateTypeEquality, types.UpdateTypePosition, types.UpdateTypeDeletionVector} {
 		t.Run(string(mode), func(t *testing.T) {
 			ctx := context.Background()
@@ -121,22 +121,47 @@ func TestNativeCopyOnWriteMaterializesEveryDeleteKind(t *testing.T) {
 			originalShape, err := ordinaryRecoveryShape(old.table.Metadata())
 			require.NoError(t, err)
 			stream.StreamMetadata.MergeStrategy = types.CopyOnWrite
-			_, _, err = newNativeWriter(ctx, cfg, stream, &destination.Options{ThreadID: "not-authorized"}, cat, nil)
-			require.ErrorContains(t, err, "materialize_existing_deletes=true")
-			stream.StreamMetadata.CowOptions.MaterializeExistingDeletes = true
-			cow := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "authorized", false)
-			defer cow.Abort()
-			require.Equal(t, originalCheckpoint, cow.table.Properties()[nativeRecoveryProperty])
-			require.Equal(t, old.table.Metadata().TableUUID(), cow.table.Metadata().TableUUID())
-			shape, err := ordinaryRecoveryShape(cow.table.Metadata())
+			before := nativeSnapshotID(old.table)
+			_, _, err = newNativeWriter(ctx, cfg, stream, &destination.Options{ThreadID: "requires-cleanup"}, cat, nil)
+			require.ErrorContains(t, err, "separate explicit maintenance rewrite")
+			fresh, err := cat.LoadTable(ctx, old.table.Identifier())
+			require.NoError(t, err)
+			require.Equal(t, before, nativeSnapshotID(fresh))
+			require.Equal(t, old.table.MetadataLocation(), fresh.MetadataLocation())
+			require.Equal(t, originalCheckpoint, fresh.Properties()[nativeRecoveryProperty])
+			require.Equal(t, old.table.Metadata().TableUUID(), fresh.Metadata().TableUUID())
+			shape, err := ordinaryRecoveryShape(fresh.Metadata())
 			require.NoError(t, err)
 			require.Equal(t, originalShape, shape)
-			require.Equal(t, map[string]int64{"a": 3, "b": 2}, nativeVisibleValues(t, cow.table))
-			deletes, _, err := nativeCOWLiveFiles(ctx, cow.table)
+			require.Equal(t, map[string]int64{"a": 3, "b": 2}, nativeVisibleValues(t, fresh))
+			hasDeletes, err := nativeCOWHasDeletes(ctx, fresh)
 			require.NoError(t, err)
-			require.Empty(t, deletes)
+			require.True(t, hasDeletes)
 		})
 	}
+}
+
+func TestNativeCopyOnWriteRejectsConcurrentLiveDeletes(t *testing.T) {
+	ctx := context.Background()
+	cfg, stream, cat := nativeCOWFixture(t, types.UpdateTypeEquality)
+	seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "seed", true)
+	require.NoError(t, seed.Write(ctx, []types.RawRecord{nativeCOWRecord("a", "r", 1, "a", 1)}))
+	require.NoError(t, seed.Close(ctx, map[string]any{"state": "seed"}))
+	cow := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "cow", false)
+	require.NoError(t, cow.Write(ctx, []types.RawRecord{nativeCOWRecord("a", "u", 1, "a", 9)}))
+	directory := cow.cow.directory
+	stream.StreamMetadata.MergeStrategy = types.MergeOnRead
+	mor := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "mor", false)
+	require.NoError(t, mor.Write(ctx, []types.RawRecord{nativeCOWRecord("a", "u", 1, "a", 2)}))
+	require.NoError(t, mor.Close(ctx, map[string]any{"state": "mor"}))
+	require.ErrorContains(t, cow.Close(ctx, map[string]any{"state": "must-not-land"}), "separate explicit maintenance rewrite")
+	fresh, err := cat.LoadTable(ctx, mor.table.Identifier())
+	require.NoError(t, err)
+	require.Equal(t, mor.table.MetadataLocation(), fresh.MetadataLocation())
+	require.Equal(t, mor.table.Properties()[nativeRecoveryProperty], fresh.Properties()[nativeRecoveryProperty])
+	require.Equal(t, map[string]int64{"a": 2}, nativeVisibleValues(t, fresh))
+	_, err = os.Stat(directory)
+	require.True(t, os.IsNotExist(err), "known rejection removes private replay input")
 }
 
 func TestNativeCopyOnWriteRefreshesAfterSameFileCompaction(t *testing.T) {
@@ -147,7 +172,7 @@ func TestNativeCopyOnWriteRefreshesAfterSameFileCompaction(t *testing.T) {
 	require.NoError(t, seed.Close(ctx, map[string]any{"state": "start"}))
 	fault := &nativeCommitFaultCatalog{Catalog: realCatalog}
 	writer := openNativeTestWriter(ctx, t, cfg, stream, fault, nil, "cow", false)
-	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeCOWRecord("updated", "u", 1, "a", 9)}))
+	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeCOWRecord("a", "u", 1, "a", 9)}))
 	fault.fault = func(ctx context.Context, id table.Identifier, _ []table.Requirement, _ []table.Update) (bool, error) {
 		fault.fault = nil
 		fresh, err := realCatalog.LoadTable(ctx, id)
@@ -167,7 +192,7 @@ func TestNativeCopyOnWriteRefreshesAfterSameFileCompaction(t *testing.T) {
 		return true, table.ErrCommitFailed
 	}
 	require.NoError(t, writer.Close(ctx, map[string]any{"state": "end"}))
-	require.Equal(t, map[string]int64{"updated": 9, "b": 2}, nativeVisibleValues(t, writer.table))
+	require.Equal(t, map[string]int64{"a": 9, "b": 2}, nativeVisibleValues(t, writer.table))
 }
 
 func TestNativeCopyOnWriteUnknownCommitRetainsReplay(t *testing.T) {
@@ -193,11 +218,6 @@ func TestNativeCopyOnWriteUnknownCommitRetainsReplay(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, map[string]int64{"landed": 7}, nativeVisibleValues(t, fresh))
 	require.Contains(t, fresh.Properties()[nativeRecoveryProperty], "landed-boundary")
-	retry := openNativeTestWriter(ctx, t, cfg, stream, realCatalog, nil, "restarted-thread", false)
-	require.NoError(t, retry.Write(ctx, []types.RawRecord{nativeCOWRecord("must-not-reapply", "u", 1, "a", 99)}))
-	require.NoError(t, retry.Close(ctx, map[string]any{"state": "landed-boundary"}))
-	require.Equal(t, nativeSnapshotID(fresh), nativeSnapshotID(retry.table))
-	require.Equal(t, map[string]int64{"landed": 7}, nativeVisibleValues(t, retry.table))
 }
 
 func TestNativeCopyOnWriteTypedSpillFidelity(t *testing.T) {
@@ -212,9 +232,7 @@ func TestNativeCopyOnWriteTypedSpillFidelity(t *testing.T) {
 	batch, err := nativeArrowRecord(schema, []map[string]any{{"id": int64(9007199254740993), "money": "123456789012345678901234.5678", "payload": payload, "at": at}})
 	require.NoError(t, err)
 	defer batch.Release()
-	_, stream, _ := nativeCOWFixture(t, types.UpdateTypeEquality)
-	spool, err := newNativeCOW(stream)
-	require.NoError(t, err)
+	spool := &nativeCOW{}
 	defer spool.cleanup(false)
 	require.NoError(t, spool.spill(batch))
 	file, err := os.Open(filepath.Join(spool.directory, "0.arrow"))
@@ -229,8 +247,6 @@ func TestNativeCopyOnWriteTypedSpillFidelity(t *testing.T) {
 	require.Equal(t, "123456789012345678901234.5678", replayed.Column(1).(*array.Decimal128).Value(0).ToString(4))
 	require.Equal(t, payload, replayed.Column(2).(*array.Binary).Value(0))
 	require.Equal(t, at.UnixMicro(), int64(replayed.Column(3).(*array.Timestamp).Value(0)))
-	_, err = nativeCOWKey(schema, []string{"id"}, map[string]any{"id": float64(9007199254740992)})
-	require.ErrorContains(t, err, "exact integer")
 }
 
 func TestNativeCopyOnWritePreservesRowsAcrossPartitionEvolution(t *testing.T) {
@@ -247,13 +263,13 @@ func TestNativeCopyOnWritePreservesRowsAcrossPartitionEvolution(t *testing.T) {
 	evolved, err := tx.Commit(ctx)
 	require.NoError(t, err)
 	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "evolved", false)
-	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeCOWRecord("new-a", "u", 1, "a", 10)}))
+	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeCOWRecord("a", "u", 1, "a", 10)}))
 	require.NoError(t, writer.Close(ctx, map[string]any{"state": "after-evolution"}))
-	require.Equal(t, map[string]int64{"new-a": 10, "b": 2, "c": 3, "d": 4}, nativeVisibleValues(t, writer.table))
+	require.Equal(t, map[string]int64{"a": 10, "b": 2, "c": 3, "d": 4}, nativeVisibleValues(t, writer.table))
 	require.Equal(t, evolved.Metadata().PartitionSpec(), writer.table.Metadata().PartitionSpec())
-	deletes, _, err := nativeCOWLiveFiles(ctx, writer.table)
+	hasDeletes, err := nativeCOWHasDeletes(ctx, writer.table)
 	require.NoError(t, err)
-	require.Empty(t, deletes)
+	require.False(t, hasDeletes)
 }
 
 func TestNativeCopyOnWriteBackfillPreservesEveryChunk(t *testing.T) {
@@ -271,7 +287,7 @@ func TestNativeCopyOnWriteBackfillPreservesEveryChunk(t *testing.T) {
 	require.ElementsMatch(t, []string{"first-chunk", "second-chunk"}, metadata.FullRefreshCommittedIDs)
 }
 
-func TestNativeCopyOnWriteEmptyTablePublishesFencedCheckpoint(t *testing.T) {
+func TestNativeCopyOnWriteEmptyTablePublishesCommonCheckpoint(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeCOWFixture(t, types.UpdateTypeDeletionVector)
 	backfill := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "empty-backfill", true)
@@ -279,7 +295,7 @@ func TestNativeCopyOnWriteEmptyTablePublishesFencedCheckpoint(t *testing.T) {
 	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "first-checkpoint", false)
 	before := nativeSnapshotID(writer.table)
 	require.NoError(t, writer.Close(ctx, map[string]any{"state": `{"lsn":"0/100"}`, "dedup_inserts": false}))
-	require.NotEqual(t, before, nativeSnapshotID(writer.table))
+	require.Equal(t, before, nativeSnapshotID(writer.table), "empty checkpoint uses the common property-only commit")
 	var metadata types.MetadataState
 	require.NoError(t, json.Unmarshal([]byte(writer.table.Properties()[nativeRecoveryProperty]), &metadata))
 	require.Equal(t, `{"lsn":"0/100"}`, metadata.State)

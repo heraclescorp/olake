@@ -368,13 +368,6 @@ func (w *nativeWriter) AlterSourceColumns(ctx context.Context, added []*nativeSo
 	if err := w.writable(); err != nil {
 		return err
 	}
-	if w.cow != nil {
-		for _, name := range dropped {
-			if slices.Contains(w.cow.keys, name) {
-				return fmt.Errorf("copy-on-write cannot drop primary key column %q; stop and reconfigure the source key safely", name)
-			}
-		}
-	}
 	if len(added) == 0 && len(dropped) == 0 {
 		return nil
 	}
@@ -503,14 +496,6 @@ func (w *nativeWriter) AlterSourceColumns(ctx context.Context, added []*nativeSo
 func (w *nativeWriter) EvolveSchema(ctx context.Context, columns map[string]string) error {
 	if err := w.writable(); err != nil {
 		return err
-	}
-	if w.cow != nil {
-		for _, name := range w.cow.keys {
-			field, found := w.table.Schema().FindFieldByName(name)
-			if !found || columns[name] != field.Type.String() {
-				return fmt.Errorf("copy-on-write cannot change primary key column %q type", name)
-			}
-		}
 	}
 	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
 		return errors.New("ordinary recovery cannot evolve the frozen destination shape")

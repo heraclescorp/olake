@@ -350,9 +350,6 @@ func runOrdinaryRecovery(cmd *cobra.Command) (err error) {
 	if err := destination.ValidateCopyOnWrite(destinationConfig, selected); err != nil {
 		return err
 	}
-	if err := connector.ValidateCopyOnWrite(ctx, selected); err != nil {
-		return err
-	}
 	identity, err := connector.ValidateOrdinaryRecovery(ctx, selected, lower)
 	if err != nil {
 		return err

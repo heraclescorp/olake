@@ -57,9 +57,8 @@ type sourceToastBatch struct {
 }
 
 func (b *sourceToastBatch) push(ctx context.Context, change abstract.CDCChange) error {
-	// A complete-COMMIT control must follow every hydrated row in its transaction.
-	// Schema notifications likewise cannot overtake earlier buffered rows.
-	if change.SourceColumns != nil || change.CommitState != nil {
+	// Never query a new schema for earlier rows buffered before its relation event.
+	if change.SourceColumns != nil {
 		if err := b.flush(ctx); err != nil {
 			return err
 		}

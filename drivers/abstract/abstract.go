@@ -32,9 +32,6 @@ type CDCChange struct {
 	// SourceColumns, when set, makes this a schema change with no row data: the
 	// stream's current source columns, applied in order with the stream's rows.
 	SourceColumns *types.SourceColumnsChange
-	// CommitState is an opt-in complete source transaction boundary. It has no
-	// Stream and must be consumed before row/schema dispatch.
-	CommitState any
 }
 
 func NewCDCChange(stream types.StreamInterface, timestamp time.Time, kind string, data, extraColumns map[string]any, sourceBytes int64, unavailableColumns []string) CDCChange {
@@ -409,7 +406,7 @@ func writerPanicError(prior error, value any) error {
 }
 
 // handleWriterCleanup joins all closes before PostCDC may acknowledge progress.
-func handleWriterCleanup(ctx context.Context, cancel context.CancelFunc, err *error, writer any, threadID string, mtState *any, dedupInserts *bool, streamDedup ...map[string]bool) {
+func handleWriterCleanup(ctx context.Context, cancel context.CancelFunc, err *error, writer any, threadID string, mtState *any, dedupInserts *bool) {
 	if r := recover(); r != nil {
 		*err = writerPanicError(*err, r)
 	}
@@ -421,7 +418,7 @@ func handleWriterCleanup(ctx context.Context, cancel context.CancelFunc, err *er
 	var closeErr error
 	_, multipleWriters := writer.(map[string]*destination.WriterThread)
 
-	closeWriter := func(w *destination.WriterThread, metadataValue any, streamID string) (setErr error) {
+	closeWriter := func(w *destination.WriterThread, metadataValue any) (setErr error) {
 		var metadataState any
 		if multipleWriters {
 			defer func() {
@@ -438,11 +435,6 @@ func handleWriterCleanup(ctx context.Context, cancel context.CancelFunc, err *er
 				cancel()
 			}
 			types.SetDedupInserts(ms, dedupInserts)
-			if len(streamDedup) != 0 {
-				if overlap, exists := streamDedup[0][streamID]; exists {
-					types.SetDedupInserts(ms, &overlap)
-				}
-			}
 			metadataState = ms
 		}
 		if threadErr := w.Close(ctx, metadataState); threadErr != nil {
@@ -459,7 +451,7 @@ func handleWriterCleanup(ctx context.Context, cancel context.CancelFunc, err *er
 			// Incremental stores cursor metadata as map[string]any; use *mtState directly (not per-stream lookup).
 			mtStateValue = *mtState
 		}
-		closeErr = closeWriter(w, mtStateValue, "")
+		closeErr = closeWriter(w, mtStateValue)
 	case map[string]*destination.WriterThread:
 		if len(w) == 0 {
 			break
@@ -479,7 +471,7 @@ func handleWriterCleanup(ctx context.Context, cancel context.CancelFunc, err *er
 				}
 			}
 			group.Add(func(_ context.Context) error {
-				if writerErr := closeWriter(inserter, mtStateValue, streamID); writerErr != nil {
+				if writerErr := closeWriter(inserter, mtStateValue); writerErr != nil {
 					closeErrMu.Lock()
 					closeErr = errors.Join(closeErr, writerErr)
 					closeErrMu.Unlock()

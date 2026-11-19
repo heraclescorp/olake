@@ -1,7 +1,6 @@
 package types
 
 import (
-	"strconv"
 	"testing"
 
 	"github.com/goccy/go-json"
@@ -11,23 +10,26 @@ import (
 func TestCopyOnWriteWireDefaultsAndValidation(t *testing.T) {
 	stream := NewStream("rows", "public", nil).WithPrimaryKey("Source ID").Wrap(0)
 	stream.Stream.UpsertField("Source ID", Int64, false, false)
-	require.NoError(t, json.Unmarshal([]byte(`{"merge_strategy":"copy-on-write","normalization":true,"append_mode":false,"cow_options":{"max_batch_rows":7}}`), &stream.StreamMetadata))
+	require.NoError(t, json.Unmarshal([]byte(`{"merge_strategy":"copy-on-write","normalization":true,"append_mode":false}`), &stream.StreamMetadata))
 	require.True(t, stream.CopyOnWriteEnabled())
-	options, err := stream.EffectiveCOWOptions()
-	require.NoError(t, err)
-	require.Equal(t, 7, options.MaxBatchRows)
-	require.Equal(t, 300, options.FlushIntervalSeconds)
-	require.Equal(t, 67108864, options.MaxBatchBytes)
-	require.Equal(t, 2, options.RewriteConcurrency)
-	require.False(t, options.MaterializeExistingDeletes)
 	require.NoError(t, stream.ValidateCopyOnWrite(Iceberg))
 	require.Error(t, stream.ValidateCopyOnWrite(Parquet))
-	stream.StreamMetadata.CowOptions.MaxBatchRows = 0
-	_, err = stream.EffectiveCOWOptions()
-	require.Error(t, err)
-	stream.StreamMetadata.CowOptions = nil
+	encoded, err := json.Marshal(stream.StreamMetadata)
+	require.NoError(t, err)
+	var canonical StreamMetadata
+	require.NoError(t, json.Unmarshal(encoded, &canonical))
+	require.Equal(t, CopyOnWrite, canonical.MergeStrategy)
+	legacy := toLegacyStreamMetadata(canonical, stream.Stream)
+	encoded, err = json.Marshal(legacy)
+	require.NoError(t, err)
+	var saved LegacyStreamMetadata
+	require.NoError(t, json.Unmarshal(encoded, &saved))
+	require.Equal(t, CopyOnWrite, legacyToStreamMetadata(saved).MergeStrategy)
 	stream.StreamMetadata.MergeStrategy = "unknown"
 	require.Error(t, stream.ValidateCopyOnWrite(Iceberg))
+	stream.StreamMetadata.MergeStrategy = ""
+	require.False(t, stream.CopyOnWriteEnabled(), "saved/CLI configurations without merge_strategy remain MOR")
+	require.NoError(t, stream.ValidateCopyOnWrite(Iceberg))
 }
 
 func TestCopyOnWriteInactiveAppendAndSavedDeletePreference(t *testing.T) {
@@ -41,29 +43,11 @@ func TestCopyOnWriteInactiveAppendAndSavedDeletePreference(t *testing.T) {
 	require.Error(t, stream.ValidateCopyOnWrite(Iceberg), "missing PK/normalization cannot silently fall back to append")
 }
 
-func TestCopyOnWriteRejectsNullableOrUnselectedKey(t *testing.T) {
+func TestCopyOnWriteDoesNotRequirePhysicalSourceKeyColumns(t *testing.T) {
 	stream := NewStream("rows", "public", nil).WithPrimaryKey("id").Wrap(0)
-	stream.Stream.UpsertField("id", Int64, true, false)
-	stream.StreamMetadata = StreamMetadata{AppendMode: new(false), Normalization: new(true), MergeStrategy: CopyOnWrite}
-	require.ErrorContains(t, stream.ValidateCopyOnWrite(Iceberg), "nonnull")
-	stream.Stream.Schema = NewTypeSchema()
 	stream.Stream.UpsertField("id", Int64, false, false)
-	stream.StreamMetadata.SelectedColumns = &SelectedColumns{Columns: []string{"other"}}
-	require.ErrorContains(t, stream.ValidateCopyOnWrite(Iceberg), "unselected")
-}
-
-func TestCopyOnWriteFlushIntervalDurationBounds(t *testing.T) {
-	if strconv.IntSize < 64 {
-		t.Skip("32-bit intervals cannot overflow time.Duration seconds")
+	stream.StreamMetadata = StreamMetadata{AppendMode: new(false), Normalization: new(true), MergeStrategy: CopyOnWrite,
+		SelectedColumns: &SelectedColumns{Columns: []string{"body"}},
 	}
-	stream := NewStream("rows", "public", nil).Wrap(0)
-	options := DefaultCOWOptions()
-	stream.StreamMetadata.CowOptions = &options
-	maximum := MaxCOWFlushIntervalSeconds
-	options.FlushIntervalSeconds = int(maximum)
-	_, err := stream.EffectiveCOWOptions()
-	require.NoError(t, err)
-	options.FlushIntervalSeconds = int(maximum + 1)
-	_, err = stream.EffectiveCOWOptions()
-	require.ErrorContains(t, err, "maximum representable duration")
+	require.NoError(t, stream.ValidateCopyOnWrite(Iceberg), "COW matches the existing canonical _olake_id, not physical source keys")
 }

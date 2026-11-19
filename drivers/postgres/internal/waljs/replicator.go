@@ -46,11 +46,8 @@ type Socket struct {
 	// initialWaitTime is the duration to wait for first wal log catchup before timing out
 	initialWaitTime time.Duration
 	// TransactionOpen prevents publishing a pgoutput stream truncated before COMMIT.
-	TransactionOpen  bool
-	StrictRecovery   bool
-	CommitAligned    bool
-	EmitCommitEvents bool
-	decodedThrough   pglogrepl.LSN
+	TransactionOpen bool
+	StrictRecovery  bool
 }
 
 func (s *Socket) BackendPID() uint32 {
@@ -160,8 +157,6 @@ func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, re
 		ReplicationSlot:    config.ReplicationSlotName,
 		initialWaitTime:    config.InitialWaitTime,
 		StrictRecovery:     config.StrictRecovery,
-		CommitAligned:      config.CommitAligned,
-		EmitCommitEvents:   config.EmitCommitEvents,
 	}
 	socket.changeFilter.replayAfter = config.ReplayAfter
 	if config.StrictRecovery {
@@ -173,10 +168,6 @@ func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, re
 	case "pgoutput":
 		return &pgoutputReplicator{socket: socket, publication: config.Publication, preserveToastValues: config.PreserveToastValues, relationIDToMsgMap: make(map[uint32]*pglogrepl.RelationMessage)}, nil
 	default:
-		if config.EmitCommitEvents {
-			_ = closeReplicationConnection(ctx, pgConn)
-			return nil, fmt.Errorf("complete-COMMIT controls require pgoutput")
-		}
 		return &wal2jsonReplicator{socket: socket}, nil
 	}
 }

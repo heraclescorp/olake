@@ -90,7 +90,6 @@ type StreamMetadata struct {
 	Normalization  *bool         `json:"normalization,omitempty"`
 	UpdateType     *string       `json:"update_type,omitempty"`
 	MergeStrategy  MergeStrategy `json:"merge_strategy,omitempty"`
-	CowOptions     *COWOptions   `json:"cow_options,omitempty"`
 	// When enabled, source column names are preserved as-is; otherwise utils.Reformat() is applied to generate destination-safe lowercase column names.
 	UseSourceColumnNames bool `json:"use_source_column_names,omitempty"`
 	// When enabled, a column dropped at the source is deleted from the destination schema; otherwise it stays and new rows hold NULL.

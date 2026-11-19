@@ -149,9 +149,6 @@ func runResync(cmd *cobra.Command, _ []string) (err error) {
 	if err := destination.ValidateCopyOnWrite(destinationConfig, classification.SelectedStreams); err != nil {
 		return err
 	}
-	if err := connector.ValidateCopyOnWrite(ctx, classification.SelectedStreams); err != nil {
-		return err
-	}
 	connector.SetupState(state)
 	if err := connector.ValidateResync(ctx, target); err != nil {
 		return err

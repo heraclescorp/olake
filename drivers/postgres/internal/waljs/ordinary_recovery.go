@@ -27,9 +27,6 @@ func SourceIdentity(system pglogrepl.IdentifySystemResult, slot, plugin string) 
 }
 
 func (p *pgoutputReplicator) changePosition() pglogrepl.LSN {
-	if p.socket.CommitAligned && p.messageLSN != 0 {
-		return p.messageLSN
-	}
 	if p.socket.StrictRecovery && p.messageLSN != 0 {
 		return p.messageLSN
 	}
@@ -97,14 +94,6 @@ func (p *pgoutputReplicator) processRecoveryBoundary(ctx context.Context, logica
 }
 
 func (s *Socket) observeKeepalive(sent pglogrepl.LSN) {
-	if s.CommitAligned && !s.StrictRecovery {
-		// A keepalive can prove that decoding reached the fixed run target, but
-		// cannot become either a table checkpoint or an acknowledged COMMIT.
-		if !s.TransactionOpen {
-			s.decodedThrough = max(s.decodedThrough, sent)
-		}
-		return
-	}
 	if !s.StrictRecovery {
 		s.ClientXLogPos = sent
 		return
