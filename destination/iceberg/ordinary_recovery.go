@@ -205,7 +205,7 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 		if tbl.Metadata().TableUUID() == uuid.Nil || tbl.Metadata().Version() < 2 {
 			return nil, errors.New("ordinary recovery table has no valid native UUID or format")
 		}
-		if stream.GetUpdateType() == types.UpdateTypeDeletionVector && tbl.Metadata().Version() < 3 {
+		if !stream.Self().CopyOnWriteEnabled() && stream.GetUpdateType() == types.UpdateTypeDeletionVector && tbl.Metadata().Version() < 3 {
 			return nil, errors.New("ordinary recovery cannot upgrade the frozen table format")
 		}
 		position, err := ordinaryRecoveryPosition(tbl, lowerValue)

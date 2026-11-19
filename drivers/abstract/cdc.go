@@ -120,6 +120,10 @@ func (a *AbstractDriver) RunChangeStream(mainCtx context.Context, pool *destinat
 //   - For Postgres: ignored (uses global replication slot)
 func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destination.WriterPool, streamIndex int, streams []types.StreamInterface) (err error) {
 	filterDataBySelectedColumnsFns := make(map[string]func(map[string]interface{}) map[string]interface{})
+	batches, err := cowBatches(mainCtx, streams)
+	if err != nil {
+		return err
+	}
 
 	// create cdc context, so that main context not affected if cdc retries
 	cdcCtx, cdcCtxCancel := context.WithCancel(mainCtx)
@@ -223,8 +227,63 @@ func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destinatio
 	if err = cdcCtx.Err(); err != nil {
 		return err
 	}
+	// The callback is synchronous: a COMMIT blocks the producer while every
+	// selected writer drains and publishes the identical explicit checkpoint.
+	checkpoint := func(ctx context.Context, boundary any) error {
+		due := false
+		for _, batch := range batches {
+			due = due || batch.due(time.Now())
+		}
+		if !due {
+			return nil
+		}
+		if err := utils.CheckExecutionFence(ctx); err != nil {
+			return err
+		}
+		var closeErr error
+		// An intermediate boundary may still precede the backfill snapshot.
+		// Preserve each table's overlap flag; only terminal catchup clears it.
+		handleWriterCleanup(ctx, cdcCtxCancel, &closeErr, writers, "", &boundary, nil, dedupInserts)
+		// Closed threads must never be closed twice, even on a partial failure.
+		clear(writers)
+		if closeErr != nil {
+			return closeErr
+		}
+		if err := utils.CheckExecutionFence(ctx); err != nil {
+			return err
+		}
+		// Reopening re-reads authoritative metadata. Quiet tables participate too;
+		// no selected table may be left behind an acknowledged slot boundary.
+		for _, stream := range streams {
+			w, metadata, err := pool.NewWriter(ctx, stream, destination.WithThreadID(generateThreadID(stream.ID(), "")), destination.WithApplyFilter(true), destination.WithKeepDeletesThroughFilter(slices.Contains(constants.CDCKeepDeletesThroughFilterDrivers, constants.DriverType(a.driver.Type()))))
+			if err != nil {
+				return fmt.Errorf("reopen CDC writer for %s: %w", stream.ID(), err)
+			}
+			writers[stream.ID()] = w
+			if metadata != nil && metadata.DedupInserts != nil {
+				dedupInserts[stream.ID()] = *metadata.DedupInserts
+			}
+		}
+		source, ok := a.driver.(CopyOnWriteSource)
+		if !ok {
+			return fmt.Errorf("source does not support copy-on-write checkpoint acknowledgement")
+		}
+		if err := source.AcknowledgeCDCCheckpoint(ctx, boundary); err != nil {
+			return err
+		}
+		for _, batch := range batches {
+			batch.rows, batch.bytes, batch.started = 0, 0, time.Now()
+		}
+		return nil
+	}
 
 	finalMetadataState, err = a.driver.StreamChanges(cdcCtx, streamIndex, metadataStates, func(ctx context.Context, change CDCChange) error {
+		if change.CommitState != nil {
+			return checkpoint(ctx, change.CommitState)
+		}
+		if change.Stream == nil {
+			return fmt.Errorf("CDC row/schema event has no stream")
+		}
 		writer := writers[change.Stream.ID()]
 		if change.SourceColumns != nil {
 			return writer.ApplySourceColumns(ctx, *change.SourceColumns)
@@ -247,7 +306,17 @@ func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destinatio
 		}
 		filteredData := filterDataBySelectedColumnsFn(change.Data)
 
-		return writer.Push(ctx, types.CreateRawRecord(filteredData, olakeColumns, change.UnavailableColumns), change.Bytes)
+		record := types.CreateRawRecord(filteredData, olakeColumns, change.UnavailableColumns)
+		if err := writer.Push(ctx, record, change.Bytes); err != nil {
+			return err
+		}
+		if batch := batches[change.Stream.ID()]; batch != nil {
+			batch.rows++
+			// PayloadSize counts decoded/hydrated values, not just the smaller WAL
+			// tuple. Row counts deliberately count incoming events, not unique keys.
+			batch.bytes += max(change.Bytes, record.PayloadSize())
+		}
+		return nil
 	})
 
 	return err

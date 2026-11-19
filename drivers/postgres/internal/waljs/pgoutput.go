@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/drivers/abstract"
+	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/datazip-inc/olake/utils/typeutils"
@@ -77,7 +79,7 @@ func (p *pgoutputReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, ins
 				return fmt.Errorf("%w, try increasing it or do full load", constants.ErrNonRetryable)
 			}
 
-			if !p.socket.TransactionOpen && p.socket.ClientXLogPos >= p.socket.CurrentWalPosition {
+			if !p.socket.TransactionOpen && (p.socket.ClientXLogPos >= p.socket.CurrentWalPosition || p.socket.CommitAligned && p.socket.decodedThrough >= p.socket.CurrentWalPosition) {
 				logger.Infof("finishing sync, reached wal position: %s", p.socket.CurrentWalPosition)
 				return nil
 			}
@@ -92,6 +94,9 @@ func (p *pgoutputReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, ins
 				}
 
 				if errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "EOF") {
+					if p.socket.CommitAligned {
+						return fmt.Errorf("copy-on-write WAL stream interrupted before its fixed target: %w", err)
+					}
 					return nil
 				}
 				return err
@@ -110,7 +115,7 @@ func (p *pgoutputReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, ins
 				}
 				progress.received(xld.WALStart, xld.ServerWALEnd, len(xld.WALData))
 				p.messageLSN = xld.WALStart
-				if !p.socket.StrictRecovery {
+				if !p.socket.StrictRecovery && !p.socket.CommitAligned {
 					p.socket.ClientXLogPos = xld.WALStart
 				}
 				if err := p.processPgoutputWAL(ctx, xld.WALData, insertFn); err != nil {
@@ -165,6 +170,9 @@ func (p *pgoutputReplicator) processPgoutputWAL(ctx context.Context, walData []b
 		}
 		return p.emitRelationColumns(ctx, msg, insertFn)
 	case *pglogrepl.BeginMessage:
+		if p.socket.CommitAligned && p.socket.TransactionOpen {
+			return fmt.Errorf("copy-on-write received nested or incomplete transaction")
+		}
 		p.socket.TransactionOpen = true
 		if p.progress != nil {
 			p.progress.transactionOpen.Store(true)
@@ -179,10 +187,16 @@ func (p *pgoutputReplicator) processPgoutputWAL(ctx context.Context, walData []b
 	case *pglogrepl.DeleteMessage:
 		return p.emitDelete(ctx, msg, insertFn)
 	case *pglogrepl.CommitMessage:
+		if p.socket.CommitAligned && (!p.socket.TransactionOpen || msg.CommitLSN != p.txnFinalLSN || msg.TransactionEndLSN <= p.socket.ClientXLogPos) {
+			return fmt.Errorf("copy-on-write requires a complete, monotonic transaction COMMIT")
+		}
 		p.socket.TransactionOpen = false
 		p.socket.ClientXLogPos = msg.TransactionEndLSN
 		if p.progress != nil {
 			p.progress.committed(msg.TransactionEndLSN)
+		}
+		if p.socket.EmitCommitEvents {
+			return insertFn(ctx, abstract.CDCChange{CommitState: WALState{LSN: msg.TransactionEndLSN.String()}})
 		}
 		return nil
 	default:
@@ -318,6 +332,11 @@ func (p *pgoutputReplicator) emitUpdate(ctx context.Context, m *pglogrepl.Update
 	if err != nil {
 		return err
 	}
+	if stream.Self().CopyOnWriteEnabled() {
+		if err := p.validateCopyOnWriteKeys(rel, stream, values, m.OldTuple); err != nil {
+			return err
+		}
+	}
 
 	return insertFn(ctx, abstract.NewCDCChange(stream, p.txnCommitTime, "update", values,
 		map[string]any{CDCLSN: p.changePosition().String()}, rowBytes, unchangedToastColumns))
@@ -344,6 +363,33 @@ func (p *pgoutputReplicator) emitDelete(ctx context.Context, m *pglogrepl.Delete
 
 	return insertFn(ctx, abstract.NewCDCChange(stream, p.txnCommitTime, "delete", values,
 		map[string]any{CDCLSN: p.changePosition().String()}, rowBytes, nil))
+}
+
+// PostgreSQL supplies an old key tuple when an UPDATE changes replica identity.
+// COW cannot safely retain the old row under an unavailable or changed source PK.
+func (p *pgoutputReplicator) validateCopyOnWriteKeys(rel *pglogrepl.RelationMessage, stream types.StreamInterface, values map[string]any, oldTuple *pglogrepl.TupleData) error {
+	keys := stream.GetStream().SourceDefinedPrimaryKey
+	if keys == nil || keys.Len() == 0 {
+		return fmt.Errorf("copy-on-write source primary keys are unavailable for %s", stream.ID())
+	}
+	var oldValues map[string]any
+	if oldTuple != nil {
+		var err error
+		oldValues, _, _, err = p.tupleValuesToMap(rel, oldTuple, nil)
+		if err != nil {
+			return err
+		}
+	}
+	for _, key := range keys.Array() {
+		value, exists := values[key]
+		if !exists || value == nil || reflect.DeepEqual(value, constants.UnavailableValue) {
+			return fmt.Errorf("copy-on-write missing or unavailable source primary key %s for %s", key, stream.ID())
+		}
+		if oldTuple != nil && !reflect.DeepEqual(oldValues[key], value) {
+			return fmt.Errorf("copy-on-write does not support changes to source primary key %s for %s", key, stream.ID())
+		}
+	}
+	return nil
 }
 
 // OIDToString converts a PostgreSQL OID to its string representation

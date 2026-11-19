@@ -28,6 +28,8 @@ type LegacyStreamMetadata struct {
 	SelectedColumns      *SelectedColumns `json:"selected_columns"`
 	DedupKeys            []string         `json:"dedup_keys,omitempty"`
 	SortOrder            SortOrder        `json:"sort_order,omitempty"`
+	MergeStrategy        MergeStrategy    `json:"merge_strategy,omitempty"`
+	CowOptions           *COWOptions      `json:"cow_options,omitempty"`
 }
 
 // LegacyCatalog is the streams.json ([]streams + selected_streams)
@@ -72,6 +74,8 @@ func legacyToStreamMetadata(streamMetadata LegacyStreamMetadata) StreamMetadata 
 		SelectedColumns:      streamMetadata.SelectedColumns,
 		DedupKeys:            streamMetadata.DedupKeys,
 		SortOrder:            streamMetadata.SortOrder,
+		MergeStrategy:        streamMetadata.MergeStrategy,
+		CowOptions:           streamMetadata.CowOptions,
 	}
 }
 
@@ -175,5 +179,7 @@ func toLegacyStreamMetadata(metadata StreamMetadata, stream *Stream) LegacyStrea
 		SelectedColumns:      selectedColumns,
 		DedupKeys:            metadata.DedupKeys,
 		SortOrder:            metadata.SortOrder,
+		MergeStrategy:        metadata.MergeStrategy,
+		CowOptions:           metadata.CowOptions,
 	}
 }

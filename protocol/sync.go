@@ -86,6 +86,19 @@ var syncCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		// COW publishes the full checkpoint mid-run; preserve opaque GLOBAL
+		// integers rather than round-tripping them through interface float64s.
+		exactState := false
+		for _, entries := range catalog.SelectedStreams {
+			for _, entry := range entries {
+				exactState = exactState || entry.MergeStrategy == types.CopyOnWrite
+			}
+		}
+		if exactState && statePath != "" && ordinaryRecoveryOriginPath == "" {
+			if err := loadOrdinaryRecoveryState(statePath, state); err != nil {
+				return err
+			}
+		}
 
 		state.RWMutex = &sync.RWMutex{}
 
@@ -126,6 +139,17 @@ var syncCmd = &cobra.Command{
 		selectedStreamsMetadata, err := classifyStreams(catalog, streams, state, destinationConfig.Type)
 		if err != nil {
 			return fmt.Errorf("failed to get selected streams for clearing: %w", err)
+		}
+		if err := destination.ValidateCopyOnWrite(destinationConfig, selectedStreamsMetadata.SelectedStreams); err != nil {
+			return err
+		}
+		if err := connector.ValidateCopyOnWrite(cmd.Context(), selectedStreamsMetadata.SelectedStreams); err != nil {
+			return err
+		}
+		for _, stream := range selectedStreamsMetadata.SelectedStreams {
+			if noSave && stream.Self().CopyOnWriteEnabled() {
+				return fmt.Errorf("copy-on-write requires durable checkpoint publication; --no-save is unsupported")
+			}
 		}
 
 		if streams == nil {

@@ -23,6 +23,10 @@ type Config struct {
 	Publication string
 	// PreserveToastValues marks columns Postgres could not send (unchanged TOAST) so the destination can recover them.
 	PreserveToastValues bool
+	// CommitAligned keeps decoded COMMIT progress separate from advertised WAL.
+	// EmitCommitEvents additionally requests synchronous complete-COMMIT controls.
+	CommitAligned    bool
+	EmitCommitEvents bool
 	// ReplayAfter excludes transactions already represented by each table's snapshot.
 	ReplayAfter map[string]pglogrepl.LSN
 	// StrictRecovery never emits a transaction past the explicit target and

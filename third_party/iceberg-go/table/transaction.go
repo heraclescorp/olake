@@ -2310,9 +2310,15 @@ func (t *Transaction) OverwriteTable(ctx context.Context, tbl arrow.Table, batch
 }
 
 type overwriteOperation struct {
-	concurrency   int
-	filter        iceberg.BooleanExpression
-	caseSensitive bool
+	concurrency        int
+	filter             iceberg.BooleanExpression
+	caseSensitive      bool
+	onFileCreate       func(string)
+	readBatchSize      int
+	writeLimits        overwriteWriteLimits
+	clusteredInput     bool
+	rewriteWindowRows  int
+	rewriteWindowBytes int64
 }
 
 // OverwriteOption applies options to overwrite operations
@@ -2336,6 +2342,52 @@ func WithOverwriteConcurrency(concurrency int) OverwriteOption {
 func WithOverwriteFilter(filter iceberg.BooleanExpression) OverwriteOption {
 	return func(op *overwriteOperation) {
 		op.filter = filter
+	}
+}
+
+// WithOverwriteFileTracking observes files staged by Overwrite before creation.
+// The callback may run concurrently and includes failed creation attempts. It
+// does not authorize deletion: retain every observed path after an ambiguous
+// catalog commit, and retain committed files referenced by historical snapshots.
+func WithOverwriteFileTracking(onFileCreate func(string)) OverwriteOption {
+	return func(op *overwriteOperation) {
+		op.onFileCreate = onFileCreate
+	}
+}
+
+// WithOverwriteReadBatchSize caps decoded rows per survivor-rewrite Arrow batch.
+// Non-positive values preserve the table's configured read batch size. A single
+// large row can exceed memory targets even with a one-row batch.
+func WithOverwriteReadBatchSize(rows int) OverwriteOption {
+	return func(op *overwriteOperation) {
+		if rows > 0 {
+			op.readBatchSize = rows
+		}
+	}
+}
+
+// WithOverwriteWriteLimits bounds output workers, queued Arrow batches and
+// Parquet row groups for incoming rows and survivor rewrites. Positive file-size
+// and row-group overrides are write-local; they do not alter table properties.
+// Non-positive values preserve the existing writer defaults.
+func WithOverwriteWriteLimits(workers, bufferBatches, rowGroupRows int, targetFileBytes int64) OverwriteOption {
+	return func(op *overwriteOperation) {
+		op.writeLimits = overwriteWriteLimits{workers: workers, bufferBatches: bufferBatches, rowGroupRows: rowGroupRows, targetFileBytes: targetFileBytes}
+	}
+}
+
+// WithOverwriteClusteredInput requires the incoming reader to be clustered by
+// partition across batches. A single bounded batch is always eligible.
+func WithOverwriteClusteredInput() OverwriteOption {
+	return func(op *overwriteOperation) { op.clusteredInput = true }
+}
+
+// WithOverwriteRewriteWindow bounds partition fanout when an existing file is
+// rewritten under an evolved partition spec. Each window is written as one
+// clustered Arrow batch; a single input batch may exceed either soft limit.
+func WithOverwriteRewriteWindow(maxRows int, maxBytes int64) OverwriteOption {
+	return func(op *overwriteOperation) {
+		op.rewriteWindowRows, op.rewriteWindowBytes = maxRows, maxBytes
 	}
 }
 
@@ -2380,7 +2432,7 @@ func (t *Transaction) Overwrite(ctx context.Context, rdr array.RecordReader, sna
 		apply(&overwrite)
 	}
 
-	updater, wfs, err := t.performCopyOnWriteDeletion(ctx, OpOverwrite, snapshotProps, overwrite.filter, overwrite.caseSensitive, overwrite.concurrency)
+	updater, wfs, err := t.performCopyOnWriteDeletion(ctx, OpOverwrite, snapshotProps, overwrite)
 	if err != nil {
 		return err
 	}
@@ -2393,12 +2445,14 @@ func (t *Transaction) Overwrite(ctx context.Context, rdr array.RecordReader, sna
 		return err
 	}
 
-	itr := recordsToDataFiles(ctx, t.tbl.Location(), meta, recordWritingArgs{
+	writeMeta, writeArgs := overwrite.writeLimits.apply(meta, recordWritingArgs{
 		sc:        rdr.Schema(),
 		itr:       array.IterFromReader(rdr),
 		fs:        wfs,
 		writeUUID: &updater.commitUuid,
+		clustered: overwrite.clusteredInput,
 	})
+	itr := recordsToDataFiles(ctx, t.tbl.Location(), writeMeta, writeArgs)
 
 	for df, err := range itr {
 		if err != nil {
@@ -2433,7 +2487,7 @@ func (t *Transaction) Overwrite(ctx context.Context, rdr array.RecordReader, sna
 	return t.apply(updates, reqs)
 }
 
-func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation Operation, snapshotProps iceberg.Properties, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) (*snapshotProducer, io.WriteFileIO, error) {
+func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation Operation, snapshotProps iceberg.Properties, overwrite overwriteOperation) (*snapshotProducer, io.WriteFileIO, error) {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return nil, nil, err
@@ -2445,6 +2499,14 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 	wfs, err := requireWriteFileIO(fs)
 	if err != nil {
 		return nil, nil, err
+	}
+	if overwrite.onFileCreate != nil {
+		tracked := &overwriteTrackingIO{WriteFileIO: wfs, onFileCreate: overwrite.onFileCreate}
+		fs, wfs = tracked, tracked
+		if reader, ok := tracked.WriteFileIO.(io.ReadFileIO); ok {
+			readable := &overwriteTrackingReadIO{overwriteTrackingIO: tracked, reader: reader}
+			fs, wfs = readable, readable
+		}
 	}
 
 	if meta.NameMapping() == nil {
@@ -2460,10 +2522,10 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 	}
 
 	commitUUID := uuid.New()
-	updater := t.updateSnapshot(wfs, snapshotProps, operation).mergeOverwrite(&commitUUID, filter)
-	updater.setManifestConcurrency(concurrency)
+	updater := t.updateSnapshot(wfs, snapshotProps, operation).mergeOverwrite(&commitUUID, overwrite.filter)
+	updater.setManifestConcurrency(overwrite.concurrency)
 
-	filesToDelete, filesToRewrite, fileSeqByPath, err := t.classifyFilesForDeletions(ctx, fs, filter, caseSensitive, concurrency)
+	filesToDelete, filesToRewrite, fileSeqByPath, err := t.classifyFilesForDeletions(ctx, fs, overwrite.filter, overwrite.caseSensitive, overwrite.concurrency)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2473,7 +2535,7 @@ func (t *Transaction) performCopyOnWriteDeletion(ctx context.Context, operation 
 	}
 
 	if len(filesToRewrite) > 0 {
-		if err := t.rewriteFilesWithFilter(ctx, fs, updater, filesToRewrite, fileSeqByPath, filter, caseSensitive, concurrency); err != nil {
+		if err := t.rewriteFilesWithFilter(ctx, fs, updater, filesToRewrite, fileSeqByPath, overwrite); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -2608,7 +2670,7 @@ func (t *Transaction) Delete(ctx context.Context, filter iceberg.BooleanExpressi
 	}
 	switch writeDeleteMode {
 	case WriteModeCopyOnWrite:
-		updater, _, err = t.performCopyOnWriteDeletion(ctx, OpDelete, snapshotProps, filter, deleteOp.caseSensitive, deleteOp.concurrency)
+		updater, _, err = t.performCopyOnWriteDeletion(ctx, OpDelete, snapshotProps, overwriteOperation{filter: filter, caseSensitive: deleteOp.caseSensitive, concurrency: deleteOp.concurrency})
 		if err != nil {
 			return err
 		}
@@ -2817,19 +2879,19 @@ func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs 
 // fileSeqByPath maps each file's path to its file_sequence_number from the source manifest entry,
 // used to synthesize _last_updated_sequence_number when the source row's value is null. The
 // filter binding and substrait conversion are computed once here and reused across every file.
-func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, updater *snapshotProducer, files []iceberg.DataFile, fileSeqByPath map[string]*int64, filter iceberg.BooleanExpression, caseSensitive bool, concurrency int) error {
+func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, updater *snapshotProducer, files []iceberg.DataFile, fileSeqByPath map[string]*int64, overwrite overwriteOperation) error {
 	meta, err := t.txnMeta()
 	if err != nil {
 		return err
 	}
 
-	complementFilter := iceberg.NewNot(filter)
+	complementFilter := iceberg.NewNot(overwrite.filter)
 
 	// Bind + convert the complement filter once for the whole rewrite. The
 	// per-batch filter function is reused across every record batch from
 	// every file in this rewrite — substrait conversion in particular is
 	// non-trivial so doing it inside the iterator loop wastes work.
-	postFilter, err := prepareBatchFilter(complementFilter, meta.CurrentSchema(), caseSensitive)
+	postFilter, err := prepareBatchFilter(complementFilter, meta.CurrentSchema(), overwrite.caseSensitive)
 	if err != nil {
 		return err
 	}
@@ -2838,14 +2900,18 @@ func (t *Transaction) rewriteFilesWithFilter(ctx context.Context, fs io.IO, upda
 		// Use a separate UUID for rewrite operations to avoid filename collisions with new data files
 		rewriteUUID := uuid.New()
 		args := rewriteSingleFileArgs{
-			fs:            fs,
-			originalFile:  originalFile,
-			fileSeqNum:    fileSeqByPath[originalFile.FilePath()],
-			filter:        complementFilter,
-			postFilter:    postFilter,
-			caseSensitive: caseSensitive,
-			commitUUID:    rewriteUUID,
-			concurrency:   concurrency,
+			fs:                 fs,
+			originalFile:       originalFile,
+			fileSeqNum:         fileSeqByPath[originalFile.FilePath()],
+			filter:             complementFilter,
+			postFilter:         postFilter,
+			caseSensitive:      overwrite.caseSensitive,
+			commitUUID:         rewriteUUID,
+			concurrency:        overwrite.concurrency,
+			readBatchSize:      overwrite.readBatchSize,
+			writeLimits:        overwrite.writeLimits,
+			rewriteWindowRows:  overwrite.rewriteWindowRows,
+			rewriteWindowBytes: overwrite.rewriteWindowBytes,
 		}
 		rewrittenFiles, err := t.rewriteSingleFile(ctx, args)
 		if err != nil {
@@ -2877,10 +2943,14 @@ type rewriteSingleFileArgs struct {
 	// filter. When preserveRowLineage applies it is the only place the
 	// filter is evaluated; the scanner's row filter is bypassed so
 	// _row_id positions stay correct.
-	postFilter    func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, error)
-	caseSensitive bool
-	commitUUID    uuid.UUID
-	concurrency   int
+	postFilter         func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, error)
+	caseSensitive      bool
+	commitUUID         uuid.UUID
+	concurrency        int
+	readBatchSize      int
+	writeLimits        overwriteWriteLimits
+	rewriteWindowRows  int
+	rewriteWindowBytes int64
 }
 
 // rewriteSingleFile reads a single data file, applies the filter, and writes
@@ -2964,6 +3034,7 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 		caseSensitive:   args.caseSensitive,
 		rowLimit:        -1, // No limit
 		concurrency:     args.concurrency,
+		arrowBatchSize:  args.readBatchSize,
 	}
 
 	arrowSchema, recordIter, err := scanner.GetRecords(ctx, []FileScanTask{*scanTask})
@@ -3024,13 +3095,19 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 	}
 
 	var result []iceberg.DataFile
-	itr := recordsToDataFiles(ctx, t.tbl.Location(), meta, recordWritingArgs{
+	writeMeta, writeArgs := args.writeLimits.apply(meta, recordWritingArgs{
 		sc:          arrowSchema,
 		itr:         releaseIter,
 		fs:          wfs,
 		writeUUID:   &args.commitUUID,
 		factoryOpts: factoryOpts,
 	})
+	var itr iter.Seq2[iceberg.DataFile, error]
+	if args.originalFile.SpecID() != int32(meta.defaultSpecID) && args.rewriteWindowRows > 0 && args.rewriteWindowBytes > 0 {
+		itr = windowedOverwriteFiles(ctx, t.tbl.Location(), writeMeta, writeArgs, args.rewriteWindowRows, args.rewriteWindowBytes)
+	} else {
+		itr = recordsToDataFiles(ctx, t.tbl.Location(), writeMeta, writeArgs)
+	}
 
 	for df, err := range itr {
 		if err != nil {

@@ -107,9 +107,22 @@ func WithKeepDeletesThroughFilter(keep bool) ThreadOptions {
 	}
 }
 
+// ValidateCopyOnWrite performs no I/O; callers use it before resets or creation.
+func ValidateCopyOnWrite(config *types.WriterConfig, streams []types.StreamInterface) error {
+	for _, stream := range streams {
+		if err := stream.Self().ValidateCopyOnWrite(config.Type); err != nil {
+			return fmt.Errorf("stream %s: %w", stream.ID(), err)
+		}
+	}
+	return nil
+}
+
 // NewWriterPool manages a destination's shared resources (e.g., Iceberg JVM) and connection health.
 // It initializes global state, runs checks, and provides thread-level writers. Call Close() to clean up.
 func NewWriterPool(ctx context.Context, config *types.WriterConfig, syncStreams []types.StreamInterface, batchSize int64) (*WriterPool, error) {
+	if err := ValidateCopyOnWrite(config, syncStreams); err != nil {
+		return nil, err
+	}
 	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return nil, err
 	}
@@ -155,7 +168,7 @@ func NewWriterPool(ctx context.Context, config *types.WriterConfig, syncStreams 
 
 	for _, stream := range syncStreams {
 		artifact := &writerSchema{
-			needsIndex: !stream.AppendModeEnabled() && stream.GetUpdateType().NeedsTableIndex(config.Type),
+			needsIndex: !stream.AppendModeEnabled() && !stream.Self().CopyOnWriteEnabled() && stream.GetUpdateType().NeedsTableIndex(config.Type),
 		}
 
 		pool.writerSchema.Store(stream.ID(), artifact)
@@ -499,6 +512,9 @@ func (wt *WriterThread) Close(closeCtx context.Context, finalMetadataState any) 
 }
 
 func DropStreams(ctx context.Context, config *types.WriterConfig, dropStreams []types.StreamInterface) error {
+	if err := ValidateCopyOnWrite(config, dropStreams); err != nil {
+		return err
+	}
 	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
 		return fmt.Errorf("recovery-only resync cannot drop destination streams")
 	}
@@ -512,10 +528,12 @@ func DropStreams(ctx context.Context, config *types.WriterConfig, dropStreams []
 		utils.BeginExecutionParticipant(ctx)(false)
 	}
 
-	// Always drop the stream index: dropStreams carry the new update type, not the one the
-	// index was built under, so a dv/pos -> eq clear would otherwise leave a stale index
-	// that outlives the recreated table. Dropping a missing index is a no-op.
+	// MOR clears stale indexes even when changing delete mode. Active COW never
+	// accesses a row index; a later MOR activation reconciles UUID/snapshot first.
 	for _, stream := range dropStreams {
+		if stream.Self().CopyOnWriteEnabled() {
+			continue
+		}
 		if err := utils.CheckExecutionFence(ctx); err != nil {
 			return err
 		}

@@ -336,6 +336,12 @@ func (s *ConfiguredStream) GetUpdateType() UpdateType {
 // ValidateUpdateType reports whether the stream's delete format is set, writable, and readable
 // by the target query engines recorded in its available_update_types.
 func (s *ConfiguredStream) ValidateUpdateType(destinationType DestinationType) error {
+	if err := s.ValidateCopyOnWrite(destinationType); err != nil {
+		return err
+	}
+	if s.CopyOnWriteEnabled() {
+		return nil
+	}
 	// Without upserts no deletes are written, so the delete format is never used.
 	if !s.UpsertApplies(destinationType) {
 		return nil

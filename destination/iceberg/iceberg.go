@@ -19,6 +19,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/compress"
@@ -640,9 +641,16 @@ type nativeWriter struct {
 	uncertain              bool
 	failed                 error
 	releaseSession         func(bool)
+	cow                    *nativeCOW
 }
 
 func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInterface, options *destination.Options, cat catalog.Catalog, indexThread *types.StreamIndexThread) (_ *nativeWriter, _ *types.MetadataState, err error) {
+	if err := stream.Self().ValidateCopyOnWrite(types.Iceberg); err != nil {
+		return nil, nil, err
+	}
+	if stream.Self().CopyOnWriteEnabled() && (indexThread != nil || options.TableIndex != nil) {
+		return nil, nil, errors.New("copy-on-write must not open a destination row index; disable destination TOAST hydration")
+	}
 	ctx, finish, err := beginNativeWriterWork(ctx, config)
 	if err != nil {
 		return nil, nil, err
@@ -688,15 +696,28 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 	}
 	state.latest = tbl
 	logNativeMetadataLSN(stream.ID(), tbl.Metadata().TableUUID().String(), nativeSnapshotID(tbl), tbl.Properties()[nativeRecoveryProperty])
-	w = &nativeWriter{table: tbl, cat: cat, coordinator: state, generation: state.generation, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), positions: make(map[string][]int64), latest: make(map[string]types.RowLocation), paths: make(map[string]struct{})}
+	w = &nativeWriter{table: tbl, cat: cat, coordinator: state, generation: state.generation, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), paths: make(map[string]struct{})}
 	w.releaseSession = release
+	if stream.Self().CopyOnWriteEnabled() {
+		w.cow, err = newNativeCOW(stream)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := w.prepareCopyOnWrite(ctx); err != nil {
+			return nil, nil, err
+		}
+	}
+	if w.cow == nil {
+		w.positions = make(map[string][]int64)
+		w.latest = make(map[string]types.RowLocation)
+	}
 	if err := w.validateFormat(ctx); err != nil {
 		return nil, nil, err
 	}
 	// Existing source columns are reconciled by ApplySourceColumns after the
 	// SyncStart phase, when PostgreSQL defaults have become authoritative. Eager
 	// union here would consume additions before their initial defaults arrive.
-	if options.TableIndex != nil {
+	if w.cow == nil && options.TableIndex != nil {
 		if err := w.migrateEqualityDeletes(ctx); err != nil {
 			return nil, nil, err
 		}
@@ -704,11 +725,13 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 	// Reconcile and return recovery from the loaded metadata, or from the
 	// successful format/migration commit that replaced it. A no-op
 	// initialization must not issue another catalog GET.
-	if err := indexdb.ReconcileTable(options.TableIndex, w.table.Properties()[resyncGenerationProperty], w.table.Metadata().TableUUID().String()); err != nil {
-		return nil, nil, fmt.Errorf("reconcile stream index generation: %w", err)
-	}
-	if err := reconcileNativeTableIndex(ctx, options.TableIndex, w.table, constants.OlakeID); err != nil {
-		return nil, nil, err
+	if w.cow == nil {
+		if err := indexdb.ReconcileTable(options.TableIndex, w.table.Properties()[resyncGenerationProperty], w.table.Metadata().TableUUID().String()); err != nil {
+			return nil, nil, fmt.Errorf("reconcile stream index generation: %w", err)
+		}
+		if err := reconcileNativeTableIndex(ctx, options.TableIndex, w.table, constants.OlakeID); err != nil {
+			return nil, nil, err
+		}
 	}
 	metadataState := &types.MetadataState{}
 	if value := w.table.Properties()[nativeRecoveryProperty]; value != "" {
@@ -746,6 +769,12 @@ func (w *nativeWriter) validateFormat(ctx context.Context) error {
 	// Initialization holds the entry lock through format changes, equality
 	// migration, index reconciliation and recovery-state publication.
 	state := w.coordinator
+	if w.cow != nil {
+		if w.table.Metadata().Version() < 2 || w.table.Metadata().Version() > 3 {
+			return errors.New("copy-on-write requires Iceberg format v2 or v3")
+		}
+		return nil
+	}
 	version := w.table.Metadata().Version()
 	if version > 3 {
 		return fmt.Errorf("unsupported Iceberg format version %d", version)
@@ -822,6 +851,9 @@ func (w *nativeWriter) Write(ctx context.Context, records []types.RawRecord) (er
 	}()
 	ctx = nativeCatalogContext(ctx, w.cat)
 	w.indexThread.SetObservabilityContext(ctx)
+	if w.cow != nil && !w.options.Backfill {
+		return w.writeCopyOnWrite(ctx, records)
+	}
 	if w.options.Backfill {
 		return w.writeBackfill(ctx, records)
 	}
@@ -1091,6 +1123,9 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		}
 	}()
 	ctx = nativeCatalogContext(ctx, w.cat)
+	if w.cow != nil && !w.options.Backfill {
+		return w.closeCopyOnWrite(ctx, finalMetadataState)
+	}
 	if err := w.finishBackfillFiles(ctx); err != nil {
 		return fmt.Errorf("finish backfill Iceberg files: %w", err)
 	}
@@ -1361,6 +1396,9 @@ func (w *nativeWriter) removeFiles(ctx context.Context, files []apacheiceberg.Da
 }
 
 func (w *nativeWriter) Abort() {
+	if w.cow != nil {
+		w.cow.cleanup(w.uncertain)
+	}
 	for _, f := range w.backfillFiles {
 		f.abort()
 	}
@@ -1430,6 +1468,28 @@ func nativeArrowRecord(schema *apacheiceberg.Schema, rows []map[string]any) (arr
 
 func appendNativeValue(builder array.Builder, value any) error {
 	switch b := builder.(type) {
+	case *array.Decimal128Builder:
+		typ := b.Type().(*arrow.Decimal128Type)
+		if v, ok := value.(decimal128.Num); ok {
+			b.Append(v)
+			break
+		}
+		if v, ok := value.(apacheiceberg.Decimal); ok {
+			if v.Scale != int(typ.Scale) {
+				return fmt.Errorf("decimal scale mismatch: expected %d, got %d", typ.Scale, v.Scale)
+			}
+			v, err := decimal128.FromString(v.String(), typ.Precision, typ.Scale)
+			if err != nil {
+				return err
+			}
+			b.Append(v)
+			break
+		}
+		v, err := decimal128.FromString(utils.ConvertToString(value), typ.Precision, typ.Scale)
+		if err != nil {
+			return err
+		}
+		b.Append(v)
 	case *array.BooleanBuilder:
 		v, err := typeutils.ReformatBool(value)
 		if err != nil {

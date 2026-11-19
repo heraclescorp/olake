@@ -120,6 +120,9 @@ func validatePublicationContainsStreams(ctx context.Context, conn *sqlx.DB, publ
 // back through the destination's table index, which append mode and eq do not keep.
 func validateToastStreams(streams []types.StreamInterface) error {
 	for _, stream := range streams {
+		if stream.Self().CopyOnWriteEnabled() {
+			return fmt.Errorf("stream %s: copy-on-write does not support destination TOAST/index hydration", stream.ID())
+		}
 		if stream.AppendModeEnabled() {
 			return errs.Precondition(errs.ConfigInvalid, codeAppendModeWithToast,
 				fmt.Errorf("stream %s: destination TOAST recovery does not support append mode", stream.ID()))
@@ -165,6 +168,17 @@ func (p *Postgres) PreCDC(ctx context.Context, streams []types.StreamInterface) 
 			return err
 		}
 		return p.validateOrdinaryRecoveryCatalog(streams, options.Plan.LowerLSN)
+	}
+	if err := p.ValidateCopyOnWrite(ctx, streams); err != nil {
+		return err
+	}
+	if _, resync := types.ResyncFromContext(ctx); !resync && hasCopyOnWrite(streams) {
+		if p.state == nil {
+			return fmt.Errorf("copy-on-write requires initialized source checkpoint state")
+		}
+		// Keep all saved stream/chunk state and membership, but advertise the
+		// actual shared PostgreSQL checkpoint shape for subsequent recovery.
+		p.state.SetType(types.GlobalType)
 	}
 	if err := p.cdcConfig.validateToastRecovery(); err != nil {
 		return err
@@ -230,6 +244,9 @@ func (p *Postgres) StreamChanges(ctx context.Context, _ int, metadataStates map[
 	}
 	if _, resync := types.ResyncFromContext(ctx); resync {
 		return p.streamResyncChanges(ctx, postgresGlobalState, metadataStates, callback)
+	}
+	if hasCopyOnWrite(p.streams) {
+		return p.streamCopyOnWriteChanges(ctx, postgresGlobalState, metadataStates, callback)
 	}
 
 	var metadataCommittedLSN string
@@ -376,6 +393,11 @@ func (p *Postgres) PostCDC(ctx context.Context, _ int) (err error) {
 		return ctx.Err()
 	default:
 		socket := p.replicator.Socket()
+		if socket.CommitAligned {
+			if _, resync := types.ResyncFromContext(ctx); !resync {
+				return p.AcknowledgeCDCCheckpoint(ctx, waljs.WALState{LSN: socket.ClientXLogPos.String()})
+			}
+		}
 		finalLSN := socket.ClientXLogPos.String()
 		// Acknowledge the replication slot BEFORE writing the state file.
 		// If the ack fails the state stays at its old value, so both the slot and

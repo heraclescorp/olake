@@ -39,7 +39,8 @@ type Stream struct {
 	// catalog predates target query engines. Not omitempty: empty must not read back as nil.
 	AvailableUpdateTypes []UpdateType `json:"available_update_types"`
 	// Fresh discovery proves this connector understands creation-only Iceberg sort policies.
-	SupportsIcebergSortOrder bool `json:"supports_iceberg_sort_order,omitempty"`
+	SupportsIcebergSortOrder   bool `json:"supports_iceberg_sort_order,omitempty"`
+	SupportsIcebergCopyOnWrite bool `json:"supports_iceberg_copy_on_write,omitempty"`
 	// Primary key if available
 	SourceDefinedPrimaryKey *Set[string] `json:"source_defined_primary_key,omitempty"`
 	// Available cursor fields supported by driver
