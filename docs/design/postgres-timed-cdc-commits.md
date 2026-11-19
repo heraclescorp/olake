@@ -48,6 +48,12 @@ This encoding is not collision-proof: values containing that delimiter can form
 the same encoded input. COW inherits this MOR identity limitation; validate the
 source keys before rollout. Iceberg does not enforce primary-key uniqueness.
 
+Automatic enrollment has its own optional `defaults.merge_strategy`. When set
+to COW, only newly discovered eligible tables are enrolled in COW; tables without
+a source primary key are skipped with a reason. Saved tables and exclusions are
+unchanged. Omitted strategy retains MOR. This setting requires the matching
+connector, worker and UI; it does not migrate existing tables or delete files.
+
 The existing terminal `nativeWriter.Close` transaction publishes data and
 `olake_2pc` together, using its existing snapshot/shape fences, conflict refresh
 and unknown-outcome protocol. Initial snapshots keep the existing append/chunk

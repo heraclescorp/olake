@@ -13,10 +13,11 @@ type enrollmentSchema struct {
 }
 
 type enrollmentDefaults struct {
-	Normalization  *bool            `json:"normalization"`
-	AppendMode     *bool            `json:"append_mode"`
-	UpdateType     types.UpdateType `json:"update_type"`
-	SyncNewColumns *bool            `json:"sync_new_columns"`
+	Normalization  *bool               `json:"normalization"`
+	AppendMode     *bool               `json:"append_mode"`
+	UpdateType     types.UpdateType    `json:"update_type"`
+	MergeStrategy  types.MergeStrategy `json:"merge_strategy,omitempty"`
+	SyncNewColumns *bool               `json:"sync_new_columns"`
 	// Optional, unlike the others: policies saved before it existed leave it unset, which is off.
 	DropRemovedColumns *bool `json:"drop_removed_columns"`
 }
@@ -37,6 +38,12 @@ func (p enrollmentPolicy) validate(saved *types.Catalog) error {
 	}
 	if err := p.Defaults.UpdateType.Validate(); err != nil {
 		return err
+	}
+	if strategy := p.Defaults.MergeStrategy; strategy != "" && strategy != types.MergeOnRead && strategy != types.CopyOnWrite {
+		return fmt.Errorf("unsupported merge_strategy %q: choose merge-on-read or copy-on-write", strategy)
+	}
+	if p.Defaults.MergeStrategy == types.CopyOnWrite && (!*p.Defaults.Normalization || *p.Defaults.AppendMode) {
+		return fmt.Errorf("copy-on-write enrollment requires normalization=true and append_mode=false (normalized upsert)")
 	}
 	if len(p.Schemas) == 0 {
 		return fmt.Errorf("enrollment requires at least one explicitly approved existing schema")
