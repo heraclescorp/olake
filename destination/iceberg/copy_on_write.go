@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
-	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -285,20 +284,14 @@ func (c *nativeCOW) filter(batch arrow.RecordBatch) (apacheiceberg.BooleanExpres
 	return nativeCOWCombine(tuples, false), nil
 }
 
-func (c *nativeCOW) overwriteOptions(filter apacheiceberg.BooleanExpression, track func(string)) []table.OverwriteOption {
+func (c *nativeCOW) overwriteOptions(filter apacheiceberg.BooleanExpression) []table.OverwriteOption {
 	return []table.OverwriteOption{
 		table.WithOverwriteFilter(filter),
 		table.WithOverwriteConcurrency(c.options.RewriteConcurrency),
-		table.WithOverwriteReadBatchSize(1),
-		table.WithOverwriteWriteLimits(c.options.RewriteConcurrency, 1, min(c.options.MaxBatchRows, 1024), int64(c.options.MaxBatchBytes)),
-		// Every incoming reader contains exactly one bounded typed record.
-		table.WithOverwriteClusteredInput(),
-		table.WithOverwriteRewriteWindow(c.options.MaxBatchRows, int64(c.options.MaxBatchBytes)),
-		table.WithOverwriteFileTracking(track),
 	}
 }
 
-func (w *nativeWriter) replayCopyOnWrite(ctx context.Context, tx *table.Transaction, track func(string)) error {
+func (w *nativeWriter) replayCopyOnWrite(ctx context.Context, tx *table.Transaction) error {
 	for segment := range w.cow.segments {
 		file, err := os.Open(filepath.Join(w.cow.directory, strconv.Itoa(segment)+".arrow"))
 		if err != nil {
@@ -324,7 +317,7 @@ func (w *nativeWriter) replayCopyOnWrite(ctx context.Context, tx *table.Transact
 			var records array.RecordReader
 			records, filterErr = array.NewRecordReader(batch.Schema(), []arrow.RecordBatch{batch})
 			if filterErr == nil {
-				filterErr = tx.Overwrite(ctx, records, apacheiceberg.Properties{"olake.thread-id": w.options.ThreadID}, w.cow.overwriteOptions(filter, track)...)
+				filterErr = tx.Overwrite(ctx, records, apacheiceberg.Properties{"olake.thread-id": w.options.ThreadID}, w.cow.overwriteOptions(filter)...)
 				records.Release()
 			}
 		}
@@ -424,11 +417,7 @@ func (w *nativeWriter) closeCopyOnWrite(ctx context.Context, finalMetadataState 
 		if err := tx.SetProperties(apacheiceberg.Properties{nativeRecoveryProperty: state, nativeCOWBatchProperty: batchID}); err != nil {
 			return err
 		}
-		var mu sync.Mutex
-		paths := make(map[string]struct{})
-		track := func(path string) { mu.Lock(); paths[path] = struct{}{}; mu.Unlock() }
-		if err := w.replayCopyOnWrite(ctx, tx, track); err != nil {
-			w.removeCOWPaths(ctx, fresh, paths)
+		if err := w.replayCopyOnWrite(ctx, tx); err != nil {
 			return err
 		}
 		if c.segments == 0 {
@@ -442,10 +431,9 @@ func (w *nativeWriter) closeCopyOnWrite(ctx context.Context, finalMetadataState 
 			if err != nil {
 				return err
 			}
-			err = tx.Overwrite(ctx, reader, nil, c.overwriteOptions(apacheiceberg.AlwaysFalse{}, track)...)
+			err = tx.Overwrite(ctx, reader, nil, c.overwriteOptions(apacheiceberg.AlwaysFalse{})...)
 			reader.Release()
 			if err != nil {
-				w.removeCOWPaths(ctx, fresh, paths)
 				return err
 			}
 		}
@@ -463,23 +451,12 @@ func (w *nativeWriter) closeCopyOnWrite(ctx context.Context, finalMetadataState 
 			w.uncertain = true
 			return fmt.Errorf("copy-on-write publication outcome unknown; staged destination files and private replay directory %q retained: %w", c.directory, commitErr)
 		}
-		w.removeCOWPaths(ctx, fresh, paths)
 		w.logConflict("copy-on-write", attempt+1, fresh, commitErr)
 		if !errors.Is(commitErr, table.ErrCommitFailed) && !errors.Is(commitErr, table.ErrConflictingDataFiles) && !errors.Is(commitErr, table.ErrConflictingDeleteFiles) {
 			return commitErr
 		}
 	}
 	return fmt.Errorf("copy-on-write refresh/rewrite retries exhausted: %w", table.ErrCommitFailed)
-}
-
-func (w *nativeWriter) removeCOWPaths(ctx context.Context, tbl *table.Table, paths map[string]struct{}) {
-	fs, err := tbl.FS(ctx)
-	if err != nil {
-		return
-	}
-	for path := range paths {
-		_ = fs.Remove(path)
-	}
 }
 
 func nativeCOWLiveFiles(ctx context.Context, tbl *table.Table) (deletes, data []apacheiceberg.DataFile, err error) {

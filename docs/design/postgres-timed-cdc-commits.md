@@ -10,12 +10,12 @@ Scope: PostgreSQL source-TOAST/native Iceberg. Copy-on-write uses complete-trans
 - Merge-on-read `nativeWriter.Close` completes files and publishes configured equality/position/DV deletes with `olake_2pc`. COW instead calls the SDK's exact-key filtered `Transaction.Overwrite`, publishing replacement data files and checkpoint together. Snapshot backfill retains the append-only writer and chunk-completion markers; it does not rewrite prior chunks or create a row index.
 - COW distinguishes advertised WAL end from processed complete-COMMIT positions. Progress logs and batch uploads do not authorize acknowledgement. Regular COW microbatches keep the replication socket open; ordinary recovery and atomic resync retain terminal-only acknowledgement.
 - Destination buffers independently track original source bytes and approximate decoded payload bytes. Hydrated values count toward the payload budget without inflating WAL-byte statistics; indivisible oversized rows flush alone. The source hydrator still materializes up to 128 fetched rows before emission, so this is not a strict process-memory cap.
-- Native Parquet writes check page/dictionary targets after each value, including backfill and delete-file writes. The 1 MiB targets remain soft: a single large value can exceed the unchanged reader limits. Per-value checks trade throughput for bounded multi-value page overshoot.
+- Backfill/MOR native Parquet writes check page/dictionary targets after each value, including delete-file writes. The 1 MiB targets remain soft: a single large value can exceed the unchanged reader limits. COW overwrite reads/writes use the SDK's existing defaults and table properties, not these per-value writer controls.
 - Ordinary CDC completion closes its replication connection even after cancellation or fence rejection, using a bounded uncanceled teardown context without authorizing acknowledgement. Resync retains separate connection ownership.
 - `iceberg_equality_delete` logs actual nonempty equality-delete file usage: `staged` records attempt-local files before commit, `commit_confirmed` records successful public table publication, and `private_resync_commit` records only a private resync-stage commit. Events include table/thread, attempt, snapshot, distinct key count and delete/data file counts, never key values. These are per-table events, not global WAL acknowledgement; retries can emit multiple staging events.
 - Non-FULL replica identity emits INFO when the decoder marks omitted TOAST values for configured recovery, not a data-loss warning. Without recovery it emits WARN that affected updates fail; the decoder's fail-closed behavior is unchanged. Relation metadata does not prove an individual value was omitted or successfully recovered.
 - PostgreSQL `varchar[]` (OID 1015) uses the pgx array codec for text/binary CDC tuples and maps to the array conversion path, preserving escaped strings, empty arrays, NULL elements and SQL NULL arrays instead of treating the array literal as a generic string.
-- `third_party/iceberg-go` contains Apache Iceberg Go v0.7.0 sources with LICENSE/NOTICE retained. Scoped RowDelta fixes validate same-delta references. COW extensions add staged-file observation, read/output memory controls, and bounded clustered survivor windows after partition-spec evolution; they reuse SDK `Overwrite`, not a separate rewrite engine. Root and standalone drivers use this local replacement until an upstream release supplies equivalent behavior.
+- `third_party/iceberg-go` contains Apache Iceberg Go v0.7.0 sources with LICENSE/NOTICE retained. Scoped RowDelta fixes validate same-delta references. COW uses the existing filtered `Overwrite` and concurrency options, without COW-specific SDK extensions. Root and standalone drivers retain the local replacement for the existing fixes until an upstream release supplies equivalent behavior.
 
 ## Retained ordinary-sync reconciliation
 
@@ -81,6 +81,13 @@ Uncertain publication retains both private replay and destination artifacts and
 keeps execution ownership unresolved. Authoritative checkpoint/batch identity
 recognizes landed work. No cleanup may delete potentially committed files.
 
+SDK overwrite outputs are not enumerated by OLake. Files from rejected or
+interrupted overwrite attempts are left for orphan-file lifecycle cleanup rather
+than guessed at or deleted by OLake. This can retain unreferenced objects and
+incur storage cost; no orphan-cleanup job or AWS maintenance setting is configured
+by selecting COW. Explicitly owned migration outputs retain their existing safe
+cleanup rules.
+
 ## Creation-time table sort policy
 
 An optional catalog-wide sort default and explicit per-table overrides configure
@@ -107,9 +114,12 @@ use a distinct namespace when a separate physical dataset is intended.
 `cow_options` defaults are 300 seconds, 100,000 incoming rows, 67,108,864 decoded
 payload bytes and rewrite concurrency 2. Interval, row/byte budgets and concurrency
 must be positive integers; interval seconds cannot exceed 9,223,372,036. These are
-soft limits, not a latency or total-process-memory guarantee. Concatenation can
-temporarily retain input/output, hydration buffers independently, and an
-indivisible large row can exceed the byte target without truncation.
+soft limits on incoming staging/materialization, not a latency or total-process-
+memory guarantee. SDK overwrite internals use their existing defaults/table
+properties; these options do not independently cap survivor-read batches, output
+queues, row groups or partition fanout. Concatenation can temporarily retain
+input/output, hydration buffers independently, and an indivisible large row can
+exceed the byte target without truncation.
 
 After the next complete COMMIT and source-hydration barrier, a due batch blocks
 the producer, drains/closes every selected writer at the same explicit checkpoint,

@@ -8,6 +8,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	arrowutil "github.com/apache/arrow-go/v18/arrow/util"
 	apacheiceberg "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 )
@@ -105,10 +106,7 @@ func (w *nativeWriter) materializeCOWView(ctx context.Context, fresh *table.Tabl
 				if readErr != nil {
 					return readErr
 				}
-				var size int64
-				for _, column := range batch.Columns() {
-					size += table.EstimateArrayDataBytes(column.Data())
-				}
+				size := arrowutil.TotalRecordSize(batch)
 				if len(pending) > 0 && (rows+batch.NumRows() > int64(w.cow.options.MaxBatchRows) || bytes+size > int64(w.cow.options.MaxBatchBytes)) {
 					if err := flush(); err != nil {
 						batch.Release()
