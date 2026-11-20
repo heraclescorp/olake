@@ -1,10 +1,14 @@
 package abstract
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/datazip-inc/olake/constants"
@@ -14,6 +18,7 @@ import (
 	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/datazip-inc/olake/utils/observability"
 	"github.com/datazip-inc/olake/utils/typeutils"
+	"github.com/jackc/pglogrepl"
 )
 
 func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams chan string, pool *destination.WriterPool, stream types.StreamInterface) error {
@@ -25,22 +30,67 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 	chunksSet := a.state.GetResumePlan(stream.Self())
 	var err error
 	if chunksSet == nil || chunksSet.Len() == 0 {
-		chunksSet, err = a.driver.GetOrSplitChunks(mainCtx, pool, stream)
-		if err != nil {
-			return fmt.Errorf("failed to get or split chunks: %w", err)
+		if options, recovery := types.OrdinaryRecoveryFromContext(mainCtx); recovery && options.Origin.Backfill {
+			chunksSet, err = pool.GetBackfillPlan(mainCtx, stream)
+			if err != nil {
+				return fmt.Errorf("load durable backfill plan: %w", err)
+			}
 		}
-		// The plan is immutable for the whole full refresh: a restarted connector reuses
-		// these exact ranges so its chunk IDs still match the already committed ones.
-		a.state.SetResumePlan(stream.Self(), chunksSet)
+		if chunksSet == nil || chunksSet.Len() == 0 {
+			chunksSet, err = a.driver.GetOrSplitChunks(mainCtx, pool, stream)
+			if err != nil {
+				return fmt.Errorf("failed to get or split chunks: %w", err)
+			}
+			options, recovery := types.OrdinaryRecoveryFromContext(mainCtx)
+			if a.driver.Type() == string(constants.Postgres) && stream.GetSyncMode() == types.CDC && (a.state.BackfillCheckpoint || (recovery && options.Origin.Backfill)) {
+				chunksSet, err = canonicalPostgresBackfillPlan(stream, chunksSet)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		if stream.GetSyncMode() == types.CDC && (chunksSet == nil || chunksSet.Len() == 0) {
+			chunksSet = types.NewSet(types.Chunk{})
+		}
+		if chunksSet != nil && chunksSet.Len() > 0 {
+			if err := a.state.SetBackfillPlan(stream.Self(), chunksSet); err != nil {
+				return err
+			}
+		}
+	}
+	if err := pool.PrepareBackfillPlan(mainCtx, stream, chunksSet); err != nil {
+		return fmt.Errorf("persist durable backfill plan: %w", err)
 	}
 	// Pending chunks shrink as chunks commit; they are what marks the full refresh complete
 	// and retires the resume plan.
 	if remaining := a.state.GetChunks(stream.Self()); remaining == nil || remaining.Len() == 0 {
 		a.state.SetChunks(stream.Self(), types.NewSet(chunksSet.Array()...))
 	}
+	options, recovery := types.OrdinaryRecoveryFromContext(mainCtx)
+	if a.state.BackfillCheckpoint || (recovery && options.Origin.Backfill) {
+		binding, err := pool.PrepareBackfillTable(mainCtx, stream)
+		if err != nil {
+			return err
+		}
+		if binding == nil {
+			return fmt.Errorf("backfill table %s has no durable binding", stream.ID())
+		}
+		if saved := a.state.GetBackfillTable(stream.Self()); saved != nil && *saved != *binding {
+			return fmt.Errorf("backfill table %s identity or shape changed", stream.ID())
+		}
+		a.state.SetBackfillTable(stream.Self(), binding)
+		if err := a.state.ErrBackfillPersistence(); err != nil {
+			return err
+		}
+	}
 	chunks := chunksSet.Array()
 	observability.AddChunks(mainCtx, "planned", int64(len(chunks)))
 	if len(chunks) == 0 {
+		if stream.GetSyncMode() == types.CDC {
+			if err := a.state.CompleteBackfill(stream.ID()); err != nil {
+				return err
+			}
+		}
 		if backfilledStreams != nil {
 			backfilledStreams <- stream.ID()
 		}
@@ -81,6 +131,9 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 		backfillCtx, backfillCtxCancel := context.WithCancel(gCtx)
 		defer backfillCtxCancel()
 
+		if err := a.state.ErrBackfillPersistence(); err != nil {
+			return err
+		}
 		threadID := generateThreadID(stream.ID(), fmt.Sprintf("min[%v]-max[%v]", chunk.Min, chunk.Max))
 		inserter, prevMetadataState, err := pool.NewWriter(backfillCtx, stream, destination.WithBackfill(true), destination.WithThreadID(threadID), destination.WithApplyFilter(slices.Contains(constants.FullRefreshPostReadFilterDrivers, constants.DriverType(a.driver.Type()))))
 		if err != nil {
@@ -91,30 +144,46 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 			if ctx.Err() != nil {
 				return
 			}
+			if persistErr := a.state.ErrBackfillPersistence(); persistErr != nil {
+				err = persistErr
+				backfillCtxCancel()
+				return
+			}
 			chunksLeft := a.state.RemoveChunk(stream.Self(), chunk)
+			if persistErr := a.state.ErrBackfillPersistence(); persistErr != nil {
+				err = persistErr
+				backfillCtxCancel()
+				return
+			}
 			if chunksLeft == 0 && backfilledStreams != nil {
+				if stream.GetSyncMode() == types.CDC {
+					if completeErr := a.state.CompleteBackfill(stream.ID()); completeErr != nil {
+						err = completeErr
+						backfillCtxCancel()
+						return
+					}
+				}
 				if !tableStart.IsZero() {
 					observability.RecordDuration(mainCtx, "table", time.Since(tableStart))
 				}
 				backfilledStreams <- stream.ID()
 			}
-			logger.Infof("finished chunk min[%v] and max[%v] of stream %s", chunk.Min, chunk.Max, stream.ID())
+			logger.Infof("finished backfill chunk for stream %s", stream.ID())
 		}(backfillCtx)
 
 		defer handleWriterCleanup(backfillCtx, backfillCtxCancel, &err, inserter, threadID, nil, nil)
 
-		// The last chunk is open ended, so rows appended since the plan was cut land there.
-		// It always re-runs; skipping it would leave that growth unbackfilled.
 		isTailChunk := chunkIndex == len(chunks)-1
-		if prevMetadataState != nil && !isTailChunk {
+		options, recovery := types.OrdinaryRecoveryFromContext(mainCtx)
+		if prevMetadataState != nil && (!isTailChunk || (recovery && options.Origin.Backfill) || canSkipCheckpointedTail(a.state, stream, a.driver.Type())) {
 			if slices.Contains(prevMetadataState.FullRefreshCommittedIDs, threadID) {
 				skipped = true
-				logger.Infof("Thread[%s]: chunk min[%v] and max[%v] already committed, skipping", threadID, chunk.Min, chunk.Max)
+				logger.Infof("backfill chunk already committed for stream %s, skipping", stream.ID())
 				return nil
 			}
 		}
 
-		logger.Infof("Thread[%s]: created writer for chunk min[%s] and max[%s] of stream %s", threadID, chunk.Min, chunk.Max, stream.ID())
+		logger.Infof("created backfill writer for stream %s", stream.ID())
 
 		return a.driver.ChunkIterator(backfillCtx, stream, chunk, func(ctx context.Context, data map[string]any, sourceBytes int64) error {
 			olakeID := utils.GetKeysHash(data, stream.GetStream().SourceDefinedPrimaryKey.Array()...)
@@ -136,4 +205,71 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 	}
 	utils.ConcurrentInGroupWithRetry(a.GlobalConnGroup, chunks, a.driver.MaxRetries(), chunkProcessor)
 	return nil
+}
+
+func canSkipCheckpointedTail(state *types.State, stream types.StreamInterface, driver string) bool {
+	if driver != string(constants.Postgres) || stream.GetSyncMode() != types.CDC || !state.BackfillCheckpoint || state.GetBackfillTable(stream.Self()) == nil {
+		return false
+	}
+	plan := state.GetBackfillPlan(stream.Self())
+	global := state.GetGlobal()
+	if plan == nil || plan.Len() == 0 || global == nil || global.State == nil {
+		return false
+	}
+	var checkpoint struct {
+		LSN string `json:"lsn"`
+	}
+	if utils.Unmarshal(global.State, &checkpoint) != nil {
+		return false
+	}
+	lower, err := pglogrepl.ParseLSN(checkpoint.LSN)
+	return err == nil && lower != 0
+}
+
+func canonicalPostgresBackfillPlan(stream types.StreamInterface, plan *types.Set[types.Chunk]) (*types.Set[types.Chunk], error) {
+	if plan == nil {
+		return nil, nil
+	}
+	chunks := plan.Array()
+	column := stream.Self().StreamMetadata.ChunkColumn
+	columnType, _ := stream.Schema().GetType(column)
+	quote := func(value string) string { return "'" + strings.ReplaceAll(value, "'", "''") + "'" }
+	boundary := func(value any) any {
+		switch value := value.(type) {
+		case time.Time:
+			return quote(value.Format(time.RFC3339Nano))
+		case []byte:
+			if columnType == types.Binary {
+				return "decode('" + hex.EncodeToString(value) + "','hex')"
+			}
+			if columnType == types.Int64 || columnType == types.Float64 {
+				return json.Number(string(value))
+			}
+			return quote(string(value))
+		case string:
+			if column != "" {
+				if columnType == types.Int64 || columnType == types.Float64 {
+					return json.Number(value)
+				}
+				return quote(value)
+			}
+			return value
+		default:
+			return value
+		}
+	}
+	for index := range chunks {
+		chunks[index].Min = boundary(chunks[index].Min)
+		chunks[index].Max = boundary(chunks[index].Max)
+	}
+	data, err := json.Marshal(chunks)
+	if err != nil {
+		return nil, fmt.Errorf("encode durable PostgreSQL backfill plan: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&chunks); err != nil {
+		return nil, fmt.Errorf("decode durable PostgreSQL backfill plan: %w", err)
+	}
+	return types.NewSet(chunks...), nil
 }

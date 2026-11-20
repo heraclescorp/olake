@@ -203,7 +203,7 @@ func TestHandleWriterCleanupMessage(t *testing.T) {
 			prior:      networkReset(),
 			panicValue: "boom",
 			threadID:   "public.users_abc",
-			contains:   []string{"thread[public.users_abc]", "panic recovered: boom", "read failed"},
+			contains:   []string{"panic recovered: boom", "read failed"},
 			asOpError:  true,
 		},
 		// the close half of the function: a writer it cannot close is reported alongside the panic
@@ -220,7 +220,7 @@ func TestHandleWriterCleanupMessage(t *testing.T) {
 			panicValue: "boom",
 			threadID:   "public.users_abc",
 			nilWriter:  true,
-			contains:   []string{"thread[public.users_abc]", "unsupported writer type", "prev error:", "read failed"},
+			contains:   []string{"unsupported writer type", "prev error:", "read failed"},
 			asOpError:  true,
 		},
 	}
@@ -232,6 +232,9 @@ func TestHandleWriterCleanupMessage(t *testing.T) {
 
 			for _, fragment := range tc.contains {
 				assert.Contains(t, err.Error(), fragment)
+			}
+			if tc.threadID != "" {
+				assert.NotContains(t, err.Error(), tc.threadID)
 			}
 			if tc.asOpError {
 				assert.True(t, errors.As(err, new(*net.OpError)), "the chain must not be flattened")

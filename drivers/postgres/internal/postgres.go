@@ -314,6 +314,7 @@ func (p *Postgres) ProduceSchema(ctx context.Context, streamID types.StreamID) (
 	populateStream := func(streamID types.StreamID) (*types.Stream, error) {
 		schemaName, streamName := streamID.Namespace, streamID.Name
 		stream := types.NewStream(streamName, schemaName, &p.config.Database)
+		stream.SupportsIcebergCopyOnWrite = true
 		var columnSchemaOutput []ColumnDetails
 		err := p.client.SelectContext(ctx, &columnSchemaOutput, getTableSchemaTmpl, schemaName, streamName)
 		if err != nil {

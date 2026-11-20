@@ -77,11 +77,18 @@ func validateOrdinaryRecoveryOrigin(origin types.OrdinaryRecoveryOrigin) error {
 	if origin.Version != 1 || strings.TrimSpace(origin.OriginalExecutionID) == "" || strings.TrimSpace(origin.OriginalLaunchID) == "" {
 		return fmt.Errorf("ordinary recovery origin has an invalid version or original identity")
 	}
+	if origin.Backfill != (origin.BackfillCheckpointSHA256 != "" && origin.SavedStateSHA256 != "") || (!origin.Backfill && (origin.BackfillCheckpointSHA256 != "" || origin.SavedStateSHA256 != "")) {
+		return fmt.Errorf("ordinary recovery backfill requires candidate and saved-state digest bindings")
+	}
 	for name, digest := range map[string]string{
 		"original_receipt_sha256": origin.OriginalReceiptSHA256,
 		"source_sha256":           origin.SourceSHA256, "destination_sha256": origin.DestinationSHA256,
 		"catalog_sha256": origin.CatalogSHA256, "baseline_state_sha256": origin.BaselineStateSHA256,
+		"backfill_checkpoint_sha256": origin.BackfillCheckpointSHA256, "saved_state_sha256": origin.SavedStateSHA256,
 	} {
+		if !origin.Backfill && (name == "backfill_checkpoint_sha256" || name == "saved_state_sha256") {
+			continue
+		}
 		if name == "original_receipt_sha256" && digest == "" {
 			continue
 		}
@@ -201,6 +208,20 @@ func prepareOrdinaryRecovery(cmd *cobra.Command) error {
 	if err := decodeOrdinaryRecoveryState(baseline, state); err != nil {
 		return err
 	}
+	options := &types.OrdinaryRecoveryOptions{Origin: origin}
+	if origin.Backfill {
+		options.BackfillCheckpoint, err = loadBackfillRecoveryCheckpoint(origin, baseline)
+		if err != nil {
+			return err
+		}
+		options.BackfillState, err = state.Clone()
+		if err != nil {
+			return err
+		}
+		binding := options.BackfillCheckpoint.SourceBinding()
+		state.BackfillSource = &binding
+		state.BackfillCheckpoint = true
+	}
 	state.SuppressPersistence = true
 	ordinaryRecoveryResultPath, ordinaryRecoveryResultURI, err = utils.ResolveArtifactOutput(ordinaryRecoveryResultPath, "ordinary-recovery-result.json", configPath)
 	if err != nil {
@@ -211,7 +232,11 @@ func prepareOrdinaryRecovery(cmd *cobra.Command) error {
 			return fmt.Errorf("ordinary recovery result must not replace an input artifact")
 		}
 	}
-	cmd.SetContext(types.WithOrdinaryRecovery(cmd.Context(), &types.OrdinaryRecoveryOptions{Origin: origin}))
+	ctx := types.WithOrdinaryRecovery(cmd.Context(), options)
+	if origin.Backfill {
+		ctx = types.WithBackfillBindingJournal(ctx, newBackfillBindingJournal(ctx, options.BackfillCheckpoint))
+	}
+	cmd.SetContext(ctx)
 	return nil
 }
 
@@ -233,6 +258,10 @@ func decodeOrdinaryRecoveryState(data []byte, checkpoint *types.State) error {
 }
 
 func ordinaryRecoverySelected(saved *types.Catalog, checkpoint *types.State) ([]types.StreamInterface, string, error) {
+	return ordinaryRecoverySelectedMode(saved, checkpoint, false)
+}
+
+func ordinaryRecoverySelectedMode(saved *types.Catalog, checkpoint *types.State, backfill bool) ([]types.StreamInterface, string, error) {
 	if checkpoint == nil || checkpoint.Type != types.GlobalType || checkpoint.Global == nil || checkpoint.Global.State == nil || checkpoint.Global.Streams == nil {
 		return nil, "", fmt.Errorf("ordinary recovery requires a saved GLOBAL LSN and completed backfill membership")
 	}
@@ -260,7 +289,7 @@ func ordinaryRecoverySelected(saved *types.Catalog, checkpoint *types.State) ([]
 	}
 	seen := make(map[string]bool)
 	for _, stream := range classification.SelectedStreams {
-		if seen[stream.ID()] || (stream.GetSyncMode() != types.CDC && stream.GetSyncMode() != types.STRICTCDC) || !checkpoint.HasCompletedBackfill(stream.Self()) || stream.GetStream().SourceDefinedPrimaryKey == nil || stream.GetStream().SourceDefinedPrimaryKey.Len() == 0 {
+		if seen[stream.ID()] || (stream.GetSyncMode() != types.CDC && stream.GetSyncMode() != types.STRICTCDC) || (!backfill && !checkpoint.HasCompletedBackfill(stream.Self())) || (backfill && stream.GetSyncMode() != types.CDC) || stream.GetStream().SourceDefinedPrimaryKey == nil || stream.GetStream().SourceDefinedPrimaryKey.Len() == 0 {
 			return nil, "", fmt.Errorf("ordinary recovery stream %s requires unique saved CDC/strictCDC selection, completed backfill and primary keys", stream.ID())
 		}
 		seen[stream.ID()] = true
@@ -280,6 +309,15 @@ func ordinaryRecoverySelected(saved *types.Catalog, checkpoint *types.State) ([]
 	sort.Slice(classification.SelectedStreams, func(i, j int) bool {
 		return classification.SelectedStreams[i].ID() < classification.SelectedStreams[j].ID()
 	})
+	if backfill {
+		data, err := checkpoint.MarshalJSON()
+		if err != nil {
+			return nil, "", err
+		}
+		if err := validateBackfillRecoveryState(data, classification.SelectedStreams); err != nil {
+			return nil, "", err
+		}
+	}
 	return classification.SelectedStreams, global.LSN, nil
 }
 
@@ -339,12 +377,15 @@ func runOrdinaryRecovery(cmd *cobra.Command) (err error) {
 		utils.SourceDrained(ctx, cleanupErr)
 		err = errors.Join(err, cleanupErr)
 	}()
-	selected, lower, err := ordinaryRecoverySelected(catalog, state)
+	selected, lower, err := ordinaryRecoverySelectedMode(catalog, state, options.Origin.Backfill)
 	if err != nil {
 		return err
 	}
 	connector.SetupState(state)
 	if err := connector.Setup(ctx); err != nil {
+		return err
+	}
+	if err := destination.ValidateCopyOnWrite(destinationConfig, selected); err != nil {
 		return err
 	}
 	identity, err := connector.ValidateOrdinaryRecovery(ctx, selected, lower)
@@ -362,6 +403,9 @@ func runOrdinaryRecovery(cmd *cobra.Command) (err error) {
 	if err := utils.UnmarshalFile(configPath, &source, true); err != nil {
 		return err
 	}
+	if options.Origin.Backfill && (identity != options.BackfillCheckpoint.ServerIdentity || source.UpdateMethod.ReplicationSlot != options.BackfillCheckpoint.SlotName) {
+		return fmt.Errorf("backfill recovery live source identity or slot differs from the durable candidate")
+	}
 	if err := checkOrdinaryRecoveryServer(ctx, options.Origin, identity, source.UpdateMethod.ReplicationSlot, false); err != nil {
 		return err
 	}
@@ -371,6 +415,25 @@ func runOrdinaryRecovery(cmd *cobra.Command) (err error) {
 		return err
 	}
 	defer pool.Shutdown(context.WithoutCancel(ctx))
+	if options.Origin.Backfill {
+		if err := pool.PrepareBackfillRecovery(ctx, selected, lower); err != nil {
+			return err
+		}
+		if err := connector.ResumeOrdinaryBackfill(ctx, pool, selected); err != nil {
+			return err
+		}
+		options.BackfillComplete = true
+		options.BackfillTargetLSN, err = pool.BackfillRecoveryTarget(ctx)
+		if err != nil {
+			return err
+		}
+		if options.BackfillTargetLSN == "" {
+			options.BackfillTargetLSN, err = connector.CaptureBackfillRecoveryTarget(ctx, lower)
+			if err != nil {
+				return err
+			}
+		}
+	}
 	proofs, err := pool.PrepareOrdinaryRecovery(ctx, selected, lower)
 	if err != nil {
 		return err
@@ -396,6 +459,11 @@ func runOrdinaryRecovery(cmd *cobra.Command) (err error) {
 	}
 	if err := verifyOrdinaryRecoveryConfig(options.Origin); err != nil {
 		return err
+	}
+	if options.Origin.Backfill {
+		if _, err := loadBackfillRecoveryCheckpoint(options.Origin, options.BackfillCheckpoint.State); err != nil {
+			return err
+		}
 	}
 	if err := connector.AcknowledgeOrdinaryRecovery(ctx, plan); err != nil {
 		return err
@@ -497,6 +565,39 @@ func validateOrdinaryRecoveryResult(checkpoint *types.State, result types.Ordina
 		position, lsnErr := ordinaryRecoveryLSN(proof.CommittedLSN)
 		if proof.Stream == "" || seen[proof.Stream] || uuidErr != nil || parsedUUID == uuid.Nil || proof.FenceSnapshotID <= 0 || lsnErr != nil || position != target || !checkpoint.Global.Streams.Exists(proof.Stream) {
 			return fmt.Errorf("ordinary recovery table proof %q does not prove the exact common boundary", proof.Stream)
+		}
+		if result.Backfill {
+			var found bool
+			for _, entry := range checkpoint.Streams {
+				if entry.Namespace+"."+entry.Stream != proof.Stream {
+					continue
+				}
+				if found {
+					return fmt.Errorf("backfill recovery result duplicates stream state")
+				}
+				found = true
+				bindingValue, _ := entry.State.Load(types.BackfillTableKey)
+				var binding types.BackfillTableBinding
+				if err := utils.Unmarshal(bindingValue, &binding); err != nil || binding.TableUUID != proof.TableUUID {
+					return fmt.Errorf("backfill recovery result lost destination identity binding")
+				}
+				for _, key := range []string{types.ChunksKey, types.ResumePlanKey} {
+					if value, exists := entry.State.Load(key); exists {
+						chunks, ok := value.(*types.Set[types.Chunk])
+						if !ok || chunks.Len() != 0 {
+							return fmt.Errorf("backfill recovery result retains unfinished backfill work")
+						}
+					}
+				}
+				value, exists := entry.State.Load(types.BackfillPlanKey)
+				plan, ok := value.(*types.Set[types.Chunk])
+				if !exists || !ok || plan.Len() == 0 {
+					return fmt.Errorf("backfill recovery result lost its immutable completed plan")
+				}
+			}
+			if !found {
+				return fmt.Errorf("backfill recovery result has no completed table state")
+			}
 		}
 		seen[proof.Stream] = true
 	}

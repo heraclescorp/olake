@@ -57,6 +57,7 @@ type (
 		resyncContext       context.Context
 		ordinaryRecovery    ordinaryRecoveryDestination
 		ordinaryPrepared    bool
+		backfillPrepared    bool
 	}
 
 	// writer thread used by reader
@@ -107,9 +108,22 @@ func WithKeepDeletesThroughFilter(keep bool) ThreadOptions {
 	}
 }
 
+// ValidateCopyOnWrite performs no I/O; callers use it before resets or creation.
+func ValidateCopyOnWrite(config *types.WriterConfig, streams []types.StreamInterface) error {
+	for _, stream := range streams {
+		if err := stream.Self().ValidateCopyOnWrite(config.Type); err != nil {
+			return fmt.Errorf("stream %s: %w", stream.ID(), err)
+		}
+	}
+	return nil
+}
+
 // NewWriterPool manages a destination's shared resources (e.g., Iceberg JVM) and connection health.
 // It initializes global state, runs checks, and provides thread-level writers. Call Close() to clean up.
 func NewWriterPool(ctx context.Context, config *types.WriterConfig, syncStreams []types.StreamInterface, batchSize int64) (*WriterPool, error) {
+	if err := ValidateCopyOnWrite(config, syncStreams); err != nil {
+		return nil, err
+	}
 	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return nil, err
 	}
@@ -155,7 +169,7 @@ func NewWriterPool(ctx context.Context, config *types.WriterConfig, syncStreams 
 
 	for _, stream := range syncStreams {
 		artifact := &writerSchema{
-			needsIndex: !stream.AppendModeEnabled() && stream.GetUpdateType().NeedsTableIndex(config.Type),
+			needsIndex: !stream.AppendModeEnabled() && !stream.Self().CopyOnWriteEnabled() && stream.GetUpdateType().NeedsTableIndex(config.Type),
 		}
 
 		pool.writerSchema.Store(stream.ID(), artifact)
@@ -192,12 +206,22 @@ func (w *WriterPool) NewWriter(ctx context.Context, stream types.StreamInterface
 	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
 		return nil, nil, fmt.Errorf("recovery-only resync cannot open a data writer")
 	}
+	opts := &Options{}
+	for _, one := range options {
+		one(opts)
+	}
 	if recovery, ok := types.OrdinaryRecoveryFromContext(ctx); ok {
-		if !w.ordinaryPrepared || recovery.Plan == nil {
-			return nil, nil, fmt.Errorf("ordinary recovery writers require prepared barriers and a bounded replay plan")
-		}
-		if _, selected := recovery.Plan.ReplayAfter[stream.ID()]; !selected {
-			return nil, nil, fmt.Errorf("ordinary recovery writer stream is outside the replay plan")
+		if recovery.Origin.Backfill && !recovery.BackfillComplete {
+			if !w.backfillPrepared || !opts.Backfill {
+				return nil, nil, fmt.Errorf("ordinary backfill recovery requires prepared tables and backfill writers")
+			}
+		} else {
+			if !w.ordinaryPrepared || recovery.Plan == nil || opts.Backfill {
+				return nil, nil, fmt.Errorf("ordinary recovery writers require prepared barriers and a bounded replay plan")
+			}
+			if _, selected := recovery.Plan.ReplayAfter[stream.ID()]; !selected {
+				return nil, nil, fmt.Errorf("ordinary recovery writer stream is outside the replay plan")
+			}
 		}
 	}
 	if err := utils.CheckExecutionFence(ctx); err != nil {
@@ -205,11 +229,6 @@ func (w *WriterPool) NewWriter(ctx context.Context, stream types.StreamInterface
 	}
 	ctx = observability.WithTable(ctx, stream.Namespace(), stream.Name())
 	w.stats.ThreadCount.Add(1)
-
-	opts := &Options{}
-	for _, one := range options {
-		one(opts)
-	}
 
 	rawStreamArtifact, ok := w.writerSchema.Load(stream.ID())
 	if !ok {
@@ -408,7 +427,7 @@ func (wt *WriterThread) flush(ctx context.Context, buf []types.RawRecord) (err e
 	}
 	observability.AddRows(ctx, "pushed", int64(len(buf)), 0)
 
-	logger.Infof("Thread[%s]: successfully wrote %d records", wt.threadID, len(buf))
+	logger.Infof("Destination writer successfully wrote %d records", len(buf))
 	return nil
 }
 
@@ -505,6 +524,9 @@ func DropStreams(ctx context.Context, config *types.WriterConfig, dropStreams []
 	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return err
 	}
+	if err := ValidateCopyOnWrite(config, dropStreams); err != nil {
+		return err
+	}
 	if len(dropStreams) == 0 {
 		return nil
 	}
@@ -512,10 +534,12 @@ func DropStreams(ctx context.Context, config *types.WriterConfig, dropStreams []
 		utils.BeginExecutionParticipant(ctx)(false)
 	}
 
-	// Always drop the stream index: dropStreams carry the new update type, not the one the
-	// index was built under, so a dv/pos -> eq clear would otherwise leave a stale index
-	// that outlives the recreated table. Dropping a missing index is a no-op.
+	// MOR clears stale indexes even when changing delete mode. Active COW never
+	// accesses a row index; a later MOR activation reconciles UUID/snapshot first.
 	for _, stream := range dropStreams {
+		if stream.Self().CopyOnWriteEnabled() {
+			continue
+		}
 		if err := utils.CheckExecutionFence(ctx); err != nil {
 			return err
 		}

@@ -92,8 +92,6 @@ var syncCmd = &cobra.Command{
 		//version
 		logger.Infof("Ruuning OLake sync with version %s", version.GetOlakeCLIVersion())
 
-		stateBytes, _ := state.MarshalJSON()
-		logger.Infof("Running sync with state: %s", stateBytes)
 		return prepareOrdinaryRecovery(cmd)
 	},
 	RunE: func(cmd *cobra.Command, _ []string) (err error) {
@@ -126,6 +124,9 @@ var syncCmd = &cobra.Command{
 		selectedStreamsMetadata, err := classifyStreams(catalog, streams, state, destinationConfig.Type)
 		if err != nil {
 			return fmt.Errorf("failed to get selected streams for clearing: %w", err)
+		}
+		if err := destination.ValidateCopyOnWrite(destinationConfig, selectedStreamsMetadata.SelectedStreams); err != nil {
+			return err
 		}
 
 		if streams == nil {
@@ -171,6 +172,9 @@ var syncCmd = &cobra.Command{
 
 		// Setup State for Connector
 		connector.SetupState(state)
+		if err := configureBackfillCheckpoint(cmd, selectedStreamsMetadata.SelectedStreams); err != nil {
+			return err
+		}
 		// Sync Telemetry tracking
 
 		// Added this check to avoid the sleep when tracking telemetry is disabled
@@ -197,6 +201,9 @@ var syncCmd = &cobra.Command{
 		}
 
 		state.LogWithLock()
+		if err := state.ErrBackfillPersistence(); err != nil {
+			return err
+		}
 		// ReadCount/RecordsFiltered are rolled back per-thread on failed or retried
 		// chunks (see WriterThread.Close), so this reflects committed rows only.
 		stats := pool.GetStats()

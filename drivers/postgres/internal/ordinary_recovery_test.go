@@ -96,6 +96,58 @@ func TestOrdinaryRecoveryPlanAcceptsBaselineAndAckBeforeStateRetries(t *testing.
 	}
 }
 
+func TestBackfillRecoveryTargetPreservesCapturedBoundary(t *testing.T) {
+	boundary, err := backfillRecoveryTarget("0/500", 0x300, 0x900)
+	require.NoError(t, err)
+	require.Equal(t, pglogrepl.LSN(0x500), boundary, "fresh WAL must not widen the captured transaction boundary")
+	for _, raw := range []string{"", "invalid", "0/0", "0/200", "0/A00"} {
+		_, err := backfillRecoveryTarget(raw, 0x300, 0x900)
+		require.Error(t, err, raw)
+	}
+}
+
+func TestBackfillRecoveryRequiresOriginalRetainedLower(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		confirmed string
+		restart   string
+		valid     bool
+	}{
+		{"original", "0/100", "0/80", true},
+		{"exact_restart", "0/100", "0/100", true},
+		{"advanced", "0/200", "0/80", false},
+		{"behind", "0/90", "0/80", false},
+		{"missing_wal", "0/100", "0/110", false},
+		{"missing_restart", "0/100", "", false},
+		{"zero_restart", "0/100", "0/0", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateBackfillRecoverySlot(ordinaryRecoverySlot{Confirmed: tc.confirmed, Restart: tc.restart}, 0x100)
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestBackfillRecoveryCatalogAllowsOnlyIncompleteCDC(t *testing.T) {
+	streams := ordinaryTestStreams()
+	for _, stream := range streams {
+		stream.GetStream().SyncMode = types.CDC
+	}
+	state := &types.State{RWMutex: &sync.RWMutex{}, Type: types.GlobalType, SuppressPersistence: true,
+		Global: &types.GlobalState{State: waljs.WALState{LSN: "0/100"}, Streams: types.NewSet[string]()}}
+	p := &Postgres{config: &Config{}, CDCSupport: true, state: state, cdcConfig: CDC{ReplicationSlot: "saved"}}
+	require.Error(t, p.validateOrdinaryRecoveryCatalog(streams, "0/100"))
+	require.NoError(t, p.validateRecoveryCatalog(streams, "0/100", true))
+	streams[0].GetStream().SyncMode = types.STRICTCDC
+	require.Error(t, p.validateRecoveryCatalog(streams, "0/100", true))
+	streams[0].GetStream().SyncMode = types.CDC
+	require.Error(t, p.validateRecoveryCatalog(streams, "0/200", true))
+}
+
 func TestOrdinaryRecoveryRequiresEverySelectedSavedGlobalMember(t *testing.T) {
 	for _, scenario := range []string{"valid", "missing_global", "stream_state", "missing_member", "extra_member", "fresh_stream", "wrong_baseline", "no_primary_key", "resync"} {
 		t.Run(scenario, func(t *testing.T) {

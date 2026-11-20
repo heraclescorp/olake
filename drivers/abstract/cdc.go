@@ -72,6 +72,9 @@ func (a *AbstractDriver) RunChangeStream(mainCtx context.Context, pool *destinat
 
 	// Wait for all backfill processes to complete
 	err = a.waitForBackfillCompletion(mainCtx, backfillCompletionChannel, streams, func(streamID string) error {
+		if err := a.state.CompleteBackfill(streamID); err != nil {
+			return err
+		}
 		// Start CDC stream immediately after backfill completes (concurrent mode)
 		if isConcurrentMode {
 			a.GlobalConnGroup.AddWithRetry(a.driver.MaxRetries(), func(connGroupCtx context.Context) error {
@@ -80,10 +83,6 @@ func (a *AbstractDriver) RunChangeStream(mainCtx context.Context, pool *destinat
 				// writers for the other streams would commit this stream's position into their tables
 				return a.streamChanges(connGroupCtx, pool, streamIndex, streams[streamIndex:streamIndex+1])
 			})
-		} else {
-			// In sequential/parallel modes, track completion but don't start CDC yet
-			// CDC will be started later based on the execution mode
-			a.state.SetGlobal(nil, streamID)
 		}
 		return nil
 	})
@@ -126,6 +125,10 @@ func (a *AbstractDriver) streamChanges(mainCtx context.Context, pool *destinatio
 	defer cdcCtxCancel()
 
 	defer func() {
+		if persistErr := a.state.ErrBackfillPersistence(); persistErr != nil {
+			err = persistErr
+			cdcCtxCancel()
+		}
 		if _, recovery := types.OrdinaryRecoveryFromContext(mainCtx); recovery {
 			return
 		}

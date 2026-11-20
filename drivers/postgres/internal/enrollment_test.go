@@ -86,3 +86,24 @@ func TestValidateTableEnrollmentWal2JSONAndAppendIdentity(t *testing.T) {
 	// wal2json is not constrained by a publication. Append does not use old row
 	// identifiers; it can enroll without DEFAULT/FULL identity or a source PK.
 }
+
+func TestCopyOnWriteEnrollmentToastRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		toast     string
+		wantError bool
+	}{
+		{"", false},
+		{"source", false},
+		{"destination", true},
+		{"invalid", true},
+	} {
+		p := &Postgres{cdcConfig: CDC{ToastValueSource: tc.toast}}
+		err := p.ValidateCopyOnWriteEnrollment()
+		if tc.wantError && (err == nil || !strings.Contains(err.Error(), "source TOAST")) {
+			t.Fatalf("toast %q: expected source TOAST error, got %v", tc.toast, err)
+		}
+		if !tc.wantError && err != nil {
+			t.Fatalf("toast %q: %v", tc.toast, err)
+		}
+	}
+}

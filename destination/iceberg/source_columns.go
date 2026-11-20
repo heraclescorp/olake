@@ -591,10 +591,11 @@ func loadOrCreateNativeTable(ctx context.Context, config *Config, stream types.S
 	if !errors.Is(err, catalog.ErrNoSuchTable) {
 		return nil, err
 	}
-	if config.ordinaryRecovery {
+	creation, _ := ctx.Value(backfillRecoveryCreationKey{}).(*nativeBackfillOwner)
+	if config.ordinaryRecovery && creation == nil {
 		return nil, errors.New("ordinary recovery cannot create a missing destination table")
 	}
-	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+	if recovery, ok := types.OrdinaryRecoveryFromContext(ctx); ok && (creation == nil || !recovery.Origin.Backfill || recovery.BackfillComplete) {
 		return nil, errors.New("ordinary recovery cannot create a missing destination table")
 	}
 	columns, err := nativeStreamColumns(stream)
@@ -617,7 +618,7 @@ func loadOrCreateNativeTable(ctx context.Context, config *Config, stream types.S
 		return nil, err
 	}
 	version := "2"
-	if stream.GetUpdateType() == types.UpdateTypeDeletionVector {
+	if !stream.Self().CopyOnWriteEnabled() && stream.GetUpdateType() == types.UpdateTypeDeletionVector {
 		version = "3"
 	}
 	// Storage credentials belong only to catalog/FileIO configuration, never table metadata.
@@ -629,9 +630,26 @@ func loadOrCreateNativeTable(ctx context.Context, config *Config, stream types.S
 	// Pin each native transaction to its original branch head. Retrying stale
 	// properties inside iceberg-go would overwrite another thread's 2PC state.
 	props["commit.retry.num-retries"] = "0"
+	props, err = nativeBloomFilterProperties(schema, stream, props)
+	if err != nil {
+		return nil, err
+	}
 	// The catalog owns table locations, including managed S3 Tables/Unity warehouses.
+	if creation != nil {
+		if creation.Plan == "" || creation.RequestedShapeSHA256 == "" {
+			return nil, errors.New("backfill table creation requires an exact plan and frozen requested shape")
+		}
+		encoded, err := json.Marshal(creation)
+		if err != nil {
+			return nil, err
+		}
+		props[nativeBackfillOwnerProperty] = string(encoded)
+	}
 	tbl, err = cat.CreateTable(ctx, identifier, schema, catalog.WithPartitionSpec(&spec), catalog.WithSortOrder(sortOrder), catalog.WithProperties(props))
 	if errors.Is(err, catalog.ErrTableAlreadyExists) {
+		if creation != nil {
+			return nil, errors.New("backfill recovery destination appeared during initialization")
+		}
 		return cat.LoadTable(ctx, identifier)
 	}
 	return tbl, err

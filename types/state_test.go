@@ -19,8 +19,7 @@ func TestFullRefreshResumePlanSurvivesRestart(t *testing.T) {
 		t.Run(string(syncMode), func(t *testing.T) {
 			state, stream := resumePlanTestState(syncMode)
 			plan := NewSet(Chunk{Min: int64(1), Max: int64(10)}, Chunk{Min: int64(10), Max: nil})
-			state.SetResumePlan(stream, plan)
-			state.SetChunks(stream, NewSet(plan.Array()...))
+			require.NoError(t, state.SetBackfillPlan(stream, plan))
 
 			restarted, err := state.Clone()
 			require.NoError(t, err)
@@ -42,8 +41,7 @@ func TestFullRefreshResumePlanRetiresAfterLastChunk(t *testing.T) {
 	state, stream := resumePlanTestState(FULLREFRESH)
 	completed, tail := Chunk{Min: int64(1), Max: int64(10)}, Chunk{Min: int64(10), Max: nil}
 	plan := NewSet(completed, tail)
-	state.SetResumePlan(stream, plan)
-	state.SetChunks(stream, NewSet(plan.Array()...))
+	require.NoError(t, state.SetBackfillPlan(stream, plan))
 
 	require.Equal(t, 1, state.RemoveChunk(stream, completed))
 	require.NotNil(t, state.GetResumePlan(stream), "the plan must outlive partial progress")
@@ -57,7 +55,7 @@ func TestFullRefreshResumePlanRetiresAfterLastChunk(t *testing.T) {
 func TestResumePlanLeavesCursorsUntouched(t *testing.T) {
 	state, stream := resumePlanTestState(CDC)
 	state.SetCursor(stream, "lsn", "0/100")
-	state.SetResumePlan(stream, NewSet(Chunk{Min: int64(1), Max: nil}))
+	require.NoError(t, state.SetBackfillPlan(stream, NewSet(Chunk{Min: int64(1), Max: nil})))
 
 	require.Equal(t, "0/100", state.GetCursor(stream, "lsn"))
 	state.RemoveChunk(stream, Chunk{Min: int64(1), Max: nil})
