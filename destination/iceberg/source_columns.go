@@ -629,6 +629,10 @@ func loadOrCreateNativeTable(ctx context.Context, config *Config, stream types.S
 	// Pin each native transaction to its original branch head. Retrying stale
 	// properties inside iceberg-go would overwrite another thread's 2PC state.
 	props["commit.retry.num-retries"] = "0"
+	props, err = nativeBloomFilterProperties(schema, stream, props)
+	if err != nil {
+		return nil, err
+	}
 	// The catalog owns table locations, including managed S3 Tables/Unity warehouses.
 	tbl, err = cat.CreateTable(ctx, identifier, schema, catalog.WithPartitionSpec(&spec), catalog.WithSortOrder(sortOrder), catalog.WithProperties(props))
 	if errors.Is(err, catalog.ErrTableAlreadyExists) {

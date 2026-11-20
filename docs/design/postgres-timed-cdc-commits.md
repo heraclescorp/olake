@@ -79,6 +79,39 @@ attempt artifacts. Incoming buffer limits do not cap SDK survivor-read/write
 memory or guarantee latency. Pilot representative updates and reader versions; no
 production integration or performance result is claimed.
 
+## Native Parquet Bloom filter defaults
+
+Native Iceberg writes default Bloom filters on for the canonical `_olake_id`,
+existing scalar destination fields named by the source primary key (including
+every composite-key component), and declared Iceberg identifier fields. Source
+names use the stream's destination-column resolution, including preserved source
+names when configured. Missing fields and struct/list/map fields receive no
+implicit filter; this is not an all-columns policy or a schema change.
+
+The standard table property
+`write.parquet.bloom-filter-enabled.column.<destination-column>` always overrides
+the default when present: `false` disables a key's filter, while `true` can enable
+one for a non-key column. Boolean values follow Iceberg's case-insensitive Java
+`true` semantics. `write.parquet.bloom-filter-max-bytes` defaults to 1 MiB per
+column per row group; explicit sizes must be decimal integers from 32 through 134217728
+bytes. Invalid sizes return an error before constructing Arrow writer properties,
+rather than panicking or silently replacing the configured bound. Native writes
+retain batch size 1, 1 MiB page/dictionary targets, the 64K row-group cap, Zstd
+level 3, statistics and page indexes.
+
+New tables persist these defaults at creation. Existing tables get missing
+properties only in their next normal data transaction, alongside data and
+`olake_2pc`; opening a writer or making a quiet metadata-only checkpoint does not
+issue a filter-enablement commit. Each conflict attempt resolves defaults against
+fresh metadata without mutating its borrowed properties. Defaults are effective
+for direct and streaming-backfill output before that metadata is published. COW
+stages them in the transaction before the SDK's `Overwrite` builds writers, so
+both incoming data and naturally rewritten survivors use the same column policy.
+No existing files are rewritten merely to enable filters; old files keep their
+original filters until otherwise rewritten. Bloom filters can help compatible
+readers prune equality lookups, but do not change row identity, deletes, source
+hydration, index handling, checkpoints, retries or MOR/COW selection.
+
 ## Creation-time table sort policy
 
 An optional catalog-wide sort default and explicit per-table overrides configure

@@ -187,6 +187,10 @@ func (w *nativeWriter) openBackfillFile(ctx context.Context, partition map[int]a
 		return nil, err
 	}
 	schema, spec := w.table.Schema(), w.table.Spec()
+	props, err := nativeParquetWriterProperties(schema, w.stream, w.table.Properties())
+	if err != nil {
+		return nil, err
+	}
 	name := uuid.NewString() + ".parquet"
 	if spec.NumFields() > 0 {
 		values := make(nativePartition, spec.NumFields())
@@ -212,7 +216,6 @@ func (w *nativeWriter) openBackfillFile(ctx context.Context, partition map[int]a
 	if err != nil {
 		return nil, err
 	}
-	props := nativeParquetWriterProperties()
 	fileState.parquet, err = pqarrow.NewFileWriter(arrowSchema, out, props, pqarrow.DefaultWriterProps())
 	if err != nil {
 		return nil, err

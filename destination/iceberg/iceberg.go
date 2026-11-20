@@ -1190,6 +1190,22 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		if err := tx.AssertDefaultShape(); err != nil {
 			return err
 		}
+		if hasFiles {
+			properties := fresh.Properties()
+			effective, err := nativeBloomFilterProperties(fresh.Schema(), w.stream, properties)
+			if err != nil {
+				return err
+			}
+			defaults := make(apacheiceberg.Properties)
+			for key, value := range effective {
+				if _, exists := properties[key]; !exists {
+					defaults[key] = value
+				}
+			}
+			if err := tx.SetProperties(defaults); err != nil {
+				return err
+			}
+		}
 		if changed {
 			if err := tx.SetProperties(apacheiceberg.Properties{nativeRecoveryProperty: state}); err != nil {
 				return err
@@ -1664,19 +1680,34 @@ func nativeRecordPartition(schema *apacheiceberg.Schema, spec apacheiceberg.Part
 // Check after every value in both streaming and one-shot writers. The 1 MiB
 // targets remain soft: Parquet cannot split an individual oversized value,
 // which can still exceed reader limits; values are never truncated.
-func nativeParquetWriterProperties() *parquet.WriterProperties {
+func nativeParquetWriterProperties(schema *apacheiceberg.Schema, stream types.StreamInterface, properties apacheiceberg.Properties) (*parquet.WriterProperties, error) {
+	properties, err := nativeBloomFilterProperties(schema, stream, properties)
+	if err != nil {
+		return nil, err
+	}
+	maxBytes, err := strconv.ParseInt(properties[nativeBloomFilterMaxBytesKey], 10, 64)
+	if err != nil {
+		return nil, err
+	}
 	const pageBytes = 1024 * 1024
-	return parquet.NewWriterProperties(
+	opts := []parquet.WriterProperty{
 		parquet.WithCompression(compress.Codecs.Zstd),
 		parquet.WithCompressionLevel(3),
 		parquet.WithStats(true),
-		parquet.WithMaxRowGroupLength(64*1024),
+		parquet.WithMaxRowGroupLength(64 * 1024),
 		parquet.WithBatchSize(1),
 		parquet.WithDataPageSize(pageBytes),
 		parquet.WithDictionaryPageSizeLimit(pageBytes),
 		parquet.WithRootName("table"),
 		parquet.WithPageIndexEnabled(true),
-	)
+		parquet.WithMaxBloomFilterBytes(maxBytes),
+	}
+	for key, value := range properties {
+		if name, ok := strings.CutPrefix(key, nativeBloomFilterColumnPrefix); ok && name != "" {
+			opts = append(opts, parquet.WithBloomFilterEnabledFor(name, strings.EqualFold(value, "true")))
+		}
+	}
+	return parquet.NewWriterProperties(opts...), nil
 }
 
 // Files are streamed directly through the catalog's native FileIO. The Parquet
@@ -1688,6 +1719,10 @@ func (w *nativeWriter) writeNativeParquet(ctx context.Context, schema *apacheice
 // Streaming callers borrow each input batch only for the duration of write.
 // The shared lifecycle always closes the footer and FileIO upload before return.
 func (w *nativeWriter) writeNativeParquetStream(ctx context.Context, schema *apacheiceberg.Schema, spec apacheiceberg.PartitionSpec, partition map[int]any, arrowSchema *arrow.Schema, write func(*pqarrow.FileWriter) error, content apacheiceberg.ManifestEntryContent, equalityIDs []int, referenced *string) (_ apacheiceberg.DataFile, err error) {
+	props, err := nativeParquetWriterProperties(schema, w.stream, w.table.Properties())
+	if err != nil {
+		return nil, err
+	}
 	ctx = nativeCatalogContext(ctx, w.cat)
 	fs, err := w.table.FS(ctx)
 	if err != nil {
@@ -1716,7 +1751,6 @@ func (w *nativeWriter) writeNativeParquetStream(ctx context.Context, schema *apa
 		return nil, err
 	}
 	counter := &nativeCountingWriter{writer: file}
-	props := nativeParquetWriterProperties()
 	writer, err := pqarrow.NewFileWriter(arrowSchema, counter, props, pqarrow.DefaultWriterProps())
 	if err != nil {
 		return nil, errors.Join(err, file.Close())
