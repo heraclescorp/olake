@@ -2,6 +2,7 @@ package abstract
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"slices"
@@ -496,7 +497,7 @@ func handleWriterCleanup(ctx context.Context, cancel context.CancelFunc, err *er
 	}
 
 	if *err != nil && threadID != "" {
-		*err = fmt.Errorf("thread[%s]: %w", threadID, *err)
+		*err = fmt.Errorf("thread[%x]: %w", sha256.Sum256([]byte(threadID)), *err)
 	}
 }
 

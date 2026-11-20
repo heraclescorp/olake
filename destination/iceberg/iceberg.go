@@ -44,16 +44,18 @@ import (
 )
 
 type Iceberg struct {
-	options          *destination.Options
-	config           *Config
-	stream           types.StreamInterface
-	partitionInfo    []internal.PartitionInfo // ordered slice to preserve partition column order
-	catalog          catalog.Catalog
-	schema           map[string]string
-	writer           Writer
-	resyncMu         sync.Mutex
-	resync           *resyncControl
-	ordinaryRecovery map[string]*ordinaryRecoveryTable
+	options              *destination.Options
+	config               *Config
+	stream               types.StreamInterface
+	partitionInfo        []internal.PartitionInfo // ordered slice to preserve partition column order
+	catalog              catalog.Catalog
+	schema               map[string]string
+	writer               Writer
+	resyncMu             sync.Mutex
+	resync               *resyncControl
+	ordinaryRecovery     map[string]*ordinaryRecoveryTable
+	backfillRecovery     map[string]*ordinaryRecoveryTable
+	initialBackfillPlans map[string]string
 	// unavailableValues recovers values the source could not send; nil unless the stream keeps a row index (pos or dv)
 	unavailableValues *unavailableValuesResolver
 	// syncStartColumns are columns added from the source catalog at sync start (see planSourceColumns).
@@ -149,6 +151,7 @@ func (i *Iceberg) Check(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
+	ctx = types.WithBackfillCheckpoint(ctx, nil)
 	stream := types.NewStream(destinationDB, destinationDB, nil)
 	stream.DestinationDatabase, stream.DestinationTable = destinationDB, destinationDB
 	for name, dataType := range types.RawSchema {
@@ -513,14 +516,19 @@ type nativeTableCoordinator struct {
 }
 
 type nativeTableState struct {
-	mu               sync.Mutex
-	latest           *table.Table
-	unknown          bool
-	closed           bool
-	generation       uint64
-	resync           *resyncControl
-	sessions         int
-	ordinaryRecovery *ordinaryRecoveryTable
+	mu                 sync.Mutex
+	latest             *table.Table
+	unknown            bool
+	closed             bool
+	generation         uint64
+	resync             *resyncControl
+	sessions           int
+	ordinaryRecovery   *ordinaryRecoveryTable
+	backfillRecovery   *ordinaryRecoveryTable
+	backfillBinding    *nativeBackfillBinding
+	backfillBindingRaw string
+	backfillChunkIDs   map[string]struct{}
+	backfillCheckpoint *types.BackfillRecoveryCheckpoint
 }
 
 type nativeTableLockKey struct{}
@@ -608,6 +616,11 @@ func (w *nativeWriter) currentTable(ctx context.Context, state *nativeTableState
 	if err := validateOrdinaryRecoveryWriter(ctx, state, state.latest, w.stream); err != nil {
 		return nil, err
 	}
+	if w.options.Backfill {
+		if err := validateOriginalBackfillWriter(ctx, state, state.latest, w.config, w.stream, w.options.ThreadID); err != nil {
+			return nil, err
+		}
+	}
 	if w.cow != nil {
 		if err := validateNativeCOWTable(ctx, state.latest); err != nil {
 			return nil, err
@@ -661,9 +674,9 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 		return nil, nil, err
 	}
 	defer finish()
-	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery || config.ordinaryRecovery {
-		if !recovery || options.Backfill {
-			return nil, nil, errors.New("ordinary recovery cannot open fresh or backfill writers")
+	if recovery, ok := types.OrdinaryRecoveryFromContext(ctx); ok || config.ordinaryRecovery {
+		if !ok || (options.Backfill && (!recovery.Origin.Backfill || recovery.BackfillComplete)) || (!options.Backfill && recovery.Origin.Backfill && !recovery.BackfillComplete) {
+			return nil, nil, errors.New("ordinary recovery writer does not match the active recovery phase")
 		}
 	}
 	identifier := catalog.ToIdentifier(stream.GetDestinationDatabase(&config.IcebergDatabase), stream.GetDestinationTable())
@@ -692,12 +705,27 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 	// Setup is the freshness boundary for external schema-only changes and
 	// response-config credentials. Hold the table lock so an older load cannot
 	// overwrite a newer local commit; Close reuses coordinated metadata.
-	tbl, err := loadOrCreateNativeTable(ctx, config, stream, cat)
+	var tbl *table.Table
+	if _, controlled := types.BackfillCheckpointFromContext(ctx); controlled && options.Backfill {
+		tbl, err = cat.LoadTable(ctx, identifier)
+	} else {
+		tbl, err = loadOrCreateNativeTable(ctx, config, stream, cat)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("load or create Iceberg table: %w", err)
 	}
 	if err := validateOrdinaryRecoveryWriter(ctx, state, tbl, stream); err != nil {
 		return nil, nil, err
+	}
+	if recovery, ok := types.OrdinaryRecoveryFromContext(ctx); ok && recovery.Origin.Backfill && !recovery.BackfillComplete {
+		if _, planned := state.backfillRecovery.chunkIDs[options.ThreadID]; !planned {
+			return nil, nil, errors.New("backfill recovery writer chunk is outside the exact durable plan")
+		}
+	}
+	if options.Backfill {
+		if err := validateOriginalBackfillWriter(ctx, state, tbl, config, stream, options.ThreadID); err != nil {
+			return nil, nil, err
+		}
 	}
 	state.latest = tbl
 	logNativeMetadataLSN(stream.ID(), tbl.Metadata().TableUUID().String(), nativeSnapshotID(tbl), tbl.Properties()[nativeRecoveryProperty])
@@ -1174,7 +1202,7 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 				}
 			}
 		}
-		state, changed, err := mergeNativeRecovery(fresh.Properties()[nativeRecoveryProperty], w.options.ThreadID, finalMetadataState, hasFiles)
+		state, changed, err := mergeNativeRecovery(fresh.Properties()[nativeRecoveryProperty], w.options.ThreadID, finalMetadataState, hasFiles || w.options.Backfill)
 		if err != nil {
 			return err
 		}
@@ -1223,7 +1251,7 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 			return err
 		}
 		if len(equalityFiles) > 0 {
-			logger.Infof("iceberg_equality_delete event=staged table=%q thread_id=%q attempt=%d base_snapshot=%d keys=%d delete_files=%d data_files=%d", strings.Join(fresh.Identifier(), "."), w.options.ThreadID, attempt+1, nativeSnapshotID(fresh), len(w.latest), len(equalityFiles), len(w.dataFiles))
+			logger.Infof("iceberg_equality_delete event=staged table=%q attempt=%d base_snapshot=%d keys=%d delete_files=%d data_files=%d", strings.Join(fresh.Identifier(), "."), attempt+1, nativeSnapshotID(fresh), len(w.latest), len(equalityFiles), len(w.dataFiles))
 		}
 		if w.cow != nil && !w.options.Backfill {
 			if err := w.replayCopyOnWrite(ctx, tx); err != nil {
@@ -1246,7 +1274,7 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 			coordinated.invalidate(unknown)
 			if unknown {
 				w.uncertain = true
-				logger.Warnf("Thread[%s]: native Iceberg commit outcome unknown; retaining staged work data_files=%d position_deletes=%d staged_paths=%d ctx_err=%v", w.options.ThreadID, len(w.dataFiles), len(w.positions), len(w.paths), ctx.Err())
+				logger.Warnf("Table[%s]: native Iceberg commit outcome unknown; retaining staged work data_files=%d position_deletes=%d staged_paths=%d ctx_err=%v", strings.Join(fresh.Identifier(), "."), len(w.dataFiles), len(w.positions), len(w.paths), ctx.Err())
 				return fmt.Errorf("Iceberg commit outcome is unknown; staged files retained for recovery: %w", commitErr)
 			}
 			// Delete files belong to this rejected attempt. Only optimistic
@@ -1266,7 +1294,7 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 			if _, private := w.cat.(*nativeResyncCatalog); private {
 				event = "private_resync_commit"
 			}
-			logger.Infof("iceberg_equality_delete event=%s table=%q thread_id=%q attempt=%d snapshot=%d keys=%d delete_files=%d data_files=%d", event, strings.Join(committed.Identifier(), "."), w.options.ThreadID, attempt+1, nativeSnapshotID(committed), len(w.latest), len(equalityFiles), len(w.dataFiles))
+			logger.Infof("iceberg_equality_delete event=%s table=%q attempt=%d snapshot=%d keys=%d delete_files=%d data_files=%d", event, strings.Join(committed.Identifier(), "."), attempt+1, nativeSnapshotID(committed), len(w.latest), len(equalityFiles), len(w.dataFiles))
 		}
 		// A successful metadata commit owns all staged files from now on.
 		// Never delete them, including when the local index checkpoint fails.
@@ -1395,7 +1423,7 @@ func nativeConflictClass(err error) string {
 func (w *nativeWriter) logConflict(operation string, attempt int, tbl *table.Table, err error) {
 	// Never log the raw catalog error: REST errors may embed response bodies,
 	// signed URLs or credentials. The classification and snapshot IDs suffice.
-	logger.Warnf("Thread[%s]: native Iceberg %s attempt=%d base_snapshot=%d classification=%s", w.options.ThreadID, operation, attempt, nativeSnapshotID(tbl), nativeConflictClass(err))
+	logger.Warnf("Table[%s]: native Iceberg %s attempt=%d base_snapshot=%d classification=%s", strings.Join(tbl.Identifier(), "."), operation, attempt, nativeSnapshotID(tbl), nativeConflictClass(err))
 }
 
 // S3 Tables reserves the --table-s3 bucket suffix and removes unreferenced

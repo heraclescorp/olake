@@ -57,6 +57,7 @@ type (
 		resyncContext       context.Context
 		ordinaryRecovery    ordinaryRecoveryDestination
 		ordinaryPrepared    bool
+		backfillPrepared    bool
 	}
 
 	// writer thread used by reader
@@ -205,12 +206,22 @@ func (w *WriterPool) NewWriter(ctx context.Context, stream types.StreamInterface
 	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
 		return nil, nil, fmt.Errorf("recovery-only resync cannot open a data writer")
 	}
+	opts := &Options{}
+	for _, one := range options {
+		one(opts)
+	}
 	if recovery, ok := types.OrdinaryRecoveryFromContext(ctx); ok {
-		if !w.ordinaryPrepared || recovery.Plan == nil {
-			return nil, nil, fmt.Errorf("ordinary recovery writers require prepared barriers and a bounded replay plan")
-		}
-		if _, selected := recovery.Plan.ReplayAfter[stream.ID()]; !selected {
-			return nil, nil, fmt.Errorf("ordinary recovery writer stream is outside the replay plan")
+		if recovery.Origin.Backfill && !recovery.BackfillComplete {
+			if !w.backfillPrepared || !opts.Backfill {
+				return nil, nil, fmt.Errorf("ordinary backfill recovery requires prepared tables and backfill writers")
+			}
+		} else {
+			if !w.ordinaryPrepared || recovery.Plan == nil || opts.Backfill {
+				return nil, nil, fmt.Errorf("ordinary recovery writers require prepared barriers and a bounded replay plan")
+			}
+			if _, selected := recovery.Plan.ReplayAfter[stream.ID()]; !selected {
+				return nil, nil, fmt.Errorf("ordinary recovery writer stream is outside the replay plan")
+			}
 		}
 	}
 	if err := utils.CheckExecutionFence(ctx); err != nil {
@@ -218,11 +229,6 @@ func (w *WriterPool) NewWriter(ctx context.Context, stream types.StreamInterface
 	}
 	ctx = observability.WithTable(ctx, stream.Namespace(), stream.Name())
 	w.stats.ThreadCount.Add(1)
-
-	opts := &Options{}
-	for _, one := range options {
-		one(opts)
-	}
 
 	rawStreamArtifact, ok := w.writerSchema.Load(stream.ID())
 	if !ok {
@@ -421,7 +427,7 @@ func (wt *WriterThread) flush(ctx context.Context, buf []types.RawRecord) (err e
 	}
 	observability.AddRows(ctx, "pushed", int64(len(buf)), 0)
 
-	logger.Infof("Thread[%s]: successfully wrote %d records", wt.threadID, len(buf))
+	logger.Infof("Destination writer successfully wrote %d records", len(buf))
 	return nil
 }
 
@@ -512,13 +518,13 @@ func (wt *WriterThread) Close(closeCtx context.Context, finalMetadataState any) 
 }
 
 func DropStreams(ctx context.Context, config *types.WriterConfig, dropStreams []types.StreamInterface) error {
-	if err := ValidateCopyOnWrite(config, dropStreams); err != nil {
-		return err
-	}
 	if options, ok := types.ResyncFromContext(ctx); ok && options.RecoverOnly {
 		return fmt.Errorf("recovery-only resync cannot drop destination streams")
 	}
 	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
+	if err := ValidateCopyOnWrite(config, dropStreams); err != nil {
 		return err
 	}
 	if len(dropStreams) == 0 {

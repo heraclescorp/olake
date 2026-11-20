@@ -25,23 +25,29 @@ import (
 const ordinaryRecoveryProperty = "olake.ordinary-recovery"
 
 type ordinaryRecoveryMarker struct {
-	Version        int                          `json:"version"`
-	Origin         types.OrdinaryRecoveryOrigin `json:"origin"`
-	SourceIdentity string                       `json:"source_identity"`
-	ExecutionID    string                       `json:"execution_id"`
-	LaunchID       string                       `json:"launch_id"`
-	LowerLSN       string                       `json:"lower_lsn"`
-	Stream         string                       `json:"stream"`
-	TableUUID      string                       `json:"table_uuid"`
-	ShapeSHA256    string                       `json:"shape_sha256"`
+	Version           int                          `json:"version"`
+	Origin            types.OrdinaryRecoveryOrigin `json:"origin"`
+	SourceIdentity    string                       `json:"source_identity"`
+	ExecutionID       string                       `json:"execution_id"`
+	LaunchID          string                       `json:"launch_id"`
+	LowerLSN          string                       `json:"lower_lsn"`
+	Stream            string                       `json:"stream"`
+	TableUUID         string                       `json:"table_uuid"`
+	ShapeSHA256       string                       `json:"shape_sha256"`
+	BackfillPlan      string                       `json:"backfill_plan,omitempty"`
+	BackfillTargetLSN string                       `json:"backfill_target_lsn,omitempty"`
 }
 
 type ordinaryRecoveryTable struct {
-	marker   ordinaryRecoveryMarker
-	encoded  string
-	proof    types.OrdinaryRecoveryTableProof
-	target   uint64
-	prepared bool
+	marker         ordinaryRecoveryMarker
+	encoded        string
+	proof          types.OrdinaryRecoveryTableProof
+	target         uint64
+	prepared       bool
+	chunkIDs       map[string]struct{}
+	acknowledged   bool
+	bindingEncoded string
+	externalBound  bool
 }
 
 func ordinaryRecoveryLSN(value string) (uint64, error) {
@@ -72,6 +78,10 @@ func ordinaryRecoveryPosition(tbl *table.Table, lower uint64) (string, error) {
 }
 
 func ordinaryRecoveryShape(metadata table.Metadata) (string, error) {
+	return ordinaryRecoveryShapeAtLocation(metadata, metadata.Location())
+}
+
+func ordinaryRecoveryShapeAtLocation(metadata table.Metadata, location string) (string, error) {
 	encoded, err := json.Marshal(struct {
 		Version       int
 		Location      string
@@ -83,7 +93,7 @@ func ordinaryRecoveryShape(metadata table.Metadata) (string, error) {
 		LastPartition *int
 		Orders        []table.SortOrder
 		DefaultOrder  int
-	}{metadata.Version(), metadata.Location(), metadata.Schemas(), metadata.CurrentSchema().ID,
+	}{metadata.Version(), location, metadata.Schemas(), metadata.CurrentSchema().ID,
 		metadata.LastColumnID(), metadata.PartitionSpecs(), metadata.DefaultPartitionSpec(),
 		metadata.LastPartitionSpecID(), metadata.SortOrders(), metadata.DefaultSortOrder()})
 	if err != nil {
@@ -113,6 +123,14 @@ func ordinaryRecoveryContext(ctx context.Context) (*types.OrdinaryRecoveryOption
 			return nil, nil, errors.New("ordinary recovery origin contains an invalid artifact digest")
 		}
 	}
+	if origin.Backfill {
+		for _, value := range []string{origin.BackfillCheckpointSHA256, origin.SavedStateSHA256} {
+			decoded, err := hex.DecodeString(value)
+			if err != nil || len(decoded) != sha256.Size || value != strings.ToLower(value) {
+				return nil, nil, errors.New("backfill recovery origin contains an invalid candidate digest")
+			}
+		}
+	}
 	if _, resync := types.ResyncFromContext(ctx); resync {
 		return nil, nil, errors.New("ordinary recovery cannot be combined with resync")
 	}
@@ -129,6 +147,9 @@ func (r *ordinaryRecoveryTable) validate(tbl *table.Table) error {
 	}
 	if tbl.Metadata().TableUUID().String() != r.marker.TableUUID || shape != r.marker.ShapeSHA256 {
 		return errors.New("ordinary recovery table UUID or shape changed")
+	}
+	if r.bindingEncoded != "" && tbl.Properties()[nativeBackfillBindingProperty] != r.bindingEncoded {
+		return errors.New("ordinary recovery table lost its immutable backfill binding")
 	}
 	if r.proof.FenceSnapshotID != 0 {
 		if tbl.Properties()[ordinaryRecoveryProperty] != r.encoded || !ordinaryRecoveryAncestor(tbl, r.proof.FenceSnapshotID, r.encoded) {
@@ -174,12 +195,29 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 	if err != nil {
 		return nil, err
 	}
-	if i.config == nil || i.config.CatalogType != RestCatalog || i.resync != nil || len(streams) == 0 || i.ordinaryRecovery != nil {
-		return nil, errors.New("ordinary recovery requires existing native REST/S3 Tables and an unprepared adapter")
+	if !nativeRecoveryCatalogSupported(i.config, i.catalog) || i.resync != nil || len(streams) == 0 || i.ordinaryRecovery != nil {
+		return nil, errors.New("ordinary recovery requires existing native REST or Hadoop tables and an unprepared adapter")
+	}
+	if options.Origin.Backfill && (!options.BackfillComplete || len(i.backfillRecovery) != len(streams)) {
+		return nil, errors.New("ordinary recovery requires completed prepared backfill")
 	}
 	lowerValue, err := ordinaryRecoveryLSN(lower)
 	if err != nil {
 		return nil, err
+	}
+	fixedTarget := uint64(0)
+	if options.Origin.Backfill {
+		fixedTarget, err = ordinaryRecoveryLSN(options.BackfillTargetLSN)
+		if err != nil || fixedTarget < lowerValue {
+			return nil, errors.New("backfill recovery requires a fixed valid replay target at or above the preserved lower LSN")
+		}
+		stored, err := backfillRecoveryTarget(i.backfillRecovery)
+		if err != nil {
+			return nil, err
+		}
+		if stored != "" && stored != options.BackfillTargetLSN {
+			return nil, errors.New("backfill recovery replay target differs from the persisted target")
+		}
 	}
 	controls := make(map[string]*ordinaryRecoveryTable, len(streams))
 	identifiers := make(map[string]struct{}, len(streams))
@@ -198,6 +236,9 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 		if _, duplicate := controls[stream.ID()]; duplicate {
 			return nil, errors.New("ordinary recovery selected stream is duplicated")
 		}
+		if err := nativeRecoveryTableIdle(i.catalog, ident); err != nil {
+			return nil, err
+		}
 		tbl, err := i.catalog.LoadTable(ctx, ident)
 		if err != nil {
 			return nil, fmt.Errorf("load existing ordinary recovery table %q: %w", stream.ID(), err)
@@ -208,7 +249,19 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 		if !stream.Self().CopyOnWriteEnabled() && stream.GetUpdateType() == types.UpdateTypeDeletionVector && tbl.Metadata().Version() < 3 {
 			return nil, errors.New("ordinary recovery cannot upgrade the frozen table format")
 		}
-		position, err := ordinaryRecoveryPosition(tbl, lowerValue)
+		position := ""
+		backfill := i.backfillRecovery[stream.ID()]
+		if options.Origin.Backfill {
+			if backfill == nil || !backfill.externalBound {
+				return nil, errors.New("ordinary recovery table has no prepared backfill evidence")
+			}
+			if err := backfill.validate(tbl); err != nil {
+				return nil, err
+			}
+			position, _, err = backfill.backfillPosition(tbl, lower, lowerValue)
+		} else {
+			position, err = ordinaryRecoveryPosition(tbl, lowerValue)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("stream %q: %w", stream.ID(), err)
 		}
@@ -217,11 +270,25 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 			return nil, err
 		}
 		marker := ordinaryRecoveryMarker{Version: 1, Origin: options.Origin, SourceIdentity: options.SourceIdentity, ExecutionID: execution.ID, LaunchID: execution.LaunchID, LowerLSN: lower, Stream: stream.ID(), TableUUID: tbl.Metadata().TableUUID().String(), ShapeSHA256: shape}
+		if backfill != nil {
+			marker.BackfillPlan = backfill.marker.BackfillPlan
+			marker.BackfillTargetLSN = options.BackfillTargetLSN
+			positionValue, _ := ordinaryRecoveryLSN(position)
+			if positionValue > fixedTarget {
+				return nil, errors.New("backfill recovery table is beyond the fixed replay target")
+			}
+		}
 		encoded, err := json.Marshal(marker)
 		if err != nil {
 			return nil, err
 		}
 		r := &ordinaryRecoveryTable{marker: marker, encoded: string(encoded), proof: types.OrdinaryRecoveryTableProof{Stream: stream.ID(), TableUUID: marker.TableUUID, CommittedLSN: position}}
+		if backfill != nil {
+			r.chunkIDs = backfill.chunkIDs
+			r.bindingEncoded = backfill.bindingEncoded
+			r.externalBound = backfill.externalBound
+			r.target = fixedTarget
+		}
 		if err := r.previousMarker(tbl); err != nil {
 			return nil, err
 		}
@@ -237,8 +304,14 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 		proofs = append(proofs, r.proof)
 	}
 	target := lowerValue
+	if options.Origin.Backfill {
+		target = fixedTarget
+	}
 	for _, proof := range proofs {
 		position, _ := ordinaryRecoveryLSN(proof.CommittedLSN)
+		if options.Origin.Backfill && position > target {
+			return nil, errors.New("backfill recovery table advanced beyond its fixed replay target")
+		}
 		if position > target {
 			target = position
 		}
@@ -265,6 +338,9 @@ func (r *ordinaryRecoveryTable) previousMarker(tbl *table.Table) error {
 	}
 	// Epochs may change, immutable evidence and source identity may not.
 	previous.ExecutionID = r.marker.ExecutionID
+	if previous.BackfillTargetLSN == "" && r.marker.Origin.Backfill && r.marker.BackfillTargetLSN != "" {
+		previous.BackfillTargetLSN = r.marker.BackfillTargetLSN
+	}
 	if previous != r.marker {
 		return errors.New("ordinary recovery table marker differs from immutable origin, source identity or shape")
 	}
@@ -300,12 +376,20 @@ func (i *Iceberg) ordinaryBarrier(ctx context.Context, stream types.StreamInterf
 		if err := r.previousMarker(fresh); err != nil {
 			return err
 		}
-		position, err := ordinaryRecoveryPosition(fresh, lower)
+		position, bootstrap := "", ""
+		if r.marker.Origin.Backfill {
+			position, bootstrap, err = r.backfillPosition(fresh, r.marker.LowerLSN, lower)
+		} else {
+			position, err = ordinaryRecoveryPosition(fresh, lower)
+		}
 		if err != nil {
 			return err
 		}
 		previousPosition, _ := ordinaryRecoveryLSN(r.proof.CommittedLSN)
 		currentPosition, _ := ordinaryRecoveryLSN(position)
+		if r.marker.Origin.Backfill && currentPosition > r.target {
+			return errors.New("backfill recovery table advanced beyond its fixed replay target")
+		}
 		if currentPosition < previousPosition {
 			return errors.New("ordinary recovery table position regressed during barrier preparation")
 		}
@@ -320,7 +404,11 @@ func (i *Iceberg) ordinaryBarrier(ctx context.Context, stream types.StreamInterf
 		if err := tx.AssertDefaultShape(); err != nil {
 			return err
 		}
-		if err := tx.SetProperties(apacheiceberg.Properties{ordinaryRecoveryProperty: r.encoded}); err != nil {
+		properties := apacheiceberg.Properties{ordinaryRecoveryProperty: r.encoded}
+		if bootstrap != "" {
+			properties[nativeRecoveryProperty] = bootstrap
+		}
+		if err := tx.SetProperties(properties); err != nil {
 			return err
 		}
 		schema, err := table.SchemaToArrowSchema(fresh.Schema(), nil, true, false)
@@ -363,7 +451,11 @@ func (i *Iceberg) ordinaryBarrier(ctx context.Context, stream types.StreamInterf
 		if err := r.validate(confirmed); err != nil {
 			return err
 		}
-		if confirmed.Properties()[nativeRecoveryProperty] != fresh.Properties()[nativeRecoveryProperty] {
+		expectedMetadata := fresh.Properties()[nativeRecoveryProperty]
+		if bootstrap != "" {
+			expectedMetadata = bootstrap
+		}
+		if confirmed.Properties()[nativeRecoveryProperty] != expectedMetadata {
 			return errors.New("ordinary recovery barrier changed the authoritative CDC metadata")
 		}
 		r.proof.CommittedLSN, err = ordinaryRecoveryPosition(confirmed, lower)
@@ -448,6 +540,17 @@ func validateOrdinaryRecoveryWriter(ctx context.Context, state *nativeTableState
 	if !recovery {
 		return nil
 	}
+	if options.Origin.Backfill && !options.BackfillComplete {
+		r := state.backfillRecovery
+		execution, controlled := utils.ExecutionFromContext(ctx)
+		if r == nil || !r.externalBound || r.acknowledged || len(r.chunkIDs) == 0 || !controlled || execution.ID != r.marker.ExecutionID || r.marker.Origin != options.Origin || r.marker.SourceIdentity != options.SourceIdentity {
+			return errors.New("backfill recovery writer does not match its durable plan and execution")
+		}
+		if err := r.previousMarker(tbl); err != nil {
+			return err
+		}
+		return r.validate(tbl)
+	}
 	r := state.ordinaryRecovery
 	execution, controlled := utils.ExecutionFromContext(ctx)
 	target := uint64(0)
@@ -455,7 +558,7 @@ func validateOrdinaryRecoveryWriter(ctx context.Context, state *nativeTableState
 	if options.Plan != nil {
 		target, targetErr = ordinaryRecoveryLSN(options.Plan.TargetLSN)
 	}
-	if r == nil || !r.prepared || !controlled || execution.ID != r.marker.ExecutionID || options.Plan == nil || targetErr != nil || target != r.target || r.proof.FenceSnapshotID == 0 || r.marker.Origin != options.Origin || r.marker.SourceIdentity != options.SourceIdentity || options.Plan.ReplayAfter[stream.ID()] != r.proof.CommittedLSN || options.Plan.LowerLSN != r.marker.LowerLSN {
+	if r == nil || !r.prepared || (options.Origin.Backfill && !r.externalBound) || !controlled || execution.ID != r.marker.ExecutionID || options.Plan == nil || targetErr != nil || target != r.target || r.proof.FenceSnapshotID == 0 || r.marker.Origin != options.Origin || r.marker.SourceIdentity != options.SourceIdentity || options.Plan.ReplayAfter[stream.ID()] != r.proof.CommittedLSN || options.Plan.LowerLSN != r.marker.LowerLSN {
 		return errors.New("ordinary recovery writer does not match its prepared barrier and replay plan")
 	}
 	return r.validate(tbl)

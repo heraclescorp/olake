@@ -54,9 +54,35 @@ func (t *nativeAWSExecutionTransport) RoundTrip(request *http.Request) (*http.Re
 	if request.Method != http.MethodGet && request.Method != http.MethodHead && request.Method != http.MethodOptions &&
 		(strings.Contains(request.Header.Get("Authorization"), "/s3/aws4_request") ||
 			(t.s3Host != "" && request.URL.Host == t.s3Host)) {
-		return t.guard.mutate(request, false)
+		return t.guard.writeStorage(request)
 	}
 	return t.guard.base.RoundTrip(request)
+}
+
+func (t *nativeRESTThrottleTransport) writeStorage(request *http.Request) (*http.Response, error) {
+	ctx, finish, err := t.execution.begin(request.Context())
+	if err != nil {
+		if request.Body != nil {
+			err = errors.Join(err, request.Body.Close())
+		}
+		return nil, &nativeMutationNotDispatched{cause: err}
+	}
+	wire := request.Clone(context.WithValue(ctx, nativeMutationWireKey{}, true))
+	wire.GetBody = nil
+	response, err := t.base.RoundTrip(wire)
+	if err != nil || response == nil {
+		if response != nil && response.Body != nil {
+			err = errors.Join(err, response.Body.Close())
+		}
+		finish()
+		return nil, err
+	}
+	if response.Body == nil {
+		finish()
+	} else {
+		response.Body = &nativeMutationResponseBody{ReadCloser: response.Body, finish: finish}
+	}
+	return response, nil
 }
 
 func (t *nativeRESTThrottleTransport) mutates(request *http.Request) bool {

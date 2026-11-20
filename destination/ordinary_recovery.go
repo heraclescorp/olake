@@ -13,6 +13,82 @@ type ordinaryRecoveryDestination interface {
 	ConfirmOrdinaryRecovery(context.Context, []types.StreamInterface, []types.OrdinaryRecoveryTableProof, string) ([]types.OrdinaryRecoveryTableProof, error)
 }
 
+type backfillRecoveryDestination interface {
+	PrepareBackfillTable(context.Context, types.StreamInterface) (*types.BackfillTableBinding, error)
+	PrepareBackfillRecovery(context.Context, []types.StreamInterface, string) error
+	GetBackfillPlan(context.Context, types.StreamInterface) (*types.Set[types.Chunk], error)
+	PrepareBackfillPlan(context.Context, types.StreamInterface, *types.Set[types.Chunk]) error
+	BackfillRecoveryTarget(context.Context) (string, error)
+}
+
+func (w *WriterPool) PrepareBackfillTable(ctx context.Context, stream types.StreamInterface) (*types.BackfillTableBinding, error) {
+	adapter, ok := w.ordinaryRecovery.(backfillRecoveryDestination)
+	if !ok {
+		return nil, fmt.Errorf("destination does not support durable backfill table bindings")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return nil, err
+	}
+	return adapter.PrepareBackfillTable(ctx, stream)
+}
+
+func (w *WriterPool) PrepareBackfillRecovery(ctx context.Context, streams []types.StreamInterface, lower string) error {
+	options, ok := types.OrdinaryRecoveryFromContext(ctx)
+	adapter, supported := w.ordinaryRecovery.(backfillRecoveryDestination)
+	if !ok || !supported || !options.Origin.Backfill || options.BackfillComplete || w.backfillPrepared || w.ordinaryPrepared {
+		return fmt.Errorf("destination has no unprepared backfill recovery")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
+	if err := w.recoveryStreams(streams); err != nil {
+		return err
+	}
+	if err := adapter.PrepareBackfillRecovery(ctx, streams, lower); err != nil {
+		return err
+	}
+	w.backfillPrepared = true
+	return nil
+}
+
+func (w *WriterPool) GetBackfillPlan(ctx context.Context, stream types.StreamInterface) (*types.Set[types.Chunk], error) {
+	adapter, ok := w.ordinaryRecovery.(backfillRecoveryDestination)
+	if !ok || !w.backfillPrepared || w.ordinaryPrepared {
+		return nil, fmt.Errorf("backfill recovery tables have not been prepared")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return nil, err
+	}
+	return adapter.GetBackfillPlan(ctx, stream)
+}
+
+func (w *WriterPool) PrepareBackfillPlan(ctx context.Context, stream types.StreamInterface, plan *types.Set[types.Chunk]) error {
+	_, recovery := types.OrdinaryRecoveryFromContext(ctx)
+	_, checkpoint := types.BackfillCheckpointFromContext(ctx)
+	if !recovery && !checkpoint {
+		return nil
+	}
+	adapter, ok := w.ordinaryRecovery.(backfillRecoveryDestination)
+	if !ok || (recovery && (!w.backfillPrepared || w.ordinaryPrepared)) {
+		return fmt.Errorf("backfill recovery tables have not been prepared")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return err
+	}
+	return adapter.PrepareBackfillPlan(ctx, stream, plan)
+}
+
+func (w *WriterPool) BackfillRecoveryTarget(ctx context.Context) (string, error) {
+	adapter, ok := w.ordinaryRecovery.(backfillRecoveryDestination)
+	if !ok || !w.backfillPrepared || w.ordinaryPrepared {
+		return "", fmt.Errorf("backfill recovery tables have not been prepared")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return "", err
+	}
+	return adapter.BackfillRecoveryTarget(ctx)
+}
+
 // recoveryStreams requires the entire frozen selection, not a convenient subset.
 func (w *WriterPool) recoveryStreams(streams []types.StreamInterface) error {
 	selected := make(map[string]struct{}, len(streams))
@@ -32,7 +108,7 @@ func (w *WriterPool) recoveryStreams(streams []types.StreamInterface) error {
 		artifact.mu.RLock()
 		started := artifact.schema != nil || artifact.streamIndex != nil
 		artifact.mu.RUnlock()
-		if !w.ordinaryPrepared && started {
+		if !w.ordinaryPrepared && !w.backfillPrepared && started {
 			return fmt.Errorf("ordinary recovery must be prepared before opening writers")
 		}
 	}
@@ -56,6 +132,9 @@ func (w *WriterPool) PrepareOrdinaryRecovery(ctx context.Context, streams []type
 	}
 	if err := w.recoveryStreams(streams); err != nil {
 		return nil, err
+	}
+	if options, _ := types.OrdinaryRecoveryFromContext(ctx); options.Origin.Backfill && (!w.backfillPrepared || !options.BackfillComplete) {
+		return nil, fmt.Errorf("ordinary recovery requires completed prepared backfill")
 	}
 	proofs, err := w.ordinaryRecovery.PrepareOrdinaryRecovery(ctx, streams, lower)
 	if err == nil {

@@ -49,8 +49,6 @@ func (p *Postgres) ChunkIterator(ctx context.Context, stream types.StreamInterfa
 		}
 	}()
 
-	logger.Debugf("Starting backfill from %v to %v with filter: %s, args: %v", chunk.Min, chunk.Max, filter, args)
-
 	chunkColumn := stream.Self().StreamMetadata.ChunkColumn
 	chunkColumn = utils.Ternary(chunkColumn == "", "ctid", chunkColumn).(string)
 	stmt := jdbc.PostgresChunkScanQuery(stream, chunkColumn, chunk, filter)
@@ -239,7 +237,7 @@ func (p *Postgres) nextChunkEnd(ctx context.Context, db sourceQuerier, stream ty
 	nextChunkEnd := jdbc.PostgresNextChunkEndQuery(stream, chunkColumn, previousChunkEnd)
 	err := db.QueryRowContext(ctx, nextChunkEnd).Scan(&chunkEnd)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query[%s] next chunk end: %w", nextChunkEnd, err)
+		return nil, fmt.Errorf("failed to query next chunk end: %w", err)
 	}
 	return chunkEnd, nil
 }

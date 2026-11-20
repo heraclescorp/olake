@@ -81,3 +81,80 @@ func TestPoolOrdinaryRecoverySkipsConnectionTestTable(t *testing.T) {
 	_, _, err = pool.NewWriter(ctx, stream)
 	require.ErrorContains(t, err, "prepared barriers")
 }
+
+type poolBackfillRecoveryAdapter struct {
+	poolOrdinaryRecoveryAdapter
+	backfills int
+	plans     int
+	plan      *types.Set[types.Chunk]
+}
+
+func (a *poolBackfillRecoveryAdapter) PrepareBackfillTable(context.Context, types.StreamInterface) (*types.BackfillTableBinding, error) {
+	return &types.BackfillTableBinding{TableUUID: "bound", ShapeSHA256: "shape"}, nil
+}
+
+func (a *poolBackfillRecoveryAdapter) PrepareBackfillRecovery(context.Context, []types.StreamInterface, string) error {
+	a.backfills++
+	return nil
+}
+
+func (a *poolBackfillRecoveryAdapter) GetBackfillPlan(context.Context, types.StreamInterface) (*types.Set[types.Chunk], error) {
+	return a.plan, nil
+}
+
+func (a *poolBackfillRecoveryAdapter) PrepareBackfillPlan(_ context.Context, _ types.StreamInterface, plan *types.Set[types.Chunk]) error {
+	a.plans++
+	a.plan = plan
+	return nil
+}
+
+func (a *poolBackfillRecoveryAdapter) BackfillRecoveryTarget(context.Context) (string, error) {
+	return "", nil
+}
+
+func TestPoolBackfillRecoveryRequiresWholeSelectionAndSeparateCompletion(t *testing.T) {
+	first := types.NewStream("first", "public", nil).Wrap(0)
+	second := types.NewStream("second", "public", nil).Wrap(0)
+	adapter := &poolBackfillRecoveryAdapter{}
+	pool := &WriterPool{ordinaryRecovery: adapter}
+	pool.writerSchema.Store(first.ID(), &writerSchema{})
+	pool.writerSchema.Store(second.ID(), &writerSchema{})
+	options := &types.OrdinaryRecoveryOptions{Origin: types.OrdinaryRecoveryOrigin{Backfill: true}}
+	ctx := types.WithOrdinaryRecovery(context.Background(), options)
+	err := pool.PrepareBackfillRecovery(ctx, []types.StreamInterface{first}, "0/10")
+	require.ErrorContains(t, err, "complete saved")
+	require.Zero(t, adapter.backfills)
+	_, err = pool.GetBackfillPlan(ctx, first)
+	require.ErrorContains(t, err, "not been prepared")
+	require.NoError(t, pool.PrepareBackfillRecovery(ctx, []types.StreamInterface{first, second}, "0/10"))
+	require.Equal(t, 1, adapter.backfills)
+	plan := types.NewSet(types.Chunk{Min: nil, Max: nil})
+	require.NoError(t, pool.PrepareBackfillPlan(ctx, first, plan))
+	restored, err := pool.GetBackfillPlan(ctx, first)
+	require.NoError(t, err)
+	require.Equal(t, plan, restored)
+	_, _, err = pool.NewWriter(ctx, first)
+	require.ErrorContains(t, err, "backfill writers")
+	_, err = pool.PrepareOrdinaryRecovery(ctx, []types.StreamInterface{first, second}, "0/10")
+	require.ErrorContains(t, err, "completed prepared backfill")
+	require.Zero(t, adapter.prepared)
+	options.BackfillComplete = true
+	pool.writerSchema.Store(first.ID(), &writerSchema{schema: "backfill writer was opened"})
+	_, err = pool.PrepareOrdinaryRecovery(ctx, []types.StreamInterface{first, second}, "0/10")
+	require.NoError(t, err)
+	require.Equal(t, 1, adapter.prepared)
+	err = pool.PrepareBackfillPlan(ctx, first, plan)
+	require.ErrorContains(t, err, "not been prepared")
+}
+
+func TestPoolLegacyBackfillPlanIsOptionalWithoutControlledCheckpoint(t *testing.T) {
+	stream := types.NewStream("events", "public", nil).Wrap(0)
+	pool := &WriterPool{}
+	plan := types.NewSet(types.Chunk{})
+	require.NoError(t, pool.PrepareBackfillPlan(context.Background(), stream, plan))
+	require.NoError(t, pool.PrepareBackfillPlan(types.WithResync(context.Background(), &types.ResyncOptions{}), stream, plan))
+	controlled := types.WithBackfillCheckpoint(context.Background(), &types.BackfillRecoveryCheckpoint{})
+	require.ErrorContains(t, pool.PrepareBackfillPlan(controlled, stream, plan), "not been prepared")
+	recovery := types.WithOrdinaryRecovery(context.Background(), &types.OrdinaryRecoveryOptions{})
+	require.ErrorContains(t, pool.PrepareBackfillPlan(recovery, stream, plan), "not been prepared")
+}

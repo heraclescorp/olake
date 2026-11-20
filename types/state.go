@@ -59,6 +59,7 @@ func (s *State) initStreamState(stream *ConfiguredStream) *StreamState {
 	return &StreamState{
 		Stream:     stream.Name(),
 		Namespace:  stream.Namespace(),
+		SyncMode:   string(stream.GetSyncMode()),
 		State:      sync.Map{},
 		HoldsValue: atomic.Bool{},
 	}
@@ -72,7 +73,12 @@ type State struct {
 	Global        *GlobalState   `json:"global,omitempty"`
 	Streams       []*StreamState `json:"streams,omitempty"` // TODO: make it set
 	// SuppressPersistence keeps an unpublished resync checkpoint in memory only.
-	SuppressPersistence bool `json:"-"`
+	SuppressPersistence    bool                       `json:"-"`
+	BackfillCheckpoint     bool                       `json:"-"`
+	BackfillIdentity       func(string, string) error `json:"-"`
+	BackfillPersist        func([]byte) error         `json:"-"`
+	BackfillSource         *BackfillSourceBinding     `json:"backfill_source,omitempty"`
+	backfillPersistenceErr error
 }
 
 var (
@@ -249,12 +255,6 @@ func (s *State) GetResumePlan(stream *ConfiguredStream) *Set[Chunk] {
 	return s.chunkSet(stream, ResumePlanKey)
 }
 
-// SetResumePlan records the full refresh plan once, before any chunk runs, so a restart
-// reproduces the same chunk IDs and committed chunks keep skipping.
-func (s *State) SetResumePlan(stream *ConfiguredStream, chunks *Set[Chunk]) {
-	s.storeStreamValue(stream, ResumePlanKey, chunks)
-}
-
 // remove chunk returns remaining chunk count after removing the chunk
 func (s *State) RemoveChunk(stream *ConfiguredStream, chunk Chunk) int {
 	s.Lock()
@@ -273,8 +273,7 @@ func (s *State) RemoveChunk(stream *ConfiguredStream, chunk Chunk) int {
 			castedStateChunks.Remove(chunk)
 			s.Streams[index].State.Store(ChunksKey, castedStateChunks)
 			remaining := castedStateChunks.Len()
-			if remaining == 0 {
-				// The full refresh finished, so its plan must not leak into a later run.
+			if remaining == 0 && !s.BackfillCheckpoint {
 				s.Streams[index].State.Delete(ResumePlanKey)
 			}
 			return remaining
@@ -310,6 +309,13 @@ func (s *State) LogWithLock() {
 
 func (s *State) LogState() {
 	// function need to be called after state lock
+	if s.BackfillPersist != nil && s.backfillPersistenceErr == nil {
+		data, err := s.MarshalJSON()
+		if err == nil {
+			err = s.BackfillPersist(data)
+		}
+		s.backfillPersistenceErr = err
+	}
 	if s.SuppressPersistence {
 		return
 	}
@@ -397,7 +403,7 @@ func (s *StreamState) UnmarshalJSON(data []byte) error {
 	if len(aux.State) > 0 {
 		s.HoldsValue.Store(true)
 	}
-	for _, key := range []string{ChunksKey, ResumePlanKey} {
+	for _, key := range []string{ChunksKey, ResumePlanKey, BackfillPlanKey} {
 		chunkSet, err := decodeChunkSet(aux.State[key])
 		if err != nil {
 			return err

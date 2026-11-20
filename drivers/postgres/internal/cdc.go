@@ -218,6 +218,41 @@ func (p *Postgres) PreCDC(ctx context.Context, streams []types.StreamInterface) 
 		p.state.SetGlobal(waljs.WALState{LSN: confirmedLSN.String()})
 		p.state.ResetStreams()
 	}
+	if p.state.BackfillCheckpoint && globalState != nil && globalState.State != nil {
+		for _, stream := range streams {
+			if stream.GetSyncMode() != types.CDC || p.state.HasCompletedBackfill(stream.Self()) {
+				continue
+			}
+			var saved waljs.WALState
+			if err := utils.Unmarshal(globalState.State, &saved); err != nil {
+				return err
+			}
+			lower, err := pglogrepl.ParseLSN(saved.LSN)
+			if err != nil || lower == 0 {
+				return fmt.Errorf("partial backfill retry requires its original nonzero GLOBAL LSN")
+			}
+			if _, err := p.ordinaryRecoverySlot(ctx, lower, 0); err != nil {
+				return err
+			}
+			var raw ordinaryRecoverySlot
+			if err := p.client.GetContext(ctx, &raw, ordinaryRecoverySlotQuery, p.cdcConfig.ReplicationSlot); err != nil {
+				return err
+			}
+			if err := validateBackfillRecoverySlot(raw, lower); err != nil {
+				return err
+			}
+			break
+		}
+	}
+	if p.state.BackfillIdentity != nil {
+		identity, err := p.identifyOrdinaryRecovery(ctx, slot)
+		if err != nil {
+			return err
+		}
+		if err := p.state.BackfillIdentity(identity, p.cdcConfig.ReplicationSlot); err != nil {
+			return err
+		}
+	}
 	p.streams = streams
 	return nil
 }

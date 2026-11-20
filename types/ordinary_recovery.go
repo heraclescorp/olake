@@ -6,14 +6,17 @@ import "context"
 // controlled sync. Configuration digests hash exact bytes; state uses canonical JSON.
 // OriginalReceiptSHA256 is empty only when no original receipt was available.
 type OrdinaryRecoveryOrigin struct {
-	Version               int    `json:"version"`
-	OriginalExecutionID   string `json:"original_execution_id"`
-	OriginalLaunchID      string `json:"original_launch_id"`
-	OriginalReceiptSHA256 string `json:"original_receipt_sha256"`
-	SourceSHA256          string `json:"source_sha256"`
-	DestinationSHA256     string `json:"destination_sha256"`
-	CatalogSHA256         string `json:"catalog_sha256"`
-	BaselineStateSHA256   string `json:"baseline_state_sha256"`
+	Version                  int    `json:"version"`
+	OriginalExecutionID      string `json:"original_execution_id"`
+	OriginalLaunchID         string `json:"original_launch_id"`
+	OriginalReceiptSHA256    string `json:"original_receipt_sha256"`
+	SourceSHA256             string `json:"source_sha256"`
+	DestinationSHA256        string `json:"destination_sha256"`
+	CatalogSHA256            string `json:"catalog_sha256"`
+	BaselineStateSHA256      string `json:"baseline_state_sha256"`
+	Backfill                 bool   `json:"backfill,omitempty"`
+	BackfillCheckpointSHA256 string `json:"backfill_checkpoint_sha256,omitempty"`
+	SavedStateSHA256         string `json:"saved_state_sha256,omitempty"`
 }
 
 type OrdinaryRecoveryTableProof struct {
@@ -44,9 +47,14 @@ type OrdinaryRecoveryPlan struct {
 }
 
 type OrdinaryRecoveryOptions struct {
-	Origin         OrdinaryRecoveryOrigin
-	SourceIdentity string
-	Plan           *OrdinaryRecoveryPlan
+	Origin                  OrdinaryRecoveryOrigin
+	SourceIdentity          string
+	Plan                    *OrdinaryRecoveryPlan
+	BackfillState           *State
+	BackfillCheckpoint      *BackfillRecoveryCheckpoint
+	BackfillComplete        bool
+	BackfillAcknowledgedLSN string
+	BackfillTargetLSN       string
 }
 
 type ordinaryRecoveryKey struct{}
