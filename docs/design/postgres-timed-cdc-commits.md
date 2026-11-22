@@ -88,6 +88,14 @@ does not migrate existing tables, reset checkpoints/slots or reread the source.
 New COW tables use v2; existing v3, UUID, schema and sort/partition metadata remain
 unchanged. Source deletes retain the existing OLake tombstone representation.
 
+COW eligibility reads the current snapshot's manifest list and opens only delete
+manifests to inspect live entries. Data manifests are not downloaded or decoded
+for this check. Retired delete entries do not block COW; unreadable delete
+manifests and unknown manifest content fail closed. Writer setup and commit-time
+validation use the same check, preserving concurrent-delete detection and the
+existing snapshot/shape fences without scanning every data-file entry per chunk.
+
+
 No SDK changes are required beyond the base's existing patches. Overwrite output
 paths are not enumerated or deleted by OLake; orphan maintenance owns rejected
 attempt artifacts. Incoming buffer limits do not cap SDK survivor-read/write

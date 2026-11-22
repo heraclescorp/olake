@@ -164,12 +164,33 @@ func (w *nativeWriter) replayCopyOnWrite(ctx context.Context, tx *table.Transact
 }
 
 func nativeCOWHasDeletes(ctx context.Context, tbl *table.Table) (bool, error) {
-	entries, err := nativeLiveEntries(ctx, tbl)
+	snapshot := tbl.CurrentSnapshot()
+	if snapshot == nil {
+		return false, nil
+	}
+	fs, err := tbl.FS(ctx)
 	if err != nil {
 		return false, err
 	}
-	for _, entry := range entries {
-		if entry.DataFile().ContentType() != apacheiceberg.EntryContentData {
+	manifests, err := snapshot.Manifests(fs)
+	if err != nil {
+		return false, err
+	}
+	for _, manifest := range manifests {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		switch manifest.ManifestContent() {
+		case apacheiceberg.ManifestContentData:
+			continue
+		case apacheiceberg.ManifestContentDeletes:
+		default:
+			return false, fmt.Errorf("unknown Iceberg manifest content %d", manifest.ManifestContent())
+		}
+		for _, err := range manifest.Entries(fs, true) {
+			if err != nil {
+				return false, err
+			}
 			return true, nil
 		}
 	}

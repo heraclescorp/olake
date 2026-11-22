@@ -15,6 +15,7 @@ import (
 	apacheiceberg "github.com/apache/iceberg-go"
 
 	"github.com/apache/iceberg-go/catalog"
+	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/datazip-inc/olake/destination"
 	"github.com/datazip-inc/olake/types"
@@ -36,6 +37,34 @@ func nativeCOWRecord(label, operation string, key int64, tenant string, value in
 	record := nativeTestRecord(label, operation, value, "one")
 	record.Data["id"], record.Data["tenant"] = key, tenant
 	return record
+}
+
+type nativeCOWManifestScopeIO struct {
+	iceio.IO
+	blocked map[string]error
+}
+
+func (fs *nativeCOWManifestScopeIO) Open(name string) (iceio.File, error) {
+	if err := fs.blocked[name]; err != nil {
+		return nil, err
+	}
+	return fs.IO.Open(name)
+}
+
+func nativeCOWManifestScope(t *testing.T, tbl *table.Table) *nativeCOWManifestScopeIO {
+	t.Helper()
+	ctx := context.Background()
+	fs, err := tbl.FS(ctx)
+	require.NoError(t, err)
+	manifests, err := tbl.CurrentSnapshot().Manifests(fs)
+	require.NoError(t, err)
+	guard := &nativeCOWManifestScopeIO{IO: fs, blocked: make(map[string]error)}
+	for _, manifest := range manifests {
+		if manifest.ManifestContent() == apacheiceberg.ManifestContentData {
+			guard.blocked[manifest.FilePath()] = errors.New("COW validation must not read data manifests")
+		}
+	}
+	return guard
 }
 
 // Tiny, real local-file/Hadoop-catalog smoke; no services or production access.
@@ -122,7 +151,9 @@ func TestNativeCopyOnWriteRejectsEveryLiveDeleteKindWithoutMutation(t *testing.T
 			require.NoError(t, err)
 			stream.StreamMetadata.MergeStrategy = types.CopyOnWrite
 			before := nativeSnapshotID(old.table)
-			_, _, err = newNativeWriter(ctx, cfg, stream, &destination.Options{ThreadID: "requires-cleanup"}, cat, nil)
+			guard := nativeCOWManifestScope(t, old.table)
+			guardedCatalog := &nativeCommitFaultCatalog{Catalog: cat, fs: guard}
+			_, _, err = newNativeWriter(ctx, cfg, stream, &destination.Options{ThreadID: "requires-cleanup"}, guardedCatalog, nil)
 			require.ErrorContains(t, err, "separate explicit maintenance rewrite")
 			fresh, err := cat.LoadTable(ctx, old.table.Identifier())
 			require.NoError(t, err)
@@ -285,6 +316,14 @@ func TestNativeCopyOnWriteBackfillPreservesEveryChunk(t *testing.T) {
 	var metadata types.MetadataState
 	require.NoError(t, json.Unmarshal([]byte(second.table.Properties()[nativeRecoveryProperty]), &metadata))
 	require.ElementsMatch(t, []string{"first-chunk", "second-chunk"}, metadata.FullRefreshCommittedIDs)
+	guard := nativeCOWManifestScope(t, second.table)
+	guardedCatalog := &nativeCommitFaultCatalog{Catalog: cat, fs: guard}
+	validation := openNativeTestWriter(ctx, t, cfg, stream, guardedCatalog, nil, "validate-data-only", false)
+	require.NoError(t, validation.Close(ctx, nil))
+	require.Equal(t, nativeSnapshotID(second.table), nativeSnapshotID(validation.table))
+	fresh, err := cat.LoadTable(ctx, second.table.Identifier())
+	require.NoError(t, err)
+	require.Equal(t, map[string]int64{"a": 1, "b": 2}, nativeVisibleValues(t, fresh))
 }
 
 func TestNativeCopyOnWriteEmptyTablePublishesCommonCheckpoint(t *testing.T) {
