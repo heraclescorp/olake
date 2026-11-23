@@ -3,9 +3,12 @@ package destination
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -157,4 +160,71 @@ func TestPoolLegacyBackfillPlanIsOptionalWithoutControlledCheckpoint(t *testing.
 	require.ErrorContains(t, pool.PrepareBackfillPlan(controlled, stream, plan), "not been prepared")
 	recovery := types.WithOrdinaryRecovery(context.Background(), &types.OrdinaryRecoveryOptions{})
 	require.ErrorContains(t, pool.PrepareBackfillPlan(recovery, stream, plan), "not been prepared")
+}
+
+type poolCommittedIDsAdapter struct {
+	poolBackfillRecoveryAdapter
+	read func(context.Context, types.StreamInterface, *types.Set[types.Chunk], types.BackfillTableBinding) (map[string]struct{}, error)
+}
+
+func (a *poolCommittedIDsAdapter) GetBackfillCommittedIDs(ctx context.Context, stream types.StreamInterface, plan *types.Set[types.Chunk], expected types.BackfillTableBinding) (map[string]struct{}, error) {
+	return a.read(ctx, stream, plan, expected)
+}
+
+func TestPoolBackfillCommittedIDsAreOptionalAndFenced(t *testing.T) {
+	stream := types.NewStream("events", "public", nil).Wrap(0)
+	plan := types.NewSet(types.Chunk{})
+	binding := types.BackfillTableBinding{TableUUID: "bound", ShapeSHA256: "shape"}
+	for _, adapter := range []ordinaryRecoveryDestination{nil, &poolBackfillRecoveryAdapter{}} {
+		ids, err := (&WriterPool{ordinaryRecovery: adapter}).GetBackfillCommittedIDs(context.Background(), stream, plan, binding)
+		require.NoError(t, err)
+		require.Nil(t, ids)
+	}
+	for _, mode := range []string{"checkpoint", "recovery", "standalone", "uncontrolled_checkpoint", "completed", "unprepared", "ordinary", "resync", "closed", "closed_during_read"} {
+		t.Run(mode, func(t *testing.T) {
+			fence := filepath.Join(t.TempDir(), "fence.json")
+			require.NoError(t, os.WriteFile(fence, []byte(`{"version":1,"execution_id":"runtime","state":"open"}`), 0600))
+			ctx := utils.WithExecution(context.Background(), &utils.ExecutionOptions{ID: "runtime", LaunchID: "runtime", Fence: fence, Command: "sync"})
+			pool := &WriterPool{backfillPrepared: true}
+			calls := 0
+			pool.ordinaryRecovery = &poolCommittedIDsAdapter{read: func(_ context.Context, gotStream types.StreamInterface, gotPlan *types.Set[types.Chunk], gotBinding types.BackfillTableBinding) (map[string]struct{}, error) {
+				calls++
+				require.Equal(t, stream, gotStream)
+				require.Same(t, plan, gotPlan)
+				require.Equal(t, binding, gotBinding)
+				if mode == "closed_during_read" {
+					require.NoError(t, os.WriteFile(fence, []byte(`{"version":1,"execution_id":"runtime","state":"closed"}`), 0600))
+				}
+				return map[string]struct{}{"committed": {}}, nil
+			}}
+			switch mode {
+			case "checkpoint", "closed", "closed_during_read":
+				ctx = types.WithBackfillCheckpoint(ctx, &types.BackfillRecoveryCheckpoint{})
+			case "uncontrolled_checkpoint":
+				ctx = types.WithBackfillCheckpoint(context.Background(), &types.BackfillRecoveryCheckpoint{})
+			case "recovery", "completed", "unprepared", "ordinary":
+				ctx = types.WithOrdinaryRecovery(ctx, &types.OrdinaryRecoveryOptions{Origin: types.OrdinaryRecoveryOrigin{Backfill: mode != "ordinary"}, BackfillComplete: mode == "completed"})
+				pool.backfillPrepared = mode != "unprepared"
+			case "resync":
+				ctx = types.WithResync(types.WithBackfillCheckpoint(ctx, &types.BackfillRecoveryCheckpoint{}), &types.ResyncOptions{})
+			}
+			if mode == "closed" {
+				require.NoError(t, os.WriteFile(fence, []byte(`{"version":1,"execution_id":"runtime","state":"closed"}`), 0600))
+			}
+			ids, err := pool.GetBackfillCommittedIDs(ctx, stream, plan, binding)
+			if mode == "checkpoint" || mode == "recovery" {
+				require.NoError(t, err)
+				require.Equal(t, map[string]struct{}{"committed": {}}, ids)
+				require.Equal(t, 1, calls)
+			} else {
+				require.Error(t, err)
+				require.Nil(t, ids)
+				if mode == "closed_during_read" {
+					require.Equal(t, 1, calls)
+				} else {
+					require.Zero(t, calls)
+				}
+			}
+		})
+	}
 }

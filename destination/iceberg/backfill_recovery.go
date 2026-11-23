@@ -11,6 +11,7 @@ import (
 	"github.com/apache/iceberg-go/catalog/hadoop"
 	"github.com/apache/iceberg-go/table"
 	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils"
 	"github.com/google/uuid"
 	"io"
 	"strings"
@@ -175,6 +176,138 @@ func backfillPlanIDs(stream types.StreamInterface, plan *types.Set[types.Chunk])
 		ids[fmt.Sprintf("%s_min[%v]-max[%v]", stream.ID(), chunk.Min, chunk.Max)] = struct{}{}
 	}
 	return ids
+}
+
+// GetBackfillCommittedIDs reads a fresh table once, without opening a writer or
+// publishing state. Neither the local table cache nor saved pending chunks prove
+// that a chunk committed to this exact owned table and immutable plan.
+func (i *Iceberg) GetBackfillCommittedIDs(ctx context.Context, stream types.StreamInterface, plan *types.Set[types.Chunk], expected types.BackfillTableBinding) (map[string]struct{}, error) {
+	i.resyncMu.Lock()
+	defer i.resyncMu.Unlock()
+	execution, controlled := utils.ExecutionFromContext(ctx)
+	if !controlled || execution.ID == "" || execution.LaunchID == "" || execution.Fence == "" || execution.Command != "sync" {
+		return nil, errors.New("backfill committed IDs require a controlled sync execution")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return nil, err
+	}
+	_, resync := types.ResyncFromContext(ctx)
+	if resync || i.resync != nil || i.ordinaryRecovery != nil || i.config == nil || i.catalog == nil || stream == nil || plan == nil || plan.Len() == 0 {
+		return nil, errors.New("backfill committed IDs require an exact prepared native backfill plan")
+	}
+	encoded, err := encodeBackfillPlan(stream, plan)
+	if err != nil {
+		return nil, err
+	}
+	ids := backfillPlanIDs(stream, plan)
+	if len(ids) != plan.Len() {
+		return nil, errors.New("backfill recovery chunk identities are not unique")
+	}
+	var owner *nativeBackfillOwner
+	var recovery *ordinaryRecoveryTable
+	if _, ok := types.OrdinaryRecoveryFromContext(ctx); ok {
+		options, current, err := ordinaryRecoveryContext(ctx)
+		if err != nil {
+			return nil, err
+		}
+		recovery = i.backfillRecovery[stream.ID()]
+		if !options.Origin.Backfill || options.BackfillComplete || options.BackfillCheckpoint == nil || options.BackfillCheckpoint.ServerIdentity != options.SourceIdentity || recovery == nil || !recovery.externalBound || recovery.marker.ExecutionID != current.ID || recovery.marker.LaunchID != current.LaunchID || recovery.marker.Origin != options.Origin || recovery.marker.SourceIdentity != options.SourceIdentity || recovery.marker.BackfillPlan != encoded {
+			return nil, errors.New("backfill committed IDs differ from the prepared recovery origin, execution or exact plan")
+		}
+		owner = recoveryBackfillOwner(options, stream, recovery.marker.LowerLSN, encoded)
+	} else {
+		checkpoint, ok := types.BackfillCheckpointFromContext(ctx)
+		if !ok || checkpoint.ExecutionID != execution.ID || checkpoint.LaunchID != execution.LaunchID || i.initialBackfillPlans[stream.ID()] != encoded {
+			return nil, errors.New("backfill committed IDs require the original checkpoint and exact prepared plan")
+		}
+		owner, err = backfillOwner(checkpoint, stream, encoded)
+		if err != nil {
+			return nil, err
+		}
+		candidate, _, err := savedBackfillAuthority(checkpoint, stream, encoded)
+		if err != nil {
+			return nil, err
+		}
+		if candidate != nil && *candidate != expected {
+			return nil, errors.New("backfill committed IDs differ from the saved table binding")
+		}
+	}
+	owner.RequestedShapeSHA256, err = requestedBackfillShape(i.config, stream)
+	if err != nil {
+		return nil, err
+	}
+	external, err := readBackfillBindingJournal(ctx, stream.ID())
+	if err != nil {
+		return nil, err
+	}
+	if external == nil {
+		return nil, errors.New("backfill committed IDs require durable immutable binding evidence")
+	}
+	ident := catalog.ToIdentifier(stream.GetDestinationDatabase(&i.config.IcebergDatabase), stream.GetDestinationTable())
+	state := nativeTableEntry(i.catalog, ident)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if err := state.usable(); err != nil {
+		return nil, err
+	}
+	if state.sessions != 0 || state.resync != nil {
+		return nil, errors.New("backfill committed IDs require all local writers and resync work to be closed")
+	}
+	ctx = nativeCatalogContext(context.WithValue(ctx, nativeTableLockKey{}, state), i.catalog)
+	tbl, err := i.catalog.LoadTable(ctx, ident)
+	if err != nil {
+		return nil, err
+	}
+	actual, err := backfillTableBinding(tbl, stream)
+	if err != nil {
+		return nil, err
+	}
+	if *actual != expected {
+		return nil, errors.New("backfill committed IDs table UUID or shape differs from the expected binding")
+	}
+	if err := checkBackfillBindingJournal(external, tbl, encoded); err != nil {
+		return nil, err
+	}
+	var binding nativeBackfillBinding
+	if err := decodeBackfillProperty(tbl.Properties()[nativeBackfillBindingProperty], &binding); err != nil {
+		return nil, fmt.Errorf("decode immutable backfill binding: %w", err)
+	}
+	if err := validateBackfillBindingWithAuthority(tbl, binding, *owner, true); err != nil {
+		return nil, err
+	}
+	if recovery != nil {
+		if err := recovery.validate(tbl); err != nil {
+			return nil, err
+		}
+		if err := recovery.previousMarker(tbl); err != nil {
+			return nil, err
+		}
+	}
+	committed := make(map[string]struct{})
+	var metadata types.MetadataState
+	if raw, exists := tbl.Properties()[nativeRecoveryProperty]; exists {
+		if strings.TrimSpace(raw) == "null" {
+			return nil, errors.New("backfill committed IDs contain null recovery metadata")
+		}
+		if err := decodeBackfillProperty(raw, &metadata); err != nil {
+			return nil, fmt.Errorf("decode authoritative backfill committed IDs: %w", err)
+		}
+		for _, id := range metadata.FullRefreshCommittedIDs {
+			if id == "" {
+				return nil, errors.New("backfill committed IDs contain an empty chunk identity")
+			}
+			if _, planned := ids[id]; planned {
+				committed[id] = struct{}{}
+			}
+		}
+	}
+	if len(metadata.FullRefreshCommittedIDs) == 0 && (tbl.CurrentSnapshot() != nil || len(tbl.Metadata().Snapshots()) != 0) {
+		return nil, errors.New("backfill table with snapshot history has no authoritative committed chunk metadata")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return nil, err
+	}
+	return committed, nil
 }
 
 func (i *Iceberg) PrepareBackfillRecovery(ctx context.Context, streams []types.StreamInterface, lower string) error {

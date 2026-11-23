@@ -67,6 +67,7 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 		a.state.SetChunks(stream.Self(), types.NewSet(chunksSet.Array()...))
 	}
 	options, recovery := types.OrdinaryRecoveryFromContext(mainCtx)
+	var tableBinding *types.BackfillTableBinding
 	if a.state.BackfillCheckpoint || (recovery && options.Origin.Backfill) {
 		binding, err := pool.PrepareBackfillTable(mainCtx, stream)
 		if err != nil {
@@ -78,6 +79,7 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 		if saved := a.state.GetBackfillTable(stream.Self()); saved != nil && *saved != *binding {
 			return fmt.Errorf("backfill table %s identity or shape changed", stream.ID())
 		}
+		tableBinding = binding
 		a.state.SetBackfillTable(stream.Self(), binding)
 		if err := a.state.ErrBackfillPersistence(); err != nil {
 			return err
@@ -101,6 +103,76 @@ func (a *AbstractDriver) Backfill(mainCtx context.Context, backfilledStreams cha
 	sort.Slice(chunks, func(i, j int) bool {
 		return typeutils.Compare(chunks[i].Min, chunks[j].Min) < 0
 	})
+	if tableBinding != nil && (canSkipCheckpointedTail(a.state, stream, a.driver.Type()) || (recovery && options.Origin.Backfill)) {
+		committed, err := pool.GetBackfillCommittedIDs(mainCtx, stream, chunksSet, *tableBinding)
+		if err != nil {
+			return fmt.Errorf("validate committed backfill chunks: %w", err)
+		}
+		if committed != nil {
+			pending := make([]types.Chunk, 0, len(chunks))
+			planIDs := make(map[string]struct{}, len(chunks))
+			for _, chunk := range chunks {
+				id := generateThreadID(stream.ID(), fmt.Sprintf("min[%v]-max[%v]", chunk.Min, chunk.Max))
+				planIDs[id] = struct{}{}
+				if _, done := committed[id]; !done {
+					pending = append(pending, chunk)
+				}
+			}
+			for id := range committed {
+				if _, exists := planIDs[id]; !exists {
+					return fmt.Errorf("committed backfill evidence is outside the immutable plan")
+				}
+			}
+			if err := mainCtx.Err(); err != nil {
+				return err
+			}
+			if err := utils.CheckExecutionFence(mainCtx); err != nil {
+				return err
+			}
+			if err := a.state.ErrBackfillPersistence(); err != nil {
+				return err
+			}
+			pendingSet := types.NewSet(pending...)
+			previous := a.state.GetChunks(stream.Self())
+			if previous != nil && !previous.SubsetOf(chunksSet) {
+				return fmt.Errorf("pending backfill chunks are outside the immutable plan")
+			}
+			if previous == nil || previous.Len() != pendingSet.Len() || !previous.SubsetOf(pendingSet) {
+				a.state.SetChunks(stream.Self(), pendingSet)
+				if err := a.state.ErrBackfillPersistence(); err != nil {
+					return err
+				}
+			}
+			skipped := len(chunks) - len(pending)
+			observability.AddChunks(mainCtx, "skipped", int64(skipped))
+			logger.Infof("stream[%s]: verified %d committed backfill chunks; scheduling %d pending chunks", stream.ID(), skipped, len(pending))
+			chunks = pending
+			if len(chunks) == 0 {
+				if err := mainCtx.Err(); err != nil {
+					return err
+				}
+				if err := utils.CheckExecutionFence(mainCtx); err != nil {
+					return err
+				}
+				if stream.GetSyncMode() == types.CDC {
+					if err := a.state.CompleteBackfill(stream.ID()); err != nil {
+						return err
+					}
+				}
+				if !tableStart.IsZero() {
+					observability.RecordDuration(mainCtx, "table", time.Since(tableStart))
+				}
+				if backfilledStreams != nil {
+					select {
+					case backfilledStreams <- stream.ID():
+					case <-mainCtx.Done():
+						return mainCtx.Err()
+					}
+				}
+				return nil
+			}
+		}
+	}
 
 	logger.Infof("Starting backfill for stream[%s] with %d chunks", stream.GetStream().Name, len(chunks))
 

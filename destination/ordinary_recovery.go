@@ -21,6 +21,40 @@ type backfillRecoveryDestination interface {
 	BackfillRecoveryTarget(context.Context) (string, error)
 }
 
+type backfillCommittedIDsDestination interface {
+	GetBackfillCommittedIDs(context.Context, types.StreamInterface, *types.Set[types.Chunk], types.BackfillTableBinding) (map[string]struct{}, error)
+}
+
+// GetBackfillCommittedIDs returns only destination-authoritative evidence. A nil
+// result preserves the per-writer checks for destinations without this capability.
+func (w *WriterPool) GetBackfillCommittedIDs(ctx context.Context, stream types.StreamInterface, plan *types.Set[types.Chunk], expected types.BackfillTableBinding) (map[string]struct{}, error) {
+	adapter, supported := w.ordinaryRecovery.(backfillCommittedIDsDestination)
+	if !supported {
+		return nil, nil
+	}
+	execution, controlled := utils.ExecutionFromContext(ctx)
+	if !controlled || execution.ID == "" || execution.LaunchID == "" || execution.Fence == "" || execution.Command != "sync" {
+		return nil, fmt.Errorf("backfill committed IDs require a controlled sync execution")
+	}
+	_, checkpoint := types.BackfillCheckpointFromContext(ctx)
+	options, recovery := types.OrdinaryRecoveryFromContext(ctx)
+	_, resync := types.ResyncFromContext(ctx)
+	if resync || (!checkpoint && !recovery) || (recovery && (!options.Origin.Backfill || options.BackfillComplete || !w.backfillPrepared || w.ordinaryPrepared)) {
+		return nil, fmt.Errorf("backfill committed IDs require a controlled checkpoint or prepared incomplete backfill recovery")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return nil, err
+	}
+	committed, err := adapter.GetBackfillCommittedIDs(ctx, stream, plan, expected)
+	if err != nil {
+		return nil, err
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return nil, err
+	}
+	return committed, nil
+}
+
 func (w *WriterPool) PrepareBackfillTable(ctx context.Context, stream types.StreamInterface) (*types.BackfillTableBinding, error) {
 	adapter, ok := w.ordinaryRecovery.(backfillRecoveryDestination)
 	if !ok {
