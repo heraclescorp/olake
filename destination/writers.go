@@ -471,12 +471,26 @@ func (wt *WriterThread) Close(closeCtx context.Context, finalMetadataState any) 
 		defer cancel()
 
 		defer func() {
+			if err == nil {
+				err = ctx.Err()
+			}
 			if err != nil {
 				cancel()
+			}
+			if err == nil {
+				if preparer, ok := wt.writer.(ClosePreparer); ok {
+					if prepareErr := preparer.PrepareClose(ctx); prepareErr != nil {
+						err = fmt.Errorf("failed to prepare writer close: %w", prepareErr)
+						cancel()
+					}
+				}
 			}
 
 			wt.streamArtifact.mu.Lock()
 			defer wt.streamArtifact.mu.Unlock()
+			if err == nil {
+				err = ctx.Err()
+			}
 
 			// if error occurred, cancel the context
 			if err != nil {

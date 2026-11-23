@@ -13,6 +13,12 @@ type Config interface {
 type Write = func(ctx context.Context, channel <-chan types.Record) error
 type FlattenFunction = func(record types.Record) (types.Record, error)
 
+// ClosePreparer finalizes writer-owned output without publishing it. Close still
+// commits or aborts under the stream lock, including after preparation fails.
+type ClosePreparer interface {
+	PrepareClose(ctx context.Context) error
+}
+
 type Writer interface {
 	Spec() any
 

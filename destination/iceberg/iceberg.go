@@ -133,6 +133,13 @@ func (i *Iceberg) Write(ctx context.Context, records []types.RawRecord) error {
 	return i.writer.Write(ctx, records[start:])
 }
 
+func (i *Iceberg) PrepareClose(ctx context.Context) error {
+	if preparer, ok := i.writer.(destination.ClosePreparer); ok {
+		return preparer.PrepareClose(ctx)
+	}
+	return nil
+}
+
 func (i *Iceberg) Close(ctx context.Context, finalMetadataState any) error {
 	if i.unavailableValues != nil {
 		i.unavailableValues.Close()
@@ -1124,6 +1131,29 @@ func nativeSnapshotID(tbl *table.Table) int64 {
 	return 0
 }
 
+func (w *nativeWriter) PrepareClose(ctx context.Context) (err error) {
+	if w.options == nil || !w.options.Backfill {
+		return nil
+	}
+	defer func() {
+		if err != nil && w.failed == nil {
+			w.failed = err
+		}
+	}()
+	ctx, finish, err := beginNativeWriterWork(ctx, w.config)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	if err := w.writable(); err != nil {
+		return err
+	}
+	if err := w.finishBackfillFiles(ctx); err != nil {
+		return fmt.Errorf("finish backfill Iceberg files: %w", err)
+	}
+	return nil
+}
+
 func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err error) {
 	ctx, finish, err := beginNativeWriterWork(ctx, w.config)
 	if err != nil {
@@ -1135,6 +1165,9 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 	}
 	defer finish()
 	if err := w.writable(); err != nil {
+		if w.failed != nil && !w.uncertain && !w.closed {
+			w.Abort()
+		}
 		return err
 	}
 	defer func() {
