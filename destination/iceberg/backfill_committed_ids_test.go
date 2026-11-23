@@ -28,6 +28,7 @@ func nativeCommittedIDsFixture(t *testing.T, checkpointMode bool) (*Iceberg, con
 		controlled, _ := ordinaryTestContext(t, "original")
 		execution, ok := utils.ExecutionFromContext(controlled)
 		require.True(t, ok)
+		execution.LaunchID = ""
 		ctx = types.WithBackfillCheckpoint(utils.WithExecution(context.Background(), execution), checkpoint)
 		ctx = types.WithBackfillBindingJournal(ctx, nativeBackfillTestJournal(t, state))
 	} else {
@@ -105,9 +106,9 @@ func TestNativeBackfillCommittedIDsRejectUnboundOrChangedEvidence(t *testing.T) 
 			name = "checkpoint"
 		}
 		t.Run(name, func(t *testing.T) {
-			mutations := []string{"expected_uuid", "expected_shape", "replaced_uuid", "changed_shape", "owner_source", "owner_plan", "malformed_binding", "missing_binding", "plan_subset", "unprepared", "foreign_source", "foreign_execution", "missing_fence", "closed_fence", "malformed_metadata", "null_metadata", "unknown_metadata", "invalid_committed_ids", "trailing_metadata", "empty_chunk_id"}
+			mutations := []string{"expected_uuid", "expected_shape", "replaced_uuid", "changed_shape", "owner_source", "owner_plan", "malformed_binding", "missing_binding", "plan_subset", "unprepared", "foreign_source", "foreign_execution", "foreign_launch", "missing_fence", "closed_fence", "malformed_metadata", "null_metadata", "unknown_metadata", "invalid_committed_ids", "trailing_metadata", "empty_chunk_id"}
 			if !checkpointMode {
-				mutations = append(mutations, "malformed_previous_marker")
+				mutations = append(mutations, "malformed_previous_marker", "missing_launch")
 			}
 			for _, mutation := range mutations {
 				t.Run(mutation, func(t *testing.T) {
@@ -170,6 +171,15 @@ func TestNativeBackfillCommittedIDsRejectUnboundOrChangedEvidence(t *testing.T) 
 						require.True(t, ok)
 						changed := *execution
 						changed.ID = "foreign-execution"
+						ctx = utils.WithExecution(ctx, &changed)
+					case "foreign_launch", "missing_launch":
+						execution, ok := utils.ExecutionFromContext(ctx)
+						require.True(t, ok)
+						changed := *execution
+						changed.LaunchID = "foreign-launch"
+						if mutation == "missing_launch" {
+							changed.LaunchID = ""
+						}
 						ctx = utils.WithExecution(ctx, &changed)
 					case "missing_fence":
 						ctx = utils.WithExecution(ctx, &utils.ExecutionOptions{ID: "runtime", LaunchID: "original", Command: "sync"})

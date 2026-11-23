@@ -185,7 +185,7 @@ func (i *Iceberg) GetBackfillCommittedIDs(ctx context.Context, stream types.Stre
 	i.resyncMu.Lock()
 	defer i.resyncMu.Unlock()
 	execution, controlled := utils.ExecutionFromContext(ctx)
-	if !controlled || execution.ID == "" || execution.LaunchID == "" || execution.Fence == "" || execution.Command != "sync" {
+	if !controlled || execution.ID == "" || execution.Fence == "" || execution.Command != "sync" {
 		return nil, errors.New("backfill committed IDs require a controlled sync execution")
 	}
 	if err := utils.CheckExecutionFence(ctx); err != nil {
@@ -216,8 +216,12 @@ func (i *Iceberg) GetBackfillCommittedIDs(ctx context.Context, stream types.Stre
 		}
 		owner = recoveryBackfillOwner(options, stream, recovery.marker.LowerLSN, encoded)
 	} else {
+		launchID := execution.LaunchID
+		if launchID == "" {
+			launchID = execution.ID
+		}
 		checkpoint, ok := types.BackfillCheckpointFromContext(ctx)
-		if !ok || checkpoint.ExecutionID != execution.ID || checkpoint.LaunchID != execution.LaunchID || i.initialBackfillPlans[stream.ID()] != encoded {
+		if !ok || checkpoint.ExecutionID != execution.ID || checkpoint.LaunchID != launchID || i.initialBackfillPlans[stream.ID()] != encoded {
 			return nil, errors.New("backfill committed IDs require the original checkpoint and exact prepared plan")
 		}
 		owner, err = backfillOwner(checkpoint, stream, encoded)

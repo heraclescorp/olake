@@ -33,13 +33,13 @@ func (w *WriterPool) GetBackfillCommittedIDs(ctx context.Context, stream types.S
 		return nil, nil
 	}
 	execution, controlled := utils.ExecutionFromContext(ctx)
-	if !controlled || execution.ID == "" || execution.LaunchID == "" || execution.Fence == "" || execution.Command != "sync" {
+	if !controlled || execution.ID == "" || execution.Fence == "" || execution.Command != "sync" {
 		return nil, fmt.Errorf("backfill committed IDs require a controlled sync execution")
 	}
 	_, checkpoint := types.BackfillCheckpointFromContext(ctx)
 	options, recovery := types.OrdinaryRecoveryFromContext(ctx)
 	_, resync := types.ResyncFromContext(ctx)
-	if resync || (!checkpoint && !recovery) || (recovery && (!options.Origin.Backfill || options.BackfillComplete || !w.backfillPrepared || w.ordinaryPrepared)) {
+	if resync || (!checkpoint && !recovery) || (recovery && (execution.LaunchID == "" || !options.Origin.Backfill || options.BackfillComplete || !w.backfillPrepared || w.ordinaryPrepared)) {
 		return nil, fmt.Errorf("backfill committed IDs require a controlled checkpoint or prepared incomplete backfill recovery")
 	}
 	if err := utils.CheckExecutionFence(ctx); err != nil {

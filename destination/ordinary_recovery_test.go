@@ -180,11 +180,15 @@ func TestPoolBackfillCommittedIDsAreOptionalAndFenced(t *testing.T) {
 		require.NoError(t, err)
 		require.Nil(t, ids)
 	}
-	for _, mode := range []string{"checkpoint", "recovery", "standalone", "uncontrolled_checkpoint", "completed", "unprepared", "ordinary", "resync", "closed", "closed_during_read"} {
+	for _, mode := range []string{"checkpoint", "checkpoint_implicit_launch", "recovery", "recovery_missing_launch", "standalone", "uncontrolled_checkpoint", "completed", "unprepared", "ordinary", "resync", "closed", "closed_during_read"} {
 		t.Run(mode, func(t *testing.T) {
 			fence := filepath.Join(t.TempDir(), "fence.json")
 			require.NoError(t, os.WriteFile(fence, []byte(`{"version":1,"execution_id":"runtime","state":"open"}`), 0600))
 			ctx := utils.WithExecution(context.Background(), &utils.ExecutionOptions{ID: "runtime", LaunchID: "runtime", Fence: fence, Command: "sync"})
+			if mode == "checkpoint_implicit_launch" || mode == "recovery_missing_launch" {
+				execution, _ := utils.ExecutionFromContext(ctx)
+				execution.LaunchID = ""
+			}
 			pool := &WriterPool{backfillPrepared: true}
 			calls := 0
 			pool.ordinaryRecovery = &poolCommittedIDsAdapter{read: func(_ context.Context, gotStream types.StreamInterface, gotPlan *types.Set[types.Chunk], gotBinding types.BackfillTableBinding) (map[string]struct{}, error) {
@@ -198,11 +202,11 @@ func TestPoolBackfillCommittedIDsAreOptionalAndFenced(t *testing.T) {
 				return map[string]struct{}{"committed": {}}, nil
 			}}
 			switch mode {
-			case "checkpoint", "closed", "closed_during_read":
+			case "checkpoint", "checkpoint_implicit_launch", "closed", "closed_during_read":
 				ctx = types.WithBackfillCheckpoint(ctx, &types.BackfillRecoveryCheckpoint{})
 			case "uncontrolled_checkpoint":
 				ctx = types.WithBackfillCheckpoint(context.Background(), &types.BackfillRecoveryCheckpoint{})
-			case "recovery", "completed", "unprepared", "ordinary":
+			case "recovery", "recovery_missing_launch", "completed", "unprepared", "ordinary":
 				ctx = types.WithOrdinaryRecovery(ctx, &types.OrdinaryRecoveryOptions{Origin: types.OrdinaryRecoveryOrigin{Backfill: mode != "ordinary"}, BackfillComplete: mode == "completed"})
 				pool.backfillPrepared = mode != "unprepared"
 			case "resync":
@@ -212,7 +216,7 @@ func TestPoolBackfillCommittedIDsAreOptionalAndFenced(t *testing.T) {
 				require.NoError(t, os.WriteFile(fence, []byte(`{"version":1,"execution_id":"runtime","state":"closed"}`), 0600))
 			}
 			ids, err := pool.GetBackfillCommittedIDs(ctx, stream, plan, binding)
-			if mode == "checkpoint" || mode == "recovery" {
+			if mode == "checkpoint" || mode == "checkpoint_implicit_launch" || mode == "recovery" {
 				require.NoError(t, err)
 				require.Equal(t, map[string]struct{}{"committed": {}}, ids)
 				require.Equal(t, 1, calls)
