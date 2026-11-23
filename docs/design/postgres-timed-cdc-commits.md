@@ -8,7 +8,6 @@ Scope: PostgreSQL source-TOAST/native Iceberg. COW reuses the existing end-of-ru
 - Rows flow through source TOAST buffering and asynchronous `WriterThread.Push`/flush. A "successfully wrote" batch log is not proof of Iceberg snapshot publication.
 - `AbstractDriver.streamChanges` returns a single final WAL state. Its deferred `handleWriterCleanup` joins all writers, closing them with that state. Only afterwards does `PostCDC` acknowledge the slot and update in-memory global state. Protocol/worker then persist the run state.
 - MOR `nativeWriter.Close` is terminal: completes files, writes same-write superseded-row position deletes (v2) or deletion vectors (v3), and publishes them with the original immutable data files and `olake_2pc` in one table transaction. It does not reread/rewrite staged Parquet data or remap its ordinals. It cannot just be called every minute while Push continues.
-- After queued writes drain, `WriterThread.Close` prepares native backfill files before acquiring the per-stream close lock. This completes Parquet footers and uploads without publishing table metadata, visible rows, recovery state or index checkpoints. Independent chunks can finalize concurrently; the existing serialized `Close` still publishes data and recovery metadata together under table coordination. Preparation failure cancels the writer and follows abort/rollback cleanup, never publication. Direct native `Close` retains file finalization for callers without the preparation phase; commit, checkpoint and source-acknowledgement ordering are unchanged.
 - Keepalive replies send the original confirmed position. The new 30-second progress logs observe decoder positions only; they do not introduce durable checkpointing.
 - Destination buffers independently track original source bytes and approximate decoded payload bytes. Hydrated values count toward the payload budget without inflating WAL-byte statistics; indivisible oversized rows flush alone. The source hydrator still materializes up to 128 fetched rows before emission, so this is not a strict process-memory cap.
 - Native Parquet writes check page/dictionary targets after each value, including backfill and delete-file writes. The 1 MiB targets remain soft: a single large value can exceed the unchanged reader limits. Per-value checks trade throughput for bounded multi-value page overshoot.
@@ -24,12 +23,6 @@ The worker/UI Reconcile action resets the same retained operation, not a new dat
 
 The connector requires paired `--ordinary-recovery-origin` and `--ordinary-recovery-result` flags plus a fresh controlled execution identity/fence and the retained launch identity. Origin hashes bind the source/destination files, legacy-or-split catalog, and an immutable baseline checkpoint. Backfill origins additionally bind the frozen provisional candidate and the authoritative saved job-state digest separately. If an original execution receipt was observed when the origin was frozen, its exact bytes remain hash-bound; otherwise its digest is empty and later receipt publication does not change that origin. Source/destination files use raw SHA256. Catalog hashing frames each present file in fixed `streams.json`, `available_streams.json`, `selected_streams.json` order as filename, NUL, decimal byte length, NUL, raw bytes; mixed/partial catalog forms are rejected. Checkpoint canonicalization preserves large JSON numbers.
 
-Recovery compares PostgreSQL positions numerically, so hexadecimal case and leading
-zeros do not change a replay boundary. Frozen source, destination, catalog,
-checkpoint and ownership-journal bytes remain hash-bound and are not rewritten
-to normalize their presentation. Malformed positions and different numeric
-boundaries still fail closed.
-
 S3 recovery initializes storage before reading its positive execution fence. The normal storage resolver validates that fence before downloading inputs or starting source/destination work. After exact old-runtime retirement, missing helper receipts or server-pin files do not prevent a fresh catalog-based recovery epoch. They do not prove settlement either: ownership remains retained until the new runtime confirms the common committed checkpoint and publishes complete settlement evidence.
 
 Live PostgreSQL server/slot identity is validated before destination mutations. Any existing standalone server pin remains binding. The connector preflights every selected table's committed checkpoint and recovery marker before writing any new barrier; prior markers must bind the same origin, original launch, source identity, stream, table UUID and frozen shape. Each fresh empty-append barrier commits that source identity in table metadata, guarded by UUID, current snapshot and default shape. The companion server-pin file is published after all barriers succeed and before CDC replay. Interrupted barrier preparation therefore recovers identity from committed catalog markers without relying on a helper receipt. Old ordinary artifacts do not prove historical server identity; the first recovery binding is to the validated live source. Barriers preserve data/deletes/history while making late old snapshot-fenced mutations conflict; a property-only marker is not a barrier.
@@ -41,25 +34,6 @@ Recovery is not unconditional replay of the last batch. Iceberg does not enforce
 Published common-checkpoint bytes bind both recovery proof and final runtime receipt; finalization hashes those persisted bytes instead of reserializing an unordered in-memory stream set. Recovery preserves OLake's existing soft-delete representation: deleted keys retain `_op_type = 'd'` tombstones, rather than being resurrected by older replayed changes.
 
 Acknowledgement follows writer drain and authoritative common-boundary confirmation. A separate identity/hash-bound recovery result and a new settled runtime receipt authorize the worker's atomic checkpoint-plus-settlement transaction. The schedule remains paused until explicit resume. If acknowledgement or artifact publication is interrupted, ownership remains retained; a fresh recovery epoch restores the immutable baseline, rechecks table/slot coverage, and rebarriers before recovery. Relaunching the failed runtime directly is unsupported. Never force an unknown receipt to settled, clear owner fields, or advance a slot based only on process exit or logs.
-
-### Clear after a terminal ordinary run
-
-The worker observes the named connector container, not just the pod phase: a live
-sidecar must not hide connector completion or failure. A missing pod is a runtime
-failure, not proof that previously dispatched mutations settled.
-
-An explicit Clear Destination request can retire a terminal controlled ordinary
-run without replaying CDC when its original sync/clear receipt positively proves
-`settled` (with a matching checkpoint hash) or `not_started`. The worker validates
-the old command and runtime identity, closes its fence, retires the exact provider
-resource, and atomically transfers ownership to a fresh clear epoch. Admission
-assigns new launch/runtime IDs. Unlaunched operations require empty launch/provider
-identities. The old checkpoint is preserved until the clear itself completes;
-original receipts are not rewritten.
-
-Active runs, unknown/missing/mismatched receipts, unresolved recovery proofs,
-unsafe cleanup and resync handoffs remain blocked. This is not an abandon-unknown
-or force-clear protocol and does not remove normal reconciliation safeguards.
 
 ### Interrupted initial backfill
 
@@ -141,27 +115,12 @@ The standard table property
 `write.parquet.bloom-filter-enabled.column.<destination-column>` always overrides
 the default when present: `false` disables a key's filter, while `true` can enable
 one for a non-key column. Boolean values follow Iceberg's case-insensitive Java
-`true` semantics. `write.parquet.bloom-filter-max-bytes` defaults to a 1 MiB maximum
-bitset per enabled column per row group; explicit sizes must be decimal integers
-from 32 through 134217728 bytes. Invalid sizes return an error before constructing
-Arrow writer properties, rather than panicking or silently replacing the bound.
-The effective cap rounds down to a power of two, so a 1000-byte cap permits at
-most 512 bytes, never 1024.
-
-Direct native, streaming-backfill and SDK COW writers adapt each filter to the
-estimated number of distinct non-null values, not the row count. Arrow selects
-the smallest viable power-of-two candidate with its default 1% false-positive
-target; repeated keys stay small while higher-cardinality groups grow up to the
-cap. The target is not guaranteed when that cap saturates. For effective caps of
-at least 2 KiB, candidates span 32 bytes through the cap; Arrow's 500-value
-estimation step makes the smallest selected filter about 2 KiB. Effective caps
-of 1 KiB or less instead use a fixed filter at the full effective cap, avoiding
-Arrow's no-candidate fallback to 32 bytes at these sizes. Building adaptive
-candidates temporarily uses less than twice the effective cap in bitset buffers
-per enabled column; only the selected filter is serialized. This adds
-no stored table property or false-positive-rate override. Native writes retain
-batch size 1, 1 MiB page/dictionary targets, the 64K row-group cap, Zstd level 3,
-statistics and page indexes.
+`true` semantics. `write.parquet.bloom-filter-max-bytes` defaults to 1 MiB per
+column per row group; explicit sizes must be decimal integers from 32 through 134217728
+bytes. Invalid sizes return an error before constructing Arrow writer properties,
+rather than panicking or silently replacing the configured bound. Native writes
+retain batch size 1, 1 MiB page/dictionary targets, the 64K row-group cap, Zstd
+level 3, statistics and page indexes.
 
 New tables persist these defaults at creation. Existing tables get missing
 properties only in their next normal data transaction, alongside data and
