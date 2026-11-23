@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,9 +42,25 @@ type ordinaryRecoverySlot struct {
 
 type ordinaryRecovery struct {
 	identity string
-	lower    string
+	lower    pglogrepl.LSN
 	plan     *types.OrdinaryRecoveryPlan
 	complete bool
+}
+
+func ordinaryRecoveryLowerLSN(raw string) (pglogrepl.LSN, error) {
+	high, low, ok := strings.Cut(raw, "/")
+	if !ok || high == "" || low == "" {
+		return 0, fmt.Errorf("invalid PostgreSQL lower LSN %q", raw)
+	}
+	hi, err := strconv.ParseUint(high, 16, 32)
+	if err != nil {
+		return 0, err
+	}
+	lo, err := strconv.ParseUint(low, 16, 32)
+	if err != nil {
+		return 0, err
+	}
+	return pglogrepl.LSN(hi<<32 | lo), nil
 }
 
 func (p *Postgres) validateOrdinaryRecoveryCatalog(streams []types.StreamInterface, lower string) error {
@@ -57,7 +74,7 @@ func (p *Postgres) validateRecoveryCatalog(streams []types.StreamInterface, lowe
 	if p.resync != nil || len(streams) == 0 || p.state == nil || p.state.Type != types.GlobalType {
 		return fmt.Errorf("ordinary recovery requires a nonempty frozen CDC catalog and saved GLOBAL state, not resync")
 	}
-	baseline, err := pglogrepl.ParseLSN(lower)
+	baseline, err := ordinaryRecoveryLowerLSN(lower)
 	if err != nil || baseline == 0 {
 		return fmt.Errorf("ordinary recovery requires a valid nonzero lower LSN %q", lower)
 	}
@@ -69,7 +86,7 @@ func (p *Postgres) validateRecoveryCatalog(streams []types.StreamInterface, lowe
 	if err := utils.Unmarshal(global.State, &saved); err != nil {
 		return fmt.Errorf("invalid ordinary recovery GLOBAL state: %w", err)
 	}
-	savedLSN, err := pglogrepl.ParseLSN(saved.LSN)
+	savedLSN, err := ordinaryRecoveryLowerLSN(saved.LSN)
 	if err != nil || savedLSN != baseline {
 		return fmt.Errorf("ordinary recovery lower LSN does not match the saved GLOBAL checkpoint")
 	}
@@ -233,11 +250,11 @@ func (p *Postgres) ValidateOrdinaryRecovery(ctx context.Context, streams []types
 	if options, ok := types.OrdinaryRecoveryFromContext(ctx); ok && options.SourceIdentity != "" && options.SourceIdentity != identity {
 		return "", fmt.Errorf("ordinary recovery source identity changed after validation")
 	}
-	if p.ordinary != nil && (p.ordinary.identity != identity || p.ordinary.lower != baseline.String()) {
+	if p.ordinary != nil && (p.ordinary.identity != identity || p.ordinary.lower != baseline) {
 		return "", fmt.Errorf("ordinary recovery source identity or baseline changed")
 	}
 	if p.ordinary == nil {
-		p.ordinary = &ordinaryRecovery{identity: identity, lower: baseline.String()}
+		p.ordinary = &ordinaryRecovery{identity: identity, lower: baseline}
 	}
 	if incomplete && slot.LSN > baseline {
 		options.BackfillAcknowledgedLSN = slot.LSN.String()
@@ -248,7 +265,7 @@ func (p *Postgres) ValidateOrdinaryRecovery(ctx context.Context, streams []types
 // ordinaryRecoveryPlan uses all table positions, never map iteration order or a
 // group-wide 'already finished' shortcut. Missing metadata is not baseline proof.
 func ordinaryRecoveryPlan(streams []types.StreamInterface, lower string, positions map[string]string, slot pglogrepl.LSN) (*types.OrdinaryRecoveryPlan, error) {
-	baseline, err := pglogrepl.ParseLSN(lower)
+	baseline, err := ordinaryRecoveryLowerLSN(lower)
 	if err != nil || baseline == 0 || len(streams) == 0 || len(positions) != len(streams) {
 		return nil, fmt.Errorf("ordinary recovery requires the baseline and exact selected table positions")
 	}
@@ -499,14 +516,14 @@ func ordinaryRecoveryCheckpoint(raw any, target string) (map[string]any, error) 
 
 func (p *Postgres) CaptureBackfillRecoveryTarget(ctx context.Context, lower string) (target string, err error) {
 	options, ok := types.OrdinaryRecoveryFromContext(ctx)
-	if !ok || !options.Origin.Backfill || !options.BackfillComplete || p.ordinary == nil || p.ordinary.identity != options.SourceIdentity || p.ordinary.lower != lower {
+	if !ok || !options.Origin.Backfill || !options.BackfillComplete || p.ordinary == nil || p.ordinary.identity != options.SourceIdentity {
 		return "", fmt.Errorf("backfill target capture requires completed backfill and validated source identity")
 	}
 	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return "", err
 	}
-	baseline, err := pglogrepl.ParseLSN(lower)
-	if err != nil || baseline == 0 {
+	baseline, err := ordinaryRecoveryLowerLSN(lower)
+	if err != nil || baseline == 0 || baseline != p.ordinary.lower {
 		return "", fmt.Errorf("backfill target capture requires the original lower LSN")
 	}
 	slot, err := p.ordinaryRecoverySlot(ctx, baseline, 0)

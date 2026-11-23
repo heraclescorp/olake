@@ -370,14 +370,14 @@ func TestNativeBackfillFixedTargetSurvivesPartialBarrierEpoch(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, target)
 	options.BackfillComplete = true
-	options.BackfillTargetLSN = "0/30"
+	options.BackfillTargetLSN = "0/a0"
 	_, err = adapter.PrepareOrdinaryRecovery(ctx, streams, "0/10")
 	require.Error(t, err)
 	firstBarrier, err := underlying.LoadTable(ctx, table.Identifier{"db", first.GetDestinationTable()})
 	require.NoError(t, err)
 	var marker ordinaryRecoveryMarker
 	require.NoError(t, json.Unmarshal([]byte(firstBarrier.Properties()[ordinaryRecoveryProperty]), &marker))
-	require.Equal(t, "0/30", marker.BackfillTargetLSN)
+	require.Equal(t, "0/a0", marker.BackfillTargetLSN)
 	untouched, err := underlying.LoadTable(ctx, table.Identifier{"db", second.GetDestinationTable()})
 	require.NoError(t, err)
 	require.Empty(t, untouched.Properties()[ordinaryRecoveryProperty])
@@ -387,29 +387,39 @@ func TestNativeBackfillFixedTargetSurvivesPartialBarrierEpoch(t *testing.T) {
 	require.NoError(t, next.PrepareBackfillRecovery(nextCtx, streams, "0/10"))
 	target, err = next.BackfillRecoveryTarget(nextCtx)
 	require.NoError(t, err)
-	require.Equal(t, "0/30", target)
+	require.Equal(t, "0/a0", target)
 	nextOptions.BackfillComplete = true
-	nextOptions.BackfillTargetLSN = "0/40"
+	nextOptions.BackfillTargetLSN = "0/B0"
 	_, err = next.PrepareOrdinaryRecovery(nextCtx, streams, "0/10")
 	require.ErrorContains(t, err, "differs from the persisted target")
 	require.Zero(t, nextFault.calls)
-	nextOptions.BackfillTargetLSN = target
+	nextOptions.BackfillTargetLSN = "000/000A0"
 	proofs, err := next.PrepareOrdinaryRecovery(nextCtx, streams, "0/10")
 	require.NoError(t, err)
-	ordinaryTestPlan(nextOptions, proofs, "0/10", target)
+	ordinaryTestPlan(nextOptions, proofs, "000/00010", "0/A0")
 	for _, stream := range streams {
 		writer := openNativeTestWriter(nextCtx, t, cfg, stream.Self(), next.catalog, nil, "bounded-cdc", false)
-		require.NoError(t, writer.Close(nextCtx, map[string]any{"state": `{"lsn":"0/30"}`}))
+		require.NoError(t, writer.Close(nextCtx, map[string]any{"state": `{"lsn":"0/A0"}`}))
 	}
 	confirmed, err := next.ConfirmOrdinaryRecovery(nextCtx, streams, proofs, target)
 	require.NoError(t, err)
 	for _, proof := range confirmed {
-		require.Equal(t, target, proof.CommittedLSN)
+		position, err := ordinaryRecoveryLSN(proof.CommittedLSN)
+		require.NoError(t, err)
+		require.Equal(t, uint64(0xA0), position)
 	}
 	current, err := underlying.LoadTable(nextCtx, table.Identifier{"db", second.GetDestinationTable()})
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal([]byte(current.Properties()[ordinaryRecoveryProperty]), &marker))
-	marker.BackfillTargetLSN = "0/40"
+	marker.BackfillTargetLSN = "0/a0"
+	equivalent, err := json.Marshal(marker)
+	require.NoError(t, err)
+	_, _, err = underlying.CommitTable(nextCtx, current.Identifier(), nil, []table.Update{table.NewSetPropertiesUpdate(apacheiceberg.Properties{ordinaryRecoveryProperty: string(equivalent)})})
+	require.NoError(t, err)
+	equivalentCtx, _ := nativeBackfillRecoveryContext(t, "equivalent-target-epoch", state)
+	equivalentAdapter := &Iceberg{config: cfg, catalog: cat}
+	require.NoError(t, equivalentAdapter.PrepareBackfillRecovery(equivalentCtx, streams, "0/10"))
+	marker.BackfillTargetLSN = "0/B0"
 	encoded, err := json.Marshal(marker)
 	require.NoError(t, err)
 	_, _, err = underlying.CommitTable(nextCtx, current.Identifier(), nil, []table.Update{table.NewSetPropertiesUpdate(apacheiceberg.Properties{ordinaryRecoveryProperty: string(encoded)})})

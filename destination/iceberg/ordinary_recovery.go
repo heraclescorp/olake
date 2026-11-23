@@ -63,6 +63,12 @@ func ordinaryRecoveryLSN(value string) (uint64, error) {
 	return high<<32 | low, nil
 }
 
+func ordinaryRecoverySameLSN(left, right string) bool {
+	leftValue, leftErr := ordinaryRecoveryLSN(left)
+	rightValue, rightErr := ordinaryRecoveryLSN(right)
+	return leftErr == nil && rightErr == nil && leftValue == rightValue
+}
+
 func ordinaryRecoveryPosition(tbl *table.Table, lower uint64) (string, error) {
 	status, position := nativeMetadataLSNPosition(tbl.Properties()[nativeRecoveryProperty])
 	if status != "present" {
@@ -215,7 +221,7 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 		if err != nil {
 			return nil, err
 		}
-		if stored != "" && stored != options.BackfillTargetLSN {
+		if stored != "" && !ordinaryRecoverySameLSN(stored, options.BackfillTargetLSN) {
 			return nil, errors.New("backfill recovery replay target differs from the persisted target")
 		}
 	}
@@ -339,6 +345,16 @@ func (r *ordinaryRecoveryTable) previousMarker(tbl *table.Table) error {
 	// Epochs may change, immutable evidence and source identity may not.
 	previous.ExecutionID = r.marker.ExecutionID
 	if previous.BackfillTargetLSN == "" && r.marker.Origin.Backfill && r.marker.BackfillTargetLSN != "" {
+		previous.BackfillTargetLSN = r.marker.BackfillTargetLSN
+	}
+	if !ordinaryRecoverySameLSN(previous.LowerLSN, r.marker.LowerLSN) {
+		return errors.New("ordinary recovery table marker lower position differs from immutable origin")
+	}
+	previous.LowerLSN = r.marker.LowerLSN
+	if previous.BackfillTargetLSN != r.marker.BackfillTargetLSN {
+		if !ordinaryRecoverySameLSN(previous.BackfillTargetLSN, r.marker.BackfillTargetLSN) {
+			return errors.New("ordinary recovery table marker replay target differs from immutable origin")
+		}
 		previous.BackfillTargetLSN = r.marker.BackfillTargetLSN
 	}
 	if previous != r.marker {
@@ -479,7 +495,7 @@ func (i *Iceberg) ConfirmOrdinaryRecovery(ctx context.Context, streams []types.S
 	if err != nil {
 		return nil, err
 	}
-	if len(streams) == 0 || len(streams) != len(i.ordinaryRecovery) || len(proofs) != len(streams) || options.Plan == nil || options.Plan.TargetLSN != target {
+	if len(streams) == 0 || len(streams) != len(i.ordinaryRecovery) || len(proofs) != len(streams) || options.Plan == nil || !ordinaryRecoverySameLSN(options.Plan.TargetLSN, target) {
 		return nil, errors.New("ordinary recovery confirmation requires every selected table and the exact replay target")
 	}
 	provided := make(map[string]types.OrdinaryRecoveryTableProof, len(proofs))
@@ -500,7 +516,7 @@ func (i *Iceberg) ConfirmOrdinaryRecovery(ctx context.Context, streams []types.S
 		}
 		seen[stream.ID()] = struct{}{}
 		r := i.ordinaryRecovery[stream.ID()]
-		if r == nil || !r.prepared || r.proof.FenceSnapshotID == 0 || provided[stream.ID()] != r.proof || r.marker.Origin != options.Origin || r.marker.SourceIdentity != options.SourceIdentity || r.marker.ExecutionID != execution.ID || r.marker.LowerLSN != options.Plan.LowerLSN || targetValue != r.target {
+		if r == nil || !r.prepared || r.proof.FenceSnapshotID == 0 || provided[stream.ID()] != r.proof || r.marker.Origin != options.Origin || r.marker.SourceIdentity != options.SourceIdentity || r.marker.ExecutionID != execution.ID || !ordinaryRecoverySameLSN(r.marker.LowerLSN, options.Plan.LowerLSN) || targetValue != r.target {
 			return nil, errors.New("ordinary recovery proof or execution binding changed")
 		}
 		ident := catalog.ToIdentifier(stream.GetDestinationDatabase(&i.config.IcebergDatabase), stream.GetDestinationTable())
@@ -558,7 +574,7 @@ func validateOrdinaryRecoveryWriter(ctx context.Context, state *nativeTableState
 	if options.Plan != nil {
 		target, targetErr = ordinaryRecoveryLSN(options.Plan.TargetLSN)
 	}
-	if r == nil || !r.prepared || (options.Origin.Backfill && !r.externalBound) || !controlled || execution.ID != r.marker.ExecutionID || options.Plan == nil || targetErr != nil || target != r.target || r.proof.FenceSnapshotID == 0 || r.marker.Origin != options.Origin || r.marker.SourceIdentity != options.SourceIdentity || options.Plan.ReplayAfter[stream.ID()] != r.proof.CommittedLSN || options.Plan.LowerLSN != r.marker.LowerLSN {
+	if r == nil || !r.prepared || (options.Origin.Backfill && !r.externalBound) || !controlled || execution.ID != r.marker.ExecutionID || options.Plan == nil || targetErr != nil || target != r.target || r.proof.FenceSnapshotID == 0 || r.marker.Origin != options.Origin || r.marker.SourceIdentity != options.SourceIdentity || !ordinaryRecoverySameLSN(options.Plan.ReplayAfter[stream.ID()], r.proof.CommittedLSN) || !ordinaryRecoverySameLSN(options.Plan.LowerLSN, r.marker.LowerLSN) {
 		return errors.New("ordinary recovery writer does not match its prepared barrier and replay plan")
 	}
 	return r.validate(tbl)

@@ -429,7 +429,7 @@ func backfillRecoveryTarget(controls map[string]*ordinaryRecoveryTable) (string,
 		if err != nil || lowerErr != nil || value < lower {
 			return "", errors.New("backfill recovery marker contains an invalid replay target")
 		}
-		if target != "" && target != control.marker.BackfillTargetLSN {
+		if target != "" && !ordinaryRecoverySameLSN(target, control.marker.BackfillTargetLSN) {
 			return "", errors.New("backfill recovery tables disagree on the persisted replay target")
 		}
 		target = control.marker.BackfillTargetLSN
