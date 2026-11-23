@@ -1746,10 +1746,6 @@ func nativeParquetWriterProperties(schema *apacheiceberg.Schema, stream types.St
 	if err != nil {
 		return nil, err
 	}
-	maxBytes, err := strconv.ParseInt(properties[nativeBloomFilterMaxBytesKey], 10, 64)
-	if err != nil {
-		return nil, err
-	}
 	const pageBytes = 1024 * 1024
 	opts := []parquet.WriterProperty{
 		parquet.WithCompression(compress.Codecs.Zstd),
@@ -1761,13 +1757,8 @@ func nativeParquetWriterProperties(schema *apacheiceberg.Schema, stream types.St
 		parquet.WithDictionaryPageSizeLimit(pageBytes),
 		parquet.WithRootName("table"),
 		parquet.WithPageIndexEnabled(true),
-		parquet.WithMaxBloomFilterBytes(maxBytes),
 	}
-	for key, value := range properties {
-		if name, ok := strings.CutPrefix(key, nativeBloomFilterColumnPrefix); ok && name != "" {
-			opts = append(opts, parquet.WithBloomFilterEnabledFor(name, strings.EqualFold(value, "true")))
-		}
-	}
+	opts = append(opts, table.ParquetBloomFilterWriteOptions(properties)...)
 	return parquet.NewWriterProperties(opts...), nil
 }
 

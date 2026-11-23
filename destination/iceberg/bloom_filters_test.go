@@ -55,7 +55,7 @@ func nativeBloomTestFileBytes(t *testing.T, tbl *table.Table, path string) []byt
 	return data
 }
 
-func nativeBloomTestFile(t *testing.T, tbl *table.Table, path string, enabled map[string][][]byte, disabled []string, maxBytes int64) {
+func nativeBloomTestFile(t *testing.T, tbl *table.Table, path string, enabled map[string][][]byte, disabled []string, maxBytes int64) map[string][]int64 {
 	t.Helper()
 	fs, err := tbl.FS(context.Background())
 	require.NoError(t, err)
@@ -71,6 +71,7 @@ func nativeBloomTestFile(t *testing.T, tbl *table.Table, path string, enabled ma
 	for index := range reader.MetaData().Schema.NumColumns() {
 		columns[reader.MetaData().Schema.Column(index).SchemaNode().Name()] = index
 	}
+	sizes := make(map[string][]int64)
 	for group := range reader.NumRowGroups() {
 		metadata := reader.MetaData().RowGroup(group)
 		for _, column := range disabled {
@@ -109,6 +110,13 @@ func nativeBloomTestFile(t *testing.T, tbl *table.Table, path string, enabled ma
 			numBytes := int64(encodedBytes >> 1)
 			require.Positive(t, numBytes)
 			require.LessOrEqual(t, numBytes, maxBytes, "Bloom bitset exceeds configured cap for %q", column)
+			require.GreaterOrEqual(t, numBytes, int64(32))
+			require.Zero(t, numBytes&(numBytes-1), "Bloom bitset must have a power-of-two size")
+			sizes[column] = append(sizes[column], numBytes)
+			expected := make(map[string]struct{}, len(values))
+			for _, value := range values {
+				expected[string(value)] = struct{}{}
+			}
 			groupData, err := arrowReader.ReadRowGroups(context.Background(), []int{index}, []int{group})
 			require.NoError(t, err)
 			defer groupData.Release()
@@ -126,7 +134,7 @@ func nativeBloomTestFile(t *testing.T, tbl *table.Table, path string, enabled ma
 					default:
 						t.Fatalf("unsupported Bloom test column %q type %T", column, chunk)
 					}
-					require.Contains(t, values, value, "unexpected stored value for %q", column)
+					require.Contains(t, expected, string(value), "unexpected stored value for %q", column)
 					require.True(t, filter.CheckHash(filter.Hasher().Sum64(value)), "Bloom false negative for %q value %x in row group %d", column, value, group)
 				}
 			}
@@ -136,7 +144,144 @@ func nativeBloomTestFile(t *testing.T, tbl *table.Table, path string, enabled ma
 					negatives++
 				}
 			}
-			require.Positive(t, negatives, "Bloom filter for %q accepts every absent probe", column)
+			// Saturated caps can legitimately accept every absent probe.
+			if int64(len(expected))*2 <= numBytes {
+				require.Positive(t, negatives, "Bloom filter for %q accepts every absent probe", column)
+			}
+		}
+	}
+	return sizes
+}
+
+// All paths use the same nullable value column and distinct composite keys, even
+// when id repeats. The COW path updates one seed row so survivors are SDK output.
+func nativeBloomTestAdaptiveOutput(t *testing.T, path string, count, distinct, maxBytes int) map[string]int64 {
+	t.Helper()
+	ctx := context.Background()
+	cfg, stream, cat := nativeCOWFixture(t, types.UpdateTypeEquality)
+	if path != "copy-on-write" {
+		stream.StreamMetadata.MergeStrategy = types.MergeOnRead
+	}
+	created := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "adaptive-create", true)
+	require.NoError(t, created.Close(ctx, nil))
+	props := apacheiceberg.Properties{
+		nativeBloomTestProperty(constants.OlakeID): "false",
+		nativeBloomTestProperty("tenant"):          "false",
+		nativeBloomTestProperty("value"):           "true",
+	}
+	if maxBytes != 0 {
+		props[table.ParquetBloomFilterMaxBytesKey] = strconv.Itoa(maxBytes)
+	}
+	tx := created.table.NewTransaction()
+	require.NoError(t, tx.SetProperties(props))
+	_, err := tx.Commit(ctx)
+	require.NoError(t, err)
+	rows := make([]types.RawRecord, count)
+	values := make([][]byte, distinct)
+	for index := range distinct {
+		values[index] = nativeBloomTestInt(int64(index))
+	}
+	for index := range rows {
+		label := fmt.Sprintf("adaptive-%05d", index)
+		rows[index] = nativeCOWRecord(label, "r", int64(index%distinct), label, 0)
+		if index%3 == 1 {
+			rows[index].Data["value"] = nil
+		}
+	}
+	var seedPaths []string
+	if path == "copy-on-write" {
+		seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "adaptive-seed", true)
+		require.NoError(t, seed.Write(ctx, rows))
+		require.NoError(t, seed.Close(ctx, nil))
+		seedPaths = nativeBloomTestDataPaths(t, seed.table)
+		require.NotEmpty(t, seedPaths)
+	}
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "adaptive-write", path == "backfill")
+	t.Cleanup(func() { writer.Abort() })
+	if path == "copy-on-write" {
+		update := rows[0]
+		update.OlakeColumns = maps.Clone(update.OlakeColumns)
+		update.OlakeColumns[constants.OpType] = "u"
+		require.NoError(t, writer.Write(ctx, []types.RawRecord{update}))
+	} else {
+		require.NoError(t, writer.Write(ctx, rows))
+	}
+	require.NoError(t, writer.Close(ctx, nil))
+	paths := nativeBloomTestDataPaths(t, writer.table)
+	require.NotEmpty(t, paths)
+	capBytes := int64(maxBytes)
+	if capBytes == 0 {
+		capBytes = 1024 * 1024
+	}
+	sizes := make(map[string]int64)
+	fs, err := writer.table.FS(ctx)
+	require.NoError(t, err)
+	var rowCount int64
+	var nulls int
+	for _, filePath := range paths {
+		require.NotContains(t, seedPaths, filePath, "inspect SDK output, not an unchanged native seed")
+		fileSizes := nativeBloomTestFile(t, writer.table, filePath, map[string][][]byte{
+			"id": values, "value": {nativeBloomTestInt(0)},
+		}, []string{constants.OlakeID, "tenant", "part", "blob", constants.OpType, constants.OlakeTimestamp}, capBytes)
+		for column, groupSizes := range fileSizes {
+			for _, size := range groupSizes {
+				sizes[column] = max(sizes[column], size)
+			}
+		}
+		input, err := fs.Open(filePath)
+		require.NoError(t, err)
+		reader, err := parquetfile.NewParquetReader(input)
+		require.NoError(t, err)
+		rowCount += reader.NumRows()
+		arrowReader, err := pqarrow.NewFileReader(reader, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+		require.NoError(t, err)
+		valueColumn := -1
+		for index := range reader.MetaData().Schema.NumColumns() {
+			if reader.MetaData().Schema.Column(index).SchemaNode().Name() == "value" {
+				valueColumn = index
+			}
+		}
+		require.NotEqual(t, -1, valueColumn)
+		for group := range reader.NumRowGroups() {
+			data, err := arrowReader.ReadRowGroups(ctx, []int{valueColumn}, []int{group})
+			require.NoError(t, err)
+			for _, chunk := range data.Column(0).Data().Chunks() {
+				nulls += chunk.NullN()
+			}
+			data.Release()
+		}
+		require.NoError(t, reader.Close())
+	}
+	require.Equal(t, int64(count), rowCount, "repeated IDs must not shrink the test dataset")
+	require.Equal(t, (count+1)/3, nulls, "the membership regression must retain its null fixture rows")
+	return sizes
+}
+
+func TestNativeBloomAdaptiveDistinctValues(t *testing.T) {
+	for _, path := range []string{"ordinary", "backfill", "copy-on-write"} {
+		t.Run(path, func(t *testing.T) {
+			tiny := nativeBloomTestAdaptiveOutput(t, path, 1, 1, 0)
+			large := nativeBloomTestAdaptiveOutput(t, path, 8192, 8192, 0)
+			repeated := nativeBloomTestAdaptiveOutput(t, path, 8192, 3, 0)
+			require.Less(t, tiny["id"], large["id"], "higher NDV must grow the serialized filter")
+			require.Equal(t, tiny["id"], repeated["id"], "equal row counts must not size repeated IDs like distinct IDs")
+			require.Less(t, large["id"], int64(1024*1024), "the default cap is not a fixed allocation on disk")
+			require.Equal(t, tiny["value"], large["value"], "nulls and repeated zero values must not inflate NDV")
+		})
+	}
+}
+
+func TestNativeBloomAdaptiveByteCaps(t *testing.T) {
+	for _, path := range []string{"ordinary", "backfill", "copy-on-write"} {
+		for _, capBytes := range []int{32, 64, 1000, 1024} {
+			t.Run(fmt.Sprintf("%s/%d", path, capBytes), func(t *testing.T) {
+				sizes := nativeBloomTestAdaptiveOutput(t, path, 2048, 2048, capBytes)
+				effectiveCap := int64(32)
+				for effectiveCap*2 <= int64(capBytes) {
+					effectiveCap *= 2
+				}
+				require.Equal(t, effectiveCap, sizes["id"], "high NDV must saturate without rounding above the configured byte cap")
+			})
 		}
 	}
 }

@@ -116,12 +116,27 @@ The standard table property
 `write.parquet.bloom-filter-enabled.column.<destination-column>` always overrides
 the default when present: `false` disables a key's filter, while `true` can enable
 one for a non-key column. Boolean values follow Iceberg's case-insensitive Java
-`true` semantics. `write.parquet.bloom-filter-max-bytes` defaults to 1 MiB per
-column per row group; explicit sizes must be decimal integers from 32 through 134217728
-bytes. Invalid sizes return an error before constructing Arrow writer properties,
-rather than panicking or silently replacing the configured bound. Native writes
-retain batch size 1, 1 MiB page/dictionary targets, the 64K row-group cap, Zstd
-level 3, statistics and page indexes.
+`true` semantics. `write.parquet.bloom-filter-max-bytes` defaults to a 1 MiB maximum
+bitset per enabled column per row group; explicit sizes must be decimal integers
+from 32 through 134217728 bytes. Invalid sizes return an error before constructing
+Arrow writer properties, rather than panicking or silently replacing the bound.
+The effective cap rounds down to a power of two, so a 1000-byte cap permits at
+most 512 bytes, never 1024.
+
+Direct native, streaming-backfill and SDK COW writers adapt each filter to the
+estimated number of distinct non-null values, not the row count. Arrow selects
+the smallest viable power-of-two candidate with its default 1% false-positive
+target; repeated keys stay small while higher-cardinality groups grow up to the
+cap. The target is not guaranteed when that cap saturates. For effective caps of
+at least 2 KiB, candidates span 32 bytes through the cap; Arrow's 500-value
+estimation step makes the smallest selected filter about 2 KiB. Effective caps
+of 1 KiB or less instead use a fixed filter at the full effective cap, avoiding
+Arrow's no-candidate fallback to 32 bytes at these sizes. Building adaptive
+candidates temporarily uses less than twice the effective cap in bitset buffers
+per enabled column; only the selected filter is serialized. This adds
+no stored table property or false-positive-rate override. Native writes retain
+batch size 1, 1 MiB page/dictionary targets, the 64K row-group cap, Zstd level 3,
+statistics and page indexes.
 
 New tables persist these defaults at creation. Existing tables get missing
 properties only in their next normal data transaction, alongside data and

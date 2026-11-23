@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"maps"
 	"math"
+	"math/bits"
 	"os"
 	"slices"
 	"strconv"
@@ -271,6 +272,41 @@ func (parquetFormat) PrimitiveTypeToPhysicalType(typ iceberg.PrimitiveType) stri
 	}
 }
 
+// ParquetBloomFilterWriteOptions returns the shared Bloom filter policy for
+// validated Parquet write properties. It leaves Arrow's default 1% false-positive
+// probability unchanged and only enables filters for explicitly selected columns.
+func ParquetBloomFilterWriteOptions(props iceberg.Properties) []parquet.WriterProperty {
+	configuredMaxBytes := props.GetInt(ParquetBloomFilterMaxBytesKey, ParquetBloomFilterMaxBytesDefault)
+	maxBytes, candidates := int64(configuredMaxBytes), 1
+	// Leave invalid caps intact for Arrow's existing range rejection.
+	if configuredMaxBytes >= parquetBloomFilterMaxBytesMin && configuredMaxBytes <= parquetBloomFilterMaxBytesMax {
+		candidates = bits.Len(uint(configuredMaxBytes / parquetBloomFilterMaxBytesMin))
+		maxBytes = int64(parquetBloomFilterMaxBytesMin) << (candidates - 1)
+	}
+
+	// Arrow rounds adaptive candidates up to powers of two. Round the cap down
+	// first so a non-power-of-two property remains a strict upper bound. Budget
+	// every power of two down to 32 bytes; candidate bitsets total less than
+	// twice this effective cap per enabled column while they are being built.
+	// Arrow's 500-NDV estimation step cannot form adaptive candidates at or
+	// below 1 KiB and falls back to 32 bytes. Use the full fixed cap there.
+	writerProps := []parquet.WriterProperty{
+		parquet.WithMaxBloomFilterBytes(maxBytes),
+		parquet.WithAdaptiveBloomFilterEnabled(maxBytes > 1024),
+		parquet.WithBloomFilterCandidates(candidates),
+	}
+	prefix := ParquetBloomFilterColumnEnabledKeyPrefix + "."
+	for key, val := range props {
+		colName, ok := strings.CutPrefix(key, prefix)
+		if !ok || colName == "" {
+			continue
+		}
+		writerProps = append(writerProps, parquet.WithBloomFilterEnabledFor(colName, javaBool(val)))
+	}
+
+	return writerProps
+}
+
 func (parquetFormat) GetWriteProperties(props iceberg.Properties) any {
 	pageVersion := props.Get(ParquetPageVersionKey, ParquetPageVersionDefault)
 
@@ -326,21 +362,7 @@ func (parquetFormat) GetWriteProperties(props iceberg.Properties) any {
 	writerProps = append(writerProps, parquet.WithCompression(codec),
 		parquet.WithCompressionLevel(compressionLevel))
 
-	// Bloom filter properties.
-	// write.parquet.bloom-filter-max-bytes caps the per-column bloom filter size.
-	bloomMaxBytes := props.GetInt(ParquetBloomFilterMaxBytesKey, ParquetBloomFilterMaxBytesDefault)
-	writerProps = append(writerProps, parquet.WithMaxBloomFilterBytes(int64(bloomMaxBytes)))
-
-	// write.parquet.bloom-filter-enabled.column.<col-name> enables bloom filters
-	// for individual columns. Scan all properties for the prefix.
-	prefix := ParquetBloomFilterColumnEnabledKeyPrefix + "."
-	for key, val := range props {
-		colName, ok := strings.CutPrefix(key, prefix)
-		if !ok || colName == "" {
-			continue
-		}
-		writerProps = append(writerProps, parquet.WithBloomFilterEnabledFor(colName, javaBool(val)))
-	}
+	writerProps = append(writerProps, ParquetBloomFilterWriteOptions(props)...)
 
 	// Dictionary encoding is on unless parquet.enable.dictionary disables it;
 	// write.parquet.dict-encoding-enabled.column.<col-name> overrides per column.
@@ -354,7 +376,7 @@ func (parquetFormat) GetWriteProperties(props iceberg.Properties) any {
 	// Iceberg field name. These differ for nested fields (Iceberg `items.element`
 	// is `items.list.element` in Parquet), so a per-column override on one of
 	// those has no effect. Same for the bloom filter prefix above.
-	prefix = ParquetDictEncodingColumnEnabledKeyPrefix + "."
+	prefix := ParquetDictEncodingColumnEnabledKeyPrefix + "."
 	for key, val := range props {
 		colName, ok := strings.CutPrefix(key, prefix)
 		if !ok || colName == "" {
