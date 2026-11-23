@@ -42,6 +42,25 @@ Published common-checkpoint bytes bind both recovery proof and final runtime rec
 
 Acknowledgement follows writer drain and authoritative common-boundary confirmation. A separate identity/hash-bound recovery result and a new settled runtime receipt authorize the worker's atomic checkpoint-plus-settlement transaction. The schedule remains paused until explicit resume. If acknowledgement or artifact publication is interrupted, ownership remains retained; a fresh recovery epoch restores the immutable baseline, rechecks table/slot coverage, and rebarriers before recovery. Relaunching the failed runtime directly is unsupported. Never force an unknown receipt to settled, clear owner fields, or advance a slot based only on process exit or logs.
 
+### Clear after a terminal ordinary run
+
+The worker observes the named connector container, not just the pod phase: a live
+sidecar must not hide connector completion or failure. A missing pod is a runtime
+failure, not proof that previously dispatched mutations settled.
+
+An explicit Clear Destination request can retire a terminal controlled ordinary
+run without replaying CDC when its original sync/clear receipt positively proves
+`settled` (with a matching checkpoint hash) or `not_started`. The worker validates
+the old command and runtime identity, closes its fence, retires the exact provider
+resource, and atomically transfers ownership to a fresh clear epoch. Admission
+assigns new launch/runtime IDs. Unlaunched operations require empty launch/provider
+identities. The old checkpoint is preserved until the clear itself completes;
+original receipts are not rewritten.
+
+Active runs, unknown/missing/mismatched receipts, unresolved recovery proofs,
+unsafe cleanup and resync handoffs remain blocked. This is not an abandon-unknown
+or force-clear protocol and does not remove normal reconciliation safeguards.
+
 ### Interrupted initial backfill
 
 Eligible controlled PostgreSQL CDC runs write `backfill-recovery-checkpoint.json` separately from authoritative `state.json`. The candidate binds the original runtime/launch, frozen configuration hashes, live PostgreSQL system identity and replication slot, original GLOBAL LSN, completed membership, table UUID/shape bindings, and exact immutable chunk plans. Fresh empty PostgreSQL state is initialized as GLOBAL; meaningful legacy state is not reinterpreted. A plan must be durable before its data writers start. Only pending chunks shrink; `backfill_plan` retains the full original ranges after completion. Transient unbound preparation state cannot replace valid durable evidence.
