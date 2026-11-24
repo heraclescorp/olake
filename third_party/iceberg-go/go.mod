@@ -282,3 +282,5 @@ require (
 	modernc.org/sqlite v1.57.0 // indirect
 	tags.cncf.io/container-device-interface v1.1.0 // indirect
 )
+
+replace github.com/apache/arrow-go/v18 => ../arrow-go

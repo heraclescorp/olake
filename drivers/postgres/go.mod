@@ -3,6 +3,7 @@ module github.com/datazip-inc/olake/drivers/postgres
 go 1.26.11
 
 replace (
+	github.com/apache/arrow-go/v18 => ../../third_party/arrow-go
 	github.com/apache/iceberg-go => ../../third_party/iceberg-go
 	github.com/datazip-inc/olake => ../../
 	google.golang.org/genproto => google.golang.org/genproto v0.0.0-20240123012728-ef4313101c80

@@ -2294,6 +2294,7 @@ func TestNativeSameWriteDeletesPreserveSchemaPartitionAndIndex(t *testing.T) {
 
 type nativeSameWriteFS struct {
 	iceio.WriteFileIO
+	mu          sync.Mutex
 	failAt      int
 	creates     int
 	created     []string
@@ -2302,21 +2303,31 @@ type nativeSameWriteFS struct {
 }
 
 func (fs *nativeSameWriteFS) Open(path string) (iceio.File, error) {
-	if _, blocked := fs.blocked[path]; blocked {
+	fs.mu.Lock()
+	_, blocked := fs.blocked[path]
+	if blocked {
 		fs.stagedReads++
+	}
+	fs.mu.Unlock()
+	if blocked {
 		return nil, errors.New("staged data read forbidden during Close")
 	}
 	return fs.WriteFileIO.Open(path)
 }
 
 func (fs *nativeSameWriteFS) Create(path string) (iceio.FileWriter, error) {
+	fs.mu.Lock()
 	fs.creates++
-	if fs.creates == fs.failAt {
+	fail := fs.creates == fs.failAt
+	fs.mu.Unlock()
+	if fail {
 		return nil, errors.New("injected same-write delete upload failure")
 	}
 	writer, err := fs.WriteFileIO.Create(path)
 	if err == nil {
+		fs.mu.Lock()
 		fs.created = append(fs.created, path)
+		fs.mu.Unlock()
 	}
 	return writer, err
 }
