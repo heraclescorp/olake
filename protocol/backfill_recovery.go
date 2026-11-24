@@ -230,8 +230,17 @@ func persistBackfillCheckpoint(ctx context.Context, candidate *types.BackfillRec
 	return nil
 }
 
-func loadBackfillRecoveryCheckpoint(origin types.OrdinaryRecoveryOrigin, baseline []byte) (*types.BackfillRecoveryCheckpoint, error) {
-	data, err := os.ReadFile(filepath.Join(filepath.Dir(ordinaryRecoveryOriginPath), backfillCheckpointName))
+func loadBackfillRecoveryCheckpoint(path string, origin types.OrdinaryRecoveryOrigin, baseline []byte) (*types.BackfillRecoveryCheckpoint, error) {
+	if !origin.Backfill {
+		if strings.TrimSpace(path) != "" {
+			return nil, fmt.Errorf("--backfill-recovery-checkpoint requires a backfill ordinary recovery origin")
+		}
+		return nil, nil
+	}
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("backfill ordinary recovery requires --backfill-recovery-checkpoint")
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("backfill recovery requires its copied durable candidate: %w", err)
 	}

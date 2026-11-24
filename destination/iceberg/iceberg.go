@@ -1191,7 +1191,7 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		return err
 	}
 	defer coordinated.mu.Unlock()
-	hasFiles := len(w.dataFiles) > 0 || len(w.positions) > 0 || w.cow != nil && w.cow.segments > 0
+	hasFiles := len(w.dataFiles) > 0 || len(w.positions) > 0 || w.cow != nil && len(w.cow.paths) > 0
 	var lastConflict error
 	for attempt := range nativeCommitAttempts {
 		if err := ctx.Err(); err != nil {
@@ -1329,11 +1329,19 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 			}
 			logger.Infof("iceberg_equality_delete event=%s table=%q attempt=%d snapshot=%d keys=%d delete_files=%d data_files=%d", event, strings.Join(committed.Identifier(), "."), attempt+1, nativeSnapshotID(committed), len(w.latest), len(equalityFiles), len(w.dataFiles))
 		}
-		// A successful metadata commit owns all staged files from now on.
-		// Never delete them, including when the local index checkpoint fails.
-		clear(w.paths)
+		// Replay inputs are private scratch objects, not files owned by the snapshot.
 		if w.cow != nil {
-			w.cow.cleanup(false)
+			w.cow.cleanup(ctx, w)
+		}
+		// Published files leave cleanup ownership; failed private cleanup remains retryable.
+		for _, file := range w.dataFiles {
+			delete(w.paths, file.FilePath())
+		}
+		for _, file := range positionFiles {
+			delete(w.paths, file.FilePath())
+		}
+		for _, file := range equalityFiles {
+			delete(w.paths, file.FilePath())
 		}
 		if hasFiles && w.indexThread != nil {
 			snapshot := committed.CurrentSnapshot()
@@ -1489,9 +1497,6 @@ func (w *nativeWriter) removeFiles(ctx context.Context, files []apacheiceberg.Da
 }
 
 func (w *nativeWriter) Abort() {
-	if w.cow != nil {
-		w.cow.cleanup(w.uncertain)
-	}
 	for _, f := range w.backfillFiles {
 		f.abort()
 	}
@@ -1513,6 +1518,16 @@ func (w *nativeWriter) Abort() {
 	}
 	for path := range w.paths {
 		_ = w.discardStagedFile(fs, path)
+	}
+	if w.cow != nil {
+		retained := w.cow.paths[:0]
+		for _, path := range w.cow.paths {
+			if _, pending := w.paths[path]; pending {
+				retained = append(retained, path)
+			}
+		}
+		clear(w.cow.paths[len(retained):])
+		w.cow.paths = retained
 	}
 }
 

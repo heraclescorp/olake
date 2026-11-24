@@ -28,19 +28,24 @@ import (
 )
 
 var (
-	ordinaryRecoveryOriginPath string
-	ordinaryRecoveryResultPath string
-	ordinaryRecoveryResultURI  string
+	ordinaryRecoveryOriginPath     string
+	ordinaryRecoveryResultPath     string
+	ordinaryRecoveryResultURI      string
+	backfillRecoveryCheckpointPath string
 )
 
 func init() {
 	syncCmd.Flags().StringVar(&ordinaryRecoveryOriginPath, "ordinary-recovery-origin", "", "Immutable original controlled-sync artifact bindings; requires --ordinary-recovery-result")
 	syncCmd.Flags().StringVar(&ordinaryRecoveryResultPath, "ordinary-recovery-result", "", "Separate proof-backed bounded recovery result; never replaces the original execution receipt")
+	syncCmd.Flags().StringVar(&backfillRecoveryCheckpointPath, "backfill-recovery-checkpoint", "", "Frozen durable candidate input; required only for ordinary recovery of a backfill origin")
 }
 
 func validateOrdinaryRecoveryFlags(cmd *cobra.Command) error {
 	origin, result := strings.TrimSpace(ordinaryRecoveryOriginPath), strings.TrimSpace(ordinaryRecoveryResultPath)
 	if origin == "" && result == "" {
+		if strings.TrimSpace(backfillRecoveryCheckpointPath) != "" {
+			return fmt.Errorf("--backfill-recovery-checkpoint is only valid for ordinary recovery")
+		}
 		if executionLaunchID != "" {
 			return fmt.Errorf("--execution-launch-id is only valid for controlled ordinary recovery")
 		}
@@ -209,11 +214,11 @@ func prepareOrdinaryRecovery(cmd *cobra.Command) error {
 		return err
 	}
 	options := &types.OrdinaryRecoveryOptions{Origin: origin}
+	options.BackfillCheckpoint, err = loadBackfillRecoveryCheckpoint(backfillRecoveryCheckpointPath, origin, baseline)
+	if err != nil {
+		return err
+	}
 	if origin.Backfill {
-		options.BackfillCheckpoint, err = loadBackfillRecoveryCheckpoint(origin, baseline)
-		if err != nil {
-			return err
-		}
 		options.BackfillState, err = state.Clone()
 		if err != nil {
 			return err
@@ -227,7 +232,7 @@ func prepareOrdinaryRecovery(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	for _, input := range []string{configPath, destinationConfigPath, statePath, streamsPath, availableStreamsPath, selectedStreamsPath, ordinaryRecoveryOriginPath} {
+	for _, input := range []string{configPath, destinationConfigPath, statePath, streamsPath, availableStreamsPath, selectedStreamsPath, ordinaryRecoveryOriginPath, backfillRecoveryCheckpointPath} {
 		if input != "" && filepath.Clean(input) == filepath.Clean(ordinaryRecoveryResultPath) {
 			return fmt.Errorf("ordinary recovery result must not replace an input artifact")
 		}
@@ -461,7 +466,7 @@ func runOrdinaryRecovery(cmd *cobra.Command) (err error) {
 		return err
 	}
 	if options.Origin.Backfill {
-		if _, err := loadBackfillRecoveryCheckpoint(options.Origin, options.BackfillCheckpoint.State); err != nil {
+		if _, err := loadBackfillRecoveryCheckpoint(backfillRecoveryCheckpointPath, options.Origin, options.BackfillCheckpoint.State); err != nil {
 			return err
 		}
 	}

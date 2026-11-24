@@ -85,10 +85,8 @@ func TestBackfillCheckpointPublishesSeparateFencedEvidenceAndPreservesLower(t *t
 }
 
 func TestBackfillCheckpointReadRejectsForeignCorruptAndMissingEvidence(t *testing.T) {
-	oldOrigin := ordinaryRecoveryOriginPath
-	t.Cleanup(func() { ordinaryRecoveryOriginPath = oldOrigin })
 	dir := t.TempDir()
-	ordinaryRecoveryOriginPath = filepath.Join(dir, "ordinary-recovery-origin.json")
+	path := filepath.Join(dir, backfillCheckpointName)
 	checkpoint, _ := backfillRecoveryFixture(t)
 	data, err := checkpoint.MarshalJSON()
 	require.NoError(t, err)
@@ -103,12 +101,12 @@ func TestBackfillCheckpointReadRejectsForeignCorruptAndMissingEvidence(t *testin
 		require.NoError(t, err)
 		sum := sha256.Sum256(encoded)
 		origin.BackfillCheckpointSHA256 = hex.EncodeToString(sum[:])
-		require.NoError(t, os.WriteFile(filepath.Join(dir, backfillCheckpointName), encoded, 0600))
+		require.NoError(t, os.WriteFile(path, encoded, 0600))
 	}
-	_, err = loadBackfillRecoveryCheckpoint(origin, data)
+	_, err = loadBackfillRecoveryCheckpoint(path, origin, data)
 	require.Error(t, err)
 	publish(candidate)
-	_, err = loadBackfillRecoveryCheckpoint(origin, data)
+	_, err = loadBackfillRecoveryCheckpoint(path, origin, data)
 	require.NoError(t, err)
 	for _, mutate := range []func(*types.BackfillRecoveryCheckpoint){
 		func(c *types.BackfillRecoveryCheckpoint) { c.ExecutionID = "foreign" },
@@ -121,13 +119,21 @@ func TestBackfillCheckpointReadRejectsForeignCorruptAndMissingEvidence(t *testin
 		changed := candidate
 		mutate(&changed)
 		publish(changed)
-		_, err := loadBackfillRecoveryCheckpoint(origin, data)
+		_, err := loadBackfillRecoveryCheckpoint(path, origin, data)
 		require.Error(t, err)
 	}
 	publish(candidate)
-	require.NoError(t, os.WriteFile(filepath.Join(dir, backfillCheckpointName), []byte(`{}`), 0600))
-	_, err = loadBackfillRecoveryCheckpoint(origin, data)
+	require.NoError(t, os.WriteFile(path, []byte(`{}`), 0600))
+	_, err = loadBackfillRecoveryCheckpoint(path, origin, data)
 	require.ErrorContains(t, err, "differs from immutable origin")
+	_, err = loadBackfillRecoveryCheckpoint("", origin, data)
+	require.ErrorContains(t, err, "requires --backfill-recovery-checkpoint")
+	origin.Backfill = false
+	_, err = loadBackfillRecoveryCheckpoint(path, origin, data)
+	require.ErrorContains(t, err, "requires a backfill ordinary recovery origin")
+	absent, err := loadBackfillRecoveryCheckpoint("", origin, data)
+	require.NoError(t, err)
+	require.Nil(t, absent)
 }
 
 func TestBackfillCheckpointRejectsIncompletePlansWithoutInventingProgress(t *testing.T) {

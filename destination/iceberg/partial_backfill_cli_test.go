@@ -29,6 +29,14 @@ import (
 )
 
 func TestPartialBackfillExportedCLISmoke(t *testing.T) {
+	for _, strategy := range []types.MergeStrategy{types.MergeOnRead, types.CopyOnWrite} {
+		t.Run(string(strategy), func(t *testing.T) {
+			partialBackfillExportedCLISmoke(t, strategy)
+		})
+	}
+}
+
+func partialBackfillExportedCLISmoke(t *testing.T, strategy types.MergeStrategy) {
 	binaryPath, dsn := os.Getenv("OLAKE_ORDINARY_RECOVERY_CLI"), os.Getenv("OLAKE_POSTGRES_TEST_DSN")
 	if binaryPath == "" || dsn == "" {
 		t.Skip("requires compiled PostgreSQL CLI and disposable logical PostgreSQL")
@@ -149,7 +157,7 @@ func TestPartialBackfillExportedCLISmoke(t *testing.T) {
 		stream.UpsertField(constants.CdcTimestamp, types.TimestampMicro, true, true)
 		stream.UpsertField("_cdc_lsn", types.String, true, true)
 		normalized, appendMode, update := true, false, string(types.UpdateTypeEquality)
-		metadata := types.StreamMetadata{StreamName: name, Normalization: &normalized, AppendMode: &appendMode, UpdateType: &update, UseSourceColumnNames: true}
+		metadata := types.StreamMetadata{StreamName: name, Normalization: &normalized, AppendMode: &appendMode, UpdateType: &update, MergeStrategy: strategy, UseSourceColumnNames: true}
 		saved.Streams = append(saved.Streams, &types.ConfiguredStream{Stream: stream, StreamMetadata: metadata})
 		saved.SelectedStreams[namespace] = append(saved.SelectedStreams[namespace], metadata)
 	}
@@ -171,6 +179,7 @@ func TestPartialBackfillExportedCLISmoke(t *testing.T) {
 		args := []string{"sync", "--config", filepath.Join(runtime, "source.json"), "--destination", filepath.Join(runtime, "destination.json"), "--available-streams", filepath.Join(runtime, "available_streams.json"), "--selected-streams", filepath.Join(runtime, "selected_streams.json"), "--state", filepath.Join(runtime, "state.json"), "--execution-id", executionID, "--execution-fence", filepath.Join(runtime, "execution-fence.json")}
 		if recovery {
 			args = append(args, "--execution-launch-id", originalID, "--ordinary-recovery-origin", filepath.Join(runtime, "ordinary-recovery-origin.json"), "--ordinary-recovery-result", filepath.Join(runtime, "ordinary-recovery-result.json"))
+			args = append(args, "--backfill-recovery-checkpoint", filepath.Join(runtime, "backfill-recovery-checkpoint.json"))
 		}
 		child := exec.CommandContext(ctx, binaryPath, args...)
 		child.Dir = runtime

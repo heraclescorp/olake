@@ -5,32 +5,45 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"os"
-	"path/filepath"
-	"strconv"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	apacheiceberg "github.com/apache/iceberg-go"
+	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/google/uuid"
 )
 
-// Each WriterThread buffer becomes one private typed segment. Keeping input on
-// disk bounds memory and lets the common Close loop recreate consumed readers.
+// Replay inputs contain source rows. The table FileIO supplies the same access
+// controls and encryption as data files without accumulating payloads on /tmp.
 type nativeCOW struct {
-	directory string
-	segments  int
+	paths []string
 }
 
-func (c *nativeCOW) cleanup(uncertain bool) {
-	// Unknown publication retains replay input, which may contain sensitive data.
-	if !uncertain && c.directory != "" {
-		_ = os.RemoveAll(c.directory)
-		c.directory = ""
+func (c *nativeCOW) cleanup(ctx context.Context, w *nativeWriter) {
+	if len(c.paths) == 0 {
+		return
 	}
+	store, err := w.table.FS(nativeCatalogContext(ctx, w.cat))
+	if err != nil {
+		logger.Warnf("COW replay input cleanup unavailable table=%q inputs=%d", w.table.Identifier(), len(c.paths))
+		return
+	}
+	retained := c.paths[:0]
+	for _, path := range c.paths {
+		if err := w.discardStagedFile(store, path); err != nil {
+			retained = append(retained, path)
+		}
+	}
+	if len(retained) != 0 {
+		logger.Warnf("COW replay input cleanup incomplete table=%q retained_inputs=%d first_input=%q", w.table.Identifier(), len(retained), retained[0])
+	}
+	clear(c.paths[len(retained):])
+	c.paths = retained
 }
 
 func (w *nativeWriter) writeCopyOnWrite(ctx context.Context, records []types.RawRecord) error {
@@ -80,28 +93,36 @@ func (w *nativeWriter) writeCopyOnWrite(ctx context.Context, records []types.Raw
 		return err
 	}
 	defer batch.Release()
-	return w.cow.spill(batch)
+	return w.cow.spill(ctx, w, batch)
 }
 
-func (c *nativeCOW) spill(batch arrow.RecordBatch) error {
-	if c.directory == "" {
-		directory, err := os.MkdirTemp("", "olake-cow-")
-		if err != nil {
-			return err
-		}
-		c.directory = directory
+func (c *nativeCOW) spill(ctx context.Context, w *nativeWriter, batch arrow.RecordBatch) error {
+	store, err := w.table.FS(nativeCatalogContext(ctx, w.cat))
+	if err != nil {
+		return err
 	}
-	file, err := os.OpenFile(filepath.Join(c.directory, strconv.Itoa(c.segments)+".arrow"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	writable, ok := store.(iceio.WriteFileIO)
+	if !ok {
+		return table.ErrWriteIORequired
+	}
+	provider, err := w.table.LocationProvider()
+	if err != nil {
+		return err
+	}
+	path := provider.NewDataLocation("olake-cow-" + uuid.NewString() + ".arrow")
+	w.paths[path] = struct{}{}
+	file, err := writable.Create(path)
 	if err != nil {
 		return err
 	}
 	writer := ipc.NewWriter(file, ipc.WithSchema(batch.Schema()))
 	err = writer.Write(batch)
 	err = errors.Join(err, writer.Close(), file.Close())
-	if err == nil {
-		c.segments++
+	if err != nil {
+		return fmt.Errorf("stage COW replay input: %w", err)
 	}
-	return err
+	c.paths = append(c.paths, path)
+	return nil
 }
 
 func nativeCOWFilter(batch arrow.RecordBatch) (apacheiceberg.BooleanExpression, error) {
@@ -122,9 +143,16 @@ func nativeCOWFilter(batch arrow.RecordBatch) (apacheiceberg.BooleanExpression, 
 }
 
 func (w *nativeWriter) replayCopyOnWrite(ctx context.Context, tx *table.Transaction) error {
-	for segment := range w.cow.segments {
+	if len(w.cow.paths) == 0 {
+		return nil
+	}
+	store, err := w.table.FS(nativeCatalogContext(ctx, w.cat))
+	if err != nil {
+		return err
+	}
+	for _, path := range w.cow.paths {
 		err := func() error {
-			file, err := os.Open(filepath.Join(w.cow.directory, strconv.Itoa(segment)+".arrow"))
+			file, err := store.Open(path)
 			if err != nil {
 				return err
 			}

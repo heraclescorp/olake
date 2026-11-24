@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -80,27 +79,35 @@ func TestNativeCopyOnWriteCanonicalIDsAcrossFlushes(t *testing.T) {
 	}))
 	require.NoError(t, seed.Close(ctx, map[string]any{"state": "start"}))
 	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "cdc", false)
+	nodeTemp := t.TempDir()
+	t.Setenv("TMPDIR", nodeTemp)
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{
 		nativeCOWRecord("1a", "u", 9007199254740993, "a", 10), nativeCOWRecord("1a", "u", 9007199254740993, "a", 11),
 		nativeCOWRecord("2b", "u", 9007199254740994, "b", 40),
 		nativeCOWRecord("", "u", 0, "", 50),
 	}))
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeCOWRecord("1a", "d", 9007199254740993, "a", 12)}))
-	privateDirectory := writer.cow.directory
-	info, err := os.Stat(privateDirectory)
+	privateInputs := append([]string(nil), writer.cow.paths...)
+	store, err := writer.table.FS(ctx)
 	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0700), info.Mode().Perm())
-	info, err = os.Stat(filepath.Join(privateDirectory, "0.arrow"))
+	for _, path := range privateInputs {
+		input, err := store.Open(path)
+		require.NoError(t, err)
+		require.NoError(t, input.Close())
+	}
+	nodeFiles, err := os.ReadDir(nodeTemp)
 	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0600), info.Mode().Perm())
+	require.Empty(t, nodeFiles, "COW payloads must not accumulate on the connector's temporary disk")
 	require.Equal(t, map[string]int64{"1a": 1, "1b": 2, "2a": 3, "2b": 4, "": 5}, nativeVisibleValues(t, writer.table), "Write is private until Close")
 	require.NoError(t, writer.Close(ctx, map[string]any{"state": "end", "dedup_inserts": false}))
 	require.Equal(t, map[string]int64{"1a": 12, "1b": 2, "2a": 3, "2b": 40, "": 50}, nativeVisibleValues(t, writer.table))
 	hasDeletes, err := nativeCOWHasDeletes(ctx, writer.table)
 	require.NoError(t, err)
 	require.False(t, hasDeletes)
-	_, err = os.Stat(privateDirectory)
-	require.True(t, os.IsNotExist(err))
+	for _, path := range privateInputs {
+		_, err := store.Open(path)
+		require.ErrorIs(t, err, os.ErrNotExist)
+	}
 	before := nativeSnapshotID(writer.table)
 	quiet := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "quiet", false)
 	require.NoError(t, quiet.Close(ctx, map[string]any{"state": "quiet-end", "dedup_inserts": true}))
@@ -180,7 +187,7 @@ func TestNativeCopyOnWriteRejectsConcurrentLiveDeletes(t *testing.T) {
 	require.NoError(t, seed.Close(ctx, map[string]any{"state": "seed"}))
 	cow := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "cow", false)
 	require.NoError(t, cow.Write(ctx, []types.RawRecord{nativeCOWRecord("a", "u", 1, "a", 9)}))
-	directory := cow.cow.directory
+	privateInputs := append([]string(nil), cow.cow.paths...)
 	stream.StreamMetadata.MergeStrategy = types.MergeOnRead
 	mor := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "mor", false)
 	require.NoError(t, mor.Write(ctx, []types.RawRecord{nativeCOWRecord("a", "u", 1, "a", 2)}))
@@ -191,8 +198,12 @@ func TestNativeCopyOnWriteRejectsConcurrentLiveDeletes(t *testing.T) {
 	require.Equal(t, mor.table.MetadataLocation(), fresh.MetadataLocation())
 	require.Equal(t, mor.table.Properties()[nativeRecoveryProperty], fresh.Properties()[nativeRecoveryProperty])
 	require.Equal(t, map[string]int64{"a": 2}, nativeVisibleValues(t, fresh))
-	_, err = os.Stat(directory)
-	require.True(t, os.IsNotExist(err), "known rejection removes private replay input")
+	store, err := cow.table.FS(ctx)
+	require.NoError(t, err)
+	for _, path := range privateInputs {
+		_, err := store.Open(path)
+		require.ErrorIs(t, err, os.ErrNotExist, "known rejection removes private replay input")
+	}
 }
 
 func TestNativeCopyOnWriteRefreshesAfterSameFileCompaction(t *testing.T) {
@@ -234,8 +245,14 @@ func TestNativeCopyOnWriteUnknownCommitRetainsReplay(t *testing.T) {
 	fault := &nativeCommitFaultCatalog{Catalog: realCatalog}
 	writer := openNativeTestWriter(ctx, t, cfg, stream, fault, nil, "unknown", false)
 	require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeCOWRecord("landed", "c", 1, "a", 7)}))
-	directory := writer.cow.directory
-	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	privateInputs := append([]string(nil), writer.cow.paths...)
+	store, err := writer.table.FS(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		for _, path := range privateInputs {
+			_ = store.Remove(path)
+		}
+	})
 	fault.fault = func(ctx context.Context, id table.Identifier, requirements []table.Requirement, updates []table.Update) (bool, error) {
 		_, _, err := realCatalog.CommitTable(ctx, id, requirements, updates)
 		require.NoError(t, err)
@@ -243,8 +260,11 @@ func TestNativeCopyOnWriteUnknownCommitRetainsReplay(t *testing.T) {
 	}
 	require.Error(t, writer.Close(ctx, map[string]any{"state": "landed-boundary"}))
 	require.True(t, writer.uncertain)
-	_, err := os.Stat(filepath.Join(directory, "0.arrow"))
-	require.NoError(t, err)
+	for _, path := range privateInputs {
+		input, err := store.Open(path)
+		require.NoError(t, err)
+		require.NoError(t, input.Close())
+	}
 	fresh, err := realCatalog.LoadTable(ctx, writer.table.Identifier())
 	require.NoError(t, err)
 	require.Equal(t, map[string]int64{"landed": 7}, nativeVisibleValues(t, fresh))
@@ -263,10 +283,14 @@ func TestNativeCopyOnWriteTypedSpillFidelity(t *testing.T) {
 	batch, err := nativeArrowRecord(schema, []map[string]any{{"id": int64(9007199254740993), "money": "123456789012345678901234.5678", "payload": payload, "at": at}})
 	require.NoError(t, err)
 	defer batch.Release()
-	spool := &nativeCOW{}
-	defer spool.cleanup(false)
-	require.NoError(t, spool.spill(batch))
-	file, err := os.Open(filepath.Join(spool.directory, "0.arrow"))
+	ctx := context.Background()
+	cfg, stream, cat := nativeCOWFixture(t, types.UpdateTypePosition)
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "typed-replay", false)
+	defer writer.Abort()
+	require.NoError(t, writer.cow.spill(ctx, writer, batch))
+	store, err := writer.table.FS(ctx)
+	require.NoError(t, err)
+	file, err := store.Open(writer.cow.paths[0])
 	require.NoError(t, err)
 	defer file.Close()
 	reader, err := ipc.NewReader(file)
