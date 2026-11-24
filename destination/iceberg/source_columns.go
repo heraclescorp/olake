@@ -39,6 +39,16 @@ func (i *Iceberg) ApplySourceColumns(ctx context.Context, globalSchema any, chan
 		i.syncStartColumns = make(map[string]struct{})
 	}
 	added, dropped := planSourceColumns(i.stream, i.schema, change, i.syncStartColumns)
+	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+		columns, err := nativeStreamColumns(i.stream)
+		if err != nil {
+			return nil, err
+		}
+		dropped = slices.DeleteFunc(dropped, func(column string) bool {
+			_, selected := columns[column]
+			return !selected
+		})
+	}
 	if len(added) == 0 && len(dropped) == 0 {
 		return globalSchema, nil
 	}
@@ -370,6 +380,9 @@ func (w *nativeWriter) AlterSourceColumns(ctx context.Context, added []*nativeSo
 	}
 	if len(added) == 0 && len(dropped) == 0 {
 		return nil
+	}
+	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+		return errors.New("ordinary recovery cannot evolve the frozen destination shape")
 	}
 	ctx, finish, err := beginNativeWriterWork(ctx, w.config)
 	if err != nil {

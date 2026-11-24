@@ -135,14 +135,7 @@ func validateBackfillBinding(tbl *table.Table, binding nativeBackfillBinding, ex
 	if err := validateBackfillOwner(binding.Owner, expected); err != nil {
 		return err
 	}
-	shape, err := ordinaryRecoveryShape(tbl.Metadata())
-	if err != nil {
-		return err
-	}
-	if binding.TableUUID != tbl.Metadata().TableUUID().String() || binding.ShapeSHA256 != shape {
-		return errors.New("immutable backfill binding table UUID or shape changed")
-	}
-	return nil
+	return validateBackfillTableBinding(tbl.Metadata(), types.BackfillTableBinding{TableUUID: binding.TableUUID, ShapeSHA256: binding.ShapeSHA256})
 }
 
 func savedBackfillAuthority(checkpoint *types.BackfillRecoveryCheckpoint, stream types.StreamInterface, plan string) (*types.BackfillTableBinding, bool, error) {
@@ -197,6 +190,9 @@ func (i *Iceberg) bindBackfillTable(ctx context.Context, stream types.StreamInte
 	if err != nil {
 		return nil, "", err
 	}
+	if external != nil && candidate != nil && (external.TableUUID != candidate.TableUUID || external.ShapeSHA256 != candidate.ShapeSHA256) {
+		return nil, "", errors.New("immutable candidate binding differs from the exact durable journal binding")
+	}
 	if err := checkBackfillBindingJournal(external, tbl, owner.Plan); err != nil {
 		return nil, "", err
 	}
@@ -207,12 +203,13 @@ func (i *Iceberg) bindBackfillTable(ctx context.Context, stream types.StreamInte
 		return current, raw, nil
 	}
 	validate := func(current *table.Table) (string, error) {
-		actual, err := backfillTableBinding(current, stream)
-		if err != nil {
+		if err := validateBackfillTableFormat(current, stream); err != nil {
 			return "", err
 		}
-		if candidate != nil && *actual != *candidate {
-			return "", errors.New("backfill table differs from the immutable candidate binding")
+		if candidate != nil {
+			if err := validateBackfillTableBinding(current.Metadata(), *candidate); err != nil {
+				return "", errors.New("backfill table differs from the immutable candidate binding")
+			}
 		}
 		if err := checkBackfillBindingJournal(external, current, owner.Plan); err != nil {
 			return "", err
@@ -221,6 +218,9 @@ func (i *Iceberg) bindBackfillTable(ctx context.Context, stream types.StreamInte
 			var stored nativeBackfillBinding
 			if err := decodeBackfillProperty(raw, &stored); err != nil {
 				return "", err
+			}
+			if candidate != nil && (stored.TableUUID != candidate.TableUUID || stored.ShapeSHA256 != candidate.ShapeSHA256) {
+				return "", errors.New("immutable backfill binding differs from the exact candidate binding")
 			}
 			return raw, validateBackfillBindingWithAuthority(current, stored, owner, savedAuthority || candidate != nil || external != nil)
 		}
@@ -256,11 +256,16 @@ func (i *Iceberg) bindBackfillTable(ctx context.Context, stream types.StreamInte
 	} else if raw != "" {
 		return finish(fresh, raw)
 	}
-	shape, err := ordinaryRecoveryShape(fresh.Metadata())
+	binding, err := currentBackfillTableBinding(fresh, stream)
 	if err != nil {
 		return nil, "", err
 	}
-	encoded, err := json.Marshal(nativeBackfillBinding{Owner: owner, TableUUID: fresh.Metadata().TableUUID().String(), ShapeSHA256: shape})
+	if candidate != nil {
+		binding = candidate
+	} else if external != nil {
+		binding = &types.BackfillTableBinding{TableUUID: external.TableUUID, ShapeSHA256: external.ShapeSHA256}
+	}
+	encoded, err := json.Marshal(nativeBackfillBinding{Owner: owner, TableUUID: binding.TableUUID, ShapeSHA256: binding.ShapeSHA256})
 	if err != nil {
 		return nil, "", err
 	}
@@ -387,11 +392,19 @@ func checkBackfillBindingJournal(entry *types.BackfillBindingJournalEntry, tbl *
 	if entry == nil {
 		return nil
 	}
-	shape, err := ordinaryRecoveryShape(tbl.Metadata())
-	if err != nil {
+	if err := validateBackfillTableBinding(tbl.Metadata(), types.BackfillTableBinding{TableUUID: entry.TableUUID, ShapeSHA256: entry.ShapeSHA256}); err != nil {
 		return err
 	}
-	if entry.TableUUID != tbl.Metadata().TableUUID().String() || entry.ShapeSHA256 != shape || string(entry.Plan) != plan {
+	if raw := tbl.Properties()[nativeBackfillBindingProperty]; raw != "" {
+		var stored nativeBackfillBinding
+		if err := decodeBackfillProperty(raw, &stored); err != nil {
+			return err
+		}
+		if stored.TableUUID != entry.TableUUID || stored.ShapeSHA256 != entry.ShapeSHA256 || stored.Owner.Plan != plan {
+			return errors.New("durable backfill binding journal differs from the exact immutable table binding")
+		}
+	}
+	if string(entry.Plan) != plan {
 		return errors.New("durable backfill binding journal differs from table UUID, shape or exact plan")
 	}
 	return nil
@@ -405,11 +418,17 @@ func persistBackfillBindingJournal(ctx context.Context, stream string, tbl *tabl
 	if err := checkBackfillBindingJournal(entry, tbl, plan); err != nil {
 		return err
 	}
-	shape, err := ordinaryRecoveryShape(tbl.Metadata())
-	if err != nil {
+	var stored nativeBackfillBinding
+	if err := decodeBackfillProperty(tbl.Properties()[nativeBackfillBindingProperty], &stored); err != nil {
 		return err
 	}
-	expected := &types.BackfillBindingJournalEntry{TableUUID: tbl.Metadata().TableUUID().String(), ShapeSHA256: shape, Plan: json.RawMessage(plan)}
+	if err := validateBackfillTableBinding(tbl.Metadata(), types.BackfillTableBinding{TableUUID: stored.TableUUID, ShapeSHA256: stored.ShapeSHA256}); err != nil {
+		return err
+	}
+	if stored.Owner.Plan != plan {
+		return errors.New("immutable backfill binding differs from the journal plan")
+	}
+	expected := &types.BackfillBindingJournalEntry{TableUUID: stored.TableUUID, ShapeSHA256: stored.ShapeSHA256, Plan: json.RawMessage(plan)}
 	journal, _ := types.BackfillBindingJournalFromContext(ctx)
 	if err := journal.Create(stream, expected); err != nil {
 		return err

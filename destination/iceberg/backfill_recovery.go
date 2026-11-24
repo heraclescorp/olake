@@ -63,17 +63,42 @@ func nativeRecoveryCatalogSupported(config *Config, cat catalog.Catalog) bool {
 }
 
 func backfillTableBinding(tbl *table.Table, stream types.StreamInterface) (*types.BackfillTableBinding, error) {
-	if tbl.Metadata().TableUUID() == uuid.Nil || tbl.Metadata().Version() < 2 {
-		return nil, errors.New("backfill table has no valid native UUID or format")
+	if raw := tbl.Properties()[nativeBackfillBindingProperty]; raw != "" {
+		if err := validateBackfillTableFormat(tbl, stream); err != nil {
+			return nil, err
+		}
+		var stored nativeBackfillBinding
+		if err := decodeBackfillProperty(raw, &stored); err != nil {
+			return nil, err
+		}
+		binding := &types.BackfillTableBinding{TableUUID: stored.TableUUID, ShapeSHA256: stored.ShapeSHA256}
+		if err := validateBackfillTableBinding(tbl.Metadata(), *binding); err != nil {
+			return nil, err
+		}
+		return binding, nil
 	}
-	if !stream.Self().CopyOnWriteEnabled() && stream.GetUpdateType() == types.UpdateTypeDeletionVector && tbl.Metadata().Version() < 3 {
-		return nil, errors.New("backfill recovery cannot upgrade the frozen table format")
+	return currentBackfillTableBinding(tbl, stream)
+}
+
+func currentBackfillTableBinding(tbl *table.Table, stream types.StreamInterface) (*types.BackfillTableBinding, error) {
+	if err := validateBackfillTableFormat(tbl, stream); err != nil {
+		return nil, err
 	}
 	shape, err := ordinaryRecoveryShape(tbl.Metadata())
 	if err != nil {
 		return nil, err
 	}
 	return &types.BackfillTableBinding{TableUUID: tbl.Metadata().TableUUID().String(), ShapeSHA256: shape}, nil
+}
+
+func validateBackfillTableFormat(tbl *table.Table, stream types.StreamInterface) error {
+	if tbl.Metadata().TableUUID() == uuid.Nil || tbl.Metadata().Version() < 2 {
+		return errors.New("backfill table has no valid native UUID or format")
+	}
+	if !stream.Self().CopyOnWriteEnabled() && stream.GetUpdateType() == types.UpdateTypeDeletionVector && tbl.Metadata().Version() < 3 {
+		return errors.New("backfill recovery cannot upgrade the frozen table format")
+	}
+	return nil
 }
 
 func (i *Iceberg) PrepareBackfillTable(ctx context.Context, stream types.StreamInterface) (*types.BackfillTableBinding, error) {
@@ -405,12 +430,14 @@ func (i *Iceberg) PrepareBackfillRecovery(ctx context.Context, streams []types.S
 		if loadErr != nil {
 			return fmt.Errorf("load backfill recovery table %q: %w", stream.ID(), loadErr)
 		}
-		actual, err := backfillTableBinding(tbl, stream)
+		actual, err := currentBackfillTableBinding(tbl, stream)
 		if err != nil {
 			return err
 		}
-		if candidate != nil && *candidate != *actual {
-			return fmt.Errorf("backfill recovery table %q UUID or shape differs from the candidate", stream.ID())
+		if candidate != nil {
+			if err := validateBackfillTableBinding(tbl.Metadata(), *candidate); err != nil {
+				return fmt.Errorf("backfill recovery table %q UUID or shape differs from the candidate: %w", stream.ID(), err)
+			}
 		}
 		planJSON, err := encodeBackfillPlan(stream, plan)
 		if err != nil {
@@ -422,6 +449,9 @@ func (i *Iceberg) PrepareBackfillRecovery(ctx context.Context, streams []types.S
 			if err := decodeBackfillProperty(journalRaw, &journal); err != nil {
 				return err
 			}
+			if candidate != nil && (journal.TableUUID != candidate.TableUUID || journal.ShapeSHA256 != candidate.ShapeSHA256) {
+				return errors.New("immutable backfill binding differs from the exact candidate binding")
+			}
 			if planJSON != "" && planJSON != journal.Owner.Plan {
 				return errors.New("immutable backfill binding plan differs from the candidate")
 			}
@@ -432,6 +462,9 @@ func (i *Iceberg) PrepareBackfillRecovery(ctx context.Context, streams []types.S
 				return fmt.Errorf("unstarted backfill table has no valid creation ownership: %w", err)
 			}
 			planJSON = intent.Plan
+		}
+		if err := checkBackfillBindingJournal(external, tbl, planJSON); err != nil {
+			return err
 		}
 		plan, err = decodeBackfillPlan(planJSON)
 		if err != nil || plan == nil || plan.Len() == 0 {
@@ -678,7 +711,7 @@ func (i *Iceberg) PrepareBackfillPlan(ctx context.Context, stream types.StreamIn
 	if err != nil {
 		return err
 	}
-	actual, err := backfillTableBinding(confirmed, stream)
+	actual, err := currentBackfillTableBinding(confirmed, stream)
 	if err != nil {
 		return err
 	}

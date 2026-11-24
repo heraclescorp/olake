@@ -667,6 +667,7 @@ type nativeWriter struct {
 	failed                 error
 	releaseSession         func(bool)
 	cow                    *nativeCOW
+	recoveryColumns        []string
 }
 
 func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInterface, options *destination.Options, cat catalog.Catalog, indexThread *types.StreamIndexThread) (_ *nativeWriter, _ *types.MetadataState, err error) {
@@ -742,6 +743,17 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 		w.cow = &nativeCOW{}
 		if err := validateNativeCOWTable(ctx, w.table); err != nil {
 			return nil, nil, err
+		}
+	}
+	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery && !options.Backfill && w.upsert {
+		columns, err := nativeStreamColumns(stream)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, field := range tbl.Schema().Fields() {
+			if _, present := columns[field.Name]; !present {
+				w.recoveryColumns = append(w.recoveryColumns, field.Name)
+			}
 		}
 	}
 	if w.cow == nil {
@@ -890,6 +902,11 @@ func (w *nativeWriter) Write(ctx context.Context, records []types.RawRecord) (er
 	}
 	if w.options.Backfill {
 		return w.writeBackfill(ctx, records)
+	}
+	if len(w.recoveryColumns) != 0 {
+		if err := w.restoreRecoveryColumns(ctx, records); err != nil {
+			return err
+		}
 	}
 	groups := make(map[string]*nativeWriteGroup)
 	rows := make([]map[string]any, len(records))
@@ -1575,6 +1592,9 @@ func nativeArrowRecord(schema *apacheiceberg.Schema, rows []map[string]any) (arr
 }
 
 func appendNativeValue(builder array.Builder, value any) error {
+	if recovered, ok := value.(nativeRecoveryEncodedValue); ok {
+		return builder.AppendValueFromString(string(recovered))
+	}
 	switch b := builder.(type) {
 	case *array.Decimal128Builder:
 		typ := b.Type().(*arrow.Decimal128Type)

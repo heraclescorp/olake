@@ -74,6 +74,13 @@ func (w *nativeWriter) writeCopyOnWrite(ctx context.Context, records []types.Raw
 		}
 		// Deletes remain OLake soft-delete tombstone after-images, as with MOR.
 		if previous, found := last[id]; found {
+			for _, column := range w.recoveryColumns {
+				if _, present := row[column]; !present {
+					if value, present := rows[previous][column]; present {
+						row[column] = value
+					}
+				}
+			}
 			rows[previous] = nil
 		}
 		last[id] = len(rows)
@@ -87,6 +94,9 @@ func (w *nativeWriter) writeCopyOnWrite(ctx context.Context, records []types.Raw
 	}
 	if len(latest) == 0 {
 		return nil
+	}
+	if len(w.recoveryColumns) != 0 {
+		return w.spillRecoveryCopyOnWrite(ctx, latest)
 	}
 	batch, err := nativeArrowRecord(w.table.Schema(), latest)
 	if err != nil {
@@ -169,6 +179,13 @@ func (w *nativeWriter) replayCopyOnWrite(ctx context.Context, tx *table.Transact
 				return errors.New("empty COW replay segment")
 			}
 			batch := reader.RecordBatch()
+			if len(w.recoveryColumns) != 0 {
+				batch, err = w.restoreRecoveryCopyOnWrite(ctx, tx, batch)
+				if err != nil {
+					return err
+				}
+				defer batch.Release()
+			}
 			filter, err := nativeCOWFilter(batch)
 			if err != nil {
 				return err

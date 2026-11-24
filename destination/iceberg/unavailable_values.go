@@ -1013,6 +1013,10 @@ func (w *nativeWriter) ReadRows(ctx context.Context, path string, positions []in
 // readNativeRows addresses physical file ordinals, not ordinals after Iceberg
 // deletes. It also reads pending uploaded files not yet present in a manifest.
 func readNativeRows(ctx context.Context, tbl *table.Table, path string, positions []int64, columns []string) (map[int64]map[string]any, error) {
+	return readNativeRowsWithValue(ctx, tbl, path, positions, columns, nativeIndexValue)
+}
+
+func readNativeRowsWithValue(ctx context.Context, tbl *table.Table, path string, positions []int64, columns []string, value func(arrow.Array, int) any) (map[int64]map[string]any, error) {
 	result := make(map[int64]map[string]any, len(positions))
 	if len(positions) == 0 {
 		return result, nil
@@ -1053,7 +1057,7 @@ func readNativeRows(ctx context.Context, tbl *table.Table, path string, position
 			}
 			row := make(map[string]any, len(selected))
 			for col, field := range batch.Schema().Fields() {
-				row[field.Name] = nativeIndexValue(batch.Column(col), int(position-base))
+				row[field.Name] = value(batch.Column(col), int(position-base))
 			}
 			result[position] = row
 			next++
