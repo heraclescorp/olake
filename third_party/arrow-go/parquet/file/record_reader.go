@@ -903,8 +903,9 @@ func newFLBARecordReader(descr *schema.Column, info LevelInfo, mem memory.Alloca
 type byteArrayRecordReader struct {
 	primitiveRecordReader
 
-	bldr     array.Builder
-	valueBuf []parquet.ByteArray
+	bldr         array.Builder
+	resultChunks []arrow.Array
+	valueBuf     []parquet.ByteArray
 }
 
 func newByteArrayRecordReader(descr *schema.Column, info LevelInfo, dtype arrow.DataType, mem memory.Allocator, bufferPool *sync.Pool) RecordReader {
@@ -920,9 +921,8 @@ func newByteArrayRecordReader(descr *schema.Column, info LevelInfo, dtype arrow.
 
 	brr := &binaryRecordReader{&recordReader{
 		recordReaderImpl: &byteArrayRecordReader{
-			*createPrimitiveRecordReader(descr, mem, bufferPool),
-			array.NewBinaryBuilder(mem, dt),
-			nil,
+			primitiveRecordReader: *createPrimitiveRecordReader(descr, mem, bufferPool),
+			bldr:                  array.NewBinaryBuilder(mem, dt),
 		},
 		leafInfo:  info,
 		defLevels: memory.NewResizableBuffer(mem),
@@ -945,16 +945,22 @@ func (br *byteArrayRecordReader) ReserveData(nbytes int64) {
 		return
 	}
 	if binaryBldr, ok := br.bldr.(*array.BinaryBuilder); ok {
-		binaryBldr.ReserveData(int(nbytes))
+		binaryBldr.ReserveData(int(min(nbytes, int64(max(0, maxBinaryChunkBytes-binaryBldr.DataLen())))))
 	}
 }
 
 func (br *byteArrayRecordReader) Retain() {
+	for _, chunk := range br.resultChunks {
+		chunk.Retain()
+	}
 	br.bldr.Retain()
 	br.primitiveRecordReader.Retain()
 }
 
 func (br *byteArrayRecordReader) Release() {
+	for _, chunk := range br.resultChunks {
+		chunk.Release()
+	}
 	br.bldr.Release()
 	br.primitiveRecordReader.Release()
 }
@@ -975,7 +981,7 @@ func (br *byteArrayRecordReader) ReadValuesDense(toRead int64) error {
 	switch bldr := br.bldr.(type) {
 	case *array.BinaryBuilder:
 		for _, val := range values {
-			bldr.Append(val)
+			br.appendBinary(bldr, val)
 		}
 	case *array.BinaryDictionaryBuilder:
 		for _, val := range values {
@@ -1008,7 +1014,7 @@ func (br *byteArrayRecordReader) ReadValuesSpaced(valuesWithNulls, nullCount int
 	case *array.BinaryBuilder:
 		for idx, val := range values {
 			if bitutil.BitIsSet(validBits, int(offset)+idx) {
-				bldr.Append(val)
+				br.appendBinary(bldr, val)
 			} else {
 				bldr.AppendNull()
 			}
@@ -1029,8 +1035,22 @@ func (br *byteArrayRecordReader) ReadValuesSpaced(valuesWithNulls, nullCount int
 	return nil
 }
 
+const maxBinaryChunkBytes = 64 << 20
+
+func (br *byteArrayRecordReader) appendBinary(bldr *array.BinaryBuilder, value []byte) {
+	if bldr.Len() > 0 && len(value) > maxBinaryChunkBytes-bldr.DataLen() {
+		br.resultChunks = append(br.resultChunks, bldr.NewArray())
+	}
+	bldr.Append(value)
+}
+
 func (br *byteArrayRecordReader) GetBuilderChunks() []arrow.Array {
-	return []arrow.Array{br.bldr.NewArray()}
+	if br.bldr.Len() > 0 || len(br.resultChunks) == 0 {
+		br.resultChunks = append(br.resultChunks, br.bldr.NewArray())
+	}
+	chunks := br.resultChunks
+	br.resultChunks = nil
+	return chunks
 }
 
 func (br *byteArrayRecordReader) ReadDictionary() bool { return false }
@@ -1054,9 +1074,8 @@ func newByteArrayDictRecordReader(descr *schema.Column, info LevelInfo, dtype ar
 	brr := &binaryRecordReader{&recordReader{
 		recordReaderImpl: &byteArrayDictRecordReader{
 			byteArrayRecordReader: byteArrayRecordReader{
-				*createPrimitiveRecordReader(descr, mem, bufferPool),
-				array.NewDictionaryBuilder(mem, dt),
-				nil,
+				primitiveRecordReader: *createPrimitiveRecordReader(descr, mem, bufferPool),
+				bldr:                  array.NewDictionaryBuilder(mem, dt),
 			},
 			resultChunks: make([]arrow.Array, 0),
 		},

@@ -380,36 +380,76 @@ func (sr *structReader) BuildArray(lenBound int64) (*arrow.Chunked, error) {
 		nullBitmap.Resize(int(bitutil.BytesForBits(validityIO.Read)))
 	}
 
-	childArrData := make([]arrow.ArrayData, len(sr.children))
-	defer releaseArrayData(childArrData)
-	// gather children arrays and def levels
+	columns := make([]arrow.Column, len(sr.children))
+	defer func() {
+		for i := range columns {
+			if columns[i].Data() != nil {
+				columns[i].Release()
+			}
+		}
+	}()
+	fields := sr.filtered.Type.(*arrow.StructType).Fields()
+	single := true
 	for i, child := range sr.children {
 		field, err := child.BuildArray(lenBound)
 		if err != nil {
 			return nil, err
 		}
-
-		childArrData[i], err = chunksToSingle(field, sr.rctx.mem)
-		field.Release() // release field before checking
-		if err != nil {
-			return nil, err
-		}
+		columns[i] = *arrow.NewColumn(fields[i], field)
+		single = single && len(field.Chunks()) == 1
+		field.Release()
 	}
-
 	if !sr.filtered.Nullable && !sr.hasRepeatedChild {
-		validityIO.Read = int64(childArrData[0].Len())
+		validityIO.Read = int64(columns[0].Len())
 	}
-
-	buffers := make([]*memory.Buffer, 1)
-	if validityIO.NullCount > 0 {
-		buffers[0] = nullBitmap
+	if single {
+		children := make([]arrow.ArrayData, len(columns))
+		for i := range columns {
+			children[i] = columns[i].Data().Chunk(0).Data()
+		}
+		var bitmap *memory.Buffer
+		if validityIO.NullCount > 0 {
+			bitmap = nullBitmap
+		}
+		data := array.NewData(sr.filtered.Type, int(validityIO.Read), []*memory.Buffer{bitmap}, children, int(validityIO.NullCount), 0)
+		defer data.Release()
+		arr := array.NewStructData(data)
+		defer arr.Release()
+		return arrow.NewChunked(sr.filtered.Type, []arrow.Array{arr}), nil
 	}
-
-	data := array.NewData(sr.filtered.Type, int(validityIO.Read), buffers, childArrData, int(validityIO.NullCount), 0)
-	defer data.Release()
-	arr := array.NewStructData(data)
-	defer arr.Release()
-	return arrow.NewChunked(sr.filtered.Type, []arrow.Array{arr}), nil
+	tbl := array.NewTable(arrow.NewSchema(fields, nil), columns, validityIO.Read)
+	defer tbl.Release()
+	reader := array.NewTableReader(tbl, 0)
+	defer reader.Release()
+	var chunks []arrow.Array
+	defer func() { releaseArrays(chunks) }()
+	var rowOffset int64
+	for reader.Next() {
+		record := reader.RecordBatch()
+		children := make([]arrow.ArrayData, record.NumCols())
+		for i, column := range record.Columns() {
+			children[i] = column.Data()
+		}
+		var validity *memory.Buffer
+		nulls := 0
+		if validityIO.NullCount > 0 {
+			validity = memory.NewResizableBuffer(sr.rctx.mem)
+			validity.Resize(int(bitutil.BytesForBits(record.NumRows())))
+			bitutil.CopyBitmap(nullBitmap.Bytes(), int(rowOffset), int(record.NumRows()), validity.Bytes(), 0)
+			nulls = int(record.NumRows()) - bitutil.CountSetBits(validity.Bytes(), 0, int(record.NumRows()))
+		}
+		data := array.NewData(sr.filtered.Type, int(record.NumRows()), []*memory.Buffer{validity}, children, nulls, 0)
+		chunks = append(chunks, array.NewStructData(data))
+		data.Release()
+		if validity != nil {
+			validity.Release()
+		}
+		rowOffset += record.NumRows()
+	}
+	if len(chunks) == 0 {
+		chunks = append(chunks, array.MakeArrayOfNull(sr.rctx.mem, sr.filtered.Type, 0))
+	}
+	return arrow.NewChunked(sr.filtered.Type, chunks), nil
 }
 
 // column reader for repeated columns specifically for list arrays
@@ -533,6 +573,9 @@ func (lr *listReader) buildArray(lenBound int64) (*arrow.Chunked, error) {
 	if validityBuffer != nil {
 		validityBuffer.Resize(int(bitutil.BytesForBits(validityIO.Read)))
 	}
+	if len(arr.Chunks()) > 1 {
+		return lr.buildChunkedList(arr, offsetsBuffer, validityBuffer, int(validityIO.Read))
+	}
 
 	item, err := chunksToSingle(arr, lr.rctx.mem)
 	if err != nil {
@@ -558,6 +601,90 @@ func (lr *listReader) buildArray(lenBound int64) (*arrow.Chunked, error) {
 	out := array.MakeFromData(data)
 	defer out.Release()
 	return arrow.NewChunked(lr.field.Type, []arrow.Array{out}), nil
+}
+
+func (lr *listReader) buildChunkedList(values *arrow.Chunked, offsets, validity *memory.Buffer, rows int) (*arrow.Chunked, error) {
+	large := lr.field.Type.ID() == arrow.LARGE_LIST
+	var getOffset func(int) int64
+	if large {
+		data := arrow.Int64Traits.CastFromBytes(offsets.Bytes())
+		getOffset = func(i int) int64 { return data[i] }
+	} else {
+		data := arrow.Int32Traits.CastFromBytes(offsets.Bytes())
+		getOffset = func(i int) int64 { return int64(data[i]) }
+	}
+	var chunks []arrow.Array
+	defer func() { releaseArrays(chunks) }()
+	chunkIndex, childEnd := 0, int64(0)
+	for start := 0; start < rows; {
+		childStart := getOffset(start)
+		for chunkIndex < len(values.Chunks()) && childEnd <= childStart {
+			childEnd += int64(values.Chunk(chunkIndex).Len())
+			chunkIndex++
+		}
+		end := start
+		for end < rows && getOffset(end+1) <= childEnd {
+			end++
+		}
+		if end == start {
+			end++
+		}
+		piece := array.NewChunkedSlice(values, childStart, getOffset(end))
+		item, err := chunksToSingle(piece, lr.rctx.mem)
+		piece.Release()
+		if err != nil {
+			return nil, err
+		}
+		var bitmap *memory.Buffer
+		nulls := 0
+		if validity != nil {
+			bitmap = memory.NewResizableBuffer(lr.rctx.mem)
+			bitmap.Resize(int(bitutil.BytesForBits(int64(end - start))))
+			bitutil.CopyBitmap(validity.Bytes(), start, end-start, bitmap.Bytes(), 0)
+			nulls = end - start - bitutil.CountSetBits(bitmap.Bytes(), 0, end-start)
+		}
+		chunkOffsets := memory.NewResizableBuffer(lr.rctx.mem)
+		if large {
+			chunkOffsets.Resize(arrow.Int64Traits.BytesRequired(end - start + 1))
+			data := arrow.Int64Traits.CastFromBytes(chunkOffsets.Bytes())
+			for i := range data {
+				data[i] = getOffset(start+i) - childStart
+			}
+		} else {
+			chunkOffsets.Resize(arrow.Int32Traits.BytesRequired(end - start + 1))
+			data := arrow.Int32Traits.CastFromBytes(chunkOffsets.Bytes())
+			for i := range data {
+				data[i] = int32(getOffset(start+i) - childStart)
+			}
+		}
+		if lr.field.Type.ID() == arrow.FIXED_SIZE_LIST {
+			itemArray := array.MakeFromData(item)
+			built, buildErr := lr.buildFixedSizeListArray(end-start, arrow.Int32Traits.CastFromBytes(chunkOffsets.Bytes()), bitmap, int64(nulls), itemArray)
+			itemArray.Release()
+			if buildErr == nil {
+				for _, chunk := range built.Chunks() {
+					chunk.Retain()
+					chunks = append(chunks, chunk)
+				}
+				built.Release()
+			}
+			err = buildErr
+		} else {
+			data := array.NewData(lr.field.Type, end-start, []*memory.Buffer{bitmap, chunkOffsets}, []arrow.ArrayData{item}, nulls, 0)
+			chunks = append(chunks, array.MakeFromData(data))
+			data.Release()
+		}
+		item.Release()
+		chunkOffsets.Release()
+		if bitmap != nil {
+			bitmap.Release()
+		}
+		if err != nil {
+			return nil, err
+		}
+		start = end
+	}
+	return arrow.NewChunked(lr.field.Type, chunks), nil
 }
 
 func (lr *listReader) buildFixedSizeListArray(length int, offsets []int32, validityBuffer *memory.Buffer,
@@ -702,7 +829,11 @@ func newFixedSizeListReader(rctx *readerCtx, field *arrow.Field, info file.Level
 func chunksToSingle(chunked *arrow.Chunked, mem memory.Allocator) (arrow.ArrayData, error) {
 	switch len(chunked.Chunks()) {
 	case 0:
-		return array.NewData(chunked.DataType(), 0, []*memory.Buffer{nil, nil}, nil, 0, 0), nil
+		empty := array.MakeArrayOfNull(mem, chunked.DataType(), 0)
+		defer empty.Release()
+		data := empty.Data()
+		data.Retain()
+		return data, nil
 	case 1:
 		data := chunked.Chunk(0).Data()
 		data.Retain() // we pass control to the caller

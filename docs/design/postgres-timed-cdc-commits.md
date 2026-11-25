@@ -90,6 +90,16 @@ released IPC buffers would retain entire message payloads (or read invalid value
 with an allocator that reuses released storage). Payload readers are still
 released after each segment; this is not a total-memory cap.
 
+Parquet scan batches are also bounded by decoded binary payload, not only row
+count. Dictionary expansion can exceed 2 GiB even for a small Parquet file;
+putting that payload in one Arrow string/binary array wraps its 32-bit offsets
+before the overwrite filter runs. The vendored reader flushes binary builders
+at 64 MiB (an individual larger value remains intact), preserves those chunks
+through nested struct/list reconstruction, and emits record batches aligned to
+column chunk boundaries. String/binary offset widths, row order, nulls and full
+payloads are unchanged. This bounds individual arrays, not all retained scan
+memory, and does not add retries or permit recovering from malformed arrays.
+
 Existing live equality/position/Puffin deletes fail before mutation: clean them
 through a separate explicit maintenance rewrite before switching. This writer
 does not migrate existing tables, reset checkpoints/slots or reread the source.

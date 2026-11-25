@@ -617,7 +617,6 @@ func (fr *FileReader) GetRecordReader(ctx context.Context, colIndices, rowGroups
 		parallel:     fr.Props.Parallel,
 		sc:           sc,
 		fieldReaders: readers,
-		mem:          fr.mem,
 	}
 	rr.refCount.Add(1)
 	return rr, nil
@@ -836,13 +835,17 @@ type recordReader struct {
 	sc           *arrow.Schema
 	fieldReaders []*ColumnReader
 	cur          arrow.RecordBatch
+	pending      *array.TableReader
 	err          error
-	mem          memory.Allocator
 
 	refCount atomic.Int64
 }
 
 func (r *recordReader) SeekToRow(row int64) error {
+	if r.pending != nil {
+		r.pending.Release()
+		r.pending = nil
+	}
 	if r.cur != nil {
 		r.cur.Release()
 		r.cur = nil
@@ -876,6 +879,10 @@ func (r *recordReader) Retain() {
 
 func (r *recordReader) Release() {
 	if r.refCount.Add(-1) == 0 {
+		if r.pending != nil {
+			r.pending.Release()
+			r.pending = nil
+		}
 		if r.cur != nil {
 			r.cur.Release()
 			r.cur = nil
@@ -893,8 +900,23 @@ func (r *recordReader) Release() {
 func (r *recordReader) Schema() *arrow.Schema { return r.sc }
 
 func (r *recordReader) next() bool {
-	cols := make([]arrow.Array, len(r.sc.Fields()))
-	defer releaseArrays(cols)
+	if r.pending != nil {
+		if r.pending.Next() {
+			r.cur = r.pending.RecordBatch()
+			r.cur.Retain()
+			return true
+		}
+		r.pending.Release()
+		r.pending = nil
+	}
+	cols := make([]arrow.Column, len(r.sc.Fields()))
+	defer func() {
+		for i := range cols {
+			if cols[i].Data() != nil {
+				cols[i].Release()
+			}
+		}
+	}()
 	readField := func(idx int, rdr *ColumnReader) error {
 		data, err := rdr.NextBatch(r.batchSize)
 		if err != nil {
@@ -906,13 +928,7 @@ func (r *recordReader) next() bool {
 			return io.EOF
 		}
 
-		arrdata, err := chunksToSingle(data, r.mem)
-		if err != nil {
-			return err
-		}
-		defer arrdata.Release()
-
-		cols[idx] = array.MakeFromData(arrdata)
+		cols[idx] = *arrow.NewColumn(r.sc.Field(idx), data)
 		return nil
 	}
 
@@ -924,8 +940,7 @@ func (r *recordReader) next() bool {
 			}
 		}
 
-		r.cur = array.NewRecordBatch(r.sc, cols, -1)
-		return true
+		return r.startBatch(cols)
 	}
 
 	var (
@@ -979,7 +994,34 @@ func (r *recordReader) next() bool {
 		return false
 	}
 
-	r.cur = array.NewRecordBatch(r.sc, cols, -1)
+	return r.startBatch(cols)
+}
+
+func (r *recordReader) startBatch(cols []arrow.Column) bool {
+	single := true
+	for i := range cols {
+		if len(cols[i].Data().Chunks()) != 1 {
+			single = false
+			break
+		}
+	}
+	if single {
+		arrays := make([]arrow.Array, len(cols))
+		for i := range cols {
+			arrays[i] = cols[i].Data().Chunk(0)
+		}
+		r.cur = array.NewRecordBatch(r.sc, arrays, -1)
+		return true
+	}
+	tbl := array.NewTable(r.sc, cols, -1)
+	r.pending = array.NewTableReader(tbl, r.batchSize)
+	tbl.Release()
+	if !r.pending.Next() {
+		r.err = io.EOF
+		return false
+	}
+	r.cur = r.pending.RecordBatch()
+	r.cur.Retain()
 	return true
 }
 

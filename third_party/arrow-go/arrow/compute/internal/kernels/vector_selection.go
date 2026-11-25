@@ -1953,6 +1953,14 @@ func VarBinaryImpl[OffsetT int32 | int64](ctx *exec.KernelCtx, batch *exec.ExecS
 		offsetBuilder = newBufferBuilder[OffsetT](exec.GetAllocator(ctx.Ctx))
 		dataBuilder   = newBufferBuilder[uint8](exec.GetAllocator(ctx.Ctx))
 	)
+	defer func() {
+		if offsetBuilder.buffer != nil {
+			offsetBuilder.buffer.Release()
+		}
+		if dataBuilder.buffer != nil {
+			dataBuilder.buffer.Release()
+		}
+	}()
 
 	// presize the data builder with a rough estimate of the required data size
 	if values.Len > 0 {
@@ -1971,15 +1979,18 @@ func VarBinaryImpl[OffsetT int32 | int64](ctx *exec.KernelCtx, batch *exec.ExecS
 	var offset OffsetT
 	err := fn(ctx, outputLength, values, selection, out,
 		func(idx int64) error {
-			offsetBuilder.unsafeAppend(offset)
 			valOffset := rawOffsets[idx]
 			valSize := rawOffsets[idx+1] - valOffset
+			if err := checkBinaryTakeOffset(offset, int64(valSize)); err != nil {
+				return err
+			}
+			offsetBuilder.unsafeAppend(offset)
 
 			if valSize == 0 {
 				return nil
 			}
 			offset += valSize
-			if valSize > OffsetT(spaceAvail) {
+			if int(valSize) > spaceAvail {
 				// Calculate how much total capacity we need
 				needed := dataBuilder.len() + int(valSize)
 				newCap := dataBuilder.cap()
@@ -1989,8 +2000,13 @@ func VarBinaryImpl[OffsetT int32 | int64](ctx *exec.KernelCtx, batch *exec.ExecS
 				if newCap == 0 {
 					newCap = int(valSize)
 				}
+				maxOffset, _ := binaryTakeOffsetLimits[OffsetT]()
 				for newCap < needed {
-					newCap = newCap * 2
+					if int64(newCap) > maxOffset/2 {
+						newCap = needed
+						break
+					}
+					newCap *= 2
 				}
 
 				// Reserve the additional capacity
