@@ -22,6 +22,7 @@ import (
 	"github.com/datazip-inc/olake/destination"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -32,15 +33,20 @@ var (
 	ordinaryRecoveryResultPath     string
 	ordinaryRecoveryResultURI      string
 	backfillRecoveryCheckpointPath string
+	recoveryCheckpointInterval     string
 )
 
 func init() {
 	syncCmd.Flags().StringVar(&ordinaryRecoveryOriginPath, "ordinary-recovery-origin", "", "Immutable original controlled-sync artifact bindings; requires --ordinary-recovery-result")
 	syncCmd.Flags().StringVar(&ordinaryRecoveryResultPath, "ordinary-recovery-result", "", "Separate proof-backed bounded recovery result; never replaces the original execution receipt")
 	syncCmd.Flags().StringVar(&backfillRecoveryCheckpointPath, "backfill-recovery-checkpoint", "", "Frozen durable candidate input; required only for ordinary recovery of a backfill origin")
+	syncCmd.Flags().StringVar(&recoveryCheckpointInterval, "recovery-checkpoint-interval", "5m", "Positive soft transaction-boundary interval for retained recovery checkpoints (OLAKE_RECOVERY_CHECKPOINT_INTERVAL)")
 }
 
 func validateOrdinaryRecoveryFlags(cmd *cobra.Command) error {
+	if _, err := ordinaryRecoveryInterval(cmd); err != nil {
+		return err
+	}
 	origin, result := strings.TrimSpace(ordinaryRecoveryOriginPath), strings.TrimSpace(ordinaryRecoveryResultPath)
 	if origin == "" && result == "" {
 		if strings.TrimSpace(backfillRecoveryCheckpointPath) != "" {
@@ -213,7 +219,11 @@ func prepareOrdinaryRecovery(cmd *cobra.Command) error {
 	if err := decodeOrdinaryRecoveryState(baseline, state); err != nil {
 		return err
 	}
-	options := &types.OrdinaryRecoveryOptions{Origin: origin}
+	interval, err := ordinaryRecoveryInterval(cmd)
+	if err != nil {
+		return err
+	}
+	options := &types.OrdinaryRecoveryOptions{Origin: origin, CheckpointInterval: interval}
 	options.BackfillCheckpoint, err = loadBackfillRecoveryCheckpoint(backfillRecoveryCheckpointPath, origin, baseline)
 	if err != nil {
 		return err
@@ -235,6 +245,17 @@ func prepareOrdinaryRecovery(cmd *cobra.Command) error {
 	for _, input := range []string{configPath, destinationConfigPath, statePath, streamsPath, availableStreamsPath, selectedStreamsPath, ordinaryRecoveryOriginPath, backfillRecoveryCheckpointPath} {
 		if input != "" && filepath.Clean(input) == filepath.Clean(ordinaryRecoveryResultPath) {
 			return fmt.Errorf("ordinary recovery result must not replace an input artifact")
+		}
+	}
+	options.Checkpoint, options.CheckpointSHA256, err = loadOrdinaryRecoveryCheckpoint(cmd.Context(), origin)
+	if err != nil {
+		return err
+	}
+	if options.Checkpoint != nil {
+		options.CheckpointLSN = options.Checkpoint.TargetLSN
+		options.Plan = &types.OrdinaryRecoveryPlan{LowerLSN: options.Checkpoint.LowerLSN, TargetLSN: options.Checkpoint.FinalTargetLSN}
+		if origin.Backfill {
+			options.BackfillTargetLSN = options.Checkpoint.FinalTargetLSN
 		}
 	}
 	ctx := types.WithOrdinaryRecovery(cmd.Context(), options)
@@ -373,8 +394,6 @@ func checkOrdinaryRecoveryServer(ctx context.Context, origin types.OrdinaryRecov
 func runOrdinaryRecovery(cmd *cobra.Command) (err error) {
 	ctx := cmd.Context()
 	options, _ := types.OrdinaryRecoveryFromContext(ctx)
-	// Even pre-read failures need positive source retirement; cleanup below owns
-	// the replication connection until after the common-boundary proof and ack.
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
@@ -385,6 +404,15 @@ func runOrdinaryRecovery(cmd *cobra.Command) (err error) {
 	selected, lower, err := ordinaryRecoverySelectedMode(catalog, state, options.Origin.Backfill)
 	if err != nil {
 		return err
+	}
+	if options.Checkpoint != nil {
+		if err := validateOrdinaryRecoveryCheckpoint(*options.Checkpoint, options.Origin, selected, lower); err != nil {
+			return err
+		}
+		if err := validateOrdinaryRecoveryCheckpointBaseline(*options.Checkpoint, state, selected); err != nil {
+			return err
+		}
+		options.BackfillComplete = options.Origin.Backfill
 	}
 	connector.SetupState(state)
 	if err := connector.Setup(ctx); err != nil {
@@ -403,48 +431,83 @@ func runOrdinaryRecovery(cmd *cobra.Command) (err error) {
 			ToastValueSource string `json:"toast_value_source"`
 		} `json:"update_method"`
 	}
-	// GetConfigRef allocates a fresh source config; calling it after Setup would
-	// erase the driver's live connection/slot settings. Decode the frozen file.
 	if err := utils.UnmarshalFile(configPath, &source, true); err != nil {
 		return err
 	}
 	if options.Origin.Backfill && (identity != options.BackfillCheckpoint.ServerIdentity || source.UpdateMethod.ReplicationSlot != options.BackfillCheckpoint.SlotName) {
 		return fmt.Errorf("backfill recovery live source identity or slot differs from the durable candidate")
 	}
+	semantics := "current_source_lookup"
+	if strings.ToLower(strings.TrimSpace(source.UpdateMethod.ToastValueSource)) == "destination" {
+		semantics = "destination"
+	}
+	if saved := options.Checkpoint; saved != nil && (saved.ServerIdentity != identity || saved.SlotName != source.UpdateMethod.ReplicationSlot || saved.ToastValueSemantics != semantics) {
+		return fmt.Errorf("ordinary recovery checkpoint source, slot or TOAST semantics changed")
+	}
 	if err := checkOrdinaryRecoveryServer(ctx, options.Origin, identity, source.UpdateMethod.ReplicationSlot, false); err != nil {
 		return err
 	}
 	options.SourceIdentity = identity
+	for {
+		completed, result, final, batchErr := runOrdinaryRecoveryBatch(ctx, selected, lower, identity, source.UpdateMethod.ReplicationSlot, semantics, options)
+		if batchErr != nil {
+			return batchErr
+		}
+		if final {
+			return writeOrdinaryRecoveryArtifacts(ctx, completed, result)
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		cleanupErr := connector.CleanupOrdinaryRecovery(cleanupCtx)
+		cancel()
+		if cleanupErr != nil {
+			return cleanupErr
+		}
+	}
+}
+
+func runOrdinaryRecoveryBatch(ctx context.Context, selected []types.StreamInterface, lower, identity, slot, semantics string, options *types.OrdinaryRecoveryOptions) (*types.State, types.OrdinaryRecoveryResult, bool, error) {
+	var empty types.OrdinaryRecoveryResult
 	pool, err := destination.NewWriterPool(ctx, destinationConfig, selected, batchSize)
 	if err != nil {
-		return err
+		return nil, empty, false, err
 	}
 	defer pool.Shutdown(context.WithoutCancel(ctx))
-	if options.Origin.Backfill {
+	if options.Origin.Backfill && !options.BackfillComplete {
 		if err := pool.PrepareBackfillRecovery(ctx, selected, lower); err != nil {
-			return err
+			return nil, empty, false, err
 		}
 		if err := connector.ResumeOrdinaryBackfill(ctx, pool, selected); err != nil {
-			return err
+			return nil, empty, false, err
 		}
 		options.BackfillComplete = true
 		options.BackfillTargetLSN, err = pool.BackfillRecoveryTarget(ctx)
 		if err != nil {
-			return err
+			return nil, empty, false, err
 		}
 		if options.BackfillTargetLSN == "" {
 			options.BackfillTargetLSN, err = connector.CaptureBackfillRecoveryTarget(ctx, lower)
 			if err != nil {
-				return err
+				return nil, empty, false, err
 			}
 		}
 	}
 	proofs, err := pool.PrepareOrdinaryRecovery(ctx, selected, lower)
 	if err != nil {
-		return err
+		return nil, empty, false, err
 	}
-	if err := checkOrdinaryRecoveryServer(ctx, options.Origin, identity, source.UpdateMethod.ReplicationSlot, true); err != nil {
-		return err
+	if saved := options.Checkpoint; saved != nil {
+		if err := validateOrdinaryRecoveryResumeProofs(*saved, proofs); err != nil {
+			return nil, empty, false, err
+		}
+		resumed := &types.State{RWMutex: &sync.RWMutex{}, SuppressPersistence: true}
+		if err := decodeOrdinaryRecoveryState(saved.State, resumed); err != nil {
+			return nil, empty, false, err
+		}
+		state = resumed
+		connector.SetupState(state)
+	}
+	if err := checkOrdinaryRecoveryServer(ctx, options.Origin, identity, slot, true); err != nil {
+		return nil, empty, false, err
 	}
 	positions := make(map[string]string, len(proofs))
 	for _, proof := range proofs {
@@ -452,36 +515,61 @@ func runOrdinaryRecovery(cmd *cobra.Command) (err error) {
 	}
 	plan, err := connector.PrepareOrdinaryRecovery(ctx, selected, lower, positions)
 	if err != nil {
-		return err
+		return nil, empty, false, err
+	}
+	if plan.LowerLSN != lower || (options.Plan != nil && plan.TargetLSN != options.Plan.TargetLSN) {
+		return nil, empty, false, fmt.Errorf("ordinary recovery immutable range changed between batches")
 	}
 	options.Plan = plan
 	if err := connector.Read(ctx, pool, nil, selected, nil); err != nil {
-		return err
+		return nil, empty, false, err
 	}
-	proofs, err = pool.ConfirmOrdinaryRecovery(ctx, selected, proofs, plan.TargetLSN)
+	boundary, err := ordinaryRecoveryLSN(plan.BatchTargetLSN)
+	finalTarget, finalErr := ordinaryRecoveryLSN(plan.TargetLSN)
+	previous := lower
+	if options.CheckpointLSN != "" {
+		previous = options.CheckpointLSN
+	}
+	previousLSN, previousErr := ordinaryRecoveryLSN(previous)
+	if err != nil || finalErr != nil || previousErr != nil || boundary < previousLSN || boundary > finalTarget || (boundary == previousLSN && boundary != finalTarget) {
+		return nil, empty, false, fmt.Errorf("ordinary recovery did not complete a valid advancing batch")
+	}
+	proofs, err = pool.ConfirmOrdinaryRecovery(ctx, selected, proofs, plan.BatchTargetLSN)
 	if err != nil {
-		return err
+		return nil, empty, false, err
 	}
 	if err := verifyOrdinaryRecoveryConfig(options.Origin); err != nil {
-		return err
+		return nil, empty, false, err
 	}
 	if options.Origin.Backfill {
 		if _, err := loadBackfillRecoveryCheckpoint(backfillRecoveryCheckpointPath, options.Origin, options.BackfillCheckpoint.State); err != nil {
-			return err
+			return nil, empty, false, err
 		}
 	}
-	if err := connector.AcknowledgeOrdinaryRecovery(ctx, plan); err != nil {
-		return err
+	completed, err := ordinaryRecoveryCompletedState(state, plan.BatchTargetLSN)
+	if err != nil {
+		return nil, empty, false, err
 	}
-	if err := utils.CheckExecutionFence(ctx); err != nil {
-		return err
+	result := types.OrdinaryRecoveryResult{OrdinaryRecoveryOrigin: options.Origin, ExecutionID: executionID, LaunchID: executionLaunchID, LowerLSN: lower, TargetLSN: plan.BatchTargetLSN, ServerIdentity: identity, SlotName: slot, ToastValueSemantics: semantics, Tables: proofs}
+	previousExecution := ""
+	if options.Checkpoint != nil {
+		previousExecution = options.Checkpoint.ExecutionID
 	}
-	semantics := "current_source_lookup"
-	if strings.ToLower(strings.TrimSpace(source.UpdateMethod.ToastValueSource)) == "destination" {
-		semantics = "destination"
+	manifest, digest, err := persistOrdinaryRecoveryBatch(ctx, completed, result, plan.TargetLSN, options.CheckpointSHA256, previousExecution, func() error {
+		return connector.AcknowledgeOrdinaryRecovery(ctx, plan)
+	})
+	if err != nil {
+		return nil, empty, false, err
 	}
-	result := types.OrdinaryRecoveryResult{OrdinaryRecoveryOrigin: options.Origin, ExecutionID: executionID, LaunchID: executionLaunchID, LowerLSN: plan.LowerLSN, TargetLSN: plan.TargetLSN, ServerIdentity: identity, SlotName: source.UpdateMethod.ReplicationSlot, ToastValueSemantics: semantics, Tables: proofs}
-	return writeOrdinaryRecoveryArtifacts(ctx, state, result)
+	state = completed
+	connector.SetupState(state)
+	options.Checkpoint = manifest
+	options.CheckpointSHA256 = digest
+	options.CheckpointLSN = plan.BatchTargetLSN
+	if !plan.BatchSourceTime.IsZero() {
+		logger.Infof("ordinary recovery completed batch checkpoint_lsn=%s source_timestamp=%s final_target_lsn=%s", plan.BatchTargetLSN, plan.BatchSourceTime.UTC().Format(time.RFC3339Nano), plan.TargetLSN)
+	}
+	return completed, result, boundary == finalTarget, nil
 }
 
 func writeOrdinaryRecoveryArtifacts(ctx context.Context, checkpoint *types.State, result types.OrdinaryRecoveryResult) error {
@@ -537,10 +625,14 @@ func ordinaryRecoveryLSN(value string) (uint64, error) {
 }
 
 func validateOrdinaryRecoveryResult(checkpoint *types.State, result types.OrdinaryRecoveryResult) error {
+	return validateOrdinaryRecoveryProof(checkpoint, result, result.TargetLSN)
+}
+
+func validateOrdinaryRecoveryProof(checkpoint *types.State, result types.OrdinaryRecoveryResult, finalTarget string) error {
 	if err := validateOrdinaryRecoveryOrigin(result.OrdinaryRecoveryOrigin); err != nil {
 		return err
 	}
-	if result.ExecutionID == "" || result.ExecutionID == result.OriginalExecutionID || result.LaunchID != result.OriginalLaunchID || result.ServerIdentity == "" || result.SlotName == "" || (result.ToastValueSemantics != "current_source_lookup" && result.ToastValueSemantics != "destination") {
+	if strings.TrimSpace(result.ExecutionID) == "" || result.ExecutionID == result.OriginalExecutionID || result.LaunchID != result.OriginalLaunchID || strings.TrimSpace(result.ServerIdentity) == "" || strings.TrimSpace(result.SlotName) == "" || (result.ToastValueSemantics != "current_source_lookup" && result.ToastValueSemantics != "destination") {
 		return fmt.Errorf("ordinary recovery result has incomplete runtime or source identity")
 	}
 	lower, err := ordinaryRecoveryLSN(result.LowerLSN)
@@ -550,6 +642,10 @@ func validateOrdinaryRecoveryResult(checkpoint *types.State, result types.Ordina
 	target, err := ordinaryRecoveryLSN(result.TargetLSN)
 	if err != nil || target < lower {
 		return fmt.Errorf("ordinary recovery result target is invalid or behind baseline")
+	}
+	upper, err := ordinaryRecoveryLSN(finalTarget)
+	if err != nil || upper < target {
+		return fmt.Errorf("ordinary recovery checkpoint exceeds its immutable final target")
 	}
 	if checkpoint == nil || checkpoint.Type != types.GlobalType || checkpoint.Global == nil || checkpoint.Global.State == nil || checkpoint.Global.Streams == nil || len(result.Tables) == 0 {
 		return fmt.Errorf("ordinary recovery result requires a full GLOBAL checkpoint and table proofs")
@@ -568,8 +664,8 @@ func validateOrdinaryRecoveryResult(checkpoint *types.State, result types.Ordina
 	for _, proof := range result.Tables {
 		parsedUUID, uuidErr := uuid.Parse(proof.TableUUID)
 		position, lsnErr := ordinaryRecoveryLSN(proof.CommittedLSN)
-		if proof.Stream == "" || seen[proof.Stream] || uuidErr != nil || parsedUUID == uuid.Nil || proof.FenceSnapshotID <= 0 || lsnErr != nil || position != target || !checkpoint.Global.Streams.Exists(proof.Stream) {
-			return fmt.Errorf("ordinary recovery table proof %q does not prove the exact common boundary", proof.Stream)
+		if proof.Stream == "" || seen[proof.Stream] || uuidErr != nil || parsedUUID == uuid.Nil || proof.FenceSnapshotID <= 0 || lsnErr != nil || position < target || position > upper || !checkpoint.Global.Streams.Exists(proof.Stream) {
+			return fmt.Errorf("ordinary recovery table proof %q does not cover the bounded common boundary", proof.Stream)
 		}
 		if result.Backfill {
 			var found bool

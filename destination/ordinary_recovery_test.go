@@ -232,3 +232,24 @@ func TestPoolBackfillCommittedIDsAreOptionalAndFenced(t *testing.T) {
 		})
 	}
 }
+
+func TestPoolCheckpointedBackfillRepreparesFreshPoolBeforeCDC(t *testing.T) {
+	stream := types.NewStream("events", "public", nil).Wrap(0)
+	adapter := &poolBackfillRecoveryAdapter{}
+	pool := &WriterPool{ordinaryRecovery: adapter}
+	pool.writerSchema.Store(stream.ID(), &writerSchema{})
+	options := &types.OrdinaryRecoveryOptions{Origin: types.OrdinaryRecoveryOrigin{Backfill: true}, BackfillComplete: true}
+	ctx := types.WithOrdinaryRecovery(context.Background(), options)
+	_, err := pool.PrepareOrdinaryRecovery(ctx, []types.StreamInterface{stream}, "0/10")
+	require.ErrorContains(t, err, "completed prepared backfill")
+	require.Zero(t, adapter.backfills)
+	options.CheckpointLSN = "0/20"
+	_, err = pool.PrepareOrdinaryRecovery(ctx, []types.StreamInterface{stream}, "0/10")
+	require.NoError(t, err)
+	require.Equal(t, 1, adapter.backfills)
+	require.Equal(t, 1, adapter.prepared)
+	require.True(t, pool.backfillPrepared)
+	require.True(t, pool.ordinaryPrepared)
+	_, err = pool.GetBackfillPlan(ctx, stream)
+	require.ErrorContains(t, err, "not been prepared")
+}

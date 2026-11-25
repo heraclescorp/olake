@@ -46,8 +46,12 @@ type Socket struct {
 	// initialWaitTime is the duration to wait for first wal log catchup before timing out
 	initialWaitTime time.Duration
 	// TransactionOpen prevents publishing a pgoutput stream truncated before COMMIT.
-	TransactionOpen bool
-	StrictRecovery  bool
+	TransactionOpen       bool
+	StrictRecovery        bool
+	RecoveryStartLSN      pglogrepl.LSN
+	RecoveryBatchLSN      pglogrepl.LSN
+	RecoveryBatchDeadline time.Time
+	RecoverySourceTime    time.Time
 }
 
 func (s *Socket) BackendPID() uint32 {
@@ -158,9 +162,23 @@ func NewReplicator(ctx context.Context, config *Config, slot ReplicationSlot, re
 		initialWaitTime:    config.InitialWaitTime,
 		StrictRecovery:     config.StrictRecovery,
 	}
+	if config.StrictRecovery {
+		interval := config.RecoveryCheckpointInterval
+		if interval == 0 {
+			interval = 5 * time.Minute
+		}
+		if interval < 0 || config.RecoveryStartLSN < slot.LSN || config.RecoveryStartLSN > targetWalPos {
+			_ = closeReplicationConnection(ctx, pgConn)
+			return nil, fmt.Errorf("ordinary recovery requires a positive checkpoint interval and verified start within the source slot and target")
+		}
+		socket.RecoveryStartLSN = config.RecoveryStartLSN
+		socket.ClientXLogPos = config.RecoveryStartLSN
+		socket.RecoveryBatchDeadline = time.Now().Add(interval)
+	}
 	socket.changeFilter.replayAfter = config.ReplayAfter
 	if config.StrictRecovery {
 		socket.changeFilter.replayThrough = recoveryLSN
+		socket.changeFilter.replayFrom = socket.RecoveryStartLSN
 	}
 
 	plugin := strings.ToLower(strings.TrimSpace(slot.Plugin))

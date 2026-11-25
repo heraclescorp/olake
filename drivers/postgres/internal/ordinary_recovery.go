@@ -14,6 +14,7 @@ import (
 	"github.com/datazip-inc/olake/drivers/postgres/internal/waljs"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/jackc/pglogrepl"
 )
 
@@ -41,10 +42,13 @@ type ordinaryRecoverySlot struct {
 }
 
 type ordinaryRecovery struct {
-	identity string
-	lower    pglogrepl.LSN
-	plan     *types.OrdinaryRecoveryPlan
-	complete bool
+	identity   string
+	lower      pglogrepl.LSN
+	checkpoint pglogrepl.LSN
+	target     pglogrepl.LSN
+	start      pglogrepl.LSN
+	plan       *types.OrdinaryRecoveryPlan
+	complete   bool
 }
 
 func ordinaryRecoveryLowerLSN(raw string) (pglogrepl.LSN, error) {
@@ -68,6 +72,10 @@ func (p *Postgres) validateOrdinaryRecoveryCatalog(streams []types.StreamInterfa
 }
 
 func (p *Postgres) validateRecoveryCatalog(streams []types.StreamInterface, lower string, incomplete bool) error {
+	return p.validateRecoveryCatalogCheckpoint(streams, lower, lower, incomplete)
+}
+
+func (p *Postgres) validateRecoveryCatalogCheckpoint(streams []types.StreamInterface, lower, checkpoint string, incomplete bool) error {
 	if !p.CDCSupport || p.config == nil || p.cdcConfig.ReplicationSlot == "" {
 		return fmt.Errorf("ordinary recovery requires configured PostgreSQL CDC and an existing replication slot")
 	}
@@ -87,8 +95,9 @@ func (p *Postgres) validateRecoveryCatalog(streams []types.StreamInterface, lowe
 		return fmt.Errorf("invalid ordinary recovery GLOBAL state: %w", err)
 	}
 	savedLSN, err := ordinaryRecoveryLowerLSN(saved.LSN)
-	if err != nil || savedLSN != baseline {
-		return fmt.Errorf("ordinary recovery lower LSN does not match the saved GLOBAL checkpoint")
+	checkpointLSN, checkpointErr := ordinaryRecoveryLowerLSN(checkpoint)
+	if err != nil || checkpointErr != nil || checkpointLSN < baseline || (savedLSN != baseline && savedLSN != checkpointLSN) {
+		return fmt.Errorf("ordinary recovery saved GLOBAL checkpoint does not match the immutable baseline or verified checkpoint")
 	}
 	seen := make(map[string]bool, len(streams))
 	for _, stream := range streams {
@@ -196,14 +205,18 @@ func (p *Postgres) ValidateOrdinaryRecovery(ctx context.Context, streams []types
 	if recovery && options.Origin.Backfill && (options.BackfillCheckpoint == nil || options.BackfillState == nil) {
 		return "", fmt.Errorf("backfill recovery requires a validated candidate and immutable baseline")
 	}
-	if recovery && options.Origin.Backfill && !options.BackfillComplete {
+	if recovery && options.Origin.Backfill && (!options.BackfillComplete || options.CheckpointLSN != "") {
 		for _, stream := range streams {
-			if stream != nil && !options.BackfillState.HasCompletedBackfill(stream.Self()) {
+			if stream != nil && (p.state == nil || !p.state.HasCompletedBackfill(stream.Self())) {
 				incomplete = true
 			}
 		}
 	}
-	if err := p.validateRecoveryCatalog(streams, lower, incomplete); err != nil {
+	checkpoint, err := p.ordinaryRecoveryCheckpointLSN(options, lower)
+	if err != nil {
+		return "", err
+	}
+	if err := p.validateRecoveryCatalogCheckpoint(streams, lower, checkpoint.String(), incomplete); err != nil {
 		return "", err
 	}
 	if err := p.cdcConfig.validateToastRecovery(); err != nil {
@@ -230,6 +243,9 @@ func (p *Postgres) ValidateOrdinaryRecovery(ctx context.Context, streams []types
 	slot, err := p.ordinaryRecoverySlot(ctx, baseline, 0)
 	if err != nil {
 		return "", err
+	}
+	if checkpoint > slot.CurrentLSN {
+		return "", fmt.Errorf("ordinary recovery verified checkpoint is beyond available source WAL")
 	}
 	if incomplete && slot.LSN == baseline {
 		var raw ordinaryRecoverySlot
@@ -260,6 +276,31 @@ func (p *Postgres) ValidateOrdinaryRecovery(ctx context.Context, streams []types
 		options.BackfillAcknowledgedLSN = slot.LSN.String()
 	}
 	return identity, nil
+}
+
+func (p *Postgres) ordinaryRecoveryCheckpointLSN(options *types.OrdinaryRecoveryOptions, lower string) (pglogrepl.LSN, error) {
+	baseline, err := ordinaryRecoveryLowerLSN(lower)
+	if err != nil || baseline == 0 {
+		return 0, fmt.Errorf("ordinary recovery requires a valid nonzero lower LSN")
+	}
+	checkpoint := baseline
+	if p.ordinary != nil {
+		checkpoint = max(checkpoint, p.ordinary.checkpoint)
+	}
+	if options != nil && options.CheckpointLSN != "" {
+		proven, err := ordinaryRecoveryLowerLSN(options.CheckpointLSN)
+		if err != nil || proven < checkpoint {
+			return 0, fmt.Errorf("ordinary recovery verified checkpoint is invalid or regresses completed recovery")
+		}
+		checkpoint = proven
+	}
+	if options != nil && options.Plan != nil && options.Plan.TargetLSN != "" {
+		target, err := ordinaryRecoveryLowerLSN(options.Plan.TargetLSN)
+		if err != nil || target < checkpoint {
+			return 0, fmt.Errorf("ordinary recovery fixed target is below the verified checkpoint")
+		}
+	}
+	return checkpoint, nil
 }
 
 // ordinaryRecoveryPlan uses all table positions, never map iteration order or a
@@ -295,6 +336,32 @@ func ordinaryRecoveryPlan(streams []types.StreamInterface, lower string, positio
 	return plan, nil
 }
 
+func ordinaryRecoveryPlanAtCheckpoint(streams []types.StreamInterface, lower string, positions map[string]string, slot, checkpoint, fixedTarget pglogrepl.LSN) (*types.OrdinaryRecoveryPlan, error) {
+	plan, err := ordinaryRecoveryPlan(streams, lower, positions, slot)
+	if err != nil {
+		return nil, err
+	}
+	baseline, _ := ordinaryRecoveryLowerLSN(plan.LowerLSN)
+	target, _ := ordinaryRecoveryLowerLSN(plan.TargetLSN)
+	if checkpoint < baseline || (fixedTarget != 0 && fixedTarget < target) {
+		return nil, fmt.Errorf("ordinary recovery checkpoint or table metadata is outside the immutable recovery range")
+	}
+	if fixedTarget != 0 {
+		target = fixedTarget
+	}
+	if checkpoint > target || slot > target {
+		return nil, fmt.Errorf("ordinary recovery checkpoint or slot exceeds the fixed target")
+	}
+	for stream, raw := range plan.ReplayAfter {
+		position, _ := ordinaryRecoveryLowerLSN(raw)
+		if position < checkpoint {
+			return nil, fmt.Errorf("ordinary recovery table %s does not cover verified checkpoint %s", stream, checkpoint)
+		}
+	}
+	plan.TargetLSN = target.String()
+	return plan, nil
+}
+
 func (p *Postgres) PrepareOrdinaryRecovery(ctx context.Context, streams []types.StreamInterface, lower string, positions map[string]string) (*types.OrdinaryRecoveryPlan, error) {
 	options, ok := types.OrdinaryRecoveryFromContext(ctx)
 	if !ok || options.SourceIdentity == "" {
@@ -306,30 +373,57 @@ func (p *Postgres) PrepareOrdinaryRecovery(ctx context.Context, streams []types.
 	if p.ordinary == nil || p.ordinary.plan != nil || p.replicator != nil {
 		return nil, fmt.Errorf("ordinary recovery source was not validated or is already prepared")
 	}
+	if options.CheckpointInterval < 0 {
+		return nil, fmt.Errorf("ordinary recovery checkpoint interval must be positive")
+	}
 	if _, err := p.ValidateOrdinaryRecovery(ctx, streams, lower); err != nil {
 		return nil, err
 	}
-	baseline, _ := pglogrepl.ParseLSN(lower)
+	checkpoint, err := p.ordinaryRecoveryCheckpointLSN(options, lower)
+	if err != nil {
+		return nil, err
+	}
+	var saved waljs.WALState
+	if err := utils.Unmarshal(p.state.GetGlobal().State, &saved); err != nil {
+		return nil, err
+	}
+	savedLSN, err := ordinaryRecoveryLowerLSN(saved.LSN)
+	if err != nil || savedLSN != checkpoint {
+		return nil, fmt.Errorf("ordinary recovery requires the verified checkpoint state before preparing replay")
+	}
+	fixedTarget := p.ordinary.target
+	if options.Plan != nil && options.Plan.TargetLSN != "" {
+		restored, err := ordinaryRecoveryLowerLSN(options.Plan.TargetLSN)
+		if err != nil || restored == 0 || (fixedTarget != 0 && fixedTarget != restored) {
+			return nil, fmt.Errorf("ordinary recovery fixed target changed between batches")
+		}
+		fixedTarget = restored
+	}
+	baseline, _ := ordinaryRecoveryLowerLSN(lower)
 	slot, err := p.ordinaryRecoverySlot(ctx, baseline, 0)
 	if err != nil {
 		return nil, err
 	}
-	plan, err := ordinaryRecoveryPlan(streams, lower, positions, slot.LSN)
+	if options.Origin.Backfill {
+		boundary, err := backfillRecoveryTarget(options.BackfillTargetLSN, max(checkpoint, fixedTarget), slot.CurrentLSN)
+		if err != nil || (fixedTarget != 0 && boundary != fixedTarget) {
+			return nil, fmt.Errorf("ordinary recovery fixed backfill target is invalid or changed")
+		}
+		fixedTarget = boundary
+	}
+	plan, err := ordinaryRecoveryPlanAtCheckpoint(streams, lower, positions, slot.LSN, checkpoint, fixedTarget)
 	if err != nil {
 		return nil, err
 	}
-	target, _ := pglogrepl.ParseLSN(plan.TargetLSN)
+	target, _ := ordinaryRecoveryLowerLSN(plan.TargetLSN)
 	if target > slot.CurrentLSN {
 		return nil, fmt.Errorf("ordinary recovery authoritative target is beyond available source WAL")
 	}
-	if options.Origin.Backfill {
-		boundary, err := backfillRecoveryTarget(options.BackfillTargetLSN, target, slot.CurrentLSN)
-		if err != nil {
-			return nil, err
-		}
-		plan.TargetLSN = boundary.String()
-	}
 	p.streams = append([]types.StreamInterface(nil), streams...)
+	p.ordinary.checkpoint = checkpoint
+	p.ordinary.start = max(checkpoint, slot.LSN)
+	p.ordinary.target = target
+	p.ordinary.complete = false
 	p.ordinary.plan = &types.OrdinaryRecoveryPlan{LowerLSN: plan.LowerLSN, TargetLSN: plan.TargetLSN, ReplayAfter: maps.Clone(plan.ReplayAfter)}
 	return plan, nil
 }
@@ -337,7 +431,7 @@ func (p *Postgres) PrepareOrdinaryRecovery(ctx context.Context, streams []types.
 func (p *Postgres) requireOrdinaryRecoveryPlan(ctx context.Context, plan *types.OrdinaryRecoveryPlan) error {
 	options, ok := types.OrdinaryRecoveryFromContext(ctx)
 	if !ok || p.ordinary == nil || p.ordinary.plan == nil || plan == nil || options.SourceIdentity != p.ordinary.identity ||
-		plan.LowerLSN != p.ordinary.plan.LowerLSN || plan.TargetLSN != p.ordinary.plan.TargetLSN || !maps.Equal(plan.ReplayAfter, p.ordinary.plan.ReplayAfter) {
+		plan.LowerLSN != p.ordinary.plan.LowerLSN || plan.TargetLSN != p.ordinary.plan.TargetLSN || plan.BatchTargetLSN != p.ordinary.plan.BatchTargetLSN || !maps.Equal(plan.ReplayAfter, p.ordinary.plan.ReplayAfter) {
 		return fmt.Errorf("ordinary recovery does not match the validated source and prepared plan")
 	}
 	return nil
@@ -350,6 +444,9 @@ func (p *Postgres) streamOrdinaryRecoveryChanges(ctx context.Context, metadata m
 	}
 	if err := p.requireOrdinaryRecoveryPlan(ctx, options.Plan); err != nil {
 		return nil, err
+	}
+	if p.ordinary.complete || p.replicator != nil {
+		return nil, fmt.Errorf("ordinary recovery batch was already read")
 	}
 	plan := p.ordinary.plan
 	if len(metadata) != len(plan.ReplayAfter) {
@@ -371,10 +468,12 @@ func (p *Postgres) streamOrdinaryRecoveryChanges(ctx context.Context, metadata m
 	if err != nil {
 		return nil, err
 	}
-	if _, err := ordinaryRecoveryPlan(p.streams, plan.LowerLSN, plan.ReplayAfter, slot.LSN); err != nil {
+	target, _ := ordinaryRecoveryLowerLSN(plan.TargetLSN)
+	if _, err := ordinaryRecoveryPlanAtCheckpoint(p.streams, plan.LowerLSN, plan.ReplayAfter, slot.LSN, p.ordinary.checkpoint, target); err != nil {
 		return nil, err
 	}
-	target, _ := pglogrepl.ParseLSN(plan.TargetLSN)
+	batch := target
+	var sourceTime time.Time
 	if slot.LSN != target {
 		config, err := p.prepareWALJSConfig(p.streams...)
 		if err != nil {
@@ -388,6 +487,8 @@ func (p *Postgres) streamOrdinaryRecoveryChanges(ctx context.Context, metadata m
 		}
 		config.StrictRecovery = true
 		config.ExpectedSourceIdentity = p.ordinary.identity
+		config.RecoveryStartLSN = max(p.ordinary.checkpoint, slot.LSN)
+		config.RecoveryCheckpointInterval = options.CheckpointInterval
 		p.replicator, err = waljs.NewReplicator(ctx, config, slot, &target, p.dataTypeConverter, p.columnType)
 		if err != nil {
 			return nil, err
@@ -403,9 +504,12 @@ func (p *Postgres) streamOrdinaryRecoveryChanges(ctx context.Context, metadata m
 		if err := p.streamChangesWithToast(ctx, callback); err != nil {
 			return nil, err
 		}
-		if socket := p.replicator.Socket(); socket.TransactionOpen || socket.ClientXLogPos != target {
-			return nil, fmt.Errorf("ordinary recovery did not finish at the exact complete-transaction target %s", target)
+		socket := p.replicator.Socket()
+		batch = socket.RecoveryBatchLSN
+		if socket.TransactionOpen || batch == 0 || socket.ClientXLogPos != batch || batch < p.ordinary.start || batch > target || (batch == p.ordinary.start && batch != target) {
+			return nil, fmt.Errorf("ordinary recovery did not finish at a prepared complete-transaction batch before target %s", target)
 		}
+		sourceTime = socket.RecoverySourceTime
 	} else {
 		identity, err := p.identifyOrdinaryRecovery(ctx, slot)
 		if err != nil {
@@ -419,8 +523,13 @@ func (p *Postgres) streamOrdinaryRecoveryChanges(ctx context.Context, metadata m
 		return nil, err
 	}
 	p.ordinary.complete = true
+	plan.BatchTargetLSN = batch.String()
+	plan.BatchSourceTime = sourceTime
+	options.Plan.BatchTargetLSN = plan.BatchTargetLSN
+	options.Plan.BatchSourceTime = sourceTime
+	logger.Infof("postgres_ordinary_recovery_batch_completed batch_lsn=%s final_target_lsn=%s", batch, target)
 	// Every selected writer receives this metadata, including tables with no rows.
-	return waljs.WALState{LSN: plan.TargetLSN}, nil
+	return waljs.WALState{LSN: plan.BatchTargetLSN}, nil
 }
 
 func (p *Postgres) AcknowledgeOrdinaryRecovery(ctx context.Context, plan *types.OrdinaryRecoveryPlan) error {
@@ -430,16 +539,20 @@ func (p *Postgres) AcknowledgeOrdinaryRecovery(ctx context.Context, plan *types.
 	if err := p.requireOrdinaryRecoveryPlan(ctx, plan); err != nil {
 		return err
 	}
-	if !p.ordinary.complete {
+	if !p.ordinary.complete || plan.BatchTargetLSN == "" {
 		return fmt.Errorf("ordinary recovery cannot acknowledge incomplete bounded replay")
 	}
-	target, _ := pglogrepl.ParseLSN(plan.TargetLSN)
+	target, err := ordinaryRecoveryLowerLSN(plan.BatchTargetLSN)
+	final, finalErr := ordinaryRecoveryLowerLSN(plan.TargetLSN)
+	if err != nil || finalErr != nil || target < p.ordinary.start || target > final {
+		return fmt.Errorf("ordinary recovery acknowledgement requires its explicit prepared batch boundary")
+	}
 	baseline, _ := pglogrepl.ParseLSN(plan.LowerLSN)
 	var ownedPID int64
 	if p.replicator != nil {
 		socket := p.replicator.Socket()
-		if socket.TransactionOpen || socket.ClientXLogPos != target || socket.CurrentWalPosition != target {
-			return fmt.Errorf("ordinary recovery acknowledgement requires the exact complete target")
+		if socket.TransactionOpen || socket.ClientXLogPos != target || socket.RecoveryBatchLSN != target || socket.CurrentWalPosition != final {
+			return fmt.Errorf("ordinary recovery acknowledgement requires the exact completed batch and immutable final target")
 		}
 		ownedPID = int64(socket.BackendPID())
 	}
@@ -472,11 +585,13 @@ func (p *Postgres) AcknowledgeOrdinaryRecovery(ctx context.Context, plan *types.
 	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return err
 	}
-	global, err := ordinaryRecoveryCheckpoint(p.state.GetGlobal().State, plan.TargetLSN)
+	global, err := ordinaryRecoveryCheckpoint(p.state.GetGlobal().State, plan.BatchTargetLSN)
 	if err != nil {
 		return err
 	}
 	p.state.SetGlobal(global)
+	p.ordinary.checkpoint = target
+	logger.Infof("postgres_ordinary_recovery_batch_acknowledged batch_lsn=%s final_target_lsn=%s", target, final)
 	return nil
 }
 
@@ -486,7 +601,11 @@ func (p *Postgres) CleanupOrdinaryRecovery(ctx context.Context) error {
 		err = waljs.Cleanup(ctx, p.replicator.Socket())
 		p.replicator = nil
 	}
-	p.ordinary = nil
+	if p.ordinary != nil {
+		p.ordinary.plan = nil
+		p.ordinary.complete = false
+		p.ordinary.start = 0
+	}
 	return err
 }
 

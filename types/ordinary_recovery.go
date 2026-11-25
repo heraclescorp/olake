@@ -1,6 +1,10 @@
 package types
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+	"time"
+)
 
 // OrdinaryRecoveryOrigin binds recovery to immutable artifacts from one retired
 // controlled sync. Configuration digests hash exact bytes; state uses canonical JSON.
@@ -39,11 +43,21 @@ type OrdinaryRecoveryResult struct {
 	Tables              []OrdinaryRecoveryTableProof `json:"tables"`
 }
 
+type OrdinaryRecoveryCheckpoint struct {
+	OrdinaryRecoveryResult
+	FinalTargetLSN           string          `json:"final_target_lsn"`
+	State                    json.RawMessage `json:"state"`
+	PreviousCheckpointSHA256 string          `json:"previous_checkpoint_sha256,omitempty"`
+	PreviousExecutionID      string          `json:"previous_execution_id,omitempty"`
+}
+
 // OrdinaryRecoveryPlan is derived solely from authoritative selected table metadata.
 type OrdinaryRecoveryPlan struct {
-	LowerLSN    string
-	TargetLSN   string
-	ReplayAfter map[string]string
+	LowerLSN        string
+	TargetLSN       string
+	ReplayAfter     map[string]string
+	BatchTargetLSN  string
+	BatchSourceTime time.Time
 }
 
 type OrdinaryRecoveryOptions struct {
@@ -55,6 +69,10 @@ type OrdinaryRecoveryOptions struct {
 	BackfillComplete        bool
 	BackfillAcknowledgedLSN string
 	BackfillTargetLSN       string
+	CheckpointInterval      time.Duration
+	CheckpointLSN           string
+	Checkpoint              *OrdinaryRecoveryCheckpoint
+	CheckpointSHA256        string
 }
 
 type ordinaryRecoveryKey struct{}

@@ -346,7 +346,7 @@ func (i *Iceberg) PrepareBackfillRecovery(ctx context.Context, streams []types.S
 	if err != nil {
 		return err
 	}
-	if !options.Origin.Backfill || options.BackfillComplete || options.BackfillState == nil || options.BackfillCheckpoint == nil || len(streams) == 0 || i.resync != nil || i.ordinaryRecovery != nil || i.backfillRecovery != nil || !nativeRecoveryCatalogSupported(i.config, i.catalog) {
+	if !options.Origin.Backfill || (options.BackfillComplete && options.CheckpointLSN == "") || options.BackfillState == nil || options.BackfillCheckpoint == nil || len(streams) == 0 || i.resync != nil || i.ordinaryRecovery != nil || i.backfillRecovery != nil || !nativeRecoveryCatalogSupported(i.config, i.catalog) {
 		return errors.New("backfill recovery requires an immutable candidate and unprepared native REST or Hadoop catalog")
 	}
 	if options.BackfillCheckpoint.ServerIdentity != options.SourceIdentity {
@@ -360,6 +360,16 @@ func (i *Iceberg) PrepareBackfillRecovery(ctx context.Context, streams []types.S
 		ack, err = ordinaryRecoveryLSN(options.BackfillAcknowledgedLSN)
 		if err != nil {
 			return err
+		}
+	}
+	if options.CheckpointLSN != "" {
+		checkpoint, checkpointErr := ordinaryRecoveryLSN(options.CheckpointLSN)
+		lowerValue, _ := ordinaryRecoveryLSN(lower)
+		if checkpointErr != nil || checkpoint < lowerValue {
+			return errors.New("backfill recovery checkpoint is behind the immutable lower LSN")
+		}
+		if checkpoint > ack {
+			ack = checkpoint
 		}
 	}
 	controls := make(map[string]*ordinaryRecoveryTable, len(streams))
@@ -510,6 +520,11 @@ func (i *Iceberg) PrepareBackfillRecovery(ctx context.Context, streams []types.S
 		r.encoded = string(encoded)
 		if err := r.previousMarker(tbl); err != nil {
 			return fmt.Errorf("backfill recovery table %q: %w", stream.ID(), err)
+		}
+		if options.BackfillComplete {
+			if err := r.validateCommittedBackfillPlan(tbl); err != nil {
+				return err
+			}
 		}
 		if ack != 0 {
 			if _, err := ordinaryRecoveryPosition(tbl, ack); err != nil {
@@ -726,6 +741,28 @@ func (i *Iceberg) PrepareBackfillPlan(ctx context.Context, stream types.StreamIn
 	state.backfillRecovery, state.latest = r, confirmed
 	return nil
 }
+func (r *ordinaryRecoveryTable) validateCommittedBackfillPlan(tbl *table.Table) error {
+	if len(r.chunkIDs) == 0 {
+		return errors.New("backfill recovery cannot establish the lower LSN without the exact full chunk plan")
+	}
+	var metadata types.MetadataState
+	if raw := tbl.Properties()[nativeRecoveryProperty]; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+			return err
+		}
+	}
+	committed := make(map[string]struct{}, len(metadata.FullRefreshCommittedIDs))
+	for _, id := range metadata.FullRefreshCommittedIDs {
+		committed[id] = struct{}{}
+	}
+	for id := range r.chunkIDs {
+		if _, ok := committed[id]; !ok {
+			return errors.New("backfill recovery full chunk plan is not authoritatively committed")
+		}
+	}
+	return nil
+}
+
 func (r *ordinaryRecoveryTable) backfillPosition(tbl *table.Table, lower string, lowerValue uint64) (string, string, error) {
 	status, _ := nativeMetadataLSNPosition(tbl.Properties()[nativeRecoveryProperty])
 	if status == "present" {
@@ -735,27 +772,14 @@ func (r *ordinaryRecoveryTable) backfillPosition(tbl *table.Table, lower string,
 	if status != "absent" && status != "no_cdc_state" {
 		return "", "", errors.New("backfill recovery table contains invalid CDC metadata")
 	}
-	if len(r.chunkIDs) == 0 {
-		return "", "", errors.New("backfill recovery cannot establish the lower LSN without the exact full chunk plan")
+	if err := r.validateCommittedBackfillPlan(tbl); err != nil {
+		return "", "", err
 	}
-	var metadata types.MetadataState
 	var root map[string]json.RawMessage
 	raw := tbl.Properties()[nativeRecoveryProperty]
 	if raw != "" {
-		if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
-			return "", "", err
-		}
 		if err := json.Unmarshal([]byte(raw), &root); err != nil {
 			return "", "", err
-		}
-	}
-	committed := make(map[string]struct{}, len(metadata.FullRefreshCommittedIDs))
-	for _, id := range metadata.FullRefreshCommittedIDs {
-		committed[id] = struct{}{}
-	}
-	for id := range r.chunkIDs {
-		if _, ok := committed[id]; !ok {
-			return "", "", errors.New("backfill recovery full chunk plan is not authoritatively committed")
 		}
 	}
 	if root == nil {

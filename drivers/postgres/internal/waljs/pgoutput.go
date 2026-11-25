@@ -49,13 +49,17 @@ func (p *pgoutputReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, ins
 	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return err
 	}
-	err := pglogrepl.StartReplication(ctx, p.socket.pgConn, fmt.Sprintf("%q", p.socket.ReplicationSlot), p.socket.ConfirmedFlushLSN, pglogrepl.StartReplicationOptions{
+	start := p.socket.ConfirmedFlushLSN
+	if p.socket.StrictRecovery {
+		start = p.socket.RecoveryStartLSN
+	}
+	err := pglogrepl.StartReplication(ctx, p.socket.pgConn, fmt.Sprintf("%q", p.socket.ReplicationSlot), start, pglogrepl.StartReplicationOptions{
 		PluginArgs: []string{"proto_version '1'", fmt.Sprintf("publication_names '%s'", p.publication)}})
 	if err != nil {
 		return fmt.Errorf("failed to start replication: %w", err)
 	}
 
-	logger.Infof("pgoutput starting from lsn=%s target=%s", p.socket.ConfirmedFlushLSN, p.socket.CurrentWalPosition)
+	logger.Infof("pgoutput starting from lsn=%s target=%s", start, p.socket.CurrentWalPosition)
 	progress, stopProgress := startReplicationProgress(p.socket, "pgoutput")
 	p.progress = progress
 	defer func() { stopProgress(); p.progress = nil }()
@@ -71,22 +75,35 @@ func (p *pgoutputReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, ins
 	for {
 		select {
 		case <-ctx.Done():
+			if p.socket.StrictRecovery {
+				return ctx.Err()
+			}
 			return nil
 		default:
-			if !messageReceived && p.socket.initialWaitTime > 0 && time.Since(cdcStartTime) > p.socket.initialWaitTime {
+			if p.socket.recoveryBatchComplete(time.Now()) {
+				return nil
+			}
+			if !p.socket.StrictRecovery && !messageReceived && p.socket.initialWaitTime > 0 && time.Since(cdcStartTime) > p.socket.initialWaitTime {
 				return fmt.Errorf("%w, try increasing it or do full load", constants.ErrNonRetryable)
 			}
 
-			if !p.socket.TransactionOpen && p.socket.ClientXLogPos >= p.socket.CurrentWalPosition {
+			if !p.socket.StrictRecovery && !p.socket.TransactionOpen && p.socket.ClientXLogPos >= p.socket.CurrentWalPosition {
 				logger.Infof("finishing sync, reached wal position: %s", p.socket.CurrentWalPosition)
 				return nil
 			}
 
 			// receive message with timeout
-			msgCtx, cancel := context.WithTimeout(ctx, p.socket.initialWaitTime)
+			msgCtx := ctx
+			cancel := func() {}
+			if !p.socket.StrictRecovery && p.socket.initialWaitTime > 0 {
+				msgCtx, cancel = context.WithTimeout(ctx, p.socket.initialWaitTime)
+			}
 			msg, err := p.socket.pgConn.ReceiveMessage(msgCtx)
 			cancel()
 			if err != nil {
+				if p.socket.StrictRecovery {
+					return fmt.Errorf("ordinary recovery WAL stream ended before a completed batch: %w", err)
+				}
 				if errors.Is(err, context.DeadlineExceeded) {
 					return fmt.Errorf("%w: no records found in given initial wait time, try increasing it or do full load", constants.ErrNonRetryable)
 				}
@@ -102,6 +119,9 @@ func (p *pgoutputReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, ins
 				return fmt.Errorf("pgoutput unexpected message type: %T", msg)
 			}
 
+			if len(copyData.Data) == 0 {
+				return fmt.Errorf("pgoutput received empty CopyData")
+			}
 			switch copyData.Data[0] {
 			case pglogrepl.XLogDataByteID:
 				xld, err := pglogrepl.ParseXLogData(copyData.Data[1:])

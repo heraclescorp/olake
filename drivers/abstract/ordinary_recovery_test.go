@@ -15,10 +15,12 @@ import (
 
 type ordinaryRecoveryTestDriver struct {
 	stubDriver
-	post     atomic.Int32
-	ack      atomic.Int32
-	backfill atomic.Int32
-	cleanup  atomic.Int32
+	post       atomic.Int32
+	ack        atomic.Int32
+	backfill   atomic.Int32
+	cleanup    atomic.Int32
+	boundaries []string
+	reads      int
 }
 
 func (*ordinaryRecoveryTestDriver) ValidateOrdinaryRecovery(context.Context, []types.StreamInterface, string) (string, error) {
@@ -35,10 +37,18 @@ func (d *ordinaryRecoveryTestDriver) CleanupOrdinaryRecovery(context.Context) er
 	d.cleanup.Add(1)
 	return nil
 }
-func (*ordinaryRecoveryTestDriver) StreamChanges(context.Context, int, map[string]any, CDCMsgFn) (any, error) {
+func (d *ordinaryRecoveryTestDriver) StreamChanges(ctx context.Context, _ int, _ map[string]any, _ CDCMsgFn) (any, error) {
+	boundary := "0/500"
+	if d.reads < len(d.boundaries) {
+		boundary = d.boundaries[d.reads]
+	}
+	d.reads++
+	if options, ok := types.OrdinaryRecoveryFromContext(ctx); ok && options.Plan != nil {
+		options.Plan.BatchTargetLSN = boundary
+	}
 	return struct {
 		LSN string `json:"lsn"`
-	}{LSN: "0/500"}, nil
+	}{LSN: boundary}, nil
 }
 func (d *ordinaryRecoveryTestDriver) PostCDC(context.Context, int) error {
 	d.post.Add(1)
@@ -115,6 +125,52 @@ func TestOrdinaryRecoveryReadJoinsEveryWriterWithoutAckOrBackfill(t *testing.T) 
 	}
 }
 
+func TestOrdinaryRecoveryReadReopensFreshPoolsAcrossCompletedBatches(t *testing.T) {
+	streams := cleanupTestStreams(3)
+	for _, stream := range streams {
+		stream.GetStream().SyncMode = types.CDC
+	}
+	options := &types.OrdinaryRecoveryOptions{SourceIdentity: "validated-live-identity"}
+	ctx := types.WithOrdinaryRecovery(context.Background(), options)
+	state := &types.State{RWMutex: &sync.RWMutex{}, Type: types.GlobalType, SuppressPersistence: true,
+		Global: &types.GlobalState{State: map[string]any{"lsn": "0/100", "opaque": "preserved"}, Streams: types.NewSet(streams[0].ID(), streams[1].ID(), streams[2].ID())}}
+	driver := &ordinaryRecoveryTestDriver{stubDriver: stubDriver{typ: "postgres", cdcSupported: true}, boundaries: []string{"0/300", "0/500"}}
+	a := NewAbstractDriver(ctx, driver)
+	a.SetupState(state)
+	previous := "0/100"
+	for index, boundary := range driver.boundaries {
+		options.Plan = &types.OrdinaryRecoveryPlan{LowerLSN: "0/100", TargetLSN: "0/500", ReplayAfter: make(map[string]string)}
+		for _, stream := range streams {
+			options.Plan.ReplayAfter[stream.ID()] = previous
+		}
+		var closed atomic.Int32
+		pool := newOrdinaryRecoveryWriterPool(t, ctx, streams, metadataWriterHooks{Close: func(_ context.Context, _ types.StreamInterface, _ *destination.Options, metadata any) error {
+			checkpoint, ok := metadata.(*types.MetadataState)
+			require.True(t, ok)
+			require.Equal(t, fmt.Sprintf(`{"lsn":%q}`, boundary), checkpoint.State)
+			closed.Add(1)
+			return nil
+		}})
+		_, err := pool.PrepareOrdinaryRecovery(ctx, streams, options.Plan.LowerLSN)
+		require.NoError(t, err)
+		require.NoError(t, a.Read(ctx, pool, nil, streams, nil))
+		require.Equal(t, int32(len(streams)), closed.Load())
+		require.Equal(t, "0/500", options.Plan.TargetLSN)
+		require.Equal(t, boundary, options.Plan.BatchTargetLSN)
+		require.Equal(t, previous, state.Global.State.(map[string]any)["lsn"])
+		require.Equal(t, int32(index), driver.ack.Load())
+		require.NoError(t, a.AcknowledgeOrdinaryRecovery(ctx, options.Plan))
+		require.NoError(t, a.CleanupOrdinaryRecovery(ctx))
+		previous = boundary
+		options.CheckpointLSN = boundary
+		state.SetGlobal(map[string]any{"lsn": boundary, "opaque": "preserved"})
+	}
+	require.Equal(t, int32(2), driver.cleanup.Load())
+	require.Equal(t, int32(2), driver.ack.Load())
+	require.Zero(t, driver.post.Load())
+	require.Zero(t, driver.backfill.Load())
+}
+
 func TestOrdinaryRecoveryRejectsFreshOrResyncReads(t *testing.T) {
 	stream := types.NewStream("items", "public", nil).Wrap(0)
 	a := NewAbstractDriver(context.Background(), &ordinaryRecoveryTestDriver{})
@@ -137,7 +193,10 @@ func TestOrdinaryRecoveryWrappersRejectUnsupportedSources(t *testing.T) {
 
 type ordinaryRecoveryTestWriter struct{ metadataTestWriter }
 
-func (*ordinaryRecoveryTestWriter) PrepareOrdinaryRecovery(_ context.Context, streams []types.StreamInterface, lower string) ([]types.OrdinaryRecoveryTableProof, error) {
+func (*ordinaryRecoveryTestWriter) PrepareOrdinaryRecovery(ctx context.Context, streams []types.StreamInterface, lower string) ([]types.OrdinaryRecoveryTableProof, error) {
+	if options, ok := types.OrdinaryRecoveryFromContext(ctx); ok && options.CheckpointLSN != "" {
+		lower = options.CheckpointLSN
+	}
 	proofs := make([]types.OrdinaryRecoveryTableProof, len(streams))
 	for index, stream := range streams {
 		proofs[index] = types.OrdinaryRecoveryTableProof{Stream: stream.ID(), TableUUID: stream.ID(), FenceSnapshotID: 1, CommittedLSN: lower}

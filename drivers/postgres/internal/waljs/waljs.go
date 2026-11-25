@@ -2,6 +2,7 @@ package waljs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -39,20 +40,26 @@ func (w *wal2jsonReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, cal
 	for key := range w.socket.changeFilter.tables {
 		tables = append(tables, key)
 	}
-	pluginArguments = append(pluginArguments, fmt.Sprintf("\"add-tables\" '%s'", strings.Join(tables, ",")))
+	arguments := make([]string, len(pluginArguments)+1)
+	copy(arguments, pluginArguments)
+	arguments[len(pluginArguments)] = fmt.Sprintf("\"add-tables\" '%s'", strings.Join(tables, ","))
 	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return err
+	}
+	start := w.socket.ConfirmedFlushLSN
+	if w.socket.StrictRecovery {
+		start = w.socket.RecoveryStartLSN
 	}
 	if err := pglogrepl.StartReplication(
 		ctx,
 		w.socket.pgConn,
 		w.socket.ReplicationSlot,
-		w.socket.ConfirmedFlushLSN,
-		pglogrepl.StartReplicationOptions{PluginArgs: pluginArguments},
+		start,
+		pglogrepl.StartReplicationOptions{PluginArgs: arguments},
 	); err != nil {
 		return fmt.Errorf("starting replication slot failed: %w", err)
 	}
-	logger.Infof("Started logical replication for slot[%s] from lsn[%s] to lsn[%s]", w.socket.ReplicationSlot, w.socket.ConfirmedFlushLSN, w.socket.CurrentWalPosition)
+	logger.Infof("Started logical replication for slot[%s] from lsn[%s] to lsn[%s]", w.socket.ReplicationSlot, start, w.socket.CurrentWalPosition)
 	progress, stopProgress := startReplicationProgress(w.socket, "wal2json")
 	defer stopProgress()
 	messageReceived := false
@@ -60,19 +67,28 @@ func (w *wal2jsonReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, cal
 	for {
 		select {
 		case <-ctx.Done():
+			if w.socket.StrictRecovery {
+				return ctx.Err()
+			}
 			return nil
 		default:
-			if !messageReceived && w.socket.initialWaitTime > 0 && time.Since(cdcStartTime) > w.socket.initialWaitTime {
+			if w.socket.recoveryBatchComplete(time.Now()) {
+				return nil
+			}
+			if !w.socket.StrictRecovery && !messageReceived && w.socket.initialWaitTime > 0 && time.Since(cdcStartTime) > w.socket.initialWaitTime {
 				return fmt.Errorf("%w, try increasing it or do full load", constants.ErrNonRetryable)
 			}
 
-			if w.socket.ClientXLogPos >= w.socket.CurrentWalPosition {
+			if !w.socket.StrictRecovery && w.socket.ClientXLogPos >= w.socket.CurrentWalPosition {
 				logger.Infof("finishing sync, reached wal position: %s", w.socket.CurrentWalPosition)
 				return nil
 			}
 
 			msg, err := w.socket.pgConn.ReceiveMessage(ctx)
 			if err != nil {
+				if w.socket.StrictRecovery {
+					return fmt.Errorf("ordinary recovery WAL stream ended before a completed batch: %w", err)
+				}
 				if strings.Contains(err.Error(), "EOF") {
 					return nil
 				}
@@ -85,6 +101,9 @@ func (w *wal2jsonReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, cal
 				return fmt.Errorf("unexpected message type: %T", msg)
 			}
 
+			if len(copyData.Data) == 0 {
+				return fmt.Errorf("wal2json received empty CopyData")
+			}
 			switch copyData.Data[0] {
 			case pglogrepl.PrimaryKeepaliveMessageByteID:
 				// For keepalive messages, process them (but no ack is sent here).
@@ -111,11 +130,23 @@ func (w *wal2jsonReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, cal
 				progress.received(xld.WALStart, xld.ServerWALEnd, len(xld.WALData))
 				// Process change with the provided callback.
 				nextLSN, records, err := w.socket.changeFilter.FilterWalJsChange(ctx, xld.WALData, callback)
+				if w.socket.StrictRecovery && errors.Is(err, errOrdinaryRecoveryTargetReached) {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					w.socket.ClientXLogPos = w.socket.CurrentWalPosition
+					if !w.socket.recoveryBatchComplete(time.Now()) {
+						return fmt.Errorf("ordinary recovery future transaction arrived before the current transaction completed")
+					}
+					return nil
+				}
 				if err != nil {
 					return fmt.Errorf("failed to filter change: %w", err)
 				}
 				messageReceived = records > 0 || messageReceived
 				w.socket.ClientXLogPos = *nextLSN
+				w.socket.RecoverySourceTime = w.socket.changeFilter.transactionTime
+				w.socket.changeFilter.replayFrom = *nextLSN
 				progress.committed(*nextLSN)
 			default:
 				logger.Warnf("received unhandled message type: %v", copyData.Data[0])

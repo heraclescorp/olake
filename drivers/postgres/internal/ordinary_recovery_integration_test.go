@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/datazip-inc/olake/drivers/postgres/internal/waljs"
 	"github.com/datazip-inc/olake/types"
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
@@ -23,14 +25,22 @@ import (
 // wal_level=logical and publication/replication-slot privileges. It never runs by
 // default and does not substitute for the CLI/native-destination recovery smoke.
 func TestOrdinaryRecoveryBoundedReplayIntegration(t *testing.T) {
-	for _, allCovered := range []bool{false, true} {
-		t.Run(fmt.Sprintf("all_tables_covered=%t", allCovered), func(t *testing.T) {
-			testOrdinaryRecoveryBoundedReplay(t, allCovered)
-		})
+	for _, plugin := range []string{"pgoutput", "wal2json"} {
+		for _, checkpointed := range []bool{false, true} {
+			for _, allCovered := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/checkpointed=%t/all_tables_covered=%t", plugin, checkpointed, allCovered), func(t *testing.T) {
+					testOrdinaryRecoveryBoundedReplay(t, plugin, allCovered, checkpointed, false)
+				})
+			}
+		}
 	}
 }
 
-func testOrdinaryRecoveryBoundedReplay(t *testing.T, allCovered bool) {
+func TestOrdinaryRecoveryWal2JSONStopsBeforeBufferedFutureTransactionIntegration(t *testing.T) {
+	testOrdinaryRecoveryBoundedReplay(t, "wal2json", false, false, true)
+}
+
+func testOrdinaryRecoveryBoundedReplay(t *testing.T, plugin string, allCovered, checkpointed, betweenTransactions bool) {
 	dsn := os.Getenv("OLAKE_POSTGRES_TEST_DSN")
 	if dsn == "" {
 		t.Skip("set OLAKE_POSTGRES_TEST_DSN to a disposable PostgreSQL database with wal_level=logical")
@@ -62,7 +72,12 @@ func testOrdinaryRecoveryBoundedReplay(t *testing.T, allCovered bool) {
 		require.NoError(t, err)
 	})
 	var lower string
-	require.NoError(t, db.GetContext(ctx, &lower, "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')", name))
+	err = db.GetContext(ctx, &lower, "SELECT lsn::text FROM pg_create_logical_replication_slot($1, $2)", name, plugin)
+	var pluginErr *pgconn.PgError
+	if plugin == "wal2json" && errors.As(err, &pluginErr) && pluginErr.Code == "58P01" {
+		t.Skip("wal2json output plugin is not installed in the disposable PostgreSQL database")
+	}
+	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanup, stop := context.WithTimeout(context.Background(), 10*time.Second)
 		defer stop()
@@ -80,24 +95,55 @@ func testOrdinaryRecoveryBoundedReplay(t *testing.T, allCovered bool) {
 		require.NoError(t, tx.Commit())
 	}
 	insertBoth(1)
+	if checkpointed {
+		insertBoth(2)
+		insertBoth(3)
+	}
 	// Peek (not consume/ACK) the plugin's complete COMMIT end, rather than
 	// deriving a replay boundary from wall-clock time or the current WAL tip.
-	rows, err := db.QueryxContext(ctx, "SELECT data FROM pg_logical_slot_peek_binary_changes($1, NULL, NULL, 'proto_version', '1', 'publication_names', $2)", name, name)
+	peekQuery := "SELECT data FROM pg_logical_slot_peek_binary_changes($1, NULL, NULL, 'proto_version', '1', 'publication_names', $2)"
+	peekArgs := []any{name, name}
+	if plugin == "wal2json" {
+		peekQuery = "SELECT data FROM pg_logical_slot_peek_binary_changes($1, NULL, NULL, 'include-lsn', 'on', 'include-timestamp', 'on')"
+		peekArgs = []any{name}
+	}
+	rows, err := db.QueryxContext(ctx, peekQuery, peekArgs...)
 	require.NoError(t, err)
 	var target pglogrepl.LSN
 	for rows.Next() {
 		var data []byte
 		require.NoError(t, rows.Scan(&data))
-		message, err := pglogrepl.Parse(data)
-		require.NoError(t, err)
-		if commit, ok := message.(*pglogrepl.CommitMessage); ok {
-			target = commit.TransactionEndLSN
+		if plugin == "pgoutput" {
+			message, err := pglogrepl.Parse(data)
+			require.NoError(t, err)
+			if commit, ok := message.(*pglogrepl.CommitMessage); ok {
+				target = commit.TransactionEndLSN
+			}
+		} else {
+			var transaction waljs.WALMessage
+			require.NoError(t, json.Unmarshal(data, &transaction))
+			target, err = pglogrepl.ParseLSN(transaction.NextLSN)
+			require.NoError(t, err)
 		}
 	}
 	require.NoError(t, rows.Err())
 	require.NoError(t, rows.Close())
 	require.NotZero(t, target)
-	insertBoth(2) // A real committed transaction beyond the authoritative bound.
+	if betweenTransactions {
+		lastCommit := target
+		_, err = db.ExecContext(ctx, "CHECKPOINT")
+		require.NoError(t, err)
+		var rawTarget string
+		require.NoError(t, db.GetContext(ctx, &rawTarget, "SELECT pg_current_wal_lsn()::text"))
+		target, err = pglogrepl.ParseLSN(rawTarget)
+		require.NoError(t, err)
+		require.Greater(t, target, lastCommit)
+	}
+	if checkpointed {
+		insertBoth(4)
+	} else {
+		insertBoth(2)
+	}
 
 	connection, err := url.Parse(dsn)
 	require.NoError(t, err)
@@ -122,6 +168,9 @@ func testOrdinaryRecoveryBoundedReplay(t *testing.T, allCovered bool) {
 	p := newSource()
 	t.Cleanup(func() { require.NoError(t, p.CleanupOrdinaryRecovery(context.Background())) })
 	options := &types.OrdinaryRecoveryOptions{}
+	if checkpointed {
+		options.CheckpointInterval = time.Nanosecond
+	}
 	recoveryCtx := types.WithOrdinaryRecovery(ctx, options)
 	options.SourceIdentity, err = p.ValidateOrdinaryRecovery(recoveryCtx, streams, lower)
 	require.NoError(t, err)
@@ -129,38 +178,85 @@ func testOrdinaryRecoveryBoundedReplay(t *testing.T, allCovered bool) {
 	if allCovered {
 		positions[streams[0].ID()] = target.String()
 	}
-	options.Plan, err = p.PrepareOrdinaryRecovery(recoveryCtx, streams, lower, positions)
-	require.NoError(t, err)
-	require.Equal(t, target.String(), options.Plan.TargetLSN)
-	require.NoError(t, p.PreCDC(recoveryCtx, streams))
-	metadata := map[string]any{streams[0].ID(): fmt.Sprintf(`{"lsn":%q}`, positions[streams[0].ID()]), streams[1].ID(): fmt.Sprintf(`{"lsn":%q}`, target.String())}
+	metadata := make(map[string]any, len(streams))
 	var got []abstract.CDCChange
-	final, err := p.StreamChanges(recoveryCtx, 0, metadata, func(_ context.Context, change abstract.CDCChange) error {
-		if change.SourceColumns == nil {
-			got = append(got, change)
-		}
-		return nil
-	})
+	parsedLower, err := pglogrepl.ParseLSN(lower)
 	require.NoError(t, err)
-	require.Equal(t, waljs.WALState{LSN: target.String()}, final)
+	previousAck, expectedStart := parsedLower, parsedLower
+	batches := 0
+	for {
+		options.Plan, err = p.PrepareOrdinaryRecovery(recoveryCtx, streams, lower, positions)
+		require.NoError(t, err)
+		require.Equal(t, target.String(), options.Plan.TargetLSN)
+		require.Empty(t, options.Plan.BatchTargetLSN)
+		require.NoError(t, p.PreCDC(recoveryCtx, streams))
+		for stream, position := range positions {
+			metadata[stream] = fmt.Sprintf(`{"lsn":%q}`, position)
+		}
+		final, err := p.StreamChanges(recoveryCtx, 0, metadata, func(_ context.Context, change abstract.CDCChange) error {
+			if change.SourceColumns == nil {
+				got = append(got, change)
+			}
+			return nil
+		})
+		require.NoError(t, err)
+		batch, err := pglogrepl.ParseLSN(options.Plan.BatchTargetLSN)
+		require.NoError(t, err)
+		require.Equal(t, waljs.WALState{LSN: batch.String()}, final)
+		require.LessOrEqual(t, batch, target)
+		if p.replicator != nil {
+			require.Equal(t, expectedStart, p.replicator.Socket().RecoveryStartLSN)
+			require.Equal(t, previousAck, p.replicator.Socket().ConfirmedFlushLSN)
+		}
+		slot, err := waljs.GetSlotPosition(ctx, db, name)
+		require.NoError(t, err)
+		require.Equal(t, previousAck, slot.LSN)
+		batches++
+		require.LessOrEqual(t, batches, 3)
+		if !allCovered {
+			positions[streams[0].ID()] = batch.String()
+		}
+		if checkpointed && !allCovered && batches == 1 {
+			require.Less(t, batch, target)
+			require.Equal(t, baseline, state.Global.State)
+			require.NoError(t, p.CleanupOrdinaryRecovery(ctx))
+			state.Global.State, err = ordinaryRecoveryCheckpoint(state.Global.State, batch.String())
+			require.NoError(t, err)
+			p = newSource()
+			options = &types.OrdinaryRecoveryOptions{SourceIdentity: options.SourceIdentity, CheckpointLSN: batch.String(), CheckpointInterval: time.Nanosecond,
+				Plan: &types.OrdinaryRecoveryPlan{LowerLSN: lower, TargetLSN: target.String()}}
+			recoveryCtx = types.WithOrdinaryRecovery(ctx, options)
+			identity, err := p.ValidateOrdinaryRecovery(recoveryCtx, streams, lower)
+			require.NoError(t, err)
+			require.Equal(t, options.SourceIdentity, identity)
+		} else {
+			require.NoError(t, p.AcknowledgeOrdinaryRecovery(recoveryCtx, options.Plan))
+			previousAck = batch
+			require.Equal(t, batch.String(), state.Global.State.(map[string]any)["lsn"])
+			require.NoError(t, p.CleanupOrdinaryRecovery(ctx))
+			options.CheckpointLSN = batch.String()
+		}
+		expectedStart = batch
+		if batch == target {
+			break
+		}
+	}
 	if allCovered {
 		require.Empty(t, got)
 	} else {
-		require.Len(t, got, 1)
-		require.Equal(t, streams[0].ID(), got[0].Stream.ID())
-		require.EqualValues(t, 1, got[0].Data["id"])
+		expectedRows := 1
+		if checkpointed {
+			expectedRows = 3
+			require.Equal(t, 3, batches)
+		}
+		require.Len(t, got, expectedRows)
+		for index, change := range got {
+			require.Equal(t, streams[0].ID(), change.Stream.ID())
+			require.EqualValues(t, index+1, change.Data["id"])
+		}
 	}
-	slot, err := waljs.GetSlotPosition(ctx, db, name)
-	require.NoError(t, err)
-	parsedLower, err := pglogrepl.ParseLSN(lower)
-	require.NoError(t, err)
-	require.Equal(t, parsedLower, slot.LSN, "bounded source read must not acknowledge before destination confirmation")
-	require.Equal(t, baseline, state.Global.State)
-	// The source API is called only after the protocol's destination proof gate.
-	require.NoError(t, p.AcknowledgeOrdinaryRecovery(recoveryCtx, options.Plan))
 	require.Equal(t, target.String(), state.Global.State.(map[string]any)["lsn"])
 	require.Equal(t, baseline["opaque"], state.Global.State.(map[string]any)["opaque"])
-	require.NoError(t, p.CleanupOrdinaryRecovery(ctx))
 
 	// Simulate losing the worker checkpoint after ACK. Every durable destination
 	// table now covers target, while the immutable saved baseline still says lower.
@@ -185,7 +281,7 @@ func testOrdinaryRecoveryBoundedReplay(t *testing.T, allCovered bool) {
 	require.Equal(t, target.String(), state.Global.State.(map[string]any)["lsn"])
 	require.Equal(t, 3, state.Global.Streams.Len())
 	require.True(t, state.Global.Streams.Exists("public.unrelated"))
-	slot, err = waljs.GetSlotPosition(ctx, db, name)
+	slot, err := waljs.GetSlotPosition(ctx, db, name)
 	require.NoError(t, err)
 	require.Equal(t, target, slot.LSN, "future transaction must remain unacknowledged")
 }

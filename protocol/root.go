@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/datazip-inc/olake/constants"
@@ -64,12 +65,17 @@ var RootCmd = &cobra.Command{
 			return err
 		}
 		utils.BeginOrdinaryExecution(cmd.Context(), cmd.Name())
+		ordinaryRecoveryCheckpointInputURI = ""
+		if strings.HasPrefix(ordinaryRecoveryOriginPath, "s3://") {
+			ordinaryRecoveryCheckpointInputURI = ordinaryRecoveryOriginPath[:strings.LastIndex(ordinaryRecoveryOriginPath, "/")+1] + utils.OrdinaryRecoveryCheckpointName
+		}
 		// Resolve now as configPaths are needed by logger.Init(), but the error is handled later because the logger is not initialized yet.
 		s3Err := utils.ResolveS3Paths(cmd.Context(), []*string{
 			&configPath, &destinationConfigPath, &streamsPath, &statePath, &differencePath,
 			&availableStreamsPath, &selectedStreamsPath, &differenceAvailableStreamsPath, &differenceSelectedStreamsPath,
 			&enrollmentPolicyPath, &ordinaryRecoveryOriginPath, &backfillRecoveryCheckpointPath,
 		}, telemetry.PropsFiles())
+		ordinaryRecoveryCheckpointInputOrigin = ordinaryRecoveryOriginPath
 		if s3Err == nil && cmd.Name() == "discover-new-tables" {
 			enrollmentResultPath, enrollmentResultURI, s3Err = utils.ResolveArtifactOutput(enrollmentResultPath, "enrollment-result.json", configPath)
 		}

@@ -30,13 +30,15 @@ import (
 
 func TestPartialBackfillExportedCLISmoke(t *testing.T) {
 	for _, strategy := range []types.MergeStrategy{types.MergeOnRead, types.CopyOnWrite} {
-		t.Run(string(strategy), func(t *testing.T) {
-			partialBackfillExportedCLISmoke(t, strategy)
-		})
+		for _, checkpointed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/checkpoints=%t", strategy, checkpointed), func(t *testing.T) {
+				partialBackfillExportedCLISmoke(t, strategy, checkpointed)
+			})
+		}
 	}
 }
 
-func partialBackfillExportedCLISmoke(t *testing.T, strategy types.MergeStrategy) {
+func partialBackfillExportedCLISmoke(t *testing.T, strategy types.MergeStrategy, checkpointed bool) {
 	binaryPath, dsn := os.Getenv("OLAKE_ORDINARY_RECOVERY_CLI"), os.Getenv("OLAKE_POSTGRES_TEST_DSN")
 	if binaryPath == "" || dsn == "" {
 		t.Skip("requires compiled PostgreSQL CLI and disposable logical PostgreSQL")
@@ -93,11 +95,25 @@ func partialBackfillExportedCLISmoke(t *testing.T, strategy types.MergeStrategy)
 	var recoveryOnce sync.Once
 	recoveryInterrupted := make(chan struct{})
 	capturedTargets := make(chan string, 1)
+	var checkpointFault atomic.Bool
+	var checkpointOnce sync.Once
+	checkpointInterrupted := make(chan []byte, 1)
+	checkpointRuntime := filepath.Join(root, "successor")
 	server := ordinaryRecoverySQLREST(t, cat, func(requestCtx context.Context, committed bool) {
 		if !committed {
 			return
 		}
 		if injected.Load() {
+			if checkpointed && checkpointFault.Load() {
+				paths, _ := filepath.Glob(filepath.Join(checkpointRuntime, "ordinary-recovery-checkpoints", "*.json"))
+				for _, path := range paths {
+					data, readErr := os.ReadFile(path)
+					var checkpoint types.OrdinaryRecoveryCheckpoint
+					if readErr == nil && json.Unmarshal(data, &checkpoint) == nil && checkpoint.TargetLSN != checkpoint.FinalTargetLSN {
+						checkpointOnce.Do(func() { checkpointInterrupted <- data; <-requestCtx.Done() })
+					}
+				}
+			}
 			if !recoveryFault.Load() {
 				return
 			}
@@ -180,6 +196,9 @@ func partialBackfillExportedCLISmoke(t *testing.T, strategy types.MergeStrategy)
 		if recovery {
 			args = append(args, "--execution-launch-id", originalID, "--ordinary-recovery-origin", filepath.Join(runtime, "ordinary-recovery-origin.json"), "--ordinary-recovery-result", filepath.Join(runtime, "ordinary-recovery-result.json"))
 			args = append(args, "--backfill-recovery-checkpoint", filepath.Join(runtime, "backfill-recovery-checkpoint.json"))
+			if checkpointed {
+				args = append(args, "--recovery-checkpoint-interval", "1ns")
+			}
 		}
 		child := exec.CommandContext(ctx, binaryPath, args...)
 		child.Dir = runtime
@@ -276,6 +295,12 @@ func partialBackfillExportedCLISmoke(t *testing.T, strategy types.MergeStrategy)
 	write("execution-fence.json", map[string]any{"version": 1, "execution_id": executionID, "state": "closed"})
 	_, err = db.ExecContext(ctx, fmt.Sprintf(`UPDATE %q.a SET value=11 WHERE id=1; UPDATE %q.b SET value=11 WHERE id=1; DELETE FROM %q.a WHERE id=2; DELETE FROM %q.b WHERE id=2; INSERT INTO %q.a VALUES(3,30); INSERT INTO %q.b VALUES(3,30)`, namespace, namespace, namespace, namespace, namespace, namespace))
 	require.NoError(t, err)
+	expectedValue := int64(11)
+	if checkpointed {
+		_, err = db.ExecContext(ctx, fmt.Sprintf(`UPDATE %q.a SET value=12 WHERE id=1; UPDATE %q.b SET value=12 WHERE id=1`, namespace, namespace))
+		require.NoError(t, err)
+		expectedValue = 12
+	}
 	runtime = filepath.Join(root, "recovery")
 	require.NoError(t, os.MkdirAll(runtime, 0700))
 	for name, data := range artifacts {
@@ -361,6 +386,54 @@ func partialBackfillExportedCLISmoke(t *testing.T, strategy types.MergeStrategy)
 	require.Equal(t, originBytes, write("ordinary-recovery-origin.json", origin))
 	executionID = "successor-" + id
 	write("execution-fence.json", map[string]any{"version": 1, "execution_id": executionID, "state": "open"})
+	if checkpointed {
+		checkpointFault.Store(true)
+		batchChild := command(true)
+		var batchLog bytes.Buffer
+		batchChild.Stdout, batchChild.Stderr = &batchLog, &batchLog
+		require.NoError(t, batchChild.Start())
+		batchFinished := make(chan error, 1)
+		go func() { batchFinished <- batchChild.Wait() }()
+		var checkpointBytes []byte
+		select {
+		case checkpointBytes = <-checkpointInterrupted:
+		case runErr := <-batchFinished:
+			t.Fatalf("checkpointed CLI exited before intermediate checkpoint interruption: %v\n%s", runErr, batchLog.String())
+		case <-ctx.Done():
+			_ = batchChild.Process.Kill()
+			<-batchFinished
+			t.Fatalf("checkpointed CLI never produced an intermediate durable checkpoint\n%s", batchLog.String())
+		}
+		require.NoError(t, batchChild.Process.Kill())
+		require.Error(t, <-batchFinished)
+		checkpointFault.Store(false)
+		var checkpoint types.OrdinaryRecoveryCheckpoint
+		require.NoError(t, json.Unmarshal(checkpointBytes, &checkpoint))
+		require.Equal(t, origin, checkpoint.OrdinaryRecoveryOrigin)
+		require.Equal(t, fixedTarget, checkpoint.FinalTargetLSN)
+		require.NotEqual(t, lowerCheckpoint.LSN, checkpoint.TargetLSN)
+		require.NotEqual(t, fixedTarget, checkpoint.TargetLSN)
+		require.NoError(t, db.QueryRowContext(ctx, "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&confirmed))
+		require.Equal(t, checkpoint.TargetLSN, confirmed)
+		for _, name := range []string{"execution-result.json", "ordinary-recovery-result.json"} {
+			_, statErr := os.Stat(filepath.Join(runtime, name))
+			require.True(t, os.IsNotExist(statErr), "an intermediate checkpoint must not settle the operation")
+		}
+		checkpointedRuntime := runtime
+		write("execution-fence.json", map[string]any{"version": 1, "execution_id": executionID, "state": "closed"})
+		runtime = filepath.Join(root, "checkpoint-successor")
+		require.NoError(t, os.MkdirAll(runtime, 0700))
+		for name, data := range artifacts {
+			require.NoError(t, os.WriteFile(filepath.Join(runtime, name), data, 0600))
+		}
+		require.NoError(t, os.WriteFile(filepath.Join(runtime, "state.json"), candidate.State, 0600))
+		require.NoError(t, os.WriteFile(filepath.Join(runtime, "backfill-recovery-checkpoint.json"), candidateBytes, 0600))
+		require.NoError(t, os.WriteFile(filepath.Join(runtime, "ordinary-recovery-checkpoint.json"), checkpointBytes, 0600))
+		inheritJournals(runtime, readJournals(checkpointedRuntime))
+		require.Equal(t, originBytes, write("ordinary-recovery-origin.json", origin))
+		executionID = "checkpoint-successor-" + id
+		write("execution-fence.json", map[string]any{"version": 1, "execution_id": executionID, "state": "open"})
+	}
 	recoveryOutput, err := command(true).CombinedOutput()
 	require.NoError(t, err, "recovery CLI: %s", recoveryOutput)
 	data, err := os.ReadFile(filepath.Join(runtime, "ordinary-recovery-result.json"))
@@ -385,14 +458,16 @@ func partialBackfillExportedCLISmoke(t *testing.T, strategy types.MergeStrategy)
 			continue
 		}
 		require.Len(t, rows, 3)
-		require.Equal(t, int64(11), rows[utils.GetKeysHash(map[string]any{"id": int64(1)}, "id")].value)
+		require.Equal(t, expectedValue, rows[utils.GetKeysHash(map[string]any{"id": int64(1)}, "id")].value)
 		require.Equal(t, "d", rows[utils.GetKeysHash(map[string]any{"id": int64(2)}, "id")].operation)
 		require.Equal(t, int64(30), rows[utils.GetKeysHash(map[string]any{"id": int64(3)}, "id")].value)
 		if name == committedName {
 			require.Equal(t, before.Metadata().TableUUID(), current.Metadata().TableUUID())
 			_, addedFieldPresent := current.Schema().FindFieldByName("added_optional")
 			require.True(t, addedFieldPresent, "recovery must preserve the added destination column")
-			require.Len(t, current.Metadata().Snapshots(), interruptedSnapshotCount+2, "committed tail must not be reread: only the fresh recovery barrier and bounded CDC may add snapshots")
+			if !checkpointed {
+				require.Len(t, current.Metadata().Snapshots(), interruptedSnapshotCount+2, "committed tail must not be reread: only the fresh recovery barrier and bounded CDC may add snapshots")
+			}
 			for _, snapshot := range before.Metadata().Snapshots() {
 				require.NotNil(t, current.Metadata().SnapshotByID(snapshot.SnapshotID))
 			}

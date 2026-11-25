@@ -168,7 +168,7 @@ func (p *Postgres) PreCDC(ctx context.Context, streams []types.StreamInterface) 
 		if err := p.requireOrdinaryRecoveryPlan(ctx, options.Plan); err != nil {
 			return err
 		}
-		return p.validateOrdinaryRecoveryCatalog(streams, options.Plan.LowerLSN)
+		return p.validateRecoveryCatalogCheckpoint(streams, options.Plan.LowerLSN, p.ordinary.checkpoint.String(), false)
 	}
 	if err := p.cdcConfig.validateToastRecovery(); err != nil {
 		return err

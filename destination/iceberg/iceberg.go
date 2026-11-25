@@ -1252,7 +1252,13 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 				}
 			}
 		}
-		state, changed, err := mergeNativeRecovery(fresh.Properties()[nativeRecoveryProperty], w.options.ThreadID, finalMetadataState, hasFiles || w.options.Backfill)
+		var state string
+		var changed bool
+		if recovery, ok := types.OrdinaryRecoveryFromContext(ctx); ok && (!recovery.Origin.Backfill || recovery.BackfillComplete) {
+			state, changed, err = mergeOrdinaryRecovery(fresh.Properties()[nativeRecoveryProperty], w.options.ThreadID, finalMetadataState, hasFiles, recovery.Plan)
+		} else {
+			state, changed, err = mergeNativeRecovery(fresh.Properties()[nativeRecoveryProperty], w.options.ThreadID, finalMetadataState, hasFiles || w.options.Backfill)
+		}
 		if err != nil {
 			return err
 		}

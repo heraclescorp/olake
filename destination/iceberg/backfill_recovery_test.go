@@ -664,3 +664,106 @@ func TestNativeScheduledBackfillRetryTransfersStrongSavedOwnership(t *testing.T)
 		})
 	}
 }
+
+func TestNativeCheckpointedBackfillRestartsWithoutReopeningChunks(t *testing.T) {
+	for _, mutation := range []string{"none", "missing-chunk", "behind-checkpoint", "widened-target"} {
+		t.Run(mutation, func(t *testing.T) {
+			cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, false, "")
+			state := nativeBackfillState()
+			plan := types.NewSet(types.Chunk{Min: nil, Max: "m"}, types.Chunk{Min: "m", Max: nil})
+			nativeBindBackfillPlan(t, cfg, stream, cat, state, plan)
+			for _, chunk := range plan.Array() {
+				writer := openNativeTestWriter(context.Background(), t, cfg, stream, cat, nil, nativeBackfillChunkID(stream, chunk), true)
+				require.NoError(t, writer.Close(context.Background(), nil))
+			}
+			frozenState, err := json.Marshal(state)
+			require.NoError(t, err)
+			frozen := &types.State{RWMutex: &sync.RWMutex{}}
+			require.NoError(t, json.Unmarshal(frozenState, frozen))
+			cfg.CatalogType = RestCatalog
+			ctx, options := nativeBackfillRecoveryContext(t, "backfill-first-batch", state)
+			options.BackfillCheckpoint.State = append(json.RawMessage(nil), frozenState...)
+			frozenCheckpoint, err := json.Marshal(options.BackfillCheckpoint)
+			require.NoError(t, err)
+			adapter := &Iceberg{config: cfg, catalog: cat}
+			streams := []types.StreamInterface{stream}
+			require.NoError(t, adapter.PrepareBackfillRecovery(ctx, streams, "0/10"))
+			options.BackfillComplete = true
+			options.BackfillTargetLSN = "0/40"
+			proofs, err := adapter.PrepareOrdinaryRecovery(ctx, streams, "0/10")
+			require.NoError(t, err)
+			ordinaryTestPlan(options, proofs, "0/10", "0/40")
+			options.Plan.BatchTargetLSN = "0/20"
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "first-cdc-batch", false)
+			require.NoError(t, writer.Close(ctx, map[string]any{"state": `{"lsn":"0/20"}`}))
+			_, err = adapter.ConfirmOrdinaryRecovery(ctx, streams, proofs, "0/20")
+			require.NoError(t, err)
+			binding := writer.table.Properties()[nativeBackfillBindingProperty]
+			journal := nativeBackfillTestJournal(t, state)
+			frozenJournal, err := journal.Read(stream.ID())
+			require.NoError(t, err)
+			nextCtx, nextOptions := nativeBackfillRecoveryContext(t, "backfill-checkpoint-restart", state)
+			nextOptions.BackfillCheckpoint.State = append(json.RawMessage(nil), frozenState...)
+			nextOptions.BackfillComplete = true
+			nextOptions.BackfillTargetLSN = "0/40"
+			nextOptions.CheckpointLSN = "0/20"
+			nextOptions.BackfillAcknowledgedLSN = "0/10"
+			nextOptions.Plan = &types.OrdinaryRecoveryPlan{LowerLSN: "0/10", TargetLSN: "0/40"}
+			properties := apacheiceberg.Properties{}
+			switch mutation {
+			case "missing-chunk":
+				properties[nativeRecoveryProperty] = `{"state":"{\"lsn\":\"0/20\"}","full_refresh_committed_ids":[]}`
+			case "behind-checkpoint":
+				nextOptions.CheckpointLSN = "0/30"
+			case "widened-target":
+				nextOptions.BackfillTargetLSN = "0/50"
+				nextOptions.Plan.TargetLSN = "0/50"
+			}
+			if len(properties) != 0 {
+				_, _, err := cat.CommitTable(ctx, writer.table.Identifier(), nil, []table.Update{table.NewSetPropertiesUpdate(properties)})
+				require.NoError(t, err)
+			}
+			fault := &nativeCommitFaultCatalog{Catalog: cat.(*nativeCatalog).Catalog}
+			next := &Iceberg{config: cfg, catalog: &nativeCatalog{Catalog: fault}}
+			restored, err := next.PrepareOrdinaryRecovery(nextCtx, streams, "0/10")
+			if mutation != "none" {
+				require.Error(t, err)
+				require.Zero(t, fault.calls)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, "0/20", restored[0].CommittedLSN)
+				require.NotEqual(t, proofs[0].FenceSnapshotID, restored[0].FenceSnapshotID)
+				_, err = next.GetBackfillPlan(nextCtx, stream)
+				require.Error(t, err)
+				_, _, err = newNativeWriter(nextCtx, cfg, stream, &destination.Options{ThreadID: nativeBackfillChunkID(stream, plan.Array()[0]), Backfill: true}, next.catalog, nil)
+				require.Error(t, err)
+				ordinaryTestPlan(nextOptions, restored, "0/10", "0/40")
+				nextOptions.Plan.BatchTargetLSN = "0/40"
+				finalWriter := openNativeTestWriter(nextCtx, t, cfg, stream, next.catalog, nil, "final-cdc-batch", false)
+				require.NoError(t, finalWriter.Close(nextCtx, map[string]any{"state": `{"lsn":"0/40"}`}))
+				confirmed, err := next.ConfirmOrdinaryRecovery(nextCtx, streams, restored, "0/40")
+				require.NoError(t, err)
+				require.Equal(t, "0/40", confirmed[0].CommittedLSN)
+				require.Equal(t, binding, finalWriter.table.Properties()[nativeBackfillBindingProperty])
+			}
+			for _, checkpoint := range []*types.BackfillRecoveryCheckpoint{options.BackfillCheckpoint, nextOptions.BackfillCheckpoint} {
+				afterCheckpoint, err := json.Marshal(checkpoint)
+				require.NoError(t, err)
+				require.Equal(t, frozenCheckpoint, afterCheckpoint)
+			}
+			require.Equal(t, frozen.Type, state.Type)
+			require.Equal(t, frozen.Version, state.Version)
+			require.Equal(t, frozen.BackfillSource, state.BackfillSource)
+			require.Equal(t, frozen.GetGlobal().State, state.GetGlobal().State)
+			require.ElementsMatch(t, frozen.GetGlobal().Streams.Array(), state.GetGlobal().Streams.Array())
+			require.Equal(t, frozen.HasCompletedBackfill(stream), state.HasCompletedBackfill(stream))
+			require.Equal(t, frozen.GetBackfillTable(stream), state.GetBackfillTable(stream))
+			require.ElementsMatch(t, frozen.GetBackfillPlan(stream).Array(), state.GetBackfillPlan(stream).Array())
+			require.ElementsMatch(t, frozen.GetChunks(stream).Array(), state.GetChunks(stream).Array())
+			require.ElementsMatch(t, frozen.GetResumePlan(stream).Array(), state.GetResumePlan(stream).Array())
+			afterJournal, err := journal.Read(stream.ID())
+			require.NoError(t, err)
+			require.Equal(t, frozenJournal, afterJournal)
+		})
+	}
+}
