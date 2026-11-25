@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"maps"
+	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -135,7 +137,7 @@ func (c *nativeCOW) spill(ctx context.Context, w *nativeWriter, batch arrow.Reco
 	return nil
 }
 
-func nativeCOWFilter(batch arrow.RecordBatch) (apacheiceberg.BooleanExpression, error) {
+func nativeCOWIDs(batch arrow.RecordBatch) (*array.String, error) {
 	indices := batch.Schema().FieldIndices(constants.OlakeID)
 	if len(indices) != 1 {
 		return nil, errors.New("copy-on-write requires one canonical _olake_id column")
@@ -144,14 +146,65 @@ func nativeCOWFilter(batch arrow.RecordBatch) (apacheiceberg.BooleanExpression, 
 	if !ok || ids.NullN() != 0 {
 		return nil, errors.New("copy-on-write requires nonnull string _olake_id values")
 	}
+	return ids, nil
+}
+
+func nativeCOWFilter(batch arrow.RecordBatch) (apacheiceberg.BooleanExpression, error) {
+	ids, err := nativeCOWIDs(batch)
+	if err != nil {
+		return nil, err
+	}
 	values := make([]apacheiceberg.Literal, ids.Len())
 	idData := string(ids.ValueBytes())
 	offsets := ids.ValueOffsets()
 	for row := range values {
 		values[row] = apacheiceberg.NewLiteral(idData[offsets[row]-offsets[0] : offsets[row+1]-offsets[0]])
 	}
+	return nativeCOWOverwriteFilter(values), nil
+}
+
+func nativeCOWOverwriteFilter(values []apacheiceberg.Literal) apacheiceberg.BooleanExpression {
 	term := apacheiceberg.Reference(constants.OlakeID)
-	return apacheiceberg.NewAnd(apacheiceberg.NotNull(term), apacheiceberg.SetPredicate(apacheiceberg.OpIn, term, values)), nil
+	return apacheiceberg.NewAnd(apacheiceberg.NotNull(term), apacheiceberg.SetPredicate(apacheiceberg.OpIn, term, values))
+}
+
+type nativeCOWRow struct {
+	segment, row int
+	recovery     map[string]nativeCOWRecoveryValue
+}
+
+// readNativeCOWSegment bounds IPC ownership to one segment at a time. The
+// consumer borrows the batch; any returned slices must own their references.
+func readNativeCOWSegment(ctx context.Context, store iceio.IO, path string, consume func(arrow.RecordBatch, *array.String) error) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	file, err := store.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
+	reader, err := ipc.NewReader(file)
+	if err != nil {
+		return err
+	}
+	defer reader.Release()
+	if !reader.Next() {
+		if err := reader.Err(); err != nil {
+			return err
+		}
+		return errors.New("empty COW replay segment")
+	}
+	batch := reader.RecordBatch()
+	ids, err := nativeCOWIDs(batch)
+	if err != nil {
+		return err
+	}
+	return consume(batch, ids)
 }
 
 func (w *nativeWriter) replayCopyOnWrite(ctx context.Context, tx *table.Transaction) error {
@@ -162,52 +215,108 @@ func (w *nativeWriter) replayCopyOnWrite(ctx context.Context, tx *table.Transact
 	if err != nil {
 		return err
 	}
-	for _, path := range w.cow.paths {
-		err := func() error {
-			file, err := store.Open(path)
-			if err != nil {
-				return err
-			}
-			defer file.Close()
-			reader, err := ipc.NewReader(file)
-			if err != nil {
-				return err
-			}
-			defer reader.Release()
-			if !reader.Next() {
-				if err := reader.Err(); err != nil {
+	// Build an attempt-local index newest first. An older row is relevant
+	// only if it explicitly supplies a column omitted by the winning row.
+	latest := make(map[string]nativeCOWRow)
+	selected := make([]bool, len(w.cow.paths))
+	for segment := len(w.cow.paths) - 1; segment >= 0; segment-- {
+		path := w.cow.paths[segment]
+		err := readNativeCOWSegment(ctx, store, path, func(batch arrow.RecordBatch, ids *array.String) error {
+			present, omitted := nativeCOWRecoveryFields(batch.Schema(), w.recoveryColumns)
+			for row := ids.Len() - 1; row >= 0; row-- {
+				if err := ctx.Err(); err != nil {
 					return err
 				}
-				return errors.New("empty COW replay segment")
-			}
-			batch := reader.RecordBatch()
-			if len(w.recoveryColumns) != 0 {
-				batch, err = w.restoreRecoveryCopyOnWrite(ctx, tx, batch)
-				if err != nil {
-					return err
+				id := ids.Value(row)
+				if winner, exists := latest[id]; exists {
+					winner.captureRecovery(batch, row, present)
+					continue
 				}
-				defer batch.Release()
+				winner := nativeCOWRow{segment: segment, row: row}
+				if len(omitted) != 0 {
+					winner.recovery = make(map[string]nativeCOWRecoveryValue, len(omitted))
+					for _, name := range omitted {
+						winner.recovery[name] = nativeCOWRecoveryValue{}
+					}
+				}
+				latest[strings.Clone(id)] = winner
+				selected[segment] = true
 			}
-			filter, err := nativeCOWFilter(batch)
-			if err != nil {
-				return err
-			}
-			records, err := array.NewRecordReader(batch.Schema(), []arrow.RecordBatch{batch})
-			if err != nil {
-				return err
-			}
-			// Overwrite consumes but does not release its reader. NewRecordReader
-			// retains the batch; IPC keeps its own reference until this call ends.
-			defer records.Release()
-			return tx.Overwrite(ctx, records, apacheiceberg.Properties{"olake.thread-id": w.options.ThreadID}, table.WithOverwriteFilter(filter))
-		}()
+			return nil
+		})
 		if err != nil {
-			return err
+			return fmt.Errorf("index COW replay input %q: %w", path, err)
 		}
 	}
+	if len(latest) == 0 {
+		return nil
+	}
+	if err := hydrateNativeCOWRecovery(ctx, tx.Scan, latest, w.recoveryColumns); err != nil {
+		return err
+	}
+	schema, err := table.SchemaToArrowSchema(w.table.Schema(), nil, true, false)
+	if err != nil {
+		return err
+	}
+	values := make([]apacheiceberg.Literal, 0, len(latest))
+	for id := range latest {
+		values = append(values, apacheiceberg.NewLiteral(id))
+	}
+	rows := array.ReaderFromIter(schema, nativeCOWSelectedRows(ctx, store, w.cow.paths, selected, schema, latest))
+	defer rows.Release()
 	// Stock Overwrite owns its output paths. They are deliberately not guessed
 	// or deleted on rejection; normal Iceberg orphan maintenance owns cleanup.
-	return nil
+	return tx.Overwrite(ctx, rows, apacheiceberg.Properties{"olake.thread-id": w.options.ThreadID}, table.WithOverwriteFilter(nativeCOWOverwriteFilter(values)))
+}
+
+func nativeCOWSelectedRows(ctx context.Context, store iceio.IO, paths []string, selected []bool, schema *arrow.Schema, latest map[string]nativeCOWRow) iter.Seq2[arrow.RecordBatch, error] {
+	return func(yield func(arrow.RecordBatch, error) bool) {
+		for segment, path := range paths {
+			if !selected[segment] {
+				continue
+			}
+			stopped := false
+			err := readNativeCOWSegment(ctx, store, path, func(batch arrow.RecordBatch, ids *array.String) error {
+				// Stream contiguous runs as slices, without decoding or copying
+				// staged source columns. Only omitted fields need new arrays.
+				matches := func(row int) bool {
+					winner, ok := latest[ids.Value(row)]
+					return ok && winner.segment == segment && winner.row == row
+				}
+				for start := 0; start < ids.Len(); {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					if !matches(start) {
+						start++
+						continue
+					}
+					end := start + 1
+					for end < ids.Len() && matches(end) {
+						end++
+					}
+					record, err := restoreNativeCOWBatch(schema, batch, ids, start, end, latest)
+					if err != nil {
+						return err
+					}
+					// ReaderFromIter owns the returned reference from here on.
+					if !yield(record, nil) {
+						stopped = true
+						break
+					}
+					start = end
+				}
+				return nil
+			})
+			if stopped {
+				return
+			}
+			if err != nil {
+				yield(nil, fmt.Errorf("stream COW replay input %q: %w", path, err))
+				return
+			}
+		}
+	}
 }
 
 func nativeCOWHasDeletes(ctx context.Context, tbl *table.Table) (bool, error) {

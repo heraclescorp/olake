@@ -75,10 +75,12 @@ and unknown-outcome protocol. Initial snapshots keep the existing append/chunk
 path. COW adds no source transaction controls, periodic checkpoints, mid-run state
 publication or recovery lifecycle. Quiet tables use existing metadata-only commits.
 
-Each existing WriterThread buffer is deduplicated by canonical ID and staged as
-typed Arrow IPC; segments replay in source order, so later versions win. Private
-0600 files under 0700 directories may contain sensitive financial/TOAST values;
-they bound incoming memory and permit recreating consumed readers on commit retry.
+Each WriterThread buffer is staged as typed Arrow IPC. At commit, COW indexes
+the latest row per canonical ID across all segments and streams the winners
+through one filtered Iceberg overwrite instead of rewriting files per segment.
+Recovery carries forward omitted fields without treating explicit nulls as missing.
+Staged payloads remain on table storage; the per-attempt index scales with the
+number of distinct changed keys and is rebuilt on commit retry.
 Unknown publication retains replay input. COW never opens a persistent row index;
 destination TOAST/index recovery is unsupported, so use source TOAST hydration.
 

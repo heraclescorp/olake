@@ -9,6 +9,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	apacheiceberg "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 	"github.com/datazip-inc/olake/constants"
@@ -50,6 +51,20 @@ func readNativeRecoveryColumns(ctx context.Context, scanRows nativeRecoveryScann
 			}
 		}
 	}
+	return scanNativeRecoveryColumns(ctx, scanRows, ids, columns, func(id string, batch arrow.RecordBatch, row int, indices []int) error {
+		if _, duplicate := previous[id]; duplicate {
+			return fmt.Errorf("recovery cannot preserve columns for duplicate canonical row identity %q", id)
+		}
+		values := make(map[string]any, len(columns))
+		for index, column := range columns {
+			values[column] = nativeRecoveryValue(batch.Column(indices[index]), row)
+		}
+		previous[id] = values
+		return nil
+	})
+}
+
+func scanNativeRecoveryColumns(ctx context.Context, scanRows nativeRecoveryScanner, ids map[string]struct{}, columns []string, consume func(string, arrow.RecordBatch, int, []int) error) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -67,26 +82,32 @@ func readNativeRecoveryColumns(ctx context.Context, scanRows nativeRecoveryScann
 	if err != nil {
 		return err
 	}
-	idIndex := schema.FieldIndices(constants.OlakeID)[0]
+	idIndices := schema.FieldIndices(constants.OlakeID)
+	if len(idIndices) != 1 {
+		return errors.New("recovery scan requires one canonical _olake_id column")
+	}
 	indices := make([]int, len(columns))
 	for index, column := range columns {
-		indices[index] = schema.FieldIndices(column)[0]
+		fields := schema.FieldIndices(column)
+		if len(fields) != 1 {
+			return fmt.Errorf("recovery scan requires one column named %q", column)
+		}
+		indices[index] = fields[0]
 	}
 	for batch, err := range batches {
 		if err != nil {
 			return err
 		}
 		for row := range int(batch.NumRows()) {
-			id := nativeIndexValue(batch.Column(idIndex), row).(string)
-			if _, duplicate := previous[id]; duplicate {
+			id, ok := nativeIndexValue(batch.Column(idIndices[0]), row).(string)
+			if !ok {
 				batch.Release()
-				return fmt.Errorf("recovery cannot preserve columns for duplicate canonical row identity %q", id)
+				return errors.New("recovery scan row is missing its string _olake_id")
 			}
-			values := make(map[string]any, len(columns))
-			for index, column := range columns {
-				values[column] = nativeRecoveryValue(batch.Column(indices[index]), row)
+			if err := consume(id, batch, row, indices); err != nil {
+				batch.Release()
+				return err
 			}
-			previous[id] = values
 		}
 		batch.Release()
 	}
@@ -212,28 +233,117 @@ func (w *nativeWriter) spillRecoveryCopyOnWrite(ctx context.Context, rows []map[
 	return nil
 }
 
-func (w *nativeWriter) restoreRecoveryCopyOnWrite(ctx context.Context, tx *table.Transaction, batch arrow.RecordBatch) (arrow.RecordBatch, error) {
-	var omitted []string
-	for _, column := range w.recoveryColumns {
-		if len(batch.Schema().FieldIndices(column)) == 0 {
+// A supplied null is distinct from a value that still needs hydration.
+type nativeCOWRecoveryValue struct {
+	value   any
+	present bool
+}
+
+func nativeCOWRecoveryFields(schema *arrow.Schema, columns []string) (present map[string]int, omitted []string) {
+	for _, column := range columns {
+		indices := schema.FieldIndices(column)
+		if len(indices) == 0 {
 			omitted = append(omitted, column)
+			continue
+		}
+		if present == nil {
+			present = make(map[string]int, len(columns))
+		}
+		present[column] = indices[0]
+	}
+	return present, omitted
+}
+
+func (winner nativeCOWRow) captureRecovery(batch arrow.RecordBatch, row int, present map[string]int) {
+	for name, value := range winner.recovery {
+		if index, found := present[name]; found && !value.present {
+			winner.recovery[name] = nativeCOWRecoveryValue{nativeRecoveryValue(batch.Column(index), row), true}
 		}
 	}
-	if len(omitted) == 0 {
-		batch.Retain()
-		return batch, nil
+}
+
+func hydrateNativeCOWRecovery(ctx context.Context, scanRows nativeRecoveryScanner, latest map[string]nativeCOWRow, columns []string) error {
+	if len(columns) == 0 {
+		return nil
 	}
-	rows := make([]map[string]any, int(batch.NumRows()))
-	for row := range rows {
-		rows[row] = make(map[string]any, w.table.Schema().NumFields())
-		for index, field := range batch.Schema().Fields() {
-			rows[row][field.Name] = nativeRecoveryValue(batch.Column(index), row)
+	ids := make(map[string]struct{})
+	missing := make(map[string]struct{})
+	for id, winner := range latest {
+		for name, value := range winner.recovery {
+			if !value.present {
+				ids[id] = struct{}{}
+				missing[name] = struct{}{}
+			}
 		}
 	}
-	previous := make(map[string]map[string]any)
-	if err := readNativeRecoveryColumns(ctx, tx.Scan, rows, omitted, previous); err != nil {
-		return nil, err
+	var projection []string
+	for _, name := range columns {
+		if _, needed := missing[name]; needed {
+			projection = append(projection, name)
+		}
 	}
-	fillNativeRecoveryColumns(rows, omitted, previous)
-	return nativeArrowRecord(w.table.Schema(), rows)
+	return scanNativeRecoveryColumns(ctx, scanRows, ids, projection, func(id string, batch arrow.RecordBatch, row int, indices []int) error {
+		if _, found := ids[id]; !found {
+			return fmt.Errorf("recovery cannot preserve columns for duplicate canonical row identity %q", id)
+		}
+		delete(ids, id)
+		values := latest[id].recovery
+		for index, name := range projection {
+			if value, needed := values[name]; needed && !value.present {
+				values[name] = nativeCOWRecoveryValue{nativeRecoveryValue(batch.Column(indices[index]), row), true}
+			}
+		}
+		return nil
+	})
+}
+
+func restoreNativeCOWBatch(schema *arrow.Schema, batch arrow.RecordBatch, ids *array.String, start, end int, latest map[string]nativeCOWRow) (arrow.RecordBatch, error) {
+	if batch.Schema().Equal(schema) {
+		if start == 0 && end == ids.Len() {
+			batch.Retain()
+			return batch, nil
+		}
+		return batch.NewSlice(int64(start), int64(end)), nil
+	}
+	columns := make([]arrow.Array, 0, schema.NumFields())
+	defer func() {
+		for _, column := range columns {
+			column.Release()
+		}
+	}()
+	for _, field := range schema.Fields() {
+		if indices := batch.Schema().FieldIndices(field.Name); len(indices) == 1 {
+			columns = append(columns, array.NewSlice(batch.Column(indices[0]), int64(start), int64(end)))
+			continue
+		}
+		column, err := buildNativeCOWRecoveryColumn(field, ids, start, end, latest)
+		if err != nil {
+			return nil, err
+		}
+		columns = append(columns, column)
+	}
+	return array.NewRecordBatch(schema, columns, int64(end-start)), nil
+}
+
+func buildNativeCOWRecoveryColumn(field arrow.Field, ids *array.String, start, end int, latest map[string]nativeCOWRow) (arrow.Array, error) {
+	builder := array.NewBuilder(memory.DefaultAllocator, field.Type)
+	defer builder.Release()
+	builder.Reserve(end - start)
+	for row := start; row < end; row++ {
+		recovered, needed := latest[ids.Value(row)].recovery[field.Name]
+		if !needed {
+			return nil, fmt.Errorf("COW replay input is missing column %q", field.Name)
+		}
+		if recovered.value == nil {
+			if !field.Nullable {
+				return nil, fmt.Errorf("required Iceberg column %q is null", field.Name)
+			}
+			builder.AppendNull()
+			continue
+		}
+		if err := appendNativeValue(builder, recovered.value); err != nil {
+			return nil, fmt.Errorf("encode Iceberg column %q: %w", field.Name, err)
+		}
+	}
+	return builder.NewArray(), nil
 }

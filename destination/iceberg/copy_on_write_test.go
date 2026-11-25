@@ -124,6 +124,70 @@ func TestNativeCopyOnWriteCanonicalIDsAcrossFlushes(t *testing.T) {
 	require.False(t, *metadata.DedupInserts, "same-LSN terminal close must retire the overlap flag")
 }
 
+func TestNativeCopyOnWriteOverlappingSegmentsPublishOneRewrite(t *testing.T) {
+	ctx := context.Background()
+	cfg, stream, cat := nativeCOWFixture(t, types.UpdateTypeEquality)
+	seed := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "seed", true)
+	require.NoError(t, seed.Write(ctx, []types.RawRecord{
+		nativeCOWRecord("updated", "r", 1, "a", 1),
+		nativeCOWRecord("deleted", "r", 2, "a", 2),
+		nativeCOWRecord("bystander", "r", 1, "b", 3),
+	}))
+	require.NoError(t, seed.Close(ctx, map[string]any{"state": "start"}))
+
+	writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "batch", false)
+	const segments = 24
+	for segment := int64(1); segment <= segments; segment++ {
+		updateOp, deleteOp := "u", "u"
+		if segment == segments-1 {
+			updateOp = "d"
+		}
+		if segment == segments {
+			deleteOp = "d"
+		}
+		require.NoError(t, writer.Write(ctx, []types.RawRecord{
+			nativeCOWRecord("updated", updateOp, 1, "a", 100+segment),
+			nativeCOWRecord("deleted", deleteOp, 2, "a", 200+segment),
+		}), "segment %d", segment)
+	}
+	require.Len(t, writer.cow.paths, segments, "each Write must stage a separate overlapping segment")
+	before, err := cat.LoadTable(ctx, seed.table.Identifier())
+	require.NoError(t, err)
+	require.Equal(t, nativeSnapshotID(seed.table), nativeSnapshotID(before), "staged segments must not publish snapshots")
+	require.Equal(t, map[string]int64{"updated": 1, "deleted": 2, "bystander": 3}, nativeVisibleValues(t, before))
+
+	require.NoError(t, writer.Close(ctx, map[string]any{"state": "end"}))
+	after, err := cat.LoadTable(ctx, seed.table.Identifier())
+	require.NoError(t, err)
+	require.Len(t, after.Metadata().Snapshots(), len(before.Metadata().Snapshots())+1)
+	snapshot := after.CurrentSnapshot()
+	require.NotNil(t, snapshot.ParentSnapshotID)
+	require.Equal(t, nativeSnapshotID(before), *snapshot.ParentSnapshotID)
+	require.Equal(t, table.OpOverwrite, snapshot.Summary.Operation)
+	require.Equal(t, map[string]int64{"updated": 124, "deleted": 224, "bystander": 3}, nativeVisibleValues(t, after))
+
+	// COW keeps the winning delete as a row tombstone, not an Iceberg delete file.
+	scan := after.Scan(table.WithSelectedFields(constants.OlakeID, constants.OpType))
+	defer scan.Close()
+	schema, batches, err := scan.ToArrowRecords(ctx)
+	require.NoError(t, err)
+	idColumn := schema.FieldIndices(constants.OlakeID)[0]
+	opColumn := schema.FieldIndices(constants.OpType)[0]
+	ops := make(map[string]string)
+	for batch, err := range batches {
+		require.NoError(t, err)
+		ids, operations := batch.Column(idColumn).(*array.String), batch.Column(opColumn).(*array.String)
+		for row := range int(batch.NumRows()) {
+			ops[ids.Value(row)] = operations.Value(row)
+		}
+		batch.Release()
+	}
+	require.Equal(t, map[string]string{"updated": "u", "deleted": "d", "bystander": "r"}, ops)
+	hasDeletes, err := nativeCOWHasDeletes(ctx, after)
+	require.NoError(t, err)
+	require.False(t, hasDeletes)
+}
+
 func TestNativeCopyOnWritePreservesNullBystanders(t *testing.T) {
 	ctx := context.Background()
 	cfg, stream, cat := nativeCOWFixture(t, types.UpdateTypeEquality)
