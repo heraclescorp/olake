@@ -334,10 +334,7 @@ func TestOrdinaryRecoveryAcknowledgementRejectsUnpreparedChangedAndIncompletePla
 	require.NotNil(t, p.replicator, "only explicit recovery cleanup owns the WAL sender")
 	require.NoError(t, p.CleanupOrdinaryRecovery(canceled))
 	require.Nil(t, p.replicator)
-	require.Equal(t, "validated", p.ordinary.identity)
-	require.Equal(t, pglogrepl.LSN(0x100), p.ordinary.lower)
-	require.Nil(t, p.ordinary.plan)
-	require.False(t, p.ordinary.complete)
+	require.Nil(t, p.ordinary)
 }
 
 func TestOrdinaryRecoveryPreservesConfiguredSourceToastSemantics(t *testing.T) {
@@ -368,103 +365,5 @@ func TestOrdinaryRecoveryPreservesConfiguredSourceToastSemantics(t *testing.T) {
 			}
 			require.NoError(t, mock.ExpectationsWereMet())
 		})
-	}
-}
-
-func TestOrdinaryRecoveryPlanRestoresLatestCheckpointAndFixedTarget(t *testing.T) {
-	streams := ordinaryTestStreams()
-	positions := map[string]string{streams[0].ID(): "0/300", streams[1].ID(): "0/500", streams[2].ID(): "0/400"}
-	for _, slot := range []pglogrepl.LSN{0x100, 0x200, 0x300} {
-		plan, err := ordinaryRecoveryPlanAtCheckpoint(streams, "0/100", positions, slot, 0x300, 0x500)
-		require.NoError(t, err)
-		require.Equal(t, "0/100", plan.LowerLSN)
-		require.Equal(t, "0/500", plan.TargetLSN)
-		require.Empty(t, plan.BatchTargetLSN)
-		require.Equal(t, positions, plan.ReplayAfter)
-	}
-	aheadPositions := maps.Clone(positions)
-	aheadPositions[streams[0].ID()] = "0/400"
-	aheadPlan, err := ordinaryRecoveryPlanAtCheckpoint(streams, "0/100", aheadPositions, 0x400, 0x300, 0x500)
-	require.NoError(t, err)
-	require.Equal(t, "0/500", aheadPlan.TargetLSN)
-	require.Equal(t, aheadPositions, aheadPlan.ReplayAfter)
-	for _, scenario := range []string{"lagging_table", "slot_ahead_of_table", "checkpoint_ahead", "metadata_after_target", "checkpoint_below_origin"} {
-		t.Run(scenario, func(t *testing.T) {
-			proofs := maps.Clone(positions)
-			slot, checkpoint, target := pglogrepl.LSN(0x300), pglogrepl.LSN(0x300), pglogrepl.LSN(0x500)
-			switch scenario {
-			case "lagging_table":
-				proofs[streams[0].ID()] = "0/200"
-				slot = 0x100
-			case "slot_ahead_of_table":
-				slot = 0x400
-			case "checkpoint_ahead":
-				checkpoint = 0x600
-			case "metadata_after_target":
-				proofs[streams[2].ID()] = "0/600"
-			case "checkpoint_below_origin":
-				checkpoint = 0x80
-			}
-			_, err := ordinaryRecoveryPlanAtCheckpoint(streams, "0/100", proofs, slot, checkpoint, target)
-			require.Error(t, err)
-		})
-	}
-	allAtCheckpoint := map[string]string{streams[0].ID(): "0/300", streams[1].ID(): "0/300", streams[2].ID(): "0/300"}
-	plan, err := ordinaryRecoveryPlanAtCheckpoint(streams, "0/100", allAtCheckpoint, 0x300, 0x300, 0x500)
-	require.NoError(t, err)
-	require.Equal(t, "0/500", plan.TargetLSN)
-}
-
-func TestOrdinaryRecoveryCatalogAllowsOnlyOriginOrVerifiedCheckpointState(t *testing.T) {
-	streams := ordinaryTestStreams()
-	p := &Postgres{config: &Config{}, CDCSupport: true, cdcConfig: CDC{ReplicationSlot: "saved"},
-		state: &types.State{RWMutex: &sync.RWMutex{}, Type: types.GlobalType, SuppressPersistence: true,
-			Global: &types.GlobalState{Streams: types.NewSet(streams[0].ID(), streams[1].ID(), streams[2].ID())}}}
-	for _, saved := range []string{"0/100", "0/300", "0/200", "0/400"} {
-		p.state.Global.State = waljs.WALState{LSN: saved}
-		err := p.validateRecoveryCatalogCheckpoint(streams, "0/100", "0/300", false)
-		if saved == "0/100" || saved == "0/300" {
-			require.NoError(t, err)
-		} else {
-			require.Error(t, err)
-		}
-	}
-}
-
-func TestOrdinaryRecoveryCleanupRetainsLatestVerifiedCheckpoint(t *testing.T) {
-	p := &Postgres{ordinary: &ordinaryRecovery{identity: "validated", lower: 0x100, checkpoint: 0x300, target: 0x500,
-		start: 0x200, complete: true, plan: &types.OrdinaryRecoveryPlan{LowerLSN: "0/100", TargetLSN: "0/500", BatchTargetLSN: "0/300"}}}
-	require.NoError(t, p.CleanupOrdinaryRecovery(context.Background()))
-	require.Equal(t, "validated", p.ordinary.identity)
-	require.Equal(t, pglogrepl.LSN(0x300), p.ordinary.checkpoint)
-	require.Equal(t, pglogrepl.LSN(0x500), p.ordinary.target)
-	require.Nil(t, p.ordinary.plan)
-	checkpoint, err := p.ordinaryRecoveryCheckpointLSN(&types.OrdinaryRecoveryOptions{}, "0/100")
-	require.NoError(t, err)
-	require.Equal(t, pglogrepl.LSN(0x300), checkpoint)
-	_, err = p.ordinaryRecoveryCheckpointLSN(&types.OrdinaryRecoveryOptions{CheckpointLSN: "0/200"}, "0/100")
-	require.Error(t, err)
-	_, err = p.ordinaryRecoveryCheckpointLSN(&types.OrdinaryRecoveryOptions{CheckpointLSN: "0/400", Plan: &types.OrdinaryRecoveryPlan{TargetLSN: "0/350"}}, "0/100")
-	require.Error(t, err)
-}
-
-func TestOrdinaryRecoveryAcknowledgementRejectsForgedAndUnfinishedBatchBoundaries(t *testing.T) {
-	plan := &types.OrdinaryRecoveryPlan{LowerLSN: "0/100", TargetLSN: "0/500", BatchTargetLSN: "0/300", ReplayAfter: map[string]string{"public.first": "0/100"}}
-	prepared := *plan
-	ctx := types.WithOrdinaryRecovery(context.Background(), &types.OrdinaryRecoveryOptions{SourceIdentity: "validated", Plan: plan})
-	p := &Postgres{ordinary: &ordinaryRecovery{identity: "validated", lower: 0x100, checkpoint: 0x100, target: 0x500, start: 0x100, complete: true, plan: &prepared}}
-	for _, boundary := range []string{"", "0/400", "0/600"} {
-		changed := *plan
-		changed.BatchTargetLSN = boundary
-		require.ErrorContains(t, p.AcknowledgeOrdinaryRecovery(ctx, &changed), "prepared plan")
-	}
-	for _, socket := range []*waljs.Socket{
-		{ClientXLogPos: 0x300, RecoveryBatchLSN: 0x300, CurrentWalPosition: 0x500, TransactionOpen: true},
-		{ClientXLogPos: 0x300, RecoveryBatchLSN: 0x300, CurrentWalPosition: 0x300},
-		{ClientXLogPos: 0x400, RecoveryBatchLSN: 0x300, CurrentWalPosition: 0x500},
-		{ClientXLogPos: 0x300, CurrentWalPosition: 0x500},
-	} {
-		p.replicator = resyncCheckpointReplicator{socket: socket}
-		require.ErrorContains(t, p.AcknowledgeOrdinaryRecovery(ctx, plan), "exact completed batch")
 	}
 }

@@ -27,10 +27,8 @@ type Config struct {
 	ReplayAfter map[string]pglogrepl.LSN
 	// StrictRecovery never emits a transaction past the explicit target and
 	// never treats the server's live WAL end as decoded recovery progress.
-	StrictRecovery             bool
-	ExpectedSourceIdentity     string
-	RecoveryCheckpointInterval time.Duration
-	RecoveryStartLSN           pglogrepl.LSN
+	StrictRecovery         bool
+	ExpectedSourceIdentity string
 }
 
 type WALState struct {

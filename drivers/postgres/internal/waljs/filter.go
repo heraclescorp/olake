@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/datazip-inc/olake/drivers/abstract"
 	"github.com/datazip-inc/olake/types"
@@ -21,11 +20,9 @@ type ChangeFilter struct {
 	tables    map[string]types.StreamInterface
 	converter func(value interface{}, columnType string) (interface{}, error)
 	// columnType maps a source type name to the type its converted values have
-	columnType      func(columnType string) types.DataType
-	replayAfter     map[string]pglogrepl.LSN
-	replayThrough   *pglogrepl.LSN
-	replayFrom      pglogrepl.LSN
-	transactionTime time.Time
+	columnType    func(columnType string) types.DataType
+	replayAfter   map[string]pglogrepl.LSN
+	replayThrough *pglogrepl.LSN
 }
 
 func NewChangeFilter(typeConverter func(value interface{}, columnType string) (interface{}, error), columnType func(columnType string) types.DataType, streams ...types.StreamInterface) ChangeFilter {
@@ -46,28 +43,19 @@ func (c ChangeFilter) skipTransaction(streamID string, commitLSN pglogrepl.LSN) 
 	return boundary != 0 && commitLSN <= boundary
 }
 
-func (c *ChangeFilter) FilterWalJsChange(ctx context.Context, change []byte, OnFiltered abstract.CDCMsgFn) (*pglogrepl.LSN, int, error) {
+func (c ChangeFilter) FilterWalJsChange(ctx context.Context, change []byte, OnFiltered abstract.CDCMsgFn) (*pglogrepl.LSN, int, error) {
 	var changes WALMessage
 	if err := json.NewDecoder(bytes.NewReader(change)).Decode(&changes); err != nil {
 		return nil, 0, fmt.Errorf("failed to parse change received from wal logs: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, 0, err
 	}
 	nextLSN, err := pglogrepl.ParseLSN(changes.NextLSN)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to parse received lsn: %w", err)
 	}
-	if c.replayThrough != nil {
-		if nextLSN == 0 || nextLSN <= c.replayFrom {
-			return nil, 0, fmt.Errorf("ordinary recovery transaction %s is not after checkpoint %s", nextLSN, c.replayFrom)
-		}
-		if nextLSN > *c.replayThrough {
-			return nil, 0, errOrdinaryRecoveryTargetReached
-		}
+	if c.replayThrough != nil && nextLSN > *c.replayThrough {
+		return nil, 0, errOrdinaryRecoveryTargetReached
 	}
 
-	c.transactionTime = changes.Timestamp.Time
 	if len(changes.Change) == 0 {
 		return &nextLSN, 0, nil
 	}
@@ -85,9 +73,6 @@ func (c *ChangeFilter) FilterWalJsChange(ctx context.Context, change []byte, OnF
 	}
 	rowsCount := 0
 	for _, ch := range changes.Change {
-		if err := ctx.Err(); err != nil {
-			return nil, rowsCount, err
-		}
 		stream, exists := c.tables[utils.StreamIdentifier(ch.Table, ch.Schema)]
 		if !exists {
 			continue

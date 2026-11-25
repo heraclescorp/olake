@@ -195,11 +195,6 @@ func (c *ordinaryBarrierCatalog) CommitTable(ctx context.Context, ident table.Id
 }
 
 func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.StreamInterface, lower string) ([]types.OrdinaryRecoveryTableProof, error) {
-	if options, ok := types.OrdinaryRecoveryFromContext(ctx); ok && options.Origin.Backfill && options.BackfillComplete && options.CheckpointLSN != "" && i.backfillRecovery == nil {
-		if err := i.PrepareBackfillRecovery(ctx, streams, lower); err != nil {
-			return nil, err
-		}
-	}
 	i.resyncMu.Lock()
 	defer i.resyncMu.Unlock()
 	options, execution, err := ordinaryRecoveryContext(ctx)
@@ -229,24 +224,6 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 		if stored != "" && !ordinaryRecoverySameLSN(stored, options.BackfillTargetLSN) {
 			return nil, errors.New("backfill recovery replay target differs from the persisted target")
 		}
-	}
-	if options.Plan != nil {
-		plannedTarget, targetErr := ordinaryRecoveryLSN(options.Plan.TargetLSN)
-		if targetErr != nil || plannedTarget < lowerValue || !ordinaryRecoverySameLSN(options.Plan.LowerLSN, lower) || (options.Origin.Backfill && plannedTarget != fixedTarget) {
-			return nil, errors.New("ordinary recovery replay plan differs from the immutable range")
-		}
-		fixedTarget = plannedTarget
-	}
-	checkpointValue := lowerValue
-	if options.CheckpointLSN != "" {
-		checkpointValue, err = ordinaryRecoveryLSN(options.CheckpointLSN)
-		if err != nil || checkpointValue < lowerValue || ((options.Origin.Backfill || options.Plan != nil) && checkpointValue > fixedTarget) {
-			return nil, errors.New("ordinary recovery checkpoint is outside the immutable replay range")
-		}
-	}
-	target := lowerValue
-	if options.Origin.Backfill || options.Plan != nil {
-		target = fixedTarget
 	}
 	controls := make(map[string]*ordinaryRecoveryTable, len(streams))
 	identifiers := make(map[string]struct{}, len(streams))
@@ -294,17 +271,6 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 		if err != nil {
 			return nil, fmt.Errorf("stream %q: %w", stream.ID(), err)
 		}
-		positionValue, _ := ordinaryRecoveryLSN(position)
-		if positionValue < checkpointValue {
-			return nil, fmt.Errorf("ordinary recovery table %q is behind the durable checkpoint", stream.ID())
-		}
-		if options.Origin.Backfill || options.Plan != nil {
-			if positionValue > target {
-				return nil, errors.New("ordinary recovery table is beyond the fixed replay target")
-			}
-		} else if positionValue > target {
-			target = positionValue
-		}
 		shape, err := ordinaryRecoveryShape(tbl.Metadata())
 		if err != nil {
 			return nil, err
@@ -313,6 +279,10 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 		if backfill != nil {
 			marker.BackfillPlan = backfill.marker.BackfillPlan
 			marker.BackfillTargetLSN = options.BackfillTargetLSN
+			positionValue, _ := ordinaryRecoveryLSN(position)
+			if positionValue > fixedTarget {
+				return nil, errors.New("backfill recovery table is beyond the fixed replay target")
+			}
 		}
 		encoded, err := json.Marshal(marker)
 		if err != nil {
@@ -323,6 +293,7 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 			r.chunkIDs = backfill.chunkIDs
 			r.bindingEncoded = backfill.bindingEncoded
 			r.externalBound = backfill.externalBound
+			r.target = fixedTarget
 		}
 		if err := r.previousMarker(tbl); err != nil {
 			return nil, err
@@ -330,9 +301,6 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 		controls[stream.ID()] = r
 	}
 	i.ordinaryRecovery = controls
-	for _, control := range controls {
-		control.target = target
-	}
 	proofs := make([]types.OrdinaryRecoveryTableProof, 0, len(streams))
 	for _, stream := range streams {
 		r := controls[stream.ID()]
@@ -341,8 +309,21 @@ func (i *Iceberg) PrepareOrdinaryRecovery(ctx context.Context, streams []types.S
 		}
 		proofs = append(proofs, r.proof)
 	}
+	target := lowerValue
+	if options.Origin.Backfill {
+		target = fixedTarget
+	}
+	for _, proof := range proofs {
+		position, _ := ordinaryRecoveryLSN(proof.CommittedLSN)
+		if options.Origin.Backfill && position > target {
+			return nil, errors.New("backfill recovery table advanced beyond its fixed replay target")
+		}
+		if position > target {
+			target = position
+		}
+	}
 	for _, control := range controls {
-		control.prepared = true
+		control.target, control.prepared = target, true
 	}
 	return proofs, nil
 }
@@ -422,8 +403,8 @@ func (i *Iceberg) ordinaryBarrier(ctx context.Context, stream types.StreamInterf
 		}
 		previousPosition, _ := ordinaryRecoveryLSN(r.proof.CommittedLSN)
 		currentPosition, _ := ordinaryRecoveryLSN(position)
-		if currentPosition > r.target {
-			return errors.New("ordinary recovery table advanced beyond its fixed replay target")
+		if r.marker.Origin.Backfill && currentPosition > r.target {
+			return errors.New("backfill recovery table advanced beyond its fixed replay target")
 		}
 		if currentPosition < previousPosition {
 			return errors.New("ordinary recovery table position regressed during barrier preparation")
@@ -503,48 +484,6 @@ func (i *Iceberg) ordinaryBarrier(ctx context.Context, stream types.StreamInterf
 	return fmt.Errorf("ordinary recovery barrier conflicts exhausted: %w", conflict)
 }
 
-func ordinaryRecoveryBatchBounds(plan *types.OrdinaryRecoveryPlan) (uint64, uint64, error) {
-	if plan == nil {
-		return 0, 0, errors.New("ordinary recovery requires a replay plan")
-	}
-	lower, lowerErr := ordinaryRecoveryLSN(plan.LowerLSN)
-	final, finalErr := ordinaryRecoveryLSN(plan.TargetLSN)
-	batch := final
-	var batchErr error
-	if plan.BatchTargetLSN != "" {
-		batch, batchErr = ordinaryRecoveryLSN(plan.BatchTargetLSN)
-	}
-	if lowerErr != nil || finalErr != nil || batchErr != nil || lower > batch || batch > final {
-		return 0, 0, errors.New("ordinary recovery batch is outside the immutable replay range")
-	}
-	return final, batch, nil
-}
-
-func mergeOrdinaryRecovery(current, threadID string, payload any, hasFiles bool, plan *types.OrdinaryRecoveryPlan) (string, bool, error) {
-	final, batch, err := ordinaryRecoveryBatchBounds(plan)
-	if err != nil {
-		return "", false, err
-	}
-	status, position := nativeMetadataLSNPosition(current)
-	value, positionErr := ordinaryRecoveryLSN(position)
-	if status != "present" || positionErr != nil || value > final {
-		return "", false, errors.New("ordinary recovery table has no valid position within the fixed target")
-	}
-	merged, changed, err := mergeNativeRecovery(current, threadID, payload, hasFiles)
-	if err != nil {
-		return "", false, err
-	}
-	mergedStatus, mergedPosition := nativeMetadataLSNPosition(merged)
-	mergedValue, mergedErr := ordinaryRecoveryLSN(mergedPosition)
-	if payload == nil || mergedStatus != "present" || mergedErr != nil || mergedValue != batch {
-		return "", false, errors.New("ordinary recovery writer metadata does not match the completed batch target")
-	}
-	if value > batch {
-		return current, false, nil
-	}
-	return merged, changed, nil
-}
-
 func (i *Iceberg) ConfirmOrdinaryRecovery(ctx context.Context, streams []types.StreamInterface, proofs []types.OrdinaryRecoveryTableProof, target string) ([]types.OrdinaryRecoveryTableProof, error) {
 	i.resyncMu.Lock()
 	defer i.resyncMu.Unlock()
@@ -556,9 +495,8 @@ func (i *Iceberg) ConfirmOrdinaryRecovery(ctx context.Context, streams []types.S
 	if err != nil {
 		return nil, err
 	}
-	finalTarget, batchTarget, err := ordinaryRecoveryBatchBounds(options.Plan)
-	if err != nil || targetValue != batchTarget || len(streams) == 0 || len(streams) != len(i.ordinaryRecovery) || len(proofs) != len(streams) {
-		return nil, errors.New("ordinary recovery confirmation requires every selected table and the exact completed batch replay target")
+	if len(streams) == 0 || len(streams) != len(i.ordinaryRecovery) || len(proofs) != len(streams) || options.Plan == nil || !ordinaryRecoverySameLSN(options.Plan.TargetLSN, target) {
+		return nil, errors.New("ordinary recovery confirmation requires every selected table and the exact replay target")
 	}
 	provided := make(map[string]types.OrdinaryRecoveryTableProof, len(proofs))
 	for _, proof := range proofs {
@@ -578,7 +516,7 @@ func (i *Iceberg) ConfirmOrdinaryRecovery(ctx context.Context, streams []types.S
 		}
 		seen[stream.ID()] = struct{}{}
 		r := i.ordinaryRecovery[stream.ID()]
-		if r == nil || !r.prepared || r.proof.FenceSnapshotID == 0 || provided[stream.ID()] != r.proof || r.marker.Origin != options.Origin || r.marker.SourceIdentity != options.SourceIdentity || r.marker.ExecutionID != execution.ID || !ordinaryRecoverySameLSN(r.marker.LowerLSN, options.Plan.LowerLSN) || !ordinaryRecoverySameLSN(options.Plan.ReplayAfter[stream.ID()], r.proof.CommittedLSN) || finalTarget != r.target {
+		if r == nil || !r.prepared || r.proof.FenceSnapshotID == 0 || provided[stream.ID()] != r.proof || r.marker.Origin != options.Origin || r.marker.SourceIdentity != options.SourceIdentity || r.marker.ExecutionID != execution.ID || !ordinaryRecoverySameLSN(r.marker.LowerLSN, options.Plan.LowerLSN) || targetValue != r.target {
 			return nil, errors.New("ordinary recovery proof or execution binding changed")
 		}
 		ident := catalog.ToIdentifier(stream.GetDestinationDatabase(&i.config.IcebergDatabase), stream.GetDestinationTable())
@@ -589,26 +527,22 @@ func (i *Iceberg) ConfirmOrdinaryRecovery(ctx context.Context, streams []types.S
 			loadErr = state.usable()
 		}
 		if loadErr == nil && state.sessions != 0 {
-			loadErr = errors.New("ordinary recovery must close every writer before batch confirmation")
+			loadErr = errors.New("ordinary recovery must close every writer before final confirmation")
 		}
 		if loadErr == nil {
 			loadErr = r.validate(tbl)
 		}
 		position := ""
 		if loadErr == nil {
-			minimum, _ := ordinaryRecoveryLSN(r.proof.CommittedLSN)
-			if minimum < targetValue {
-				minimum = targetValue
-			}
-			position, loadErr = ordinaryRecoveryPosition(tbl, minimum)
+			position, loadErr = ordinaryRecoveryPosition(tbl, targetValue)
 		}
 		state.mu.Unlock()
 		if loadErr != nil {
-			return nil, fmt.Errorf("ordinary recovery batch table %q: %w", stream.ID(), loadErr)
+			return nil, fmt.Errorf("ordinary recovery final table %q: %w", stream.ID(), loadErr)
 		}
 		value, err := ordinaryRecoveryLSN(position)
-		if err != nil || value < targetValue || value > finalTarget {
-			return nil, errors.New("ordinary recovery tables do not prove the common batch within the fixed target")
+		if err != nil || value != targetValue {
+			return nil, errors.New("ordinary recovery tables do not prove the exact common target")
 		}
 		proof := r.proof
 		proof.CommittedLSN = position
@@ -635,21 +569,13 @@ func validateOrdinaryRecoveryWriter(ctx context.Context, state *nativeTableState
 	}
 	r := state.ordinaryRecovery
 	execution, controlled := utils.ExecutionFromContext(ctx)
-	target, _, targetErr := ordinaryRecoveryBatchBounds(options.Plan)
+	target := uint64(0)
+	var targetErr error
+	if options.Plan != nil {
+		target, targetErr = ordinaryRecoveryLSN(options.Plan.TargetLSN)
+	}
 	if r == nil || !r.prepared || (options.Origin.Backfill && !r.externalBound) || !controlled || execution.ID != r.marker.ExecutionID || options.Plan == nil || targetErr != nil || target != r.target || r.proof.FenceSnapshotID == 0 || r.marker.Origin != options.Origin || r.marker.SourceIdentity != options.SourceIdentity || !ordinaryRecoverySameLSN(options.Plan.ReplayAfter[stream.ID()], r.proof.CommittedLSN) || !ordinaryRecoverySameLSN(options.Plan.LowerLSN, r.marker.LowerLSN) {
 		return errors.New("ordinary recovery writer does not match its prepared barrier and replay plan")
 	}
-	if err := r.validate(tbl); err != nil {
-		return err
-	}
-	minimum, _ := ordinaryRecoveryLSN(r.proof.CommittedLSN)
-	position, err := ordinaryRecoveryPosition(tbl, minimum)
-	if err != nil {
-		return err
-	}
-	value, _ := ordinaryRecoveryLSN(position)
-	if value > target {
-		return errors.New("ordinary recovery writer table is beyond the fixed replay target")
-	}
-	return nil
+	return r.validate(tbl)
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/datazip-inc/olake/drivers/abstract"
 	"github.com/jackc/pglogrepl"
@@ -84,7 +83,6 @@ func (p *pgoutputReplicator) processRecoveryBoundary(ctx context.Context, logica
 		clear(p.recoveryPending)
 		p.recoveryPending = p.recoveryPending[:0]
 		p.socket.TransactionOpen = false
-		p.socket.RecoverySourceTime = msg.CommitTime
 		p.socket.ClientXLogPos = msg.TransactionEndLSN
 		if p.progress != nil {
 			p.progress.committed(msg.TransactionEndLSN)
@@ -107,15 +105,4 @@ func (s *Socket) observeKeepalive(sent pglogrepl.LSN) {
 	if !s.TransactionOpen {
 		s.ClientXLogPos = max(s.ClientXLogPos, min(sent, s.CurrentWalPosition))
 	}
-}
-
-func (s *Socket) recoveryBatchComplete(now time.Time) bool {
-	if !s.StrictRecovery || s.TransactionOpen {
-		return false
-	}
-	if s.ClientXLogPos == s.CurrentWalPosition || (!s.RecoveryBatchDeadline.IsZero() && !now.Before(s.RecoveryBatchDeadline) && s.ClientXLogPos > s.RecoveryStartLSN && s.ClientXLogPos < s.CurrentWalPosition) {
-		s.RecoveryBatchLSN = s.ClientXLogPos
-		return true
-	}
-	return false
 }
