@@ -145,8 +145,10 @@ func nativeCOWFilter(batch arrow.RecordBatch) (apacheiceberg.BooleanExpression, 
 		return nil, errors.New("copy-on-write requires nonnull string _olake_id values")
 	}
 	values := make([]apacheiceberg.Literal, ids.Len())
+	idData := string(ids.ValueBytes())
+	offsets := ids.ValueOffsets()
 	for row := range values {
-		values[row] = apacheiceberg.NewLiteral(ids.Value(row))
+		values[row] = apacheiceberg.NewLiteral(idData[offsets[row]-offsets[0] : offsets[row+1]-offsets[0]])
 	}
 	term := apacheiceberg.Reference(constants.OlakeID)
 	return apacheiceberg.NewAnd(apacheiceberg.NotNull(term), apacheiceberg.SetPredicate(apacheiceberg.OpIn, term, values)), nil

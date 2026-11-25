@@ -6,16 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	apacheiceberg "github.com/apache/iceberg-go"
 
 	"github.com/apache/iceberg-go/catalog"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
+	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/destination"
 	"github.com/datazip-inc/olake/types"
 	"github.com/stretchr/testify/require"
@@ -302,6 +305,63 @@ func TestNativeCopyOnWriteTypedSpillFidelity(t *testing.T) {
 	require.Equal(t, "123456789012345678901234.5678", replayed.Column(1).(*array.Decimal128).Value(0).ToString(4))
 	require.Equal(t, payload, replayed.Column(2).(*array.Binary).Value(0))
 	require.Equal(t, at.UnixMicro(), int64(replayed.Column(3).(*array.Timestamp).Value(0)))
+}
+
+type nativeCOWClearingAllocator struct {
+	memory.Allocator
+}
+
+func (a nativeCOWClearingAllocator) Free(data []byte) {
+	clear(data)
+	a.Allocator.Free(data)
+}
+
+func TestNativeCopyOnWriteFilterOwnsIPCIdentities(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		ids   []string
+		start int64
+		end   int64
+	}{
+		{name: "empty"},
+		{name: "single", ids: []string{"identity-to-retain"}, end: 1},
+		{name: "multiple", ids: []string{"first", "second", "third"}, end: 3},
+		{name: "sliced", ids: []string{"exclude-before", "", "identity-to-retain", "other-你好", "exclude-after"}, start: 1, end: 4},
+		{name: "duplicates", ids: []string{"same", "same", "other"}, end: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			schema := apacheiceberg.NewSchema(0,
+				apacheiceberg.NestedField{ID: 1, Name: constants.OlakeID, Type: apacheiceberg.StringType{}, Required: true},
+				apacheiceberg.NestedField{ID: 2, Name: "wide", Type: apacheiceberg.StringType{}},
+			)
+			rows := make([]map[string]any, len(test.ids))
+			for row, id := range test.ids {
+				rows[row] = map[string]any{constants.OlakeID: id, "wide": strings.Repeat("wide", 1024)}
+			}
+			batch, err := nativeArrowRecord(schema, rows)
+			require.NoError(t, err)
+			var serialized bytes.Buffer
+			writer := ipc.NewWriter(&serialized, ipc.WithSchema(batch.Schema()))
+			require.NoError(t, writer.Write(batch))
+			require.NoError(t, writer.Close())
+			batch.Release()
+			reader, err := ipc.NewReader(bytes.NewReader(serialized.Bytes()), ipc.WithAllocator(nativeCOWClearingAllocator{Allocator: memory.DefaultAllocator}))
+			require.NoError(t, err)
+			require.True(t, reader.Next())
+			sliced := reader.RecordBatch().NewSlice(test.start, test.end)
+			filter, err := nativeCOWFilter(sliced)
+			require.NoError(t, err)
+			sliced.Release()
+			reader.Release()
+			values := make([]apacheiceberg.Literal, 0, test.end-test.start)
+			for _, id := range test.ids[test.start:test.end] {
+				values = append(values, apacheiceberg.NewLiteral(id))
+			}
+			term := apacheiceberg.Reference(constants.OlakeID)
+			expected := apacheiceberg.NewAnd(apacheiceberg.NotNull(term), apacheiceberg.SetPredicate(apacheiceberg.OpIn, term, values))
+			require.True(t, expected.Equals(filter), "the transaction retains the filter after the IPC reader releases its body")
+		})
+	}
 }
 
 func TestNativeCopyOnWritePreservesRowsAcrossPartitionEvolution(t *testing.T) {

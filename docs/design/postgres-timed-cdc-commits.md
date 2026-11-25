@@ -82,6 +82,14 @@ they bound incoming memory and permit recreating consumed readers on commit retr
 Unknown publication retains replay input. COW never opens a persistent row index;
 destination TOAST/index recovery is unsupported, so use source TOAST hydration.
 
+Overwrite predicates retain an owned, compact copy of each segment's canonical ID
+bytes. The vendored SDK also owns string partition values retained in file
+metadata, including identity and truncate transforms. The SDK keeps predicates
+and file metadata until the table transaction ends; borrowing strings from
+released IPC buffers would retain entire message payloads (or read invalid values
+with an allocator that reuses released storage). Payload readers are still
+released after each segment; this is not a total-memory cap.
+
 Existing live equality/position/Puffin deletes fail before mutation: clean them
 through a separate explicit maintenance rewrite before switching. This writer
 does not migrate existing tables, reset checkpoints/slots or reread the source.
