@@ -2645,6 +2645,7 @@ func (pfs *ParquetFileSource) GetReader(ctx context.Context) (result FileReader,
 	if err != nil {
 		return nil, err
 	}
+	pf = parquetRewriteReadAhead(ctx, pf)
 
 	defer func() {
 		if err != nil {

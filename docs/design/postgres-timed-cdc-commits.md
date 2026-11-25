@@ -92,6 +92,12 @@ released IPC buffers would retain entire message payloads (or read invalid value
 with an allocator that reuses released storage). Payload readers are still
 released after each segment; this is not a total-memory cap.
 
+COW survivor scans on object storage coalesce nearby Parquet reads into
+1 MiB windows (up to four cached per open file, 128 MiB across the process).
+Reads spanning a window or exceeding the cache budget use the direct reader.
+The cache trades some extra bytes for fewer requests on dense rewrites; it does
+not change rewrite selection, normal scans, or checkpoint ordering.
+
 Parquet scan batches are also bounded by decoded binary payload, not only row
 count. Dictionary expansion can exceed 2 GiB even for a small Parquet file;
 putting that payload in one Arrow string/binary array wraps its 32-bit offsets
