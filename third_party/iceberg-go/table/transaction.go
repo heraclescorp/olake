@@ -2966,7 +2966,7 @@ func (t *Transaction) rewriteSingleFile(ctx context.Context, args rewriteSingleF
 		concurrency:     args.concurrency,
 	}
 
-	arrowSchema, recordIter, err := scanner.GetRecords(ctx, []FileScanTask{*scanTask})
+	arrowSchema, recordIter, err := scanner.GetRecords(tblutils.WithParquetRewriteReadAhead(ctx), []FileScanTask{*scanTask})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get records from original file: %w", err)
 	}

@@ -68,7 +68,7 @@ var RootCmd = &cobra.Command{
 		s3Err := utils.ResolveS3Paths(cmd.Context(), []*string{
 			&configPath, &destinationConfigPath, &streamsPath, &statePath, &differencePath,
 			&availableStreamsPath, &selectedStreamsPath, &differenceAvailableStreamsPath, &differenceSelectedStreamsPath,
-			&enrollmentPolicyPath, &ordinaryRecoveryOriginPath,
+			&enrollmentPolicyPath, &ordinaryRecoveryOriginPath, &backfillRecoveryCheckpointPath,
 		}, telemetry.PropsFiles())
 		if s3Err == nil && cmd.Name() == "discover-new-tables" {
 			enrollmentResultPath, enrollmentResultURI, s3Err = utils.ResolveArtifactOutput(enrollmentResultPath, "enrollment-result.json", configPath)

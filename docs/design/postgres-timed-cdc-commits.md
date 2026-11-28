@@ -1,13 +1,13 @@
 # PostgreSQL time-based CDC commit triage
 
-Scope: source-based TOAST/equality branch. This is a design assessment, not implemented periodic checkpointing.
+Scope: PostgreSQL source-TOAST/native Iceberg. COW and retained recovery use an end-of-run commit boundary. Retained recovery reads to its original fixed WAL target without periodic CDC checkpoints; the time-based checkpoint sections below are design assessment only.
 
 ## Current behavior
 
 - `waljs.NewReplicator` captures `IDENTIFY_SYSTEM.XLogPos` once as the run target. `pgoutput.StreamChanges` returns after reaching it outside an open transaction.
 - Rows flow through source TOAST buffering and asynchronous `WriterThread.Push`/flush. A "successfully wrote" batch log is not proof of Iceberg snapshot publication.
 - `AbstractDriver.streamChanges` returns a single final WAL state. Its deferred `handleWriterCleanup` joins all writers, closing them with that state. Only afterwards does `PostCDC` acknowledge the slot and update in-memory global state. Protocol/worker then persist the run state.
-- `nativeWriter.Close` is terminal: completes files, writes same-write superseded-row position deletes (v2) or deletion vectors (v3), and publishes them with the original immutable data files and `olake_2pc` in one table transaction. It does not reread/rewrite staged Parquet data or remap its ordinals. It cannot just be called every minute while Push continues.
+- MOR `nativeWriter.Close` is terminal: completes files, writes same-write superseded-row position deletes (v2) or deletion vectors (v3), and publishes them with the original immutable data files and `olake_2pc` in one table transaction. It does not reread/rewrite staged Parquet data or remap its ordinals. It cannot just be called every minute while Push continues.
 - Keepalive replies send the original confirmed position. The new 30-second progress logs observe decoder positions only; they do not introduce durable checkpointing.
 - Destination buffers independently track original source bytes and approximate decoded payload bytes. Hydrated values count toward the payload budget without inflating WAL-byte statistics; indivisible oversized rows flush alone. The source hydrator still materializes up to 128 fetched rows before emission, so this is not a strict process-memory cap.
 - Native Parquet writes check page/dictionary targets after each value, including backfill and delete-file writes. The 1 MiB targets remain soft: a single large value can exceed the unchanged reader limits. Per-value checks trade throughput for bounded multi-value page overshoot.
@@ -19,21 +19,147 @@ Scope: source-based TOAST/equality branch. This is a design assessment, not impl
 
 ## Retained ordinary-sync reconciliation
 
-The worker/UI Reconcile action resets the same retained operation, not a new data sync. A recovery epoch first proves the old Temporal run terminal, seals admission, closes its positive fence, and retires the exact provider resource. Original `execution-result.json` evidence is never rewritten. Only controlled PostgreSQL-to-native-REST ordinary syncs with a frozen all-CDC/strict-CDC catalog, primary keys, complete GLOBAL backfill membership, and existing table checkpoints are supported; unsupported or inconsistent evidence stays locked.
+The worker/UI Reconcile action resets the same retained operation, not a new data sync. A recovery epoch first proves the old Temporal run terminal, seals admission, closes its positive fence, and retires the exact provider resource. Original `execution-result.json` evidence is never rewritten. Controlled PostgreSQL-to-native-REST ordinary CDC recovery requires a frozen CDC/strict-CDC catalog, primary keys, complete GLOBAL membership, and existing table checkpoints. Interrupted initial backfill has the additional durable-evidence requirements below; unsupported or inconsistent evidence stays locked.
 
-The connector requires paired `--ordinary-recovery-origin` and `--ordinary-recovery-result` flags plus a fresh controlled execution identity/fence and the retained launch identity. Origin hashes bind the source/destination files, legacy-or-split catalog, and an immutable complete baseline checkpoint. If an original execution receipt was observed when the origin was frozen, its exact bytes remain hash-bound; otherwise its digest is empty and later receipt publication does not change that origin. Source/destination files use raw SHA256. Catalog hashing frames each present file in fixed `streams.json`, `available_streams.json`, `selected_streams.json` order as filename, NUL, decimal byte length, NUL, raw bytes; mixed/partial catalog forms are rejected. Checkpoint canonicalization preserves large JSON numbers.
+The connector requires paired `--ordinary-recovery-origin` and `--ordinary-recovery-result` flags plus a fresh controlled execution identity/fence and the retained launch identity. Origin hashes bind the source/destination files, legacy-or-split catalog, and an immutable baseline checkpoint. Backfill origins additionally bind the frozen provisional candidate and the authoritative saved job-state digest separately. If an original execution receipt was observed when the origin was frozen, its exact bytes remain hash-bound; otherwise its digest is empty and later receipt publication does not change that origin. Source/destination files use raw SHA256. Catalog hashing frames each present file in fixed `streams.json`, `available_streams.json`, `selected_streams.json` order as filename, NUL, decimal byte length, NUL, raw bytes; mixed/partial catalog forms are rejected. Checkpoint canonicalization preserves large JSON numbers.
 
 S3 recovery initializes storage before reading its positive execution fence. The normal storage resolver validates that fence before downloading inputs or starting source/destination work. After exact old-runtime retirement, missing helper receipts or server-pin files do not prevent a fresh catalog-based recovery epoch. They do not prove settlement either: ownership remains retained until the new runtime confirms the common committed checkpoint and publishes complete settlement evidence.
 
 Live PostgreSQL server/slot identity is validated before destination mutations. Any existing standalone server pin remains binding. The connector preflights every selected table's committed checkpoint and recovery marker before writing any new barrier; prior markers must bind the same origin, original launch, source identity, stream, table UUID and frozen shape. Each fresh empty-append barrier commits that source identity in table metadata, guarded by UUID, current snapshot and default shape. The companion server-pin file is published after all barriers succeed and before CDC replay. Interrupted barrier preparation therefore recovers identity from committed catalog markers without relying on a helper receipt. Old ordinary artifacts do not prove historical server identity; the first recovery binding is to the validated live source. Barriers preserve data/deletes/history while making late old snapshot-fenced mutations conflict; a property-only marker is not a barrier.
 
-The recovery target is the deterministic maximum authoritative selected-table checkpoint, never a log-derived LSN. Missing or below-baseline table metadata fails closed. Tables behind that boundary replay only their own missing transaction prefix; completed writers publish a common checkpoint. Logical keepalives are not decoded transactions, crossing/future transactions are withheld, and slot/server/WAL-floor validation precedes replay. Existing source TOAST hydration retains latest-state semantics: values fetched from the current source can be newer than the bounded WAL target; missing/deleted/rekeyed rows still fail closed.
+The CDC-only recovery target is the deterministic maximum authoritative selected-table checkpoint, never a log-derived LSN. Missing or below-baseline table metadata fails closed. Tables behind that boundary replay only their own missing transaction prefix; completed writers publish a common checkpoint. Logical keepalives are not decoded transactions, crossing/future transactions are withheld, and slot/server/WAL-floor validation precedes replay. Existing source TOAST hydration retains latest-state semantics: values fetched from the current source can be newer than the bounded WAL target; missing/deleted/rekeyed rows still fail closed.
 
 Recovery is not unconditional replay of the last batch. Iceberg does not enforce primary-key uniqueness, and replaying older changes over a table already ahead can duplicate or regress rows unless the full upsert/delete sequence completes. Per-table committed CDC positions determine which transaction prefixes are skipped. Source WAL must cover every missing range, and the final boundary must be common to every selected table before acknowledgement. No table or checkpoint is reset merely because a prior client lost its commit response.
 
 Published common-checkpoint bytes bind both recovery proof and final runtime receipt; finalization hashes those persisted bytes instead of reserializing an unordered in-memory stream set. Recovery preserves OLake's existing soft-delete representation: deleted keys retain `_op_type = 'd'` tombstones, rather than being resurrected by older replayed changes.
 
 Acknowledgement follows writer drain and authoritative common-boundary confirmation. A separate identity/hash-bound recovery result and a new settled runtime receipt authorize the worker's atomic checkpoint-plus-settlement transaction. The schedule remains paused until explicit resume. If acknowledgement or artifact publication is interrupted, ownership remains retained; a fresh recovery epoch restores the immutable baseline, rechecks table/slot coverage, and rebarriers before recovery. Relaunching the failed runtime directly is unsupported. Never force an unknown receipt to settled, clear owner fields, or advance a slot based only on process exit or logs.
+
+### Interrupted initial backfill
+
+Eligible controlled PostgreSQL CDC runs write `backfill-recovery-checkpoint.json` separately from authoritative `state.json`. The candidate binds the original runtime/launch, frozen configuration hashes, live PostgreSQL system identity and replication slot, original GLOBAL LSN, completed membership, table UUID/shape bindings, and exact immutable chunk plans. Fresh empty PostgreSQL state is initialized as GLOBAL; meaningful legacy state is not reinterpreted. A plan must be durable before its data writers start. Only pending chunks shrink; `backfill_plan` retains the full original ranges after completion. Transient unbound preparation state cannot replace valid durable evidence.
+
+Table creation uses the ordinary REST operation with an origin-bound intent. Before data work, a create-only `backfill-recovery-binding-<sha256(stream-id)>.json` journal records the actual UUID, shape and full plan. Journals survive table deletion, bind to the original operation rather than an individual recovery epoch, and detect dropped/replaced tables. An interrupted create without a journal can adopt only its matching, pristine, expected-shape table. Native S3 Tables does not support `stage-create`; recovery does not require it. See the [AWS REST limitations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-open-source.html).
+
+After exact runtime retirement, the worker freezes validated candidate bytes create-only in the stable operation directory before publishing baseline/origin. Later uploads to the original runtime candidate cannot change that frozen evidence. The worker promotes immutable binding journals from each retired epoch and copies them byte-identically into its successor. Missing, foreign, changed or inconsistent evidence never clears ownership.
+
+Recovery validates source/slot/WAL coverage, resumes exact plans, and consults authoritative committed chunk IDs rather than trusting pending flags. Committed tails are skipped: CDC from the preserved lower LSN covers growth. Successful empty chunks retain commit IDs without inventing data rows. After backfill, a temporary logical replication slot captures a transaction-consistent replay boundary; this requires one spare logical slot/WAL sender and existing replication privileges. Destination barriers persist that boundary before replay, and successors reuse it instead of widening to later source changes. All selected tables must reach the common target before source acknowledgement and atomic checkpoint/ownership settlement.
+
+Local checkpoint updates are provisional. Authoritative S3 state and the worker DB checkpoint remain settlement-gated. Healthy completed legacy CDC/enrollment runs do not acquire unsupported backfill evidence requirements. Historical `{}` state with no original candidate cannot be fabricated into a resumable backfill: retain the operation and partial destination, restore valid evidence from backup if available, or explicitly plan an isolated fresh backfill.
+
+S3 object uploads remain positively fenced and drain-tracked, but their transport failures do not by themselves imply catalog publication. Existing bounded SDK retries can recover a transient upload failure. REST/Glue catalog mutations and catalog-level ambiguous failures retain the execution-wide unknown-outcome guard; this is not permission to retry ambiguous table commits.
+
+
+## Index-free copy-on-write writer
+
+Selected-stream `merge_strategy: "copy-on-write"` uses the SDK's stock filtered
+`Transaction.Overwrite`, matching OLake's existing canonical string `_olake_id`.
+MOR remains explicit; omitted strategy preserves saved/CLI behavior. New eligible
+PostgreSQL/native normalized upsert selections in the UI explicitly default to COW.
+Append ignores the saved policy. Matching connector/UI builds are required.
+
+For composite keys, the existing `_olake_id` hashes source values joined by `|`.
+This encoding is not collision-proof: values containing that delimiter can form
+the same encoded input. COW inherits this MOR identity limitation; validate the
+source keys before rollout. Iceberg does not enforce primary-key uniqueness.
+
+Automatic enrollment has its own optional `defaults.merge_strategy`. When set
+to COW, only newly discovered eligible tables are enrolled in COW; tables without
+a source primary key are skipped with a reason. Saved tables and exclusions are
+unchanged. Omitted strategy retains MOR. This setting requires the matching
+connector, worker and UI; it does not migrate existing tables or delete files.
+
+The existing terminal `nativeWriter.Close` transaction publishes data and
+`olake_2pc` together, using its existing snapshot/shape fences, conflict refresh
+and unknown-outcome protocol. Initial snapshots keep the existing append/chunk
+path. COW adds no source transaction controls, periodic checkpoints, mid-run state
+publication or recovery lifecycle. Quiet tables use existing metadata-only commits.
+
+Each WriterThread buffer is staged as typed Arrow IPC. At commit, COW indexes
+the latest row per canonical ID across all segments and streams the winners
+through one filtered Iceberg overwrite instead of rewriting files per segment.
+Recovery carries forward omitted fields without treating explicit nulls as missing.
+Staged payloads remain on table storage; the per-attempt index scales with the
+number of distinct changed keys and is rebuilt on commit retry.
+Unknown publication retains replay input. COW never opens a persistent row index;
+destination TOAST/index recovery is unsupported, so use source TOAST hydration.
+
+Overwrite predicates retain an owned, compact copy of each segment's canonical ID
+bytes. The vendored SDK also owns string partition values retained in file
+metadata, including identity and truncate transforms. The SDK keeps predicates
+and file metadata until the table transaction ends; borrowing strings from
+released IPC buffers would retain entire message payloads (or read invalid values
+with an allocator that reuses released storage). Payload readers are still
+released after each segment; this is not a total-memory cap.
+
+COW survivor scans on object storage coalesce nearby Parquet reads into
+1 MiB windows (up to four cached per open file, 128 MiB across the process).
+Reads spanning a window or exceeding the cache budget use the direct reader.
+The cache trades some extra bytes for fewer requests on dense rewrites; it does
+not change rewrite selection, normal scans, or checkpoint ordering.
+
+Parquet scan batches are also bounded by decoded binary payload, not only row
+count. Dictionary expansion can exceed 2 GiB even for a small Parquet file;
+putting that payload in one Arrow string/binary array wraps its 32-bit offsets
+before the overwrite filter runs. The vendored reader flushes binary builders
+at 64 MiB (an individual larger value remains intact), preserves those chunks
+through nested struct/list reconstruction, and emits record batches aligned to
+column chunk boundaries. String/binary offset widths, row order, nulls and full
+payloads are unchanged. This bounds individual arrays, not all retained scan
+memory, and does not add retries or permit recovering from malformed arrays.
+
+Existing live equality/position/Puffin deletes fail before mutation: clean them
+through a separate explicit maintenance rewrite before switching. This writer
+does not migrate existing tables, reset checkpoints/slots or reread the source.
+New COW tables use v2; existing v3, UUID, schema and sort/partition metadata remain
+unchanged. Source deletes retain the existing OLake tombstone representation.
+
+COW eligibility reads the current snapshot's manifest list and opens only delete
+manifests to inspect live entries. Data manifests are not downloaded or decoded
+for this check. Retired delete entries do not block COW; unreadable delete
+manifests and unknown manifest content fail closed. Writer setup and commit-time
+validation use the same check, preserving concurrent-delete detection and the
+existing snapshot/shape fences without scanning every data-file entry per chunk.
+
+
+No SDK changes are required beyond the base's existing patches. Overwrite output
+paths are not enumerated or deleted by OLake; orphan maintenance owns rejected
+attempt artifacts. Incoming buffer limits do not cap SDK survivor-read/write
+memory or guarantee latency. Pilot representative updates and reader versions; no
+production integration or performance result is claimed.
+
+## Native Parquet Bloom filter defaults
+
+Native Iceberg writes default Bloom filters on for the canonical `_olake_id`,
+existing scalar destination fields named by the source primary key (including
+every composite-key component), and declared Iceberg identifier fields. Source
+names use the stream's destination-column resolution, including preserved source
+names when configured. Missing fields and struct/list/map fields receive no
+implicit filter; this is not an all-columns policy or a schema change.
+
+The standard table property
+`write.parquet.bloom-filter-enabled.column.<destination-column>` always overrides
+the default when present: `false` disables a key's filter, while `true` can enable
+one for a non-key column. Boolean values follow Iceberg's case-insensitive Java
+`true` semantics. `write.parquet.bloom-filter-max-bytes` defaults to 1 MiB per
+column per row group; explicit sizes must be decimal integers from 32 through 134217728
+bytes. Invalid sizes return an error before constructing Arrow writer properties,
+rather than panicking or silently replacing the configured bound. Native writes
+retain batch size 1, 1 MiB page/dictionary targets, the 64K row-group cap, Zstd
+level 3, statistics and page indexes.
+
+New tables persist these defaults at creation. Existing tables get missing
+properties only in their next normal data transaction, alongside data and
+`olake_2pc`; opening a writer or making a quiet metadata-only checkpoint does not
+issue a filter-enablement commit. Each conflict attempt resolves defaults against
+fresh metadata without mutating its borrowed properties. Defaults are effective
+for direct and streaming-backfill output before that metadata is published. COW
+stages them in the transaction before the SDK's `Overwrite` builds writers, so
+both incoming data and naturally rewritten survivors use the same column policy.
+No existing files are rewritten merely to enable filters; old files keep their
+original filters until otherwise rewritten. Bloom filters can help compatible
+readers prune equality lookups, but do not change row identity, deletes, source
+hydration, index handling, checkpoints, retries or MOR/COW selection.
 
 ## Creation-time table sort policy
 

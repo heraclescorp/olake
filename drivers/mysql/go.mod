@@ -3,6 +3,7 @@ module github.com/datazip-inc/olake/drivers/mysql
 go 1.26.11
 
 replace (
+	github.com/apache/arrow-go/v18 => ../../third_party/arrow-go
 	github.com/apache/iceberg-go => ../../third_party/iceberg-go
 	github.com/datazip-inc/olake => ../../
 	google.golang.org/genproto => google.golang.org/genproto v0.0.0-20240123012728-ef4313101c80
@@ -67,6 +68,8 @@ require (
 	github.com/googleapis/gax-go/v2 v2.24.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
+	github.com/jackc/pgio v1.0.0 // indirect
+	github.com/jackc/pglogrepl v0.0.0-20250322012620-f1e2b1498ed6 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/pgx/v5 v5.13.0 // indirect

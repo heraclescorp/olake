@@ -168,6 +168,60 @@ func TestGetCommonAncestorType(t *testing.T) {
 			t2:       Object,
 			expected: Binary,
 		},
+		{
+			name:     "date promotes to a wall-clock timestamp",
+			t1:       Date,
+			t2:       TimestampNTZ,
+			expected: TimestampNTZ,
+		},
+		{
+			name:     "date promotes to timestamptz",
+			t1:       Date,
+			t2:       TimestampMicro,
+			expected: TimestampMicro,
+		},
+		{
+			name:     "wall-clock timestamp promotes to timestamptz",
+			t1:       TimestampNTZ,
+			t2:       Timestamp,
+			expected: Timestamp,
+		},
+		{
+			name:     "date and string meet at string",
+			t1:       Date,
+			t2:       String,
+			expected: String,
+		},
+		{
+			name:     "decimals widen to hold both",
+			t1:       Decimal.Of(10, 2),
+			t2:       Decimal.Of(12, 4),
+			expected: Decimal.Of(12, 4),
+		},
+		{
+			name:     "decimals too wide to share one fall back to double",
+			t1:       Decimal.Of(38, 0),
+			t2:       Decimal.Of(10, 5),
+			expected: Float64,
+		},
+		{
+			name:     "decimal falls back to double",
+			t1:       Decimal.Of(16, 2),
+			t2:       Float64,
+			expected: Float64,
+		},
+		{
+			name:     "decimal and integer meet at double",
+			t1:       Decimal.Of(16, 2),
+			t2:       Int64,
+			expected: Float64,
+		},
+		{
+			name:     "decimal and timestamp only meet at string",
+			t1:       Decimal.Of(16, 2),
+			t2:       Date,
+			expected: String,
+		},
 	}
 
 	for _, tc := range testCases {

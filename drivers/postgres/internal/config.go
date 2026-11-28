@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/errs"
 )
@@ -142,7 +143,18 @@ type Table struct {
 }
 
 type ColumnDetails struct {
-	Name       string  `db:"column_name"`
-	DataType   *string `db:"data_type"`
-	IsNullable *string `db:"is_nullable"`
+	Name             string  `db:"column_name"`
+	DataType         *string `db:"data_type"`
+	IsNullable       *string `db:"is_nullable"`
+	NumericPrecision *int64  `db:"numeric_precision"`
+	NumericScale     *int64  `db:"numeric_scale"`
+}
+
+// decimalType is the decimal(p,s) a numeric column with a declared precision and scale holds, when
+// Iceberg holds such a decimal.
+func (c ColumnDetails) decimalType() (types.DataType, bool) {
+	if c.DataType == nil || *c.DataType != "numeric" || c.NumericPrecision == nil || c.NumericScale == nil {
+		return "", false
+	}
+	return types.DecimalOf(int(*c.NumericPrecision), int(*c.NumericScale))
 }

@@ -235,6 +235,13 @@ func (a *AbstractDriver) FormatCursorValue(cursorValue any) any {
 			return v.Format(constants.DB2StateTimestampFormat)
 		}
 		return v.UTC().Format(constants.DefaultStateTimestampFormat)
+	case typeutils.Date:
+		return a.FormatCursorValue(v.Time)
+	case typeutils.TimestampNTZ:
+		return a.FormatCursorValue(v.Time)
+	case typeutils.Decimal:
+		// the exact text, which a JSON number in state would round to a double
+		return v.String()
 	case primitive.ObjectID:
 		return v.Hex()
 	case []byte:

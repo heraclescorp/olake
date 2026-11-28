@@ -48,8 +48,8 @@ const (
 	// extends getPrivilegedTablesTmpl to restrict to user-specified schemas
 	getPrivilegedTablesFilteredTmpl = getPrivilegedTablesTmpl + `
 		AND nspname = ANY($1)`
-	// get table schema
-	getTableSchemaTmpl = `SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`
+	// get table schema; numeric_precision and numeric_scale are a numeric column's declared typmod, NULL when unconstrained
+	getTableSchemaTmpl = `SELECT column_name, data_type, is_nullable, numeric_precision, numeric_scale FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`
 	// get primary key columns, query copied from pgjdbc's PgDatabaseMetaData.getPrimaryKeys() with the always-NULL TABLE_CAT column omitted
 	// ref: https://github.com/pgjdbc/pgjdbc/blob/master/pgjdbc/src/main/java/org/postgresql/jdbc/PgDatabaseMetaData.java#L2134
 	getTablePrimaryKey = `SELECT result.column_name
@@ -314,6 +314,7 @@ func (p *Postgres) ProduceSchema(ctx context.Context, streamID types.StreamID) (
 	populateStream := func(streamID types.StreamID) (*types.Stream, error) {
 		schemaName, streamName := streamID.Namespace, streamID.Name
 		stream := types.NewStream(streamName, schemaName, &p.config.Database)
+		stream.SupportsIcebergCopyOnWrite = true
 		var columnSchemaOutput []ColumnDetails
 		err := p.client.SelectContext(ctx, &columnSchemaOutput, getTableSchemaTmpl, schemaName, streamName)
 		if err != nil {
@@ -334,7 +335,9 @@ func (p *Postgres) ProduceSchema(ctx context.Context, streamID types.StreamID) (
 		for _, column := range columnSchemaOutput {
 			stream.WithCursorField(column.Name)
 			var datatype types.DataType
-			if val, found := p.typeMapping[*column.DataType]; found {
+			if decimal, isDecimal := column.decimalType(); isDecimal {
+				datatype = decimal
+			} else if val, found := p.typeMapping[*column.DataType]; found {
 				datatype = val
 			} else {
 				logger.Debugf("failed to get respective type in datatypes for column: %s[%s]", column.Name, *column.DataType)
@@ -381,14 +384,23 @@ func (p *Postgres) MaxRetries() int {
 }
 
 func (p *Postgres) columnType(columnType string) types.DataType {
-	return typeutils.ExtractAndMapColumnType(columnType, p.typeMapping)
+	return pgColumnType(columnType, p.typeMapping)
+}
+
+// pgColumnType maps a source type name to the type its converted values have. Readers name a
+// numeric column with a declared precision and scale by the decimal(p,s) it holds.
+func pgColumnType(columnType string, typeMapping map[string]types.DataType) types.DataType {
+	if _, _, isDecimal := types.DecimalParams(types.DataType(columnType)); isDecimal {
+		return types.DataType(columnType)
+	}
+	return typeutils.ExtractAndMapColumnType(columnType, typeMapping)
 }
 
 func (p *Postgres) dataTypeConverter(value interface{}, columnType string) (interface{}, error) {
 	if value == nil {
 		return nil, typeutils.ErrNullValue
 	}
-	olakeType := typeutils.ExtractAndMapColumnType(columnType, p.typeMapping)
+	olakeType := pgColumnType(columnType, p.typeMapping)
 	if olakeType == types.Binary {
 		if value, ok := value.(string); ok {
 			decoded, err := hex.DecodeString(strings.TrimPrefix(value, `\x`))

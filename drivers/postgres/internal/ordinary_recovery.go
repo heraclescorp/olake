@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/datazip-inc/olake/drivers/abstract"
@@ -40,19 +42,39 @@ type ordinaryRecoverySlot struct {
 
 type ordinaryRecovery struct {
 	identity string
-	lower    string
+	lower    pglogrepl.LSN
 	plan     *types.OrdinaryRecoveryPlan
 	complete bool
 }
 
+func ordinaryRecoveryLowerLSN(raw string) (pglogrepl.LSN, error) {
+	high, low, ok := strings.Cut(raw, "/")
+	if !ok || high == "" || low == "" {
+		return 0, fmt.Errorf("invalid PostgreSQL lower LSN %q", raw)
+	}
+	hi, err := strconv.ParseUint(high, 16, 32)
+	if err != nil {
+		return 0, err
+	}
+	lo, err := strconv.ParseUint(low, 16, 32)
+	if err != nil {
+		return 0, err
+	}
+	return pglogrepl.LSN(hi<<32 | lo), nil
+}
+
 func (p *Postgres) validateOrdinaryRecoveryCatalog(streams []types.StreamInterface, lower string) error {
+	return p.validateRecoveryCatalog(streams, lower, false)
+}
+
+func (p *Postgres) validateRecoveryCatalog(streams []types.StreamInterface, lower string, incomplete bool) error {
 	if !p.CDCSupport || p.config == nil || p.cdcConfig.ReplicationSlot == "" {
 		return fmt.Errorf("ordinary recovery requires configured PostgreSQL CDC and an existing replication slot")
 	}
 	if p.resync != nil || len(streams) == 0 || p.state == nil || p.state.Type != types.GlobalType {
 		return fmt.Errorf("ordinary recovery requires a nonempty frozen CDC catalog and saved GLOBAL state, not resync")
 	}
-	baseline, err := pglogrepl.ParseLSN(lower)
+	baseline, err := ordinaryRecoveryLowerLSN(lower)
 	if err != nil || baseline == 0 {
 		return fmt.Errorf("ordinary recovery requires a valid nonzero lower LSN %q", lower)
 	}
@@ -64,7 +86,7 @@ func (p *Postgres) validateOrdinaryRecoveryCatalog(streams []types.StreamInterfa
 	if err := utils.Unmarshal(global.State, &saved); err != nil {
 		return fmt.Errorf("invalid ordinary recovery GLOBAL state: %w", err)
 	}
-	savedLSN, err := pglogrepl.ParseLSN(saved.LSN)
+	savedLSN, err := ordinaryRecoveryLowerLSN(saved.LSN)
 	if err != nil || savedLSN != baseline {
 		return fmt.Errorf("ordinary recovery lower LSN does not match the saved GLOBAL checkpoint")
 	}
@@ -74,8 +96,8 @@ func (p *Postgres) validateOrdinaryRecoveryCatalog(streams []types.StreamInterfa
 			return fmt.Errorf("ordinary recovery catalog contains a missing or duplicate stream")
 		}
 		seen[stream.ID()] = true
-		if (stream.GetSyncMode() != types.CDC && stream.GetSyncMode() != types.STRICTCDC) || !global.Streams.Exists(stream.ID()) {
-			return fmt.Errorf("ordinary recovery stream %s must be CDC/strictCDC with saved backfill-completed membership", stream.ID())
+		if (stream.GetSyncMode() != types.CDC && stream.GetSyncMode() != types.STRICTCDC) || (!incomplete && !global.Streams.Exists(stream.ID())) || (incomplete && stream.GetSyncMode() != types.CDC) {
+			return fmt.Errorf("ordinary recovery stream %s requires CDC and saved backfill membership unless recovering a validated backfill candidate", stream.ID())
 		}
 		if keys := stream.GetStream().SourceDefinedPrimaryKey; keys == nil || keys.Len() == 0 {
 			return fmt.Errorf("ordinary recovery requires existing primary keys for stream %s", stream.ID())
@@ -123,6 +145,18 @@ func validateOrdinaryRecoverySlot(raw ordinaryRecoverySlot, database, publicatio
 	return waljs.ReplicationSlot{Plugin: raw.Plugin, SlotType: raw.SlotType, LSN: confirmed, CurrentLSN: current}, nil
 }
 
+func validateBackfillRecoverySlot(raw ordinaryRecoverySlot, lower pglogrepl.LSN) error {
+	confirmed, err := pglogrepl.ParseLSN(raw.Confirmed)
+	if err != nil || confirmed != lower {
+		return fmt.Errorf("backfill recovery requires an unadvanced slot at the original lower LSN")
+	}
+	restart, err := pglogrepl.ParseLSN(raw.Restart)
+	if err != nil || restart == 0 || restart > lower {
+		return fmt.Errorf("backfill recovery requires retained WAL at the original lower LSN")
+	}
+	return nil
+}
+
 func (p *Postgres) identifyOrdinaryRecovery(ctx context.Context, slot waljs.ReplicationSlot) (string, error) {
 	config, err := p.prepareWALJSConfig()
 	if err != nil {
@@ -157,7 +191,19 @@ func (p *Postgres) ValidateOrdinaryRecovery(ctx context.Context, streams []types
 	if _, resync := types.ResyncFromContext(ctx); resync {
 		return "", fmt.Errorf("ordinary recovery cannot use resync context")
 	}
-	if err := p.validateOrdinaryRecoveryCatalog(streams, lower); err != nil {
+	options, recovery := types.OrdinaryRecoveryFromContext(ctx)
+	incomplete := false
+	if recovery && options.Origin.Backfill && (options.BackfillCheckpoint == nil || options.BackfillState == nil) {
+		return "", fmt.Errorf("backfill recovery requires a validated candidate and immutable baseline")
+	}
+	if recovery && options.Origin.Backfill && !options.BackfillComplete {
+		for _, stream := range streams {
+			if stream != nil && !options.BackfillState.HasCompletedBackfill(stream.Self()) {
+				incomplete = true
+			}
+		}
+	}
+	if err := p.validateRecoveryCatalog(streams, lower, incomplete); err != nil {
 		return "", err
 	}
 	if err := p.cdcConfig.validateToastRecovery(); err != nil {
@@ -185,18 +231,33 @@ func (p *Postgres) ValidateOrdinaryRecovery(ctx context.Context, streams []types
 	if err != nil {
 		return "", err
 	}
+	if incomplete && slot.LSN == baseline {
+		var raw ordinaryRecoverySlot
+		if err := p.client.GetContext(ctx, &raw, ordinaryRecoverySlotQuery, p.cdcConfig.ReplicationSlot); err != nil {
+			return "", err
+		}
+		if err := validateBackfillRecoverySlot(raw, baseline); err != nil {
+			return "", err
+		}
+	}
 	identity, err := p.identifyOrdinaryRecovery(ctx, slot)
 	if err != nil {
 		return "", err
 	}
+	if recovery && options.Origin.Backfill && (options.BackfillCheckpoint.ServerIdentity != identity || options.BackfillCheckpoint.SlotName != p.cdcConfig.ReplicationSlot) {
+		return "", fmt.Errorf("backfill recovery source identity or slot differs from the candidate")
+	}
 	if options, ok := types.OrdinaryRecoveryFromContext(ctx); ok && options.SourceIdentity != "" && options.SourceIdentity != identity {
 		return "", fmt.Errorf("ordinary recovery source identity changed after validation")
 	}
-	if p.ordinary != nil && (p.ordinary.identity != identity || p.ordinary.lower != baseline.String()) {
+	if p.ordinary != nil && (p.ordinary.identity != identity || p.ordinary.lower != baseline) {
 		return "", fmt.Errorf("ordinary recovery source identity or baseline changed")
 	}
 	if p.ordinary == nil {
-		p.ordinary = &ordinaryRecovery{identity: identity, lower: baseline.String()}
+		p.ordinary = &ordinaryRecovery{identity: identity, lower: baseline}
+	}
+	if incomplete && slot.LSN > baseline {
+		options.BackfillAcknowledgedLSN = slot.LSN.String()
 	}
 	return identity, nil
 }
@@ -204,7 +265,7 @@ func (p *Postgres) ValidateOrdinaryRecovery(ctx context.Context, streams []types
 // ordinaryRecoveryPlan uses all table positions, never map iteration order or a
 // group-wide 'already finished' shortcut. Missing metadata is not baseline proof.
 func ordinaryRecoveryPlan(streams []types.StreamInterface, lower string, positions map[string]string, slot pglogrepl.LSN) (*types.OrdinaryRecoveryPlan, error) {
-	baseline, err := pglogrepl.ParseLSN(lower)
+	baseline, err := ordinaryRecoveryLowerLSN(lower)
 	if err != nil || baseline == 0 || len(streams) == 0 || len(positions) != len(streams) {
 		return nil, fmt.Errorf("ordinary recovery requires the baseline and exact selected table positions")
 	}
@@ -239,6 +300,9 @@ func (p *Postgres) PrepareOrdinaryRecovery(ctx context.Context, streams []types.
 	if !ok || options.SourceIdentity == "" {
 		return nil, fmt.Errorf("ordinary recovery requires the pre-barrier source identity")
 	}
+	if options.Origin.Backfill && !options.BackfillComplete {
+		return nil, fmt.Errorf("backfill recovery must finish all tables before preparing CDC")
+	}
 	if p.ordinary == nil || p.ordinary.plan != nil || p.replicator != nil {
 		return nil, fmt.Errorf("ordinary recovery source was not validated or is already prepared")
 	}
@@ -257,6 +321,13 @@ func (p *Postgres) PrepareOrdinaryRecovery(ctx context.Context, streams []types.
 	target, _ := pglogrepl.ParseLSN(plan.TargetLSN)
 	if target > slot.CurrentLSN {
 		return nil, fmt.Errorf("ordinary recovery authoritative target is beyond available source WAL")
+	}
+	if options.Origin.Backfill {
+		boundary, err := backfillRecoveryTarget(options.BackfillTargetLSN, target, slot.CurrentLSN)
+		if err != nil {
+			return nil, err
+		}
+		plan.TargetLSN = boundary.String()
 	}
 	p.streams = append([]types.StreamInterface(nil), streams...)
 	p.ordinary.plan = &types.OrdinaryRecoveryPlan{LowerLSN: plan.LowerLSN, TargetLSN: plan.TargetLSN, ReplayAfter: maps.Clone(plan.ReplayAfter)}
@@ -441,4 +512,70 @@ func ordinaryRecoveryCheckpoint(raw any, target string) (map[string]any, error) 
 	}
 	checkpoint["lsn"] = target
 	return checkpoint, nil
+}
+
+func (p *Postgres) CaptureBackfillRecoveryTarget(ctx context.Context, lower string) (target string, err error) {
+	options, ok := types.OrdinaryRecoveryFromContext(ctx)
+	if !ok || !options.Origin.Backfill || !options.BackfillComplete || p.ordinary == nil || p.ordinary.identity != options.SourceIdentity {
+		return "", fmt.Errorf("backfill target capture requires completed backfill and validated source identity")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return "", err
+	}
+	baseline, err := ordinaryRecoveryLowerLSN(lower)
+	if err != nil || baseline == 0 || baseline != p.ordinary.lower {
+		return "", fmt.Errorf("backfill target capture requires the original lower LSN")
+	}
+	slot, err := p.ordinaryRecoverySlot(ctx, baseline, 0)
+	if err != nil {
+		return "", err
+	}
+	config, err := p.prepareWALJSConfig()
+	if err != nil {
+		return "", err
+	}
+	conn, err := waljs.ConnectReplication(ctx, config)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if closeErr := conn.Close(cleanupCtx); err == nil && closeErr != nil {
+			err = fmt.Errorf("close temporary backfill boundary slot: %w", closeErr)
+		}
+	}()
+	system, err := pglogrepl.IdentifySystem(ctx, conn)
+	if err != nil {
+		return "", err
+	}
+	identity, err := waljs.SourceIdentity(system, p.cdcConfig.ReplicationSlot, slot.Plugin)
+	if err != nil || system.DBName != p.config.Database || identity != options.SourceIdentity {
+		return "", fmt.Errorf("backfill target source identity or database changed")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return "", err
+	}
+	created, err := pglogrepl.CreateReplicationSlot(ctx, conn, "olake_backfill_"+strings.ToLower(utils.ULID()), slot.Plugin, pglogrepl.CreateReplicationSlotOptions{
+		Temporary: true, Mode: pglogrepl.LogicalReplication, SnapshotAction: "NOEXPORT_SNAPSHOT",
+	})
+	if err != nil {
+		return "", fmt.Errorf("capture backfill transaction boundary; one spare logical replication slot is required: %w", err)
+	}
+	boundary, err := pglogrepl.ParseLSN(created.ConsistentPoint)
+	if err != nil || boundary == 0 || boundary < baseline || boundary < slot.LSN {
+		return "", fmt.Errorf("temporary backfill slot returned an invalid transaction boundary")
+	}
+	if err := utils.CheckExecutionFence(ctx); err != nil {
+		return "", err
+	}
+	return boundary.String(), nil
+}
+
+func backfillRecoveryTarget(raw string, minimum, current pglogrepl.LSN) (pglogrepl.LSN, error) {
+	boundary, err := pglogrepl.ParseLSN(raw)
+	if err != nil || boundary == 0 || boundary < minimum || boundary > current {
+		return 0, fmt.Errorf("backfill recovery requires its exact captured transaction boundary covering every table within available WAL")
+	}
+	return boundary, nil
 }

@@ -457,6 +457,60 @@ func ordinaryRecoverySQLREST(t *testing.T, cat catalog.Catalog, onCommit func(co
 			return
 		}
 		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) == 2 && parts[0] == "v1" && parts[1] == "namespaces" && r.Method == http.MethodPost {
+			var request struct {
+				Namespace []string `json:"namespace"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				fail(400, err)
+				return
+			}
+			if err := cat.CreateNamespace(r.Context(), request.Namespace, nil); err != nil {
+				if errors.Is(err, catalog.ErrNamespaceAlreadyExists) {
+					fail(409, err)
+				} else {
+					fail(500, err)
+				}
+				return
+			}
+			respond(map[string]any{"namespace": request.Namespace, "properties": map[string]string{}})
+			return
+		}
+		if len(parts) == 4 && parts[0] == "v1" && parts[1] == "namespaces" && parts[3] == "tables" && r.Method == http.MethodPost {
+			var request struct {
+				Name          string                       `json:"name"`
+				Schema        *apacheiceberg.Schema        `json:"schema"`
+				Location      string                       `json:"location"`
+				PartitionSpec *apacheiceberg.PartitionSpec `json:"partition-spec"`
+				SortOrder     table.SortOrder              `json:"write-order"`
+				Properties    apacheiceberg.Properties     `json:"properties"`
+				StageCreate   bool                         `json:"stage-create"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				fail(400, err)
+				return
+			}
+			ident := append(strings.Split(parts[2], "\x1f"), request.Name)
+			opts := []catalog.CreateTableOpt{catalog.WithProperties(request.Properties), catalog.WithPartitionSpec(request.PartitionSpec), catalog.WithSortOrder(request.SortOrder)}
+			if request.Location != "" {
+				opts = append(opts, catalog.WithLocation(request.Location))
+			}
+			if request.StageCreate {
+				fail(400, errors.New("stage-create is unsupported"))
+				return
+			}
+			tbl, err := cat.CreateTable(r.Context(), ident, request.Schema, opts...)
+			if err != nil {
+				status := 500
+				if errors.Is(err, catalog.ErrTableAlreadyExists) {
+					status = 409
+				}
+				fail(status, err)
+				return
+			}
+			respond(map[string]any{"metadata-location": tbl.MetadataLocation(), "metadata": tbl.Metadata(), "config": map[string]string{}})
+			return
+		}
 		if len(parts) == 3 && parts[0] == "v1" && parts[1] == "namespaces" {
 			if r.Method == http.MethodHead {
 				w.WriteHeader(http.StatusNoContent)

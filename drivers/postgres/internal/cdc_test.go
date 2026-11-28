@@ -27,6 +27,8 @@ func TestValidateToastStreams(t *testing.T) {
 			StreamMetadata: types.StreamMetadata{StreamName: "users", UpdateType: &updateType, AppendMode: &appendMode},
 		}
 	}
+	cow := stream("pos", false).Self()
+	cow.StreamMetadata.MergeStrategy = types.CopyOnWrite
 
 	tests := []struct {
 		name     string
@@ -36,6 +38,7 @@ func TestValidateToastStreams(t *testing.T) {
 		{name: "pos keeps the index", stream: stream("pos", false)},
 		{name: "eq keeps no index", stream: stream("eq", false), wantCode: codeUpdateTypeWithoutIndex},
 		{name: "append mode keeps no index", stream: stream("pos", true), wantCode: codeAppendModeWithToast},
+		{name: "COW keeps no index", stream: cow, wantCode: codeUpdateTypeWithoutIndex},
 	}
 
 	for _, tc := range tests {

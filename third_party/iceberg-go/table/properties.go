@@ -21,6 +21,7 @@ import (
 	"math"
 	"strings"
 
+	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table/internal"
 )
@@ -175,6 +176,15 @@ const (
 	CommitTotalRetryTimeoutMsKey     = "commit.retry.total-timeout-ms"
 	CommitTotalRetryTimeoutMsDefault = 30 * 60 * 1000
 )
+
+// ParquetBloomFilterWriteOptions returns the SDK's adaptive Bloom filter policy
+// for validated Parquet write properties. Enabled columns retain Arrow's default
+// 1% false-positive target, with a power-of-two size bounded by the configured
+// maximum. Effective caps at or below 1 KiB use fixed filters to avoid Arrow's
+// 32-byte adaptive fallback. Other Parquet writer settings are unaffected.
+func ParquetBloomFilterWriteOptions(props iceberg.Properties) []parquet.WriterProperty {
+	return internal.ParquetBloomFilterWriteOptions(props)
+}
 
 func isGCEnabled(props iceberg.Properties) bool {
 	value, ok := props[GCEnabledKey]

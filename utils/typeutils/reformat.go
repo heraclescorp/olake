@@ -62,6 +62,9 @@ func ReformatValue(dataType types.DataType, v any) (any, error) {
 	if v == nil {
 		return v, nil
 	}
+	if types.BaseOf(dataType) == types.Decimal {
+		return ReformatDecimal(dataType, v)
+	}
 	switch dataType.ValueType() {
 	case types.Null:
 		return nil, ErrNullValue
@@ -71,6 +74,10 @@ func ReformatValue(dataType types.DataType, v any) (any, error) {
 		return ReformatInt64(v)
 	case types.Int32:
 		return ReformatInt32(v)
+	case types.Date:
+		return ReformatCalendarDate(v)
+	case types.TimestampNTZ:
+		return ReformatTimestampNTZ(v)
 	case types.Timestamp, types.TimestampMilli, types.TimestampMicro, types.TimestampNano:
 		return ReformatDate(v, true)
 	case types.String:
@@ -95,9 +102,22 @@ func ReformatValue(dataType types.DataType, v any) (any, error) {
 // ParseFilterValue parses v into dataType strictly and returns the typed value.
 // For timestamp types, an unparseable string always returns an error
 // ReformatValue which silently falls back to epoch when isTimestampInDB=true).
-// A binary value is hex from state version 8, as JSON cannot carry bytes.
+// A binary value is hex from state version 8, as JSON cannot carry bytes. A decimal keeps its own
+// scale, so a bound with more digits than the column compares exactly.
 func ParseFilterValue(dataType types.DataType, v any) (any, error) {
+	if types.BaseOf(dataType) == types.Decimal {
+		return ParseDecimal(v)
+	}
 	switch dataType {
+	case types.Date, types.TimestampNTZ:
+		t, err := ReformatDate(v, false)
+		if err != nil {
+			return nil, err
+		}
+		if dataType == types.Date {
+			return DateOf(t), nil
+		}
+		return TimestampNTZOf(t), nil
 	case types.Timestamp, types.TimestampMilli, types.TimestampMicro, types.TimestampNano:
 		return ReformatDate(v, false)
 	default:
@@ -200,6 +220,10 @@ func ReformatDate(v interface{}, isTimestampInDB bool) (time.Time, error) {
 			default:
 				return time.Time{}, fmt.Errorf("null time passed")
 			}
+		case Date:
+			return v.Time, nil
+		case TimestampNTZ:
+			return v.Time, nil
 		case time.Time:
 			return v, nil
 		case *time.Time:
@@ -437,6 +461,8 @@ func ReformatInt32(v any) (int32, error) {
 
 func ReformatFloat64(v interface{}) (float64, error) {
 	switch v := v.(type) {
+	case Decimal:
+		return v.Float64(), nil
 	case json.Number:
 		return v.Float64()
 	case []uint8:
@@ -489,6 +515,8 @@ func ReformatFloat64(v interface{}) (float64, error) {
 
 func ReformatFloat32(v interface{}) (float32, error) {
 	switch v := v.(type) {
+	case Decimal:
+		return float32(v.Float64()), nil
 	case json.Number:
 		f64, err := v.Float64()
 		if err != nil {

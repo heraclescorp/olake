@@ -70,6 +70,7 @@ require (
 	github.com/googleapis/enterprise-certificate-proxy v0.3.20 // indirect
 	github.com/googleapis/gax-go/v2 v2.24.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
+	github.com/jackc/pgio v1.0.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.3 // indirect
@@ -172,6 +173,7 @@ require (
 
 require (
 	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.4.1
+	github.com/jackc/pglogrepl v0.0.0-20250322012620-f1e2b1498ed6
 	github.com/paulmach/orb v0.12.0
 	github.com/twmb/avro v1.8.0
 )
@@ -236,7 +238,8 @@ require (
 )
 
 replace (
-	github.com/apache/iceberg-go => ./third_party/iceberg-go
 	cloud.google.com/go/compute => cloud.google.com/go/compute v1.23.3
+	github.com/apache/arrow-go/v18 => ./third_party/arrow-go
+	github.com/apache/iceberg-go => ./third_party/iceberg-go
 	google.golang.org/genproto => google.golang.org/genproto v0.0.0-20240123012728-ef4313101c80
 )

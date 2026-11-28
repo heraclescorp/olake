@@ -28,6 +28,9 @@ func pgTypeToDataTypes() map[string]types.DataType {
 		"bigserial":   types.Int64,
 
 		// numbers
+		// A numeric with a declared precision of at most 38 digits reaches the converter named by
+		// its decimal(p,s) (see pgColumnType). An unconstrained numeric, or a wider one, stays a
+		// double: an Iceberg decimal needs a fixed precision of at most 38 digits.
 		"decimal":          types.Float64,
 		"numeric":          types.Float64,
 		"double precision": types.Float64,
@@ -83,11 +86,11 @@ func pgTypeToDataTypes() map[string]types.DataType {
 		"time":                        types.String,
 		"timez":                       types.String,
 		"interval":                    types.String,
-		"date":                        types.Timestamp,
-		"timestamp":                   types.Timestamp,
+		"date":                        types.Date,
+		"timestamp":                   types.TimestampNTZ,
 		"timestampz":                  types.Timestamp,
 		"timestamp with time zone":    types.Timestamp,
-		"timestamp without time zone": types.Timestamp,
+		"timestamp without time zone": types.TimestampNTZ,
 		"timestamptz":                 types.Timestamp,
 
 		// arrays

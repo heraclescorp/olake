@@ -470,3 +470,15 @@ func TestCDCFencedCompletionStillReleasesSource(t *testing.T) {
 		})
 	}
 }
+
+func TestWriterCleanupDoesNotExposeChunkBounds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	failure := errors.New("storage failure")
+	observed := error(failure)
+	handleWriterCleanup(ctx, cancel, &observed, nil, "public.target_min[sensitive-key]-max[private-key]", nil, nil)
+	require.ErrorIs(t, observed, failure)
+	require.NotContains(t, observed.Error(), "sensitive-key")
+	require.NotContains(t, observed.Error(), "private-key")
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
+}

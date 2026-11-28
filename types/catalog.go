@@ -83,12 +83,13 @@ func (s SelectedColumns) MarshalJSON() ([]byte, error) {
 }
 
 type StreamMetadata struct {
-	ChunkColumn    string  `json:"chunk_column,omitempty"`
-	PartitionRegex string  `json:"partition_regex"`
-	StreamName     string  `json:"stream_name"`
-	AppendMode     *bool   `json:"append_mode,omitempty"`
-	Normalization  *bool   `json:"normalization,omitempty"`
-	UpdateType     *string `json:"update_type,omitempty"`
+	ChunkColumn    string        `json:"chunk_column,omitempty"`
+	PartitionRegex string        `json:"partition_regex"`
+	StreamName     string        `json:"stream_name"`
+	AppendMode     *bool         `json:"append_mode,omitempty"`
+	Normalization  *bool         `json:"normalization,omitempty"`
+	UpdateType     *string       `json:"update_type,omitempty"`
+	MergeStrategy  MergeStrategy `json:"merge_strategy,omitempty"`
 	// When enabled, source column names are preserved as-is; otherwise utils.Reformat() is applied to generate destination-safe lowercase column names.
 	UseSourceColumnNames bool `json:"use_source_column_names,omitempty"`
 	// When enabled, a column dropped at the source is deleted from the destination schema; otherwise it stays and new rows hold NULL.
@@ -348,6 +349,10 @@ func pinImplicitUpdateType(metadata *StreamMetadata, oldStream, newStream *Strea
 // cleared rather than replaced: switching delete formats can force a table recreate, so the user
 // must pick the new one explicitly, and a blank update_type fails validation until they do.
 func mergeUpdateType(metadata *StreamMetadata, streamID string, available []UpdateType) {
+	// Saved MOR delete preferences stay inactive, not destroyed, under COW.
+	if metadata.MergeStrategy == CopyOnWrite {
+		return
+	}
 	if metadata.UpdateType == nil {
 		return
 	}

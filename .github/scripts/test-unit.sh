@@ -56,6 +56,7 @@ END {
 # Left unquoted on purpose: the newline-separated patterns word-split into separate arguments.
 packages=$(go list -m -f '{{.Dir}}' | sed "s#^$(pwd)#.#"'; s#$#/...#')
 coverpkg=$(echo $packages | tr ' ' ',')
+packages="$packages github.com/apache/arrow-go/v18/parquet/metadata github.com/apache/arrow-go/v18/parquet/file"
 
 tab=$(printf '\t')
 rcfile=$(mktemp)

@@ -1,0 +1,10 @@
+Apache Arrow Go
+Copyright 2016-2025 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (http://www.apache.org/).
+
+This runtime-source copy is based on Apache Arrow Go v18.8.0
+(72e9a5695337bab9ac01ec1e4d58177bc4949dc3).
+Local modifications compact adaptive Parquet Bloom-filter candidates after
+successful row-group finalization, retaining the selected filter until the footer.

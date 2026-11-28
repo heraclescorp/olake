@@ -89,6 +89,14 @@ const enrollmentUnfilteredPublication = `SELECT
 	FROM pg_publication_tables pt
 	WHERE pt.pubname = $1 AND pt.schemaname = $2 AND pt.tablename = $3`
 
+// ValidateCopyOnWriteEnrollment checks the same effective TOAST setting used by CDC.
+func (p *Postgres) ValidateCopyOnWriteEnrollment() error {
+	if !p.cdcConfig.sourceToastRecovery() {
+		return fmt.Errorf("copy-on-write enrollment requires source TOAST recovery; set toast_value_source to source")
+	}
+	return nil
+}
+
 func (p *Postgres) ValidateTableEnrollment(ctx context.Context, stream *types.Stream) error {
 	if p.enrollmentIssue != nil {
 		return p.enrollmentIssue

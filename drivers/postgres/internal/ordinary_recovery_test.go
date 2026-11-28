@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"sync"
 	"testing"
@@ -40,6 +41,74 @@ func TestOrdinaryRecoveryPlanUsesDeterministicMaximumAndEveryTable(t *testing.T)
 		require.Equal(t, "0/500", plan.TargetLSN)
 		require.Equal(t, positions, plan.ReplayAfter, "an ahead table must not skip another table's missing prefix")
 		require.Len(t, plan.ReplayAfter, len(streams))
+	}
+}
+
+func TestOrdinaryRecoveryAcceptsEquivalentLowerSpellings(t *testing.T) {
+	for _, lower := range []string{"0/abc", "0/ABC", "000/000ABC"} {
+		t.Run(lower, func(t *testing.T) {
+			streams := ordinaryTestStreams()
+			p, _ := newMockPostgres(t)
+			p.CDCSupport = true
+			p.cdcConfig.ReplicationSlot = "saved"
+			saved := waljs.WALState{LSN: "000/000aBc"}
+			p.state = &types.State{RWMutex: &sync.RWMutex{}, Type: types.GlobalType, SuppressPersistence: true,
+				Global: &types.GlobalState{State: saved, Streams: types.NewSet(streams[0].ID(), streams[1].ID(), streams[2].ID())}}
+			require.NoError(t, p.validateOrdinaryRecoveryCatalog(streams, lower))
+			require.Equal(t, saved, p.state.Global.State, "validation must not rewrite the frozen checkpoint")
+			positions := map[string]string{streams[0].ID(): "0/ABC", streams[1].ID(): "0/abc", streams[2].ID(): "000/000ABC"}
+			plan, err := ordinaryRecoveryPlan(streams, lower, positions, 0xABC)
+			require.NoError(t, err)
+			require.Equal(t, "0/ABC", plan.LowerLSN)
+			require.Equal(t, "0/ABC", plan.TargetLSN)
+			for _, stream := range streams {
+				require.Equal(t, "0/ABC", plan.ReplayAfter[stream.ID()])
+			}
+			require.Equal(t, "0/abc", positions[streams[1].ID()], "plan normalization must not rewrite input bookmarks")
+		})
+	}
+}
+
+func TestOrdinaryRecoveryRejectsMalformedLowerSpellings(t *testing.T) {
+	streams := ordinaryTestStreams()
+	positions := map[string]string{streams[0].ID(): "0/ABC", streams[1].ID(): "0/ABC", streams[2].ID(): "0/ABC"}
+	for _, lower := range []string{"", "invalid", "0/0", "0/ABCjunk", "0/ABC/1", "100000000/ABC", "0/100000ABC", " 0/ABC", "0/ABC "} {
+		t.Run(lower, func(t *testing.T) {
+			_, err := ordinaryRecoveryPlan(streams, lower, positions, 0xABC)
+			require.Error(t, err)
+			p, _ := newMockPostgres(t)
+			p.CDCSupport = true
+			p.cdcConfig.ReplicationSlot = "saved"
+			p.state = &types.State{RWMutex: &sync.RWMutex{}, Type: types.GlobalType, SuppressPersistence: true,
+				Global: &types.GlobalState{State: waljs.WALState{LSN: lower}, Streams: types.NewSet(streams[0].ID(), streams[1].ID(), streams[2].ID())}}
+			require.Error(t, p.validateOrdinaryRecoveryCatalog(streams, "0/ABC"), "malformed frozen checkpoints must also fail closed")
+			require.Error(t, p.validateOrdinaryRecoveryCatalog(streams, lower))
+		})
+	}
+}
+
+func TestCaptureBackfillRecoveryTargetValidatesNumericOriginalLower(t *testing.T) {
+	for _, lower := range []string{"0/abc", "0/ABC", "000/000ABC", "0/ABD", "0/ABB", "", "invalid", "0/0", "0/ABCjunk", "0/ABC/1", "100000000/ABC", "0/100000ABC", " 0/ABC", "0/ABC "} {
+		t.Run(lower, func(t *testing.T) {
+			p, mock := newMockPostgres(t)
+			p.cdcConfig.ReplicationSlot = "saved"
+			p.ordinary = &ordinaryRecovery{identity: "validated", lower: 0xABC}
+			options := &types.OrdinaryRecoveryOptions{SourceIdentity: "validated", BackfillComplete: true}
+			options.Origin.Backfill = true
+			ctx := types.WithOrdinaryRecovery(context.Background(), options)
+			valid := lower == "0/abc" || lower == "0/ABC" || lower == "000/000ABC"
+			slotRead := errors.New("target capture reached validated slot lookup")
+			if valid {
+				mock.ExpectQuery(ordinaryRecoverySlotQuery).WithArgs("saved").WillReturnError(slotRead)
+			}
+			target, err := p.CaptureBackfillRecoveryTarget(ctx, lower)
+			require.Empty(t, target)
+			if valid {
+				require.ErrorIs(t, err, slotRead, "equivalent spelling must pass the capture boundary guard")
+			} else {
+				require.ErrorContains(t, err, "requires the original lower LSN")
+			}
+		})
 	}
 }
 
@@ -94,6 +163,58 @@ func TestOrdinaryRecoveryPlanAcceptsBaselineAndAckBeforeStateRetries(t *testing.
 		require.NoError(t, err)
 		require.Equal(t, scenario.target, plan.TargetLSN)
 	}
+}
+
+func TestBackfillRecoveryTargetPreservesCapturedBoundary(t *testing.T) {
+	boundary, err := backfillRecoveryTarget("0/500", 0x300, 0x900)
+	require.NoError(t, err)
+	require.Equal(t, pglogrepl.LSN(0x500), boundary, "fresh WAL must not widen the captured transaction boundary")
+	for _, raw := range []string{"", "invalid", "0/0", "0/200", "0/A00"} {
+		_, err := backfillRecoveryTarget(raw, 0x300, 0x900)
+		require.Error(t, err, raw)
+	}
+}
+
+func TestBackfillRecoveryRequiresOriginalRetainedLower(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		confirmed string
+		restart   string
+		valid     bool
+	}{
+		{"original", "0/100", "0/80", true},
+		{"exact_restart", "0/100", "0/100", true},
+		{"advanced", "0/200", "0/80", false},
+		{"behind", "0/90", "0/80", false},
+		{"missing_wal", "0/100", "0/110", false},
+		{"missing_restart", "0/100", "", false},
+		{"zero_restart", "0/100", "0/0", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateBackfillRecoverySlot(ordinaryRecoverySlot{Confirmed: tc.confirmed, Restart: tc.restart}, 0x100)
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestBackfillRecoveryCatalogAllowsOnlyIncompleteCDC(t *testing.T) {
+	streams := ordinaryTestStreams()
+	for _, stream := range streams {
+		stream.GetStream().SyncMode = types.CDC
+	}
+	state := &types.State{RWMutex: &sync.RWMutex{}, Type: types.GlobalType, SuppressPersistence: true,
+		Global: &types.GlobalState{State: waljs.WALState{LSN: "0/100"}, Streams: types.NewSet[string]()}}
+	p := &Postgres{config: &Config{}, CDCSupport: true, state: state, cdcConfig: CDC{ReplicationSlot: "saved"}}
+	require.Error(t, p.validateOrdinaryRecoveryCatalog(streams, "0/100"))
+	require.NoError(t, p.validateRecoveryCatalog(streams, "0/100", true))
+	streams[0].GetStream().SyncMode = types.STRICTCDC
+	require.Error(t, p.validateRecoveryCatalog(streams, "0/100", true))
+	streams[0].GetStream().SyncMode = types.CDC
+	require.Error(t, p.validateRecoveryCatalog(streams, "0/200", true))
 }
 
 func TestOrdinaryRecoveryRequiresEverySelectedSavedGlobalMember(t *testing.T) {
@@ -199,7 +320,7 @@ func TestOrdinaryRecoveryAcknowledgementRejectsUnpreparedChangedAndIncompletePla
 	ctx := types.WithOrdinaryRecovery(context.Background(), &types.OrdinaryRecoveryOptions{SourceIdentity: "validated", Plan: plan})
 	p := &Postgres{}
 	require.ErrorContains(t, p.AcknowledgeOrdinaryRecovery(ctx, plan), "prepared plan")
-	p.ordinary = &ordinaryRecovery{identity: "validated", lower: "0/100", plan: plan}
+	p.ordinary = &ordinaryRecovery{identity: "validated", lower: 0x100, plan: plan}
 	require.ErrorContains(t, p.AcknowledgeOrdinaryRecovery(ctx, plan), "incomplete")
 	changed := &types.OrdinaryRecoveryPlan{LowerLSN: plan.LowerLSN, TargetLSN: "0/600", ReplayAfter: plan.ReplayAfter}
 	require.ErrorContains(t, p.AcknowledgeOrdinaryRecovery(ctx, changed), "prepared plan")

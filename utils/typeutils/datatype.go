@@ -44,6 +44,12 @@ func TypeFromValue(v interface{}) types.DataType {
 		}
 	case time.Time:
 		return detectTimestampPrecision(val)
+	case Date:
+		return types.Date
+	case TimestampNTZ:
+		return types.TimestampNTZ
+	case Decimal:
+		return val.Type()
 	case []any:
 		return types.Array
 	case map[string]any:

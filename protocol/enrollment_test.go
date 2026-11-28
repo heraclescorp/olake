@@ -20,6 +20,8 @@ type enrollmentTestSource struct {
 	produced []types.StreamID
 	invalid  map[string]string
 	noPK     map[string]bool
+	noCOW    map[string]bool
+	cowIssue error
 	setup    int
 }
 
@@ -31,6 +33,7 @@ func (s *enrollmentTestSource) GetStreamNames(context.Context) ([]types.StreamID
 func (s *enrollmentTestSource) ProduceSchema(_ context.Context, id types.StreamID) (*types.Stream, error) {
 	s.produced = append(s.produced, id)
 	stream := types.NewStream(id.Name, id.Namespace, nil)
+	stream.SupportsIcebergCopyOnWrite = !s.noCOW[id.Name]
 	stream.UpsertField("id", types.Int64, false, false)
 	stream.UpsertField("payload", types.String, true, false)
 	stream.UpsertField("created_at", types.TimestampMicro, true, false)
@@ -46,6 +49,8 @@ func (s *enrollmentTestSource) ValidateTableEnrollment(_ context.Context, stream
 	}
 	return nil
 }
+
+func (s *enrollmentTestSource) ValidateCopyOnWriteEnrollment() error { return s.cowIssue }
 
 const enrollmentSavedFixture = `{
  "future_root":{"keep":true},
@@ -130,6 +135,19 @@ func TestEnrollmentExplicitPolicy(t *testing.T) {
 		{"duplicate schema", func(p *enrollmentPolicy) { p.Schemas = append(p.Schemas, p.Schemas[0]) }, "more than once"},
 		{"blank destination", func(p *enrollmentPolicy) { p.Schemas[0].DestinationDatabase = " " }, "nonblank"},
 		{"unknown delete type", func(p *enrollmentPolicy) { p.Defaults.UpdateType = "future" }, "invalid"},
+		{"unknown strategy", func(p *enrollmentPolicy) { p.Defaults.MergeStrategy = "future" }, "merge_strategy"},
+		{"cow requires normalization", func(p *enrollmentPolicy) {
+			p.Defaults.MergeStrategy = types.CopyOnWrite
+			p.Defaults.Normalization = new(false)
+		}, "normalized upsert"},
+		{"cow requires upsert", func(p *enrollmentPolicy) {
+			p.Defaults.MergeStrategy = types.CopyOnWrite
+			p.Defaults.AppendMode = new(true)
+		}, "normalized upsert"},
+		{"cow invalid inactive preference", func(p *enrollmentPolicy) {
+			p.Defaults.MergeStrategy = types.CopyOnWrite
+			p.Defaults.UpdateType = "future"
+		}, "invalid"},
 		{"unknown reader", func(p *enrollmentPolicy) { p.TargetQueryEngines = []string{"typo"} }, "unknown"},
 	}
 	for _, tc := range cases {
@@ -154,6 +172,14 @@ func TestEnrollmentExplicitPolicy(t *testing.T) {
 	}
 	if savedPolicy.Defaults.DropRemovedColumns != nil {
 		t.Fatal("absent drop_removed_columns must stay unset")
+	}
+	if savedPolicy.Defaults.MergeStrategy != "" {
+		t.Fatal("absent merge_strategy must retain existing MOR behavior")
+	}
+	explicitMOR := enrollmentTestPolicy()
+	explicitMOR.Defaults.MergeStrategy = types.MergeOnRead
+	if err := explicitMOR.validate(saved.saved); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -281,6 +307,156 @@ func testEnrollmentApprovedSubset(t *testing.T, split bool, dropRemovedColumns *
 	existing := &types.ConfiguredStream{Stream: loaded.Streams[0].Stream, StreamMetadata: loaded.SelectedStreams["public"][0]}
 	if existing.DropRemovedColumnsEnabled() {
 		t.Fatal("policy default changed an existing stream")
+	}
+}
+
+func TestEnrollmentCopyOnWriteCatalogs(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		for _, preference := range []types.UpdateType{types.UpdateTypePosition, types.UpdateTypeEquality, types.UpdateTypeDeletionVector} {
+			t.Run(map[bool]string{false: "legacy", true: "split"}[split]+"/"+string(preference), func(t *testing.T) {
+				saved := enrollmentTestCatalog(t, split, enrollmentSavedFixture)
+				oldStreams := slices.Clone(saved.streams)
+				oldSelection := slices.Clone(saved.selections["public"])
+				policy := enrollmentTestPolicy()
+				policy.Defaults.MergeStrategy = types.CopyOnWrite
+				policy.Defaults.UpdateType = preference
+				policy.TargetQueryEngines = []string{"databricks"}
+				destination := enrollmentTestDestination()
+				destination.WriterConfig.(map[string]any)["no_identifier_fields"] = true
+				source := &enrollmentTestSource{
+					names: []types.StreamID{{Namespace: "public", Name: "valid"}, {Namespace: "public", Name: "no_pk"}, {Namespace: "public", Name: "no_support"}},
+					noPK:  map[string]bool{"no_pk": true}, noCOW: map[string]bool{"no_support": true},
+				}
+				result, err := discoverNewTables(context.Background(), source, saved, policy, destination, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(result.Enrolled, []enrolledTable{{Namespace: "public", StreamName: "valid"}}) || len(result.Skipped) != 2 || !strings.Contains(result.Skipped[0].Reason, "primary key") || !strings.Contains(result.Skipped[1].Reason, "copy-on-write") {
+					t.Fatalf("unexpected result: %+v", result)
+				}
+				for i := range oldStreams {
+					assertEnrollmentJSONEqual(t, oldStreams[i], saved.streams[i])
+				}
+				assertEnrollmentJSONEqual(t, oldSelection[0], saved.selections["public"][0])
+				var metadata map[string]json.RawMessage
+				if err := json.Unmarshal(saved.selections["public"][1], &metadata); err != nil {
+					t.Fatal(err)
+				}
+				if string(metadata["merge_strategy"]) != `"copy-on-write"` || string(metadata["update_type"]) != `"`+string(preference)+`"` || string(metadata["append_mode"]) != "false" {
+					t.Fatalf("incorrect COW selection: %s", saved.selections["public"][1])
+				}
+				dir := t.TempDir()
+				var catalog *types.Catalog
+				if split {
+					a, s := filepath.Join(dir, "available.json"), filepath.Join(dir, "selected.json")
+					if err := os.WriteFile(a, []byte(result.AvailableStreamsConfig), 0600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(s, []byte(result.SelectedStreamsConfig), 0600); err != nil {
+						t.Fatal(err)
+					}
+					catalog, err = types.ResolveCatalog("", a, s)
+				} else {
+					path := filepath.Join(dir, "streams.json")
+					if err := os.WriteFile(path, []byte(result.StreamsConfig), 0600); err != nil {
+						t.Fatal(err)
+					}
+					catalog, err = types.ResolveCatalog(path, "", "")
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				configured := &types.ConfiguredStream{Stream: catalog.Streams[2].Stream, StreamMetadata: catalog.SelectedStreams["public"][1]}
+				if !configured.Stream.SupportsIcebergCopyOnWrite || !configured.CopyOnWriteEnabled() || configured.GetUpdateType() != preference || configured.GetSyncMode() != types.CDC {
+					t.Fatalf("COW settings lost on ordinary catalog load: %+v", configured)
+				}
+				if err := configured.ValidateUpdateType(types.Iceberg); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+func TestEnrollmentCopyOnWriteSourceFailurePreservesCatalog(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		saved := enrollmentTestCatalog(t, split, enrollmentSavedFixture)
+		policy := enrollmentTestPolicy()
+		policy.Defaults.MergeStrategy = types.CopyOnWrite
+		source := &enrollmentTestSource{names: []types.StreamID{{Namespace: "public", Name: "valid"}}, cowIssue: errors.New("copy-on-write requires source TOAST recovery")}
+		result, err := discoverNewTables(context.Background(), source, saved, policy, enrollmentTestDestination(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Enrolled) != 0 || len(result.Skipped) != 1 || !strings.Contains(result.Skipped[0].Reason, "source TOAST") || len(source.produced) != 0 {
+			t.Fatalf("source TOAST must skip candidate: %+v", result)
+		}
+		if split {
+			if result.AvailableStreamsConfig != saved.originalAvailable || result.SelectedStreamsConfig != saved.originalSelected {
+				t.Fatal("unchanged split catalogs were rewritten")
+			}
+		} else if result.StreamsConfig != saved.originalAvailable {
+			t.Fatal("unchanged legacy catalog was rewritten")
+		}
+	}
+}
+
+func TestEnrollmentExplicitMergeOnReadIsRetained(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		saved := enrollmentTestCatalog(t, split, enrollmentSavedFixture)
+		policy := enrollmentTestPolicy()
+		policy.Defaults.MergeStrategy = types.MergeOnRead
+		result, err := discoverNewTables(context.Background(), &enrollmentTestSource{names: []types.StreamID{{Namespace: "public", Name: "valid"}}}, saved, policy, enrollmentTestDestination(), nil)
+		if err != nil || len(result.Enrolled) != 1 {
+			t.Fatalf("MOR enrollment failed: %+v %v", result, err)
+		}
+		var metadata map[string]json.RawMessage
+		if err := json.Unmarshal(saved.selections["public"][1], &metadata); err != nil {
+			t.Fatal(err)
+		}
+		if string(metadata["merge_strategy"]) != `"merge-on-read"` {
+			t.Fatalf("explicit MOR lost: %s", saved.selections["public"][1])
+		}
+	}
+}
+
+func TestEnrollmentMORAppendWithoutPrimaryKeyOrCOWSupport(t *testing.T) {
+	for _, strategy := range []types.MergeStrategy{"", types.MergeOnRead} {
+		saved := enrollmentTestCatalog(t, false, enrollmentSavedFixture)
+		policy := enrollmentTestPolicy()
+		policy.Defaults.MergeStrategy = strategy
+		policy.Defaults.AppendMode = new(true)
+		source := &enrollmentTestSource{
+			names: []types.StreamID{{Namespace: "public", Name: "no_pk"}},
+			noPK:  map[string]bool{"no_pk": true}, noCOW: map[string]bool{"no_pk": true},
+			cowIssue: errors.New("destination TOAST"),
+		}
+		result, err := discoverNewTables(context.Background(), source, saved, policy, enrollmentTestDestination(), nil)
+		if err != nil || len(result.Enrolled) != 1 || len(result.Skipped) != 0 {
+			t.Fatalf("MOR append should remain eligible: %+v %v", result, err)
+		}
+		var metadata map[string]json.RawMessage
+		if err := json.Unmarshal(saved.selections["public"][1], &metadata); err != nil {
+			t.Fatal(err)
+		}
+		if strategy == "" {
+			if _, present := metadata["merge_strategy"]; present {
+				t.Fatal("omitted MOR strategy must remain omitted")
+			}
+		} else if string(metadata["merge_strategy"]) != `"merge-on-read"` {
+			t.Fatalf("explicit MOR lost: %s", saved.selections["public"][1])
+		}
+	}
+}
+
+func TestEnrollmentCopyOnWriteRequiresIceberg(t *testing.T) {
+	saved := enrollmentTestCatalog(t, false, enrollmentSavedFixture)
+	policy := enrollmentTestPolicy()
+	policy.Defaults.MergeStrategy = types.CopyOnWrite
+	source := &enrollmentTestSource{names: []types.StreamID{{Namespace: "public", Name: "valid"}}}
+	_, err := discoverNewTables(context.Background(), source, saved, policy, &types.WriterConfig{Type: types.Parquet}, nil)
+	if err == nil || !strings.Contains(err.Error(), "Iceberg destination") || source.setup != 0 {
+		t.Fatalf("non-Iceberg destination must fail before discovery: %v", err)
 	}
 }
 

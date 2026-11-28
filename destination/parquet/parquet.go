@@ -223,6 +223,7 @@ func (p *Parquet) Write(_ context.Context, records []types.RawRecord) error {
 			if err := p.checkFixedWidths(record.Data); err != nil {
 				return destination.WriteFailure(fmt.Errorf("failed to write in parquet file: %w", err))
 			}
+			toParquetValues(record.Data)
 			_, err = partitionFile.writer.Write([]any{record.Data})
 		} else {
 			dataBytes, merr := json.Marshal(record.Data)
@@ -260,6 +261,39 @@ func (p *Parquet) checkFixedWidths(data map[string]any) error {
 		}
 	}
 	return nil
+}
+
+// toParquetValues converts in place the exact values the reformatted record carries to what
+// parquet-go writes into their columns: a decimal as its unscaled integer (as its text past 18
+// digits, see the decimal node) and NaN, which no decimal holds, as null; a date or wall-clock
+// timestamp as its time.Time.
+func toParquetValues(data map[string]any) {
+	for column, value := range data {
+		switch v := value.(type) {
+		case typeutils.Decimal:
+			data[column] = parquetDecimal(v)
+		case typeutils.Date:
+			data[column] = v.Time
+		case typeutils.TimestampNTZ:
+			data[column] = v.Time
+		}
+	}
+}
+
+func parquetDecimal(v typeutils.Decimal) any {
+	if v.IsNaN() {
+		return nil
+	}
+	unscaled, _ := v.Unscaled()
+	precision, _, _ := types.DecimalParams(v.Type())
+	switch {
+	case precision <= 9:
+		return int32(unscaled.LowBits()) //nolint:gosec // G115: nine digits fit an int32
+	case precision <= 18:
+		return int64(unscaled.LowBits()) //nolint:gosec // G115: eighteen digits fit an int64
+	default:
+		return v.String()
+	}
 }
 
 // roll gives true when we need to check for rolling based on the current index of record

@@ -137,11 +137,14 @@ func partitionRecordsEqual(left, right partitionRecord) bool {
 }
 
 func clonePartitionValue(value any) any {
-	if bytes, ok := value.([]byte); ok {
-		return slices.Clone(bytes)
+	switch value := value.(type) {
+	case string:
+		return strings.Clone(value)
+	case []byte:
+		return slices.Clone(value)
+	default:
+		return value
 	}
-
-	return value
 }
 
 // NewPartitionedFanoutWriter creates a new PartitionedFanoutWriter with the specified

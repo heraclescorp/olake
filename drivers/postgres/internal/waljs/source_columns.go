@@ -17,7 +17,7 @@ import (
 // attmissingval holds the value rows stored before an ADD COLUMN read for it, when Postgres
 // could record it without rewriting the table (a non-volatile default). attgenerated is read
 // through to_jsonb so the query also runs on versions without generated columns.
-const sourceColumnsQuery = `SELECT a.attname, a.atttypid::int8 AS atttypid, a.atthasmissing,
+const sourceColumnsQuery = `SELECT a.attname, a.atttypid::int8 AS atttypid, a.atttypmod, a.atthasmissing,
 	(a.attmissingval::text::text[])[1] AS missing_value, d.adbin IS NOT NULL AS has_default,
 	COALESCE(to_jsonb(a)->>'attgenerated', '') <> '' AS generated
 FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
@@ -26,6 +26,7 @@ WHERE a.attrelid = %s AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum`
 type catalogColumn struct {
 	Name         string  `db:"attname"`
 	TypeOID      int64   `db:"atttypid"`
+	TypeMod      int32   `db:"atttypmod"`
 	HasMissing   bool    `db:"atthasmissing"`
 	MissingValue *string `db:"missing_value"`
 	HasDefault   bool    `db:"has_default"`
@@ -49,23 +50,25 @@ func fetchCatalogColumns(ctx context.Context, db *sqlx.DB, relation string, args
 
 // relationColumnsChanged reports whether a Relation message changes the column list Postgres
 // last sent for the relation. pgoutput resends Relation messages after unrelated cache
-// invalidations too, which must not count as schema changes.
+// invalidations too, which must not count as schema changes. A changed type modifier (a numeric's
+// precision or scale) changes the type the column's values have.
 func relationColumnsChanged(prev, next *pglogrepl.RelationMessage) bool {
 	if prev == nil || len(prev.Columns) != len(next.Columns) {
 		return true
 	}
 	for idx, column := range next.Columns {
-		if column.Name != prev.Columns[idx].Name || column.DataType != prev.Columns[idx].DataType {
+		previous := prev.Columns[idx]
+		if column.Name != previous.Name || column.DataType != previous.DataType || column.TypeModifier != previous.TypeModifier {
 			return true
 		}
 	}
 	return false
 }
 
-// sourceColumn describes a column whose values are typed by typeOID. catalog is the column's
-// current catalog entry, nil when the column (with that type) is no longer in the catalog.
-func (c ChangeFilter) sourceColumn(name string, typeOID uint32, catalog *catalogColumn) types.SourceColumn {
-	typeName := oidToString(typeOID)
+// sourceColumn describes a column whose values are typed by typeOID and typmod. catalog is the
+// column's current catalog entry, nil when the column (with that type) is no longer in the catalog.
+func (c ChangeFilter) sourceColumn(name string, typeOID uint32, typmod int32, catalog *catalogColumn) types.SourceColumn {
+	typeName := columnTypeName(typeOID, typmod)
 	column := types.SourceColumn{Name: name, Type: c.columnType(typeName)}
 	switch {
 	case catalog == nil:
@@ -106,10 +109,10 @@ func (c ChangeFilter) relationSourceColumns(msg *pglogrepl.RelationMessage, cata
 	}
 	for _, column := range msg.Columns {
 		entry := byName[column.Name]
-		if entry != nil && entry.TypeOID != int64(column.DataType) {
+		if entry != nil && (entry.TypeOID != int64(column.DataType) || entry.TypeMod != column.TypeModifier) {
 			entry = nil
 		}
-		change.Columns = append(change.Columns, c.sourceColumn(column.Name, column.DataType, entry))
+		change.Columns = append(change.Columns, c.sourceColumn(column.Name, column.DataType, column.TypeModifier, entry))
 	}
 	return change, nil
 }
@@ -126,7 +129,7 @@ func (c ChangeFilter) catalogSourceColumns(catalog []catalogColumn) (types.Sourc
 			change.KeepColumns = append(change.KeepColumns, catalog[idx].Name)
 			continue
 		}
-		change.Columns = append(change.Columns, c.sourceColumn(catalog[idx].Name, typeOID, &catalog[idx]))
+		change.Columns = append(change.Columns, c.sourceColumn(catalog[idx].Name, typeOID, catalog[idx].TypeMod, &catalog[idx]))
 	}
 	return change, nil
 }

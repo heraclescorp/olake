@@ -122,7 +122,7 @@ func TestOrdinaryRecoveryWal2JSONRejectsFutureBeforeAnyCallback(t *testing.T) {
 			return nil
 		})
 		if next == "0/600" {
-			require.ErrorContains(t, err, "exceeds target")
+			require.ErrorIs(t, err, errOrdinaryRecoveryTargetReached)
 			require.Empty(t, emitted)
 		} else {
 			require.NoError(t, err)

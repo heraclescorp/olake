@@ -25,12 +25,15 @@ import (
 func TestOrdinaryRecoveryBoundedReplayIntegration(t *testing.T) {
 	for _, allCovered := range []bool{false, true} {
 		t.Run(fmt.Sprintf("all_tables_covered=%t", allCovered), func(t *testing.T) {
-			testOrdinaryRecoveryBoundedReplay(t, allCovered)
+			testOrdinaryRecoveryBoundedReplay(t, allCovered, false)
 		})
 	}
+	t.Run("resume_after_intermediate_ack", func(t *testing.T) {
+		testOrdinaryRecoveryBoundedReplay(t, false, true)
+	})
 }
 
-func testOrdinaryRecoveryBoundedReplay(t *testing.T, allCovered bool) {
+func testOrdinaryRecoveryBoundedReplay(t *testing.T, allCovered, intermediateACK bool) {
 	dsn := os.Getenv("OLAKE_POSTGRES_TEST_DSN")
 	if dsn == "" {
 		t.Skip("set OLAKE_POSTGRES_TEST_DSN to a disposable PostgreSQL database with wal_level=logical")
@@ -82,22 +85,37 @@ func testOrdinaryRecoveryBoundedReplay(t *testing.T, allCovered bool) {
 	insertBoth(1)
 	// Peek (not consume/ACK) the plugin's complete COMMIT end, rather than
 	// deriving a replay boundary from wall-clock time or the current WAL tip.
-	rows, err := db.QueryxContext(ctx, "SELECT data FROM pg_logical_slot_peek_binary_changes($1, NULL, NULL, 'proto_version', '1', 'publication_names', $2)", name, name)
-	require.NoError(t, err)
-	var target pglogrepl.LSN
-	for rows.Next() {
-		var data []byte
-		require.NoError(t, rows.Scan(&data))
-		message, err := pglogrepl.Parse(data)
+	peekTarget := func() pglogrepl.LSN {
+		rows, err := db.QueryxContext(ctx, "SELECT data FROM pg_logical_slot_peek_binary_changes($1, NULL, NULL, 'proto_version', '1', 'publication_names', $2)", name, name)
 		require.NoError(t, err)
-		if commit, ok := message.(*pglogrepl.CommitMessage); ok {
-			target = commit.TransactionEndLSN
+		defer rows.Close()
+		var target pglogrepl.LSN
+		for rows.Next() {
+			var data []byte
+			require.NoError(t, rows.Scan(&data))
+			message, err := pglogrepl.Parse(data)
+			require.NoError(t, err)
+			if commit, ok := message.(*pglogrepl.CommitMessage); ok {
+				target = commit.TransactionEndLSN
+			}
 		}
+		require.NoError(t, rows.Err())
+		require.NotZero(t, target)
+		return target
 	}
-	require.NoError(t, rows.Err())
-	require.NoError(t, rows.Close())
-	require.NotZero(t, target)
-	insertBoth(2) // A real committed transaction beyond the authoritative bound.
+	target := peekTarget()
+	replayAfter := lower
+	wantID := 1
+	if intermediateACK {
+		replayAfter = target.String()
+		var advanced string
+		require.NoError(t, db.GetContext(ctx, &advanced, "SELECT end_lsn::text FROM pg_replication_slot_advance($1, $2::pg_lsn)", name, replayAfter))
+		require.Equal(t, replayAfter, advanced)
+		insertBoth(2)
+		target = peekTarget()
+		wantID = 2
+	}
+	insertBoth(wantID + 1) // A real committed transaction beyond the authoritative bound.
 
 	connection, err := url.Parse(dsn)
 	require.NoError(t, err)
@@ -125,7 +143,7 @@ func testOrdinaryRecoveryBoundedReplay(t *testing.T, allCovered bool) {
 	recoveryCtx := types.WithOrdinaryRecovery(ctx, options)
 	options.SourceIdentity, err = p.ValidateOrdinaryRecovery(recoveryCtx, streams, lower)
 	require.NoError(t, err)
-	positions := map[string]string{streams[0].ID(): lower, streams[1].ID(): target.String()}
+	positions := map[string]string{streams[0].ID(): replayAfter, streams[1].ID(): target.String()}
 	if allCovered {
 		positions[streams[0].ID()] = target.String()
 	}
@@ -148,13 +166,13 @@ func testOrdinaryRecoveryBoundedReplay(t *testing.T, allCovered bool) {
 	} else {
 		require.Len(t, got, 1)
 		require.Equal(t, streams[0].ID(), got[0].Stream.ID())
-		require.EqualValues(t, 1, got[0].Data["id"])
+		require.EqualValues(t, wantID, got[0].Data["id"])
 	}
 	slot, err := waljs.GetSlotPosition(ctx, db, name)
 	require.NoError(t, err)
-	parsedLower, err := pglogrepl.ParseLSN(lower)
+	parsedReadStart, err := pglogrepl.ParseLSN(replayAfter)
 	require.NoError(t, err)
-	require.Equal(t, parsedLower, slot.LSN, "bounded source read must not acknowledge before destination confirmation")
+	require.Equal(t, parsedReadStart, slot.LSN, "bounded source read must not acknowledge before destination confirmation")
 	require.Equal(t, baseline, state.Global.State)
 	// The source API is called only after the protocol's destination proof gate.
 	require.NoError(t, p.AcknowledgeOrdinaryRecovery(recoveryCtx, options.Plan))

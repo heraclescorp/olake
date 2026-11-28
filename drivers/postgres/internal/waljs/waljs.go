@@ -2,6 +2,7 @@ package waljs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -39,7 +40,9 @@ func (w *wal2jsonReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, cal
 	for key := range w.socket.changeFilter.tables {
 		tables = append(tables, key)
 	}
-	pluginArguments = append(pluginArguments, fmt.Sprintf("\"add-tables\" '%s'", strings.Join(tables, ",")))
+	arguments := make([]string, len(pluginArguments)+1)
+	copy(arguments, pluginArguments)
+	arguments[len(pluginArguments)] = fmt.Sprintf("\"add-tables\" '%s'", strings.Join(tables, ","))
 	if err := utils.CheckExecutionFence(ctx); err != nil {
 		return err
 	}
@@ -48,7 +51,7 @@ func (w *wal2jsonReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, cal
 		w.socket.pgConn,
 		w.socket.ReplicationSlot,
 		w.socket.ConfirmedFlushLSN,
-		pglogrepl.StartReplicationOptions{PluginArgs: pluginArguments},
+		pglogrepl.StartReplicationOptions{PluginArgs: arguments},
 	); err != nil {
 		return fmt.Errorf("starting replication slot failed: %w", err)
 	}
@@ -111,6 +114,13 @@ func (w *wal2jsonReplicator) StreamChanges(ctx context.Context, db *sqlx.DB, cal
 				progress.received(xld.WALStart, xld.ServerWALEnd, len(xld.WALData))
 				// Process change with the provided callback.
 				nextLSN, records, err := w.socket.changeFilter.FilterWalJsChange(ctx, xld.WALData, callback)
+				if w.socket.StrictRecovery && errors.Is(err, errOrdinaryRecoveryTargetReached) {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					w.socket.ClientXLogPos = w.socket.CurrentWalPosition
+					return nil
+				}
 				if err != nil {
 					return fmt.Errorf("failed to filter change: %w", err)
 				}

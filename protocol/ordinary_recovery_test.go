@@ -122,10 +122,13 @@ func TestOrdinaryRecoveryFlagsNeverReopenOriginalFence(t *testing.T) {
 	t.Setenv(constants.EnvStorageMode, "nfs")
 	t.Setenv(constants.EnvS3ConfigFolder, "")
 	oldOrigin, oldResult, oldExecution, oldLaunch, oldFence, oldState, oldSave, oldDiscover, oldPrefix := ordinaryRecoveryOriginPath, ordinaryRecoveryResultPath, executionID, executionLaunchID, executionFence, statePath, noSave, discoverSchema, destinationDatabasePrefix
+	oldCheckpoint := backfillRecoveryCheckpointPath
 	t.Cleanup(func() {
 		ordinaryRecoveryOriginPath, ordinaryRecoveryResultPath, executionID, executionLaunchID, executionFence, statePath, noSave, discoverSchema, destinationDatabasePrefix = oldOrigin, oldResult, oldExecution, oldLaunch, oldFence, oldState, oldSave, oldDiscover, oldPrefix
+		backfillRecoveryCheckpointPath = oldCheckpoint
 	})
 	ordinaryRecoveryOriginPath, ordinaryRecoveryResultPath = "ordinary-recovery-origin.json", "ordinary-recovery-result.json"
+	backfillRecoveryCheckpointPath = ""
 	executionID, executionLaunchID, statePath, noSave, discoverSchema, destinationDatabasePrefix = "recovery", "original", "state.json", false, false, ""
 	executionFence = filepath.Join(t.TempDir(), "execution-fence.json")
 	require.NoError(t, os.WriteFile(executionFence, []byte(`{"version":1,"execution_id":"recovery","state":"open"}`), 0600))
@@ -138,6 +141,11 @@ func TestOrdinaryRecoveryFlagsNeverReopenOriginalFence(t *testing.T) {
 	unchanged, err := os.ReadFile(executionFence)
 	require.NoError(t, err)
 	require.Contains(t, string(unchanged), `"state":"closed"`)
+	backfillRecoveryCheckpointPath = backfillCheckpointName
+	require.NoError(t, validateOrdinaryRecoveryFlags(cmd))
+	ordinaryRecoveryOriginPath, ordinaryRecoveryResultPath, executionLaunchID = "", "", ""
+	require.ErrorContains(t, validateOrdinaryRecoveryFlags(cmd), "only valid for ordinary recovery")
+	ordinaryRecoveryOriginPath, ordinaryRecoveryResultPath, executionLaunchID = "ordinary-recovery-origin.json", "ordinary-recovery-result.json", "original"
 	cmd.Use = "resync"
 	require.Error(t, validateOrdinaryRecoveryFlags(cmd))
 }
@@ -198,6 +206,133 @@ func TestOrdinaryRecoveryColdS3StartupPublishesNoStartReceipt(t *testing.T) {
 	require.Equal(t, "recovery", receipt.ExecutionID)
 	require.Equal(t, "original", receipt.LaunchID)
 	require.Empty(t, receipt.StateSHA256)
+}
+
+func TestOrdinaryRecoveryCheckpointCLILocalizesAndRejectsUnboundInputs(t *testing.T) {
+	scenario := os.Getenv("OLAKE_TEST_CHECKPOINT_SCENARIO")
+	if scenario == "" {
+		for _, mode := range []string{"uri", "config-folder"} {
+			for _, input := range []string{"valid", "missing-flag", "missing-object", "wrong-hash", "other-job", "non-backfill"} {
+				t.Run(mode+"/"+input, func(t *testing.T) {
+					child := exec.Command(os.Args[0], "-test.run=^TestOrdinaryRecoveryCheckpointCLILocalizesAndRejectsUnboundInputs$", "-test.count=1")
+					child.Env = append(os.Environ(), "OLAKE_TEST_CHECKPOINT_SCENARIO="+mode+"/"+input)
+					output, err := child.CombinedOutput()
+					require.NoError(t, err, "%s", output)
+				})
+			}
+		}
+		return
+	}
+	mode, input, _ := strings.Cut(scenario, "/")
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	checkpoint, _ := backfillRecoveryFixture(t)
+	baseline, err := checkpoint.MarshalJSON()
+	require.NoError(t, err)
+	origin := recoveryTestOrigin()
+	origin.Backfill, origin.SavedStateSHA256 = true, strings.Repeat("d", 64)
+	origin.BaselineStateSHA256, err = utils.CanonicalStateSHA256(baseline)
+	require.NoError(t, err)
+	candidate := types.BackfillRecoveryCheckpoint{Version: 1, ExecutionID: origin.OriginalExecutionID, LaunchID: origin.OriginalLaunchID, SourceSHA256: origin.SourceSHA256, DestinationSHA256: origin.DestinationSHA256, CatalogSHA256: origin.CatalogSHA256, StateSHA256: origin.BaselineStateSHA256, State: baseline, ServerIdentity: "synthetic-system", SlotName: "synthetic-slot"}
+	if input == "other-job" {
+		candidate.ExecutionID = "other-job-runtime"
+	}
+	candidateBytes, err := json.Marshal(candidate)
+	require.NoError(t, err)
+	sum := sha256.Sum256(candidateBytes)
+	origin.BackfillCheckpointSHA256 = hex.EncodeToString(sum[:])
+	if input == "wrong-hash" {
+		candidateBytes = append(candidateBytes, '\n')
+	}
+	if input == "missing-flag" {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, backfillCheckpointName), candidateBytes, 0600))
+	}
+	if input == "non-backfill" {
+		origin.Backfill, origin.SavedStateSHA256, origin.BackfillCheckpointSHA256 = false, "", ""
+	}
+	originBytes, err := json.Marshal(origin)
+	require.NoError(t, err)
+	objects := map[string][]byte{
+		"ordinary-recovery-origin.json": originBytes,
+		backfillCheckpointName:          candidateBytes,
+		"state.json":                    baseline,
+		"source.json":                   []byte(`{}`),
+		"destination.json":              []byte(`{}`),
+		"execution-fence.json":          []byte(`{"version":1,"execution_id":"recovery","state":"open"}`),
+	}
+	if input == "missing-object" {
+		delete(objects, backfillCheckpointName)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/synthetic-bucket/runtime/") {
+			http.Error(w, "unexpected storage operation", http.StatusBadRequest)
+			return
+		}
+		if data, ok := objects[strings.TrimPrefix(r.URL.Path, "/synthetic-bucket/runtime/")]; ok {
+			_, _ = w.Write(data)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	t.Setenv(constants.EnvStorageMode, constants.StorageModeS3)
+	t.Setenv(constants.EnvS3ConfigFolder, "")
+	t.Setenv(constants.EnvS3Endpoint, server.URL)
+	t.Setenv(constants.EnvS3Region, "us-east-2")
+	t.Setenv(constants.EnvS3AccessKeyID, "synthetic")
+	t.Setenv(constants.EnvS3SecretAccessKey, "synthetic")
+	prefix := "s3://synthetic-bucket/runtime/"
+	path := func(name string) string { return prefix + name }
+	if mode == "config-folder" {
+		t.Setenv(constants.EnvS3ConfigFolder, prefix)
+		path = func(name string) string { return filepath.Join("/mnt/config", name) }
+	}
+	stopped := errors.New("stop before any source or destination work")
+	launched := false
+	root := &cobra.Command{Use: "olake", PersistentPreRunE: RootCmd.PersistentPreRunE, SilenceErrors: true, SilenceUsage: true}
+	root.PersistentFlags().AddFlagSet(RootCmd.PersistentFlags())
+	sync := &cobra.Command{Use: "sync", PreRunE: func(*cobra.Command, []string) error {
+		data, err := os.ReadFile(ordinaryRecoveryOriginPath)
+		if err != nil {
+			return err
+		}
+		var localizedOrigin types.OrdinaryRecoveryOrigin
+		if err := strictRecoveryJSON(data, &localizedOrigin); err != nil {
+			return err
+		}
+		if err := validateOrdinaryRecoveryOrigin(localizedOrigin); err != nil {
+			return err
+		}
+		_, err = loadBackfillRecoveryCheckpoint(backfillRecoveryCheckpointPath, localizedOrigin, baseline)
+		return err
+	}, RunE: func(*cobra.Command, []string) error {
+		launched = true
+		return stopped
+	}}
+	sync.Flags().AddFlagSet(syncCmd.Flags())
+	root.AddCommand(sync)
+	args := []string{"sync", "--config", path("source.json"), "--destination", path("destination.json"), "--state", path("state.json"), "--execution-id", "recovery", "--execution-launch-id", "original", "--execution-fence", prefix + "execution-fence.json", "--ordinary-recovery-origin", path("ordinary-recovery-origin.json"), "--ordinary-recovery-result", path("ordinary-recovery-result.json")}
+	if input != "missing-flag" {
+		args = append(args, "--backfill-recovery-checkpoint", path(backfillCheckpointName))
+	}
+	root.SetArgs(args)
+	err = root.Execute()
+	if input == "valid" {
+		require.ErrorIs(t, err, stopped)
+		require.True(t, launched)
+		require.Equal(t, filepath.Join(dir, backfillCheckpointName), backfillRecoveryCheckpointPath)
+		localized, err := os.ReadFile(backfillRecoveryCheckpointPath)
+		require.NoError(t, err)
+		require.Equal(t, candidateBytes, localized)
+	} else {
+		require.Error(t, err)
+		require.NotErrorIs(t, err, stopped)
+		require.False(t, launched, "invalid recovery inputs must fail before launching data work")
+		for _, name := range []string{"ordinary-recovery-result.json", "execution-result.json"} {
+			_, err := os.Stat(filepath.Join(dir, name))
+			require.True(t, os.IsNotExist(err), "invalid recovery must not publish settlement evidence")
+		}
+	}
 }
 
 func TestOrdinaryRecoveryServerPinSurvivesInterruptedEpochAndRejectsDrift(t *testing.T) {

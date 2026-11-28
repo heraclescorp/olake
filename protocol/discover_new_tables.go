@@ -176,6 +176,15 @@ func discoverNewTables(ctx context.Context, source abstract.TableEnrollmentSourc
 		if err := source.SetupTableEnrollment(ctx); err != nil {
 			return nil, err
 		}
+		var cowSourceIssue error
+		if policy.Defaults.MergeStrategy == types.CopyOnWrite {
+			validator, ok := source.(interface{ ValidateCopyOnWriteEnrollment() error })
+			if !ok {
+				cowSourceIssue = fmt.Errorf("source does not support copy-on-write enrollment")
+			} else {
+				cowSourceIssue = validator.ValidateCopyOnWriteEnrollment()
+			}
+		}
 		names, err := source.GetStreamNames(ctx)
 		if err != nil {
 			return nil, err
@@ -229,11 +238,15 @@ func discoverNewTables(ctx context.Context, source abstract.TableEnrollmentSourc
 				skip("canonical destination collides with a saved stream or another new candidate")
 				continue
 			}
-			if !*policy.Defaults.AppendMode && (len(available) == 0 || !slices.Contains(available, policy.Defaults.UpdateType)) {
+			if cowSourceIssue != nil {
+				skip(cowSourceIssue.Error())
+				continue
+			}
+			if policy.Defaults.MergeStrategy != types.CopyOnWrite && !*policy.Defaults.AppendMode && (len(available) == 0 || !slices.Contains(available, policy.Defaults.UpdateType)) {
 				skip("policy delete format is not readable by every target query engine")
 				continue
 			}
-			if !*policy.Defaults.AppendMode && policy.Defaults.UpdateType == types.UpdateTypeEquality && (writer.NoIdentifierFields || writer.CatalogType == "unity") {
+			if policy.Defaults.MergeStrategy != types.CopyOnWrite && !*policy.Defaults.AppendMode && policy.Defaults.UpdateType == types.UpdateTypeEquality && (writer.NoIdentifierFields || writer.CatalogType == "unity") {
 				skip("destination does not support identifier fields required by equality deletes")
 				continue
 			}
@@ -253,6 +266,19 @@ func discoverNewTables(ctx context.Context, source abstract.TableEnrollmentSourc
 			if reason := enrollmentSchemaIssue(stream, *policy.Defaults.AppendMode); reason != "" {
 				skip(reason)
 				continue
+			}
+			if policy.Defaults.MergeStrategy == types.CopyOnWrite {
+				if !stream.SupportsIcebergCopyOnWrite {
+					skip("discovered source does not support copy-on-write")
+					continue
+				}
+				configured := &types.ConfiguredStream{Stream: stream, StreamMetadata: types.StreamMetadata{
+					MergeStrategy: policy.Defaults.MergeStrategy, Normalization: policy.Defaults.Normalization, AppendMode: policy.Defaults.AppendMode,
+				}}
+				if err := configured.ValidateCopyOnWrite(destination.Type); err != nil {
+					skip(err.Error())
+					continue
+				}
 			}
 			if err := source.ValidateTableEnrollment(ctx, stream); err != nil {
 				skip(err.Error())

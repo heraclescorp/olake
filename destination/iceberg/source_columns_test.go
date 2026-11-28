@@ -8,10 +8,12 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	apacheiceberg "github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils/typeutils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -313,6 +315,12 @@ func TestNativeSourceColumnDefaultConversions(t *testing.T) {
 		{"timestamptz", stamp, apacheiceberg.Timestamp(stamp.UnixMicro())},
 		{"binary", []byte{1, 2}, []byte{1, 2}},
 		{"fixed[2]", []byte{1, 2}, []byte{1, 2}},
+		{"date", "2026-01-31", apacheiceberg.Date(20484)},
+		{"date", typeutils.Date{Time: time.Date(2026, 1, 31, 0, 0, 0, 0, time.UTC)}, apacheiceberg.Date(20484)},
+		{"timestamp", typeutils.TimestampNTZ{Time: stamp}, apacheiceberg.Timestamp(stamp.UnixMicro())},
+		{"decimal(16, 2)", "48.10", apacheiceberg.Decimal{Val: decimal128.FromI64(4810), Scale: 2}},
+		{"decimal(16, 2)", sourceDecimal(t, "0.30"), apacheiceberg.Decimal{Val: decimal128.FromI64(30), Scale: 2}},
+		{"double", sourceDecimal(t, "0.30"), float64(0.3)},
 	} {
 		t.Run(tc.iceType, func(t *testing.T) {
 			literal, err := nativeSourceColumnDefault(tc.iceType, tc.value)
@@ -338,6 +346,9 @@ func TestNativeSourceColumnDefaultConversions(t *testing.T) {
 		{"long", 1.5}, {"float", float64(1e100)},
 		{"double", "1e1000"}, {"timestamp", "2025-02-30T12:00:00Z"},
 		{"timestamptz", "2025-03-08Tnot-a-time"},
+		{"date", "not-a-date"}, {"date", "2025-02-30"},
+		{"decimal(16, 2)", "48.105"}, {"decimal(16, 2)", "not-a-number"},
+		{"decimal(16, 2)", "NaN"}, {"decimal(2, 0)", "100"},
 	} {
 		_, err := nativeSourceColumnDefault(tc.iceType, tc.value)
 		require.Error(t, err)
@@ -468,6 +479,8 @@ func TestNativeSourcePrimitiveDefaultsPersistAndReadOldRows(t *testing.T) {
 				{"new_double", "double", "2.5", float64(2.5)},
 				{"new_bool", "boolean", "false", false},
 				{"new_string", "string", "", ""},
+				{"new_decimal", "decimal(16, 2)", "48.10", sourceDecimal(t, "48.10")},
+				{"new_date", "date", "2026-01-31", typeutils.Date{Time: time.Date(2026, 1, 31, 0, 0, 0, 0, time.UTC)}},
 			}
 			// Upstream v0.7.0 rounds integer defaults above 2^53 and cannot
 			// round-trip temporal defaults through its metadata codec.

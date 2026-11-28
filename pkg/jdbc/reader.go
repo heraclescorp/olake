@@ -99,14 +99,26 @@ func getColumnMetadata(rows *sql.Rows) ([]string, []*sql.ColumnType, error) {
 	return columns, colTypes, nil
 }
 
-// normalizeDataTypeAndConvert normalizes the datatype and converts the raw value using the converter function
-func normalizeDataTypeAndConvert(rawData any, colType *sql.ColumnType, converter func(value interface{}, columnType string) (interface{}, error)) (any, error) {
+// columnTypeName is the type name the converter receives for a column. A NUMERIC column with a
+// declared precision and scale (PostgreSQL's) is named by the decimal(p,s) DataType it holds, so its
+// values convert exactly; one Iceberg cannot hold as a decimal keeps its name.
+func columnTypeName(colType *sql.ColumnType) string {
 	datatype := colType.DatabaseTypeName()
 	precision, scale, hasPrecisionScale := colType.DecimalSize()
-	if datatype == "NUMBER" && hasPrecisionScale && scale == 0 {
-		datatype = utils.Ternary(precision > 9, "int64", "int32").(string)
+	switch {
+	case datatype == "NUMBER" && hasPrecisionScale && scale == 0:
+		return utils.Ternary(precision > 9, "int64", "int32").(string)
+	case datatype == "NUMERIC" && hasPrecisionScale:
+		if decimal, ok := types.DecimalOf(int(precision), int(scale)); ok {
+			return string(decimal)
+		}
 	}
-	conv, err := converter(rawData, datatype)
+	return datatype
+}
+
+// convertValue converts the raw value of a column named typeName using the converter function
+func convertValue(rawData any, typeName string, converter func(value interface{}, columnType string) (interface{}, error)) (any, error) {
+	conv, err := converter(rawData, typeName)
 	if err != nil && err != typeutils.ErrNullValue {
 		return nil, err
 	}
@@ -142,7 +154,7 @@ func MapScan(rows *sql.Rows, dest map[string]any, converter func(value interface
 			rowBytes += columnSizer(colTypes[i])(rawData)
 		}
 		if converter != nil {
-			conv, err := normalizeDataTypeAndConvert(rawData, colTypes[i], converter)
+			conv, err := convertValue(rawData, columnTypeName(colTypes[i]), converter)
 			if err != nil {
 				return 0, err
 			}
@@ -219,6 +231,7 @@ func MapScanConcurrent(setter *Reader[*sql.Rows], converter func(value interface
 	// Consumer: convert + emit records.
 	consumer := func(ctx context.Context) error {
 		var sizeOf map[string]func(v any) int64
+		var typeNames []string
 		var readRows, readBytes int64
 		defer func() {
 			if measuring {
@@ -227,12 +240,14 @@ func MapScanConcurrent(setter *Reader[*sql.Rows], converter func(value interface
 		}()
 		for vals := range valuesCh {
 			// colTypes is safely visible here: the producer sets it before the first
-			// channel send. Build the per-column sizers once for the result set, keyed
-			// by column name (unique for a single-table scan).
+			// channel send. Build the per-column sizers and type names once for the
+			// result set; sizers are keyed by column name (unique for a single-table scan).
 			if sizeOf == nil {
 				sizeOf = make(map[string]func(v any) int64, len(columns))
+				typeNames = make([]string, len(columns))
 				for i, col := range columns {
 					sizeOf[col] = columnSizer(colTypes[i])
+					typeNames[i] = columnTypeName(colTypes[i])
 				}
 			}
 
@@ -253,7 +268,7 @@ func MapScanConcurrent(setter *Reader[*sql.Rows], converter func(value interface
 					continue
 				}
 
-				conv, err := normalizeDataTypeAndConvert(rawData, colTypes[i], converter)
+				conv, err := convertValue(rawData, typeNames[i], converter)
 				if err != nil {
 					return fmt.Errorf("failed to convert value for column %s: %w", col, err)
 				}

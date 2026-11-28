@@ -3,6 +3,7 @@ package waljs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/datazip-inc/olake/drivers/abstract"
@@ -12,6 +13,8 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/jackc/pglogrepl"
 )
+
+var errOrdinaryRecoveryTargetReached = errors.New("ordinary recovery reached its fixed target before the next transaction")
 
 type ChangeFilter struct {
 	tables    map[string]types.StreamInterface
@@ -50,7 +53,7 @@ func (c ChangeFilter) FilterWalJsChange(ctx context.Context, change []byte, OnFi
 		return nil, 0, fmt.Errorf("failed to parse received lsn: %w", err)
 	}
 	if c.replayThrough != nil && nextLSN > *c.replayThrough {
-		return nil, 0, fmt.Errorf("ordinary recovery transaction %s exceeds target %s", nextLSN, *c.replayThrough)
+		return nil, 0, errOrdinaryRecoveryTargetReached
 	}
 
 	if len(changes.Change) == 0 {

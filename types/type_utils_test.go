@@ -91,8 +91,44 @@ func TestFixedBinaryGrammar(t *testing.T) {
 func TestBaseOf(t *testing.T) {
 	require.Equal(t, FixedBinary, BaseOf(FixedBinaryOf(16)))
 	require.Equal(t, FixedBinary, BaseOf(FixedBinary))
+	require.Equal(t, Decimal, BaseOf(Decimal.Of(16, 2)))
 	for _, dataType := range append(declaredDataTypes(t), Null, Unknown, DataType("undeclared_type")) {
 		require.Equal(t, dataType, BaseOf(dataType), "%s must be its own base", dataType)
+	}
+}
+
+func TestDecimalGrammar(t *testing.T) {
+	testCases := []struct {
+		precision, scale int
+		ok               bool
+	}{
+		{precision: 16, scale: 2, ok: true},
+		{precision: 6, scale: 4, ok: true},
+		{precision: 38, scale: 0, ok: true},
+		{precision: 38, scale: 38, ok: true},
+		{precision: 1, scale: 0, ok: true},
+		{precision: 39, scale: 2, ok: false}, // past Iceberg's 38 digits
+		{precision: 0, scale: 0, ok: false},
+		{precision: 3, scale: 5, ok: false}, // PostgreSQL 15 allows a scale above the precision
+		{precision: 10, scale: -2, ok: false},
+	}
+	for _, tc := range testCases {
+		dataType, ok := DecimalOf(tc.precision, tc.scale)
+		require.Equal(t, tc.ok, ok, "decimal(%d,%d)", tc.precision, tc.scale)
+		if !ok {
+			continue
+		}
+		require.Equal(t, Decimal.Of(tc.precision, tc.scale), dataType)
+		precision, scale, parsed := DecimalParams(dataType)
+		require.True(t, parsed)
+		require.Equal(t, []int{tc.precision, tc.scale}, []int{precision, scale})
+		precision, scale, parsed = IcebergDecimalParams(dataType.ToIceberg())
+		require.True(t, parsed)
+		require.Equal(t, []int{tc.precision, tc.scale}, []int{precision, scale})
+	}
+	for _, dataType := range []DataType{Decimal, "decimal(16, 2)", "decimal(39,2)", Float64} {
+		_, _, ok := DecimalParams(dataType)
+		require.False(t, ok, "%s is no decimal(p,s) instance", dataType)
 	}
 }
 

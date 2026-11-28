@@ -30,6 +30,11 @@ func plainNode(construct func() parquet.Node) pqNodeConstructor {
 
 func timestampNode(...any) parquet.Node { return parquet.Timestamp(parquet.Microsecond) }
 
+// timestampNTZNode keeps a wall-clock value: parquet's isAdjustedToUTC=false.
+func timestampNTZNode(...any) parquet.Node {
+	return parquet.TimestampAdjusted(parquet.Microsecond, false)
+}
+
 // typeFamily is used for parameterised DataType
 type typeFamily struct {
 	pattern DataType
@@ -40,6 +45,7 @@ type typeFamily struct {
 // families is the roster of parameterised DataTypes. Each family describes itself in its own file.
 var families = []*typeFamily{
 	fixedBinaryFamily,
+	decimalFamily,
 }
 
 func newTypeFamily(pattern DataType, valid func([]int) bool) *typeFamily {
@@ -115,6 +121,8 @@ func BaseOf(d DataType) DataType {
 	switch d[:open] {
 	case "fixed_binary":
 		return FixedBinary
+	case "decimal":
+		return Decimal
 	default:
 		return d
 	}

@@ -19,6 +19,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/compress"
@@ -43,16 +44,18 @@ import (
 )
 
 type Iceberg struct {
-	options          *destination.Options
-	config           *Config
-	stream           types.StreamInterface
-	partitionInfo    []internal.PartitionInfo // ordered slice to preserve partition column order
-	catalog          catalog.Catalog
-	schema           map[string]string
-	writer           Writer
-	resyncMu         sync.Mutex
-	resync           *resyncControl
-	ordinaryRecovery map[string]*ordinaryRecoveryTable
+	options              *destination.Options
+	config               *Config
+	stream               types.StreamInterface
+	partitionInfo        []internal.PartitionInfo // ordered slice to preserve partition column order
+	catalog              catalog.Catalog
+	schema               map[string]string
+	writer               Writer
+	resyncMu             sync.Mutex
+	resync               *resyncControl
+	ordinaryRecovery     map[string]*ordinaryRecoveryTable
+	backfillRecovery     map[string]*ordinaryRecoveryTable
+	initialBackfillPlans map[string]string
 	// unavailableValues recovers values the source could not send; nil unless the stream keeps a row index (pos or dv)
 	unavailableValues *unavailableValuesResolver
 	// syncStartColumns are columns added from the source catalog at sync start (see planSourceColumns).
@@ -60,18 +63,28 @@ type Iceberg struct {
 	// Schema is refreshed at explicit evolution and commit boundaries.
 }
 
-// Pre-computed lookup tables for type validation
+// Pre-computed lookup tables for type validation; a decimal(p, s) value is looked up as "decimal".
+// Tables created before PostgreSQL numeric, date and timestamp columns got their own types hold
+// them as double and timestamptz. Such a column keeps its type: a decimal is written as the double
+// its text parses to, a date as UTC midnight and a wall-clock timestamp as that instant in UTC,
+// exactly the values those columns received before.
 var validTypeTransitions = map[string]map[string]bool{
 	"int":         {"int": true, "long": true},
 	"long":        {"long": true, "int": true},
 	"float":       {"float": true, "double": true},
-	"double":      {"double": true, "float": true},
+	"double":      {"double": true, "float": true, "decimal": true},
 	"boolean":     {"boolean": true},
 	"string":      {"string": true},
-	"timestamptz": {"timestamptz": true},
+	"date":        {"date": true},
+	"timestamp":   {"timestamp": true, "date": true},
+	"timestamptz": {"timestamptz": true, "timestamp": true, "date": true},
 }
 
-// promotionTransitions tracks when type promotion is required
+// nanDecimalAsNull warns once a sync, not once a row, that a NaN decimal is written as null.
+var nanDecimalAsNull sync.Once
+
+// promotionTransitions tracks when type promotion is required; isPromotionRequired also widens a
+// decimal's precision.
 var promotionTransitions = map[string]map[string]bool{
 	"int":   {"long": true},
 	"float": {"double": true},
@@ -130,6 +143,13 @@ func (i *Iceberg) Write(ctx context.Context, records []types.RawRecord) error {
 	return i.writer.Write(ctx, records[start:])
 }
 
+func (i *Iceberg) PrepareClose(ctx context.Context) error {
+	if preparer, ok := i.writer.(destination.ClosePreparer); ok {
+		return preparer.PrepareClose(ctx)
+	}
+	return nil
+}
+
 func (i *Iceberg) Close(ctx context.Context, finalMetadataState any) error {
 	if i.unavailableValues != nil {
 		i.unavailableValues.Close()
@@ -148,6 +168,7 @@ func (i *Iceberg) Check(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
+	ctx = types.WithBackfillCheckpoint(ctx, nil)
 	stream := types.NewStream(destinationDB, destinationDB, nil)
 	stream.DestinationDatabase, stream.DestinationTable = destinationDB, destinationDB
 	for name, dataType := range types.RawSchema {
@@ -405,14 +426,27 @@ func parsePartitionRegex(pattern string, resolveColumnName func(string) string) 
 // iceberg type valueType, as its value type or through an iceberg promotion. A fixed[n] value of
 // the wrong length fails on write.
 func isValidTypeForColumn(columnType, valueType string) bool {
-	if types.IcebergValueType(columnType) == valueType || validTypeTransitions[columnType][valueType] {
+	if types.IcebergValueType(columnType) == valueType || validTypeTransitions[columnType][transitionKey(valueType)] || isPromotionRequired(columnType, valueType) {
 		return true
 	}
 	return getCommonAncestorType(columnType, valueType) == columnType
 }
 
-// isPromotionRequired checks if promotion is needed using lookup table
+// transitionKey is the validTypeTransitions key of a value's iceberg type: a decimal's family.
+func transitionKey(valueType string) string {
+	if _, _, isDecimal := types.IcebergDecimalParams(valueType); isDecimal {
+		return "decimal"
+	}
+	return valueType
+}
+
+// isPromotionRequired checks if promotion is needed using lookup table. Iceberg widens a decimal's
+// precision, never its scale.
 func isPromotionRequired(oldType, newType string) bool {
+	if oldPrecision, oldScale, isDecimal := types.IcebergDecimalParams(oldType); isDecimal {
+		newPrecision, newScale, isNewDecimal := types.IcebergDecimalParams(newType)
+		return isNewDecimal && newScale == oldScale && newPrecision > oldPrecision
+	}
 	if transitions, ok := promotionTransitions[oldType]; ok {
 		return transitions[newType]
 	}
@@ -512,14 +546,19 @@ type nativeTableCoordinator struct {
 }
 
 type nativeTableState struct {
-	mu               sync.Mutex
-	latest           *table.Table
-	unknown          bool
-	closed           bool
-	generation       uint64
-	resync           *resyncControl
-	sessions         int
-	ordinaryRecovery *ordinaryRecoveryTable
+	mu                 sync.Mutex
+	latest             *table.Table
+	unknown            bool
+	closed             bool
+	generation         uint64
+	resync             *resyncControl
+	sessions           int
+	ordinaryRecovery   *ordinaryRecoveryTable
+	backfillRecovery   *ordinaryRecoveryTable
+	backfillBinding    *nativeBackfillBinding
+	backfillBindingRaw string
+	backfillChunkIDs   map[string]struct{}
+	backfillCheckpoint *types.BackfillRecoveryCheckpoint
 }
 
 type nativeTableLockKey struct{}
@@ -607,6 +646,16 @@ func (w *nativeWriter) currentTable(ctx context.Context, state *nativeTableState
 	if err := validateOrdinaryRecoveryWriter(ctx, state, state.latest, w.stream); err != nil {
 		return nil, err
 	}
+	if w.options.Backfill {
+		if err := validateOriginalBackfillWriter(ctx, state, state.latest, w.config, w.stream, w.options.ThreadID); err != nil {
+			return nil, err
+		}
+	}
+	if w.cow != nil {
+		if err := validateNativeCOWTable(ctx, state.latest); err != nil {
+			return nil, err
+		}
+	}
 	return state.latest, nil
 }
 
@@ -634,23 +683,30 @@ type nativeWriter struct {
 	paths                  map[string]struct{}
 	backfillFiles          map[string]*nativeBackfillFile
 	backfillClock          uint64
-	backfillTargetBytes    int64
 	backfillPartitionLimit int
 	closed                 bool
 	uncertain              bool
 	failed                 error
 	releaseSession         func(bool)
+	cow                    *nativeCOW
+	recoveryColumns        []string
 }
 
 func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInterface, options *destination.Options, cat catalog.Catalog, indexThread *types.StreamIndexThread) (_ *nativeWriter, _ *types.MetadataState, err error) {
+	if err := stream.Self().ValidateCopyOnWrite(types.Iceberg); err != nil {
+		return nil, nil, err
+	}
+	if stream.Self().CopyOnWriteEnabled() && (indexThread != nil || options.TableIndex != nil) {
+		return nil, nil, errors.New("copy-on-write must not open a destination row index; disable destination TOAST hydration")
+	}
 	ctx, finish, err := beginNativeWriterWork(ctx, config)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer finish()
-	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery || config.ordinaryRecovery {
-		if !recovery || options.Backfill {
-			return nil, nil, errors.New("ordinary recovery cannot open fresh or backfill writers")
+	if recovery, ok := types.OrdinaryRecoveryFromContext(ctx); ok || config.ordinaryRecovery {
+		if !ok || (options.Backfill && (!recovery.Origin.Backfill || recovery.BackfillComplete)) || (!options.Backfill && recovery.Origin.Backfill && !recovery.BackfillComplete) {
+			return nil, nil, errors.New("ordinary recovery writer does not match the active recovery phase")
 		}
 	}
 	identifier := catalog.ToIdentifier(stream.GetDestinationDatabase(&config.IcebergDatabase), stream.GetDestinationTable())
@@ -679,24 +735,60 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 	// Setup is the freshness boundary for external schema-only changes and
 	// response-config credentials. Hold the table lock so an older load cannot
 	// overwrite a newer local commit; Close reuses coordinated metadata.
-	tbl, err := loadOrCreateNativeTable(ctx, config, stream, cat)
+	var tbl *table.Table
+	if _, controlled := types.BackfillCheckpointFromContext(ctx); controlled && options.Backfill {
+		tbl, err = cat.LoadTable(ctx, identifier)
+	} else {
+		tbl, err = loadOrCreateNativeTable(ctx, config, stream, cat)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("load or create Iceberg table: %w", err)
 	}
 	if err := validateOrdinaryRecoveryWriter(ctx, state, tbl, stream); err != nil {
 		return nil, nil, err
 	}
+	if recovery, ok := types.OrdinaryRecoveryFromContext(ctx); ok && recovery.Origin.Backfill && !recovery.BackfillComplete {
+		if _, planned := state.backfillRecovery.chunkIDs[options.ThreadID]; !planned {
+			return nil, nil, errors.New("backfill recovery writer chunk is outside the exact durable plan")
+		}
+	}
+	if options.Backfill {
+		if err := validateOriginalBackfillWriter(ctx, state, tbl, config, stream, options.ThreadID); err != nil {
+			return nil, nil, err
+		}
+	}
 	state.latest = tbl
 	logNativeMetadataLSN(stream.ID(), tbl.Metadata().TableUUID().String(), nativeSnapshotID(tbl), tbl.Properties()[nativeRecoveryProperty])
-	w = &nativeWriter{table: tbl, cat: cat, coordinator: state, generation: state.generation, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), positions: make(map[string][]int64), latest: make(map[string]types.RowLocation), paths: make(map[string]struct{})}
+	w = &nativeWriter{table: tbl, cat: cat, coordinator: state, generation: state.generation, config: config, stream: stream, options: options, indexThread: indexThread, upsert: isUpsertMode(stream, options.Backfill), deleteMode: stream.GetUpdateType(), paths: make(map[string]struct{})}
 	w.releaseSession = release
+	if stream.Self().CopyOnWriteEnabled() {
+		w.cow = &nativeCOW{}
+		if err := validateNativeCOWTable(ctx, w.table); err != nil {
+			return nil, nil, err
+		}
+	}
+	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery && !options.Backfill && w.upsert {
+		columns, err := nativeStreamColumns(stream)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, field := range tbl.Schema().Fields() {
+			if _, present := columns[field.Name]; !present {
+				w.recoveryColumns = append(w.recoveryColumns, field.Name)
+			}
+		}
+	}
+	if w.cow == nil {
+		w.positions = make(map[string][]int64)
+		w.latest = make(map[string]types.RowLocation)
+	}
 	if err := w.validateFormat(ctx); err != nil {
 		return nil, nil, err
 	}
 	// Existing source columns are reconciled by ApplySourceColumns after the
 	// SyncStart phase, when PostgreSQL defaults have become authoritative. Eager
 	// union here would consume additions before their initial defaults arrive.
-	if options.TableIndex != nil {
+	if w.cow == nil && options.TableIndex != nil {
 		if err := w.migrateEqualityDeletes(ctx); err != nil {
 			return nil, nil, err
 		}
@@ -704,11 +796,13 @@ func newNativeWriter(ctx context.Context, config *Config, stream types.StreamInt
 	// Reconcile and return recovery from the loaded metadata, or from the
 	// successful format/migration commit that replaced it. A no-op
 	// initialization must not issue another catalog GET.
-	if err := indexdb.ReconcileTable(options.TableIndex, w.table.Properties()[resyncGenerationProperty], w.table.Metadata().TableUUID().String()); err != nil {
-		return nil, nil, fmt.Errorf("reconcile stream index generation: %w", err)
-	}
-	if err := reconcileNativeTableIndex(ctx, options.TableIndex, w.table, constants.OlakeID); err != nil {
-		return nil, nil, err
+	if w.cow == nil {
+		if err := indexdb.ReconcileTable(options.TableIndex, w.table.Properties()[resyncGenerationProperty], w.table.Metadata().TableUUID().String()); err != nil {
+			return nil, nil, fmt.Errorf("reconcile stream index generation: %w", err)
+		}
+		if err := reconcileNativeTableIndex(ctx, options.TableIndex, w.table, constants.OlakeID); err != nil {
+			return nil, nil, err
+		}
 	}
 	metadataState := &types.MetadataState{}
 	if value := w.table.Properties()[nativeRecoveryProperty]; value != "" {
@@ -746,6 +840,9 @@ func (w *nativeWriter) validateFormat(ctx context.Context) error {
 	// Initialization holds the entry lock through format changes, equality
 	// migration, index reconciliation and recovery-state publication.
 	state := w.coordinator
+	if w.cow != nil {
+		return nil
+	}
 	version := w.table.Metadata().Version()
 	if version > 3 {
 		return fmt.Errorf("unsupported Iceberg format version %d", version)
@@ -822,8 +919,16 @@ func (w *nativeWriter) Write(ctx context.Context, records []types.RawRecord) (er
 	}()
 	ctx = nativeCatalogContext(ctx, w.cat)
 	w.indexThread.SetObservabilityContext(ctx)
+	if w.cow != nil && !w.options.Backfill {
+		return w.writeCopyOnWrite(ctx, records)
+	}
 	if w.options.Backfill {
 		return w.writeBackfill(ctx, records)
+	}
+	if len(w.recoveryColumns) != 0 {
+		if err := w.restoreRecoveryColumns(ctx, records); err != nil {
+			return err
+		}
 	}
 	groups := make(map[string]*nativeWriteGroup)
 	rows := make([]map[string]any, len(records))
@@ -1065,6 +1170,29 @@ func nativeSnapshotID(tbl *table.Table) int64 {
 	return 0
 }
 
+func (w *nativeWriter) PrepareClose(ctx context.Context) (err error) {
+	if w.options == nil || !w.options.Backfill {
+		return nil
+	}
+	defer func() {
+		if err != nil && w.failed == nil {
+			w.failed = err
+		}
+	}()
+	ctx, finish, err := beginNativeWriterWork(ctx, w.config)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	if err := w.writable(); err != nil {
+		return err
+	}
+	if err := w.finishBackfillFiles(ctx); err != nil {
+		return fmt.Errorf("finish backfill Iceberg files: %w", err)
+	}
+	return nil
+}
+
 func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err error) {
 	ctx, finish, err := beginNativeWriterWork(ctx, w.config)
 	if err != nil {
@@ -1076,6 +1204,9 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 	}
 	defer finish()
 	if err := w.writable(); err != nil {
+		if w.failed != nil && !w.uncertain && !w.closed {
+			w.Abort()
+		}
 		return err
 	}
 	defer func() {
@@ -1099,7 +1230,7 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		return err
 	}
 	defer coordinated.mu.Unlock()
-	hasFiles := len(w.dataFiles) > 0 || len(w.positions) > 0
+	hasFiles := len(w.dataFiles) > 0 || len(w.positions) > 0 || w.cow != nil && len(w.cow.paths) > 0
 	var lastConflict error
 	for attempt := range nativeCommitAttempts {
 		if err := ctx.Err(); err != nil {
@@ -1108,6 +1239,19 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		fresh, err := w.currentTable(ctx, coordinated)
 		if err != nil {
 			return err
+		}
+		if w.cow != nil {
+			baseShape, err := ordinaryRecoveryShape(w.table.Metadata())
+			if err != nil {
+				return err
+			}
+			shape, err := ordinaryRecoveryShape(fresh.Metadata())
+			if err != nil {
+				return err
+			}
+			if shape != baseShape {
+				return errors.New("copy-on-write table shape changed; refresh source schema before retry")
+			}
 		}
 		var indexBase int64
 		if hasFiles && w.indexThread != nil {
@@ -1130,7 +1274,7 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 				}
 			}
 		}
-		state, changed, err := mergeNativeRecovery(fresh.Properties()[nativeRecoveryProperty], w.options.ThreadID, finalMetadataState, hasFiles)
+		state, changed, err := mergeNativeRecovery(fresh.Properties()[nativeRecoveryProperty], w.options.ThreadID, finalMetadataState, hasFiles || w.options.Backfill)
 		if err != nil {
 			return err
 		}
@@ -1145,6 +1289,22 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 		}
 		if err := tx.AssertDefaultShape(); err != nil {
 			return err
+		}
+		if hasFiles {
+			properties := fresh.Properties()
+			effective, err := nativeBloomFilterProperties(fresh.Schema(), w.stream, properties)
+			if err != nil {
+				return err
+			}
+			defaults := make(apacheiceberg.Properties)
+			for key, value := range effective {
+				if _, exists := properties[key]; !exists {
+					defaults[key] = value
+				}
+			}
+			if err := tx.SetProperties(defaults); err != nil {
+				return err
+			}
 		}
 		if changed {
 			if err := tx.SetProperties(apacheiceberg.Properties{nativeRecoveryProperty: state}); err != nil {
@@ -1163,9 +1323,13 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 			return err
 		}
 		if len(equalityFiles) > 0 {
-			logger.Infof("iceberg_equality_delete event=staged table=%q thread_id=%q attempt=%d base_snapshot=%d keys=%d delete_files=%d data_files=%d", strings.Join(fresh.Identifier(), "."), w.options.ThreadID, attempt+1, nativeSnapshotID(fresh), len(w.latest), len(equalityFiles), len(w.dataFiles))
+			logger.Infof("iceberg_equality_delete event=staged table=%q attempt=%d base_snapshot=%d keys=%d delete_files=%d data_files=%d", strings.Join(fresh.Identifier(), "."), attempt+1, nativeSnapshotID(fresh), len(w.latest), len(equalityFiles), len(w.dataFiles))
 		}
-		if hasFiles {
+		if w.cow != nil && !w.options.Backfill {
+			if err := w.replayCopyOnWrite(ctx, tx); err != nil {
+				return err
+			}
+		} else if hasFiles {
 			delta := tx.NewRowDelta(apacheiceberg.Properties{"olake.thread-id": w.options.ThreadID})
 			delta.AddRows(w.dataFiles...).AddDeletes(equalityFiles...).AddDeletes(positionFiles...).RemoveDeletes(replaced...)
 			if err := delta.Commit(ctx); err != nil {
@@ -1182,7 +1346,7 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 			coordinated.invalidate(unknown)
 			if unknown {
 				w.uncertain = true
-				logger.Warnf("Thread[%s]: native Iceberg commit outcome unknown; retaining staged work data_files=%d position_deletes=%d staged_paths=%d ctx_err=%v", w.options.ThreadID, len(w.dataFiles), len(w.positions), len(w.paths), ctx.Err())
+				logger.Warnf("Table[%s]: native Iceberg commit outcome unknown; retaining staged work data_files=%d position_deletes=%d staged_paths=%d ctx_err=%v", strings.Join(fresh.Identifier(), "."), len(w.dataFiles), len(w.positions), len(w.paths), ctx.Err())
 				return fmt.Errorf("Iceberg commit outcome is unknown; staged files retained for recovery: %w", commitErr)
 			}
 			// Delete files belong to this rejected attempt. Only optimistic
@@ -1202,11 +1366,22 @@ func (w *nativeWriter) Close(ctx context.Context, finalMetadataState any) (err e
 			if _, private := w.cat.(*nativeResyncCatalog); private {
 				event = "private_resync_commit"
 			}
-			logger.Infof("iceberg_equality_delete event=%s table=%q thread_id=%q attempt=%d snapshot=%d keys=%d delete_files=%d data_files=%d", event, strings.Join(committed.Identifier(), "."), w.options.ThreadID, attempt+1, nativeSnapshotID(committed), len(w.latest), len(equalityFiles), len(w.dataFiles))
+			logger.Infof("iceberg_equality_delete event=%s table=%q attempt=%d snapshot=%d keys=%d delete_files=%d data_files=%d", event, strings.Join(committed.Identifier(), "."), attempt+1, nativeSnapshotID(committed), len(w.latest), len(equalityFiles), len(w.dataFiles))
 		}
-		// A successful metadata commit owns all staged files from now on.
-		// Never delete them, including when the local index checkpoint fails.
-		clear(w.paths)
+		// Replay inputs are private scratch objects, not files owned by the snapshot.
+		if w.cow != nil {
+			w.cow.cleanup(ctx, w)
+		}
+		// Published files leave cleanup ownership; failed private cleanup remains retryable.
+		for _, file := range w.dataFiles {
+			delete(w.paths, file.FilePath())
+		}
+		for _, file := range positionFiles {
+			delete(w.paths, file.FilePath())
+		}
+		for _, file := range equalityFiles {
+			delete(w.paths, file.FilePath())
+		}
 		if hasFiles && w.indexThread != nil {
 			snapshot := committed.CurrentSnapshot()
 			parent := int64(0)
@@ -1328,7 +1503,7 @@ func nativeConflictClass(err error) string {
 func (w *nativeWriter) logConflict(operation string, attempt int, tbl *table.Table, err error) {
 	// Never log the raw catalog error: REST errors may embed response bodies,
 	// signed URLs or credentials. The classification and snapshot IDs suffice.
-	logger.Warnf("Thread[%s]: native Iceberg %s attempt=%d base_snapshot=%d classification=%s", w.options.ThreadID, operation, attempt, nativeSnapshotID(tbl), nativeConflictClass(err))
+	logger.Warnf("Table[%s]: native Iceberg %s attempt=%d base_snapshot=%d classification=%s", strings.Join(tbl.Identifier(), "."), operation, attempt, nativeSnapshotID(tbl), nativeConflictClass(err))
 }
 
 // S3 Tables reserves the --table-s3 bucket suffix and removes unreferenced
@@ -1383,6 +1558,16 @@ func (w *nativeWriter) Abort() {
 	for path := range w.paths {
 		_ = w.discardStagedFile(fs, path)
 	}
+	if w.cow != nil {
+		retained := w.cow.paths[:0]
+		for _, path := range w.cow.paths {
+			if _, pending := w.paths[path]; pending {
+				retained = append(retained, path)
+			}
+		}
+		clear(w.cow.paths[len(retained):])
+		w.cow.paths = retained
+	}
 }
 
 type nativePartition []any
@@ -1429,7 +1614,51 @@ func nativeArrowRecord(schema *apacheiceberg.Schema, rows []map[string]any) (arr
 }
 
 func appendNativeValue(builder array.Builder, value any) error {
+	if recovered, ok := value.(nativeRecoveryEncodedValue); ok {
+		return builder.AppendValueFromString(string(recovered))
+	}
 	switch b := builder.(type) {
+	case *array.Decimal128Builder:
+		typ := b.Type().(*arrow.Decimal128Type)
+		if v, ok := value.(typeutils.Decimal); ok {
+			if v.IsNaN() {
+				nanDecimalAsNull.Do(func() { logger.Warn("writing NaN as null in decimal columns, which cannot hold it") })
+				b.AppendNull()
+				break
+			}
+			unscaled, scale := v.Unscaled()
+			if scale != typ.Scale || !unscaled.FitsInPrecision(typ.Precision) {
+				return fmt.Errorf("decimal value %s does not fit column type %s", v, typ)
+			}
+			b.Append(unscaled)
+			break
+		}
+		if v, ok := value.(decimal128.Num); ok {
+			b.Append(v)
+			break
+		}
+		if v, ok := value.(apacheiceberg.Decimal); ok {
+			if v.Scale != int(typ.Scale) {
+				return fmt.Errorf("decimal scale mismatch: expected %d, got %d", typ.Scale, v.Scale)
+			}
+			v, err := decimal128.FromString(v.String(), typ.Precision, typ.Scale)
+			if err != nil {
+				return err
+			}
+			b.Append(v)
+			break
+		}
+		v, err := decimal128.FromString(utils.ConvertToString(value), typ.Precision, typ.Scale)
+		if err != nil {
+			return err
+		}
+		b.Append(v)
+	case *array.Date32Builder:
+		v, err := typeutils.ReformatCalendarDate(value)
+		if err != nil {
+			return err
+		}
+		b.Append(arrow.Date32FromTime(v.Time))
 	case *array.BooleanBuilder:
 		v, err := typeutils.ReformatBool(value)
 		if err != nil {
@@ -1538,6 +1767,20 @@ func nativePartitionLiteral(field apacheiceberg.NestedField, value any) (apachei
 			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 		}
 		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
+	case apacheiceberg.DateType:
+		v, err := typeutils.ReformatCalendarDate(value)
+		if err != nil {
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
+		}
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(apacheiceberg.Date(arrow.Date32FromTime(v.Time))), Valid: true}, nil
+	case apacheiceberg.DecimalType:
+		typ := field.Type.(apacheiceberg.DecimalType)
+		v, err := typeutils.ReformatDecimal(types.Decimal.Of(typ.Precision(), typ.Scale()), value)
+		if err != nil || v.IsNaN() {
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
+		}
+		unscaled, scale := v.Unscaled()
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(apacheiceberg.Decimal{Val: unscaled, Scale: int(scale)}), Valid: true}, nil
 	case apacheiceberg.TimestampType, apacheiceberg.TimestampTzType:
 		v, err := typeutils.ReformatDate(value, true)
 		if err != nil {
@@ -1582,25 +1825,76 @@ func nativeRecordPartition(schema *apacheiceberg.Schema, spec apacheiceberg.Part
 	return fmt.Sprintf("%#v", partition), values, nil
 }
 
+// nativeParquetSizing is the table's Iceberg write-size configuration. The
+// keys and defaults are iceberg-go's, so native writes, copy-on-write rewrites
+// and external maintenance (S3 Tables compaction) all target the same sizes.
+type nativeParquetSizing struct {
+	targetFileBytes int64
+	rowGroupBytes   int64
+	rowGroupRows    int64
+}
+
+// Like Iceberg Java and iceberg-go's write validation, explicitly configured
+// non-numeric or non-positive sizes are rejected instead of silently replaced.
+func nativeParquetSizes(properties apacheiceberg.Properties) (nativeParquetSizing, error) {
+	var sizes nativeParquetSizing
+	for _, setting := range []struct {
+		key   string
+		value *int64
+		def   int64
+	}{
+		{table.WriteTargetFileSizeBytesKey, &sizes.targetFileBytes, table.WriteTargetFileSizeBytesDefault},
+		{table.ParquetRowGroupSizeBytesKey, &sizes.rowGroupBytes, table.ParquetRowGroupSizeBytesDefault},
+		{table.ParquetRowGroupLimitKey, &sizes.rowGroupRows, table.ParquetRowGroupLimitDefault},
+	} {
+		*setting.value = setting.def
+		raw, exists := properties[setting.key]
+		if !exists {
+			continue
+		}
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return nativeParquetSizing{}, fmt.Errorf("%w: invalid %s value %q: %v", apacheiceberg.ErrInvalidArgument, setting.key, raw, err)
+		}
+		if parsed <= 0 {
+			return nativeParquetSizing{}, fmt.Errorf("%w: %s must be greater than 0, got %d", apacheiceberg.ErrInvalidArgument, setting.key, parsed)
+		}
+		*setting.value = parsed
+	}
+	return sizes, nil
+}
+
 // Arrow checks data-page and dictionary sizes only after a column minibatch.
 // Its default of 1,024 values can therefore produce pages larger than the
 // reader's safety limits when CDC has hydrated large string/binary values.
 // Check after every value in both streaming and one-shot writers. The 1 MiB
 // targets remain soft: Parquet cannot split an individual oversized value,
 // which can still exceed reader limits; values are never truncated.
-func nativeParquetWriterProperties() *parquet.WriterProperties {
+// The row-group row cap is the table's write.parquet.row-group-limit, so a
+// CDC flush up to that size stays a single row group.
+func nativeParquetWriterProperties(schema *apacheiceberg.Schema, stream types.StreamInterface, properties apacheiceberg.Properties) (*parquet.WriterProperties, error) {
+	sizes, err := nativeParquetSizes(properties)
+	if err != nil {
+		return nil, err
+	}
+	properties, err = nativeBloomFilterProperties(schema, stream, properties)
+	if err != nil {
+		return nil, err
+	}
 	const pageBytes = 1024 * 1024
-	return parquet.NewWriterProperties(
+	opts := []parquet.WriterProperty{
 		parquet.WithCompression(compress.Codecs.Zstd),
 		parquet.WithCompressionLevel(3),
 		parquet.WithStats(true),
-		parquet.WithMaxRowGroupLength(64*1024),
+		parquet.WithMaxRowGroupLength(sizes.rowGroupRows),
 		parquet.WithBatchSize(1),
 		parquet.WithDataPageSize(pageBytes),
 		parquet.WithDictionaryPageSizeLimit(pageBytes),
 		parquet.WithRootName("table"),
 		parquet.WithPageIndexEnabled(true),
-	)
+	}
+	opts = append(opts, table.ParquetBloomFilterWriteOptions(properties)...)
+	return parquet.NewWriterProperties(opts...), nil
 }
 
 // Files are streamed directly through the catalog's native FileIO. The Parquet
@@ -1612,6 +1906,10 @@ func (w *nativeWriter) writeNativeParquet(ctx context.Context, schema *apacheice
 // Streaming callers borrow each input batch only for the duration of write.
 // The shared lifecycle always closes the footer and FileIO upload before return.
 func (w *nativeWriter) writeNativeParquetStream(ctx context.Context, schema *apacheiceberg.Schema, spec apacheiceberg.PartitionSpec, partition map[int]any, arrowSchema *arrow.Schema, write func(*pqarrow.FileWriter) error, content apacheiceberg.ManifestEntryContent, equalityIDs []int, referenced *string) (_ apacheiceberg.DataFile, err error) {
+	props, err := nativeParquetWriterProperties(schema, w.stream, w.table.Properties())
+	if err != nil {
+		return nil, err
+	}
 	ctx = nativeCatalogContext(ctx, w.cat)
 	fs, err := w.table.FS(ctx)
 	if err != nil {
@@ -1640,7 +1938,6 @@ func (w *nativeWriter) writeNativeParquetStream(ctx context.Context, schema *apa
 		return nil, err
 	}
 	counter := &nativeCountingWriter{writer: file}
-	props := nativeParquetWriterProperties()
 	writer, err := pqarrow.NewFileWriter(arrowSchema, counter, props, pqarrow.DefaultWriterProps())
 	if err != nil {
 		return nil, errors.Join(err, file.Close())

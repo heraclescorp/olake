@@ -26,6 +26,7 @@ import (
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/datazip-inc/olake/utils/typeutils"
 	"github.com/goccy/go-json"
 )
 
@@ -1013,6 +1014,10 @@ func (w *nativeWriter) ReadRows(ctx context.Context, path string, positions []in
 // readNativeRows addresses physical file ordinals, not ordinals after Iceberg
 // deletes. It also reads pending uploaded files not yet present in a manifest.
 func readNativeRows(ctx context.Context, tbl *table.Table, path string, positions []int64, columns []string) (map[int64]map[string]any, error) {
+	return readNativeRowsWithValue(ctx, tbl, path, positions, columns, nativeIndexValue)
+}
+
+func readNativeRowsWithValue(ctx context.Context, tbl *table.Table, path string, positions []int64, columns []string, value func(arrow.Array, int) any) (map[int64]map[string]any, error) {
 	result := make(map[int64]map[string]any, len(positions))
 	if len(positions) == 0 {
 		return result, nil
@@ -1053,7 +1058,7 @@ func readNativeRows(ctx context.Context, tbl *table.Table, path string, position
 			}
 			row := make(map[string]any, len(selected))
 			for col, field := range batch.Schema().Fields() {
-				row[field.Name] = nativeIndexValue(batch.Column(col), int(position-base))
+				row[field.Name] = value(batch.Column(col), int(position-base))
 			}
 			result[position] = row
 			next++
@@ -1224,11 +1229,23 @@ func nativeIndexValue(column arrow.Array, row int) any {
 		return value.Value(row)
 	case *array.Float64:
 		return value.Value(row)
+	case *array.Decimal128:
+		typ := value.DataType().(*arrow.Decimal128Type)
+		return typeutils.NewDecimal(value.Value(row), typ.Precision, typ.Scale)
+	case *array.Date32:
+		return typeutils.Date{Time: value.Value(row).ToTime().UTC()}
+	case *array.Timestamp:
+		typ := value.DataType().(*arrow.TimestampType)
+		if typ.TimeZone != "" {
+			return column.GetOneForMarshal(row)
+		}
+		return typeutils.TimestampNTZ{Time: value.Value(row).ToTime(typ.Unit)}
 	case *array.Dictionary:
 		return nativeIndexValue(value.Dictionary(), value.GetValueIndex(row))
 	default:
 		// TOAST-bearing source values (text, JSON, arrays) are stored as strings;
-		// the other primitive values retain their Arrow logical representation.
+		// the other primitive values retain their Arrow logical representation, and
+		// decimals, dates and wall-clock timestamps the source type they were read as.
 		return column.GetOneForMarshal(row)
 	}
 }

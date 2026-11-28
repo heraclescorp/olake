@@ -20,8 +20,13 @@ import (
 )
 
 const (
-	nativeBackfillTargetBytes   = int64(512 * 1024 * 1024)
+	// Each open backfill file buffers its current row group's encoded pages in
+	// memory until the row group reaches write.parquet.row-group-size-bytes
+	// (128 MiB by default) or write.parquet.row-group-limit rows. Capping open
+	// partitions bounds a writer's buffered Parquet to this many row groups.
 	nativeBackfillMaxPartitions = 8
+	// Slices bound the decoded Arrow batch built per write; they are not row
+	// groups. Slices append to the open buffered row group.
 	nativeBackfillBatchBytes    = int64(4 * 1024 * 1024)
 	nativeBackfillBatchRows     = 8192
 	nativeBackfillFragmentBytes = 256 * 1024
@@ -156,6 +161,8 @@ type nativeBackfillFile struct {
 	rows          int64
 	lastUsed      uint64
 	finished      bool
+	targetBytes   int64
+	rowGroupBytes int64
 }
 
 func (w *nativeWriter) openBackfillFile(ctx context.Context, partition map[int]any) (_ *nativeBackfillFile, err error) {
@@ -187,6 +194,14 @@ func (w *nativeWriter) openBackfillFile(ctx context.Context, partition map[int]a
 		return nil, err
 	}
 	schema, spec := w.table.Schema(), w.table.Spec()
+	sizes, err := nativeParquetSizes(w.table.Properties())
+	if err != nil {
+		return nil, err
+	}
+	props, err := nativeParquetWriterProperties(schema, w.stream, w.table.Properties())
+	if err != nil {
+		return nil, err
+	}
 	name := uuid.NewString() + ".parquet"
 	if spec.NumFields() > 0 {
 		values := make(nativePartition, spec.NumFields())
@@ -202,7 +217,7 @@ func (w *nativeWriter) openBackfillFile(ctx context.Context, partition map[int]a
 		return nil, err
 	}
 	out := newNativeAsyncOutput(fileCtx, file)
-	fileState := &nativeBackfillFile{path: path, schema: schema, spec: spec, partition: partition, output: out, cancel: cancel, stopExecution: stopExecution}
+	fileState := &nativeBackfillFile{path: path, schema: schema, spec: spec, partition: partition, output: out, cancel: cancel, stopExecution: stopExecution, targetBytes: sizes.targetFileBytes, rowGroupBytes: sizes.rowGroupBytes}
 	defer func() {
 		if err != nil {
 			fileState.abort()
@@ -212,7 +227,6 @@ func (w *nativeWriter) openBackfillFile(ctx context.Context, partition map[int]a
 	if err != nil {
 		return nil, err
 	}
-	props := nativeParquetWriterProperties()
 	fileState.parquet, err = pqarrow.NewFileWriter(arrowSchema, out, props, pqarrow.DefaultWriterProps())
 	if err != nil {
 		return nil, err
@@ -405,7 +419,17 @@ func (w *nativeWriter) writeBackfill(ctx context.Context, records []types.RawRec
 				return err
 			}
 			stop := context.AfterFunc(ctx, f.cancel)
-			err = f.parquet.Write(batch)
+			// Mirror iceberg-go's ParquetFileWriter: rotate before appending the
+			// next slice once the open row group reached its byte target, so a
+			// file never ends with an empty row group. WriteBuffered itself
+			// rotates at write.parquet.row-group-limit rows. Closing a row group
+			// writes its column chunks, Bloom filters and page indexes.
+			if f.parquet.RowGroupTotalBytesWritten() >= f.rowGroupBytes {
+				err = f.parquet.NewBufferedRowGroupChecked()
+			}
+			if err == nil {
+				err = f.parquet.WriteBuffered(batch)
+			}
 			batch.Release()
 			if err == nil {
 				err = f.output.flush()
@@ -421,11 +445,9 @@ func (w *nativeWriter) writeBackfill(ctx context.Context, records []types.RawRec
 				locations[idx] = types.RowLocation{FilePath: f.path, Position: f.rows + int64(position)}
 			}
 			f.rows += int64(len(group.rows))
-			target := w.backfillTargetBytes
-			if target <= 0 {
-				target = nativeBackfillTargetBytes
-			}
-			if f.output.size.Load() >= target {
+			// The output only counts closed row groups; the open buffered row
+			// group's encoded bytes must be added or files would never roll.
+			if f.output.size.Load()+f.parquet.RowGroupTotalBytesWritten() >= f.targetBytes {
 				if err := w.finishBackfillFile(ctx, key); err != nil {
 					return err
 				}

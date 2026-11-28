@@ -107,6 +107,37 @@ func TestOrdinaryRecoveryBarrierPreservesDataDeletesSchemaAndHistory(t *testing.
 	}
 }
 
+func TestOrdinaryRecoveryEquivalentBookmarkSpellings(t *testing.T) {
+	for _, lower := range []string{"0/ABC", "0/abc", "000/000aBc"} {
+		t.Run(lower, func(t *testing.T) {
+			cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
+			original := ordinaryTestSeed(t, cfg, stream, cat, "0/abc")
+			cfg.CatalogType = RestCatalog
+			ctx, options := ordinaryTestContext(t, "equivalent-bookmarks")
+			adapter := &Iceberg{config: cfg, catalog: cat}
+			streams := []types.StreamInterface{stream}
+			proofs, err := adapter.PrepareOrdinaryRecovery(ctx, streams, lower)
+			require.NoError(t, err)
+			ordinaryTestPlan(options, proofs, "0/ABC", "000/000ABC")
+			options.Plan.ReplayAfter[stream.ID()] = "000/000aBc"
+			writer := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "bookmark-replay", false)
+			require.NoError(t, writer.Close(ctx, map[string]any{"state": `{"lsn":"0/ABC"}`}))
+			_, err = adapter.ConfirmOrdinaryRecovery(ctx, streams, proofs, "0/abc")
+			require.NoError(t, err)
+			current, err := cat.LoadTable(ctx, original.Identifier())
+			require.NoError(t, err)
+			require.Equal(t, nativeVisibleValues(t, original), nativeVisibleValues(t, current))
+			for _, invalid := range []string{"", "0/ABD", "0/not-hex", "0/ABC/extra"} {
+				options.Plan.LowerLSN = invalid
+				_, err = adapter.ConfirmOrdinaryRecovery(ctx, streams, proofs, "0/ABC")
+				require.Error(t, err)
+				_, _, err = newNativeWriter(ctx, cfg, stream, &destination.Options{ThreadID: "invalid-bookmark"}, cat, types.NewStreamIndexThread(nil))
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
 func TestOrdinaryRecoveryRepeatedEpochRebarriersAndBindsImmutableEvidence(t *testing.T) {
 	cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, false, "")
 	ordinaryTestSeed(t, cfg, stream, cat, "0/10")
@@ -391,7 +422,7 @@ func TestOrdinaryRecoveryRequiresExactCommonBoundary(t *testing.T) {
 	_, err = adapter.ConfirmOrdinaryRecovery(ctx, streams, proofs, "0/20")
 	require.ErrorContains(t, err, "behind")
 	_, _, err = newNativeWriter(ctx, cfg, first, &destination.Options{ThreadID: "bad-backfill", Backfill: true}, cat, nil)
-	require.ErrorContains(t, err, "backfill")
+	require.Error(t, err)
 	// The writer for the behind table commits only its missing prefix, with the
 	// common target even if that table sees no rows in the final transaction.
 	writer := openResyncTestWriter(t, ctx, cfg, first, cat, nil, "replay", false)

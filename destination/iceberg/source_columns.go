@@ -39,6 +39,16 @@ func (i *Iceberg) ApplySourceColumns(ctx context.Context, globalSchema any, chan
 		i.syncStartColumns = make(map[string]struct{})
 	}
 	added, dropped := planSourceColumns(i.stream, i.schema, change, i.syncStartColumns)
+	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+		columns, err := nativeStreamColumns(i.stream)
+		if err != nil {
+			return nil, err
+		}
+		dropped = slices.DeleteFunc(dropped, func(column string) bool {
+			_, selected := columns[column]
+			return !selected
+		})
+	}
 	if len(added) == 0 && len(dropped) == 0 {
 		return globalSchema, nil
 	}
@@ -304,7 +314,7 @@ func nativeSourceColumnDefault(iceType string, value any) (apacheiceberg.Optiona
 				return apacheiceberg.Optional[apacheiceberg.Literal]{}, fmt.Errorf("source default %v is not a valid %s", value, iceType)
 			}
 		}
-	case apacheiceberg.TimestampType, apacheiceberg.TimestampTzType:
+	case apacheiceberg.DateType, apacheiceberg.TimestampType, apacheiceberg.TimestampTzType:
 		if bytes, ok := value.([]byte); ok {
 			value = string(bytes)
 		}
@@ -340,6 +350,10 @@ func nativeSourceColumnDefault(iceType string, value any) (apacheiceberg.Optiona
 	if err != nil {
 		return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 	}
+	if !optional.Valid {
+		// a NaN decimal, which no decimal column holds
+		return apacheiceberg.Optional[apacheiceberg.Literal]{}, fmt.Errorf("source default %v is not a valid %s", value, iceType)
+	}
 	literal := optional.Val
 	switch number := literal.Any().(type) {
 	case float32:
@@ -370,6 +384,9 @@ func (w *nativeWriter) AlterSourceColumns(ctx context.Context, added []*nativeSo
 	}
 	if len(added) == 0 && len(dropped) == 0 {
 		return nil
+	}
+	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+		return errors.New("ordinary recovery cannot evolve the frozen destination shape")
 	}
 	ctx, finish, err := beginNativeWriterWork(ctx, w.config)
 	if err != nil {
@@ -423,8 +440,13 @@ func (w *nativeWriter) AlterSourceColumns(ctx context.Context, added []*nativeSo
 					// TimestampLiteral represents both timezone variants, but the
 					// SDK's default validator treats its native type as timestamp.
 					// Its supported JSON numeric form retains exact epoch micros.
-					if _, timezone := field.Type.(apacheiceberg.TimestampTzType); timezone {
+					switch field.Type.(type) {
+					case apacheiceberg.TimestampTzType:
 						field.InitialDefault = json.Number(strconv.FormatInt(int64(field.InitialDefault.(apacheiceberg.Timestamp)), 10))
+					case apacheiceberg.DecimalType:
+						// A decimal's single-value JSON form is its exact text; the
+						// struct would encode its unscaled integer as an empty object.
+						field.InitialDefault = field.InitialDefault.(apacheiceberg.Decimal).String()
 					}
 				}
 			}
@@ -591,10 +613,11 @@ func loadOrCreateNativeTable(ctx context.Context, config *Config, stream types.S
 	if !errors.Is(err, catalog.ErrNoSuchTable) {
 		return nil, err
 	}
-	if config.ordinaryRecovery {
+	creation, _ := ctx.Value(backfillRecoveryCreationKey{}).(*nativeBackfillOwner)
+	if config.ordinaryRecovery && creation == nil {
 		return nil, errors.New("ordinary recovery cannot create a missing destination table")
 	}
-	if _, recovery := types.OrdinaryRecoveryFromContext(ctx); recovery {
+	if recovery, ok := types.OrdinaryRecoveryFromContext(ctx); ok && (creation == nil || !recovery.Origin.Backfill || recovery.BackfillComplete) {
 		return nil, errors.New("ordinary recovery cannot create a missing destination table")
 	}
 	columns, err := nativeStreamColumns(stream)
@@ -617,21 +640,42 @@ func loadOrCreateNativeTable(ctx context.Context, config *Config, stream types.S
 		return nil, err
 	}
 	version := "2"
-	if stream.GetUpdateType() == types.UpdateTypeDeletionVector {
+	if !stream.Self().CopyOnWriteEnabled() && stream.GetUpdateType() == types.UpdateTypeDeletionVector {
 		version = "3"
 	}
 	// Storage credentials belong only to catalog/FileIO configuration, never table metadata.
+	// Persist the size targets the writers use so external maintenance such as
+	// S3 Tables compaction reads the same file and row-group targets.
 	props := apacheiceberg.Properties{
 		table.PropertyFormatVersion:       version,
 		"write.format.default":            "parquet",
 		"write.parquet.compression-codec": "zstd",
+		table.WriteTargetFileSizeBytesKey: strconv.Itoa(table.WriteTargetFileSizeBytesDefault),
+		table.ParquetRowGroupSizeBytesKey: strconv.Itoa(table.ParquetRowGroupSizeBytesDefault),
 	}
 	// Pin each native transaction to its original branch head. Retrying stale
 	// properties inside iceberg-go would overwrite another thread's 2PC state.
 	props["commit.retry.num-retries"] = "0"
+	props, err = nativeBloomFilterProperties(schema, stream, props)
+	if err != nil {
+		return nil, err
+	}
 	// The catalog owns table locations, including managed S3 Tables/Unity warehouses.
+	if creation != nil {
+		if creation.Plan == "" || creation.RequestedShapeSHA256 == "" {
+			return nil, errors.New("backfill table creation requires an exact plan and frozen requested shape")
+		}
+		encoded, err := json.Marshal(creation)
+		if err != nil {
+			return nil, err
+		}
+		props[nativeBackfillOwnerProperty] = string(encoded)
+	}
 	tbl, err = cat.CreateTable(ctx, identifier, schema, catalog.WithPartitionSpec(&spec), catalog.WithSortOrder(sortOrder), catalog.WithProperties(props))
 	if errors.Is(err, catalog.ErrTableAlreadyExists) {
+		if creation != nil {
+			return nil, errors.New("backfill recovery destination appeared during initialization")
+		}
 		return cat.LoadTable(ctx, identifier)
 	}
 	return tbl, err
