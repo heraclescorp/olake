@@ -635,10 +635,14 @@ func loadOrCreateNativeTable(ctx context.Context, config *Config, stream types.S
 		version = "3"
 	}
 	// Storage credentials belong only to catalog/FileIO configuration, never table metadata.
+	// Persist the size targets the writers use so external maintenance such as
+	// S3 Tables compaction reads the same file and row-group targets.
 	props := apacheiceberg.Properties{
 		table.PropertyFormatVersion:       version,
 		"write.format.default":            "parquet",
 		"write.parquet.compression-codec": "zstd",
+		table.WriteTargetFileSizeBytesKey: strconv.Itoa(table.WriteTargetFileSizeBytesDefault),
+		table.ParquetRowGroupSizeBytesKey: strconv.Itoa(table.ParquetRowGroupSizeBytesDefault),
 	}
 	// Pin each native transaction to its original branch head. Retrying stale
 	// properties inside iceberg-go would overwrite another thread's 2PC state.

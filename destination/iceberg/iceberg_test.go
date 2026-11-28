@@ -2146,6 +2146,8 @@ func TestNativeWriterCreationKeepsCatalogLocationAndCredentialsPrivate(t *testin
 		require.NotContains(t, string(metadata), secret)
 	}
 	require.Equal(t, "parquet", persisted.Properties()["write.format.default"])
+	require.Equal(t, strconv.Itoa(table.WriteTargetFileSizeBytesDefault), persisted.Properties()[table.WriteTargetFileSizeBytesKey])
+	require.Equal(t, strconv.Itoa(table.ParquetRowGroupSizeBytesDefault), persisted.Properties()[table.ParquetRowGroupSizeBytesKey])
 }
 
 func nativePendingLocation(t *testing.T, writer *nativeWriter, id string) types.RowLocation {

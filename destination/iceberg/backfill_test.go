@@ -2,13 +2,17 @@ package iceberg
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/rand/v2"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	parquetfile "github.com/apache/arrow-go/v18/parquet/file"
 	apacheiceberg "github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
@@ -49,12 +53,11 @@ func TestNativeBackfillRollingAndCDC(t *testing.T) {
 				require.EqualValues(t, 1, b.Position)
 				require.Empty(t, index.rows)
 			}
-			writer.backfillTargetBytes = first.output.size.Load() + 1
+			first.targetBytes = 1
 			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("c", "r", 3, "one")}))
 			require.Len(t, writer.dataFiles, 1)
 			require.EqualValues(t, 3, writer.dataFiles[0].Count())
 			require.Equal(t, first.path, writer.dataFiles[0].FilePath())
-			writer.backfillTargetBytes = nativeBackfillTargetBytes
 			require.NoError(t, writer.Write(ctx, []types.RawRecord{nativeTestRecord("d", "r", 4, "one")}))
 			if index != nil {
 				c, found, err := writer.indexThread.Lookup("c")
@@ -241,6 +244,11 @@ func TestNativeBackfillFailureAbortAndRetry(t *testing.T) {
 			w := openNativeTestWriter(ctx, t, cfg, stream, cat, index, "failed", true)
 			fault := nativeBackfillInjectFS(t, w)
 			require.NoError(t, w.Write(ctx, []types.RawRecord{nativeTestRecord("a", "r", 1, "p")}))
+			// Buffered row groups reach storage only on close; roll the file at
+			// the next write so write failures still surface from Write.
+			for _, f := range w.backfillFiles {
+				f.targetBytes = 1
+			}
 			loc, found, err := w.indexThread.Lookup("a")
 			require.NoError(t, err)
 			require.True(t, found)
@@ -334,11 +342,10 @@ func TestNativeAtomicResyncBackfillRollsAndPublishes(t *testing.T) {
 		require.NoError(t, w.Write(ctx, []types.RawRecord{nativeTestRecord(fmt.Sprint(n), "r", int64(n), "p")}))
 	}
 	for _, file := range w.backfillFiles {
-		w.backfillTargetBytes = file.output.size.Load() + 1
+		file.targetBytes = 1
 	}
 	require.NoError(t, w.Write(ctx, []types.RawRecord{nativeTestRecord("3", "r", 3, "p")}))
 	require.Len(t, w.dataFiles, 1)
-	w.backfillTargetBytes = nativeBackfillTargetBytes
 	require.NoError(t, w.Write(ctx, []types.RawRecord{nativeTestRecord("4", "r", 4, "p")}))
 	require.NoError(t, w.Close(ctx, nil))
 	require.Len(t, w.dataFiles, 2)
@@ -436,6 +443,9 @@ func TestNativeBackfillLargeRowWriteFailureRemainsRecoverable(t *testing.T) {
 	require.NoError(t, w.EvolveSchema(ctx, columns))
 	fault := nativeBackfillInjectFS(t, w)
 	require.NoError(t, w.Write(ctx, []types.RawRecord{nativeTestRecord("first", "r", 1, "p")}))
+	for _, f := range w.backfillFiles {
+		f.targetBytes = 1
+	}
 	loc, found, err := w.indexThread.Lookup("first")
 	require.NoError(t, err)
 	require.True(t, found)
@@ -458,4 +468,85 @@ func TestNativeBackfillLargeRowWriteFailureRemainsRecoverable(t *testing.T) {
 	rows, err := retry.ReadRows(ctx, loc.FilePath, []int64{loc.Position}, []string{"payload"})
 	require.NoError(t, err)
 	require.Equal(t, large, rows[loc.Position]["payload"])
+}
+
+// Backfill slices are an in-memory chunking unit only: many Write calls must
+// coalesce into row groups sized by the table's row-group targets, not one
+// row group per slice.
+func TestNativeBackfillRowGroupsFollowTableTargets(t *testing.T) {
+	const writes, rowsPerWrite, rowGroupBytes = 30, 1000, 4 * 1024 * 1024
+	for _, tc := range []struct {
+		name    string
+		props   apacheiceberg.Properties
+		payload bool
+	}{
+		{name: "defaults"},
+		{name: "row-limit", props: apacheiceberg.Properties{table.ParquetRowGroupLimitKey: "10000"}},
+		{name: "byte-target", props: apacheiceberg.Properties{table.ParquetRowGroupSizeBytesKey: strconv.Itoa(rowGroupBytes)}, payload: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			cfg, stream, cat := nativeWriterFixture(t, types.UpdateTypeEquality, true, "")
+			created := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "create", true)
+			require.NoError(t, created.Close(ctx, nil))
+			if tc.props != nil {
+				tx := created.table.NewTransaction()
+				require.NoError(t, tx.SetProperties(tc.props))
+				_, err := tx.Commit(ctx)
+				require.NoError(t, err)
+			}
+			w := openNativeTestWriter(ctx, t, cfg, stream, cat, nil, "row-groups", true)
+			// Random hex compresses poorly, so the byte target is reached by
+			// real encoded bytes rather than by the row limit.
+			random := rand.NewChaCha8([32]byte{1})
+			payload := make([]byte, 512)
+			for batch := range writes {
+				rows := make([]types.RawRecord, rowsPerWrite)
+				for row := range rows {
+					n := batch*rowsPerWrite + row
+					part := "p"
+					if tc.payload {
+						_, _ = random.Read(payload)
+						part = hex.EncodeToString(payload)
+					}
+					rows[row] = nativeTestRecord(fmt.Sprint(n), "r", int64(n), part)
+				}
+				require.NoError(t, w.Write(ctx, rows))
+			}
+			require.NoError(t, w.Close(ctx, nil))
+			require.Len(t, w.dataFiles, 1)
+			require.Len(t, nativeVisibleValues(t, w.table), writes*rowsPerWrite)
+			fs, err := w.table.FS(ctx)
+			require.NoError(t, err)
+			input, err := fs.Open(w.dataFiles[0].FilePath())
+			require.NoError(t, err)
+			reader, err := parquetfile.NewParquetReader(input)
+			require.NoError(t, err)
+			defer reader.Close()
+			groups := reader.NumRowGroups()
+			var rows []int64
+			for group := range groups {
+				rows = append(rows, reader.MetaData().RowGroup(group).NumRows())
+			}
+			switch tc.name {
+			case "defaults":
+				require.Equal(t, []int64{writes * rowsPerWrite}, rows)
+			case "row-limit":
+				require.Equal(t, []int64{10000, 10000, 10000}, rows)
+			case "byte-target":
+				require.Greater(t, groups, 1)
+				var total int64
+				for group := range groups {
+					metadata := reader.MetaData().RowGroup(group)
+					total += metadata.NumRows()
+					require.LessOrEqual(t, metadata.TotalCompressedSize(), int64(2*rowGroupBytes), "row group %d", group)
+					if group < groups-1 {
+						require.GreaterOrEqual(t, metadata.TotalCompressedSize(), int64(rowGroupBytes), "row group %d", group)
+						require.Greater(t, metadata.NumRows(), int64(rowsPerWrite), "row group %d must span several writes", group)
+					}
+				}
+				require.EqualValues(t, writes*rowsPerWrite, total)
+			}
+		})
+	}
 }

@@ -660,7 +660,6 @@ type nativeWriter struct {
 	paths                  map[string]struct{}
 	backfillFiles          map[string]*nativeBackfillFile
 	backfillClock          uint64
-	backfillTargetBytes    int64
 	backfillPartitionLimit int
 	closed                 bool
 	uncertain              bool
@@ -1770,14 +1769,59 @@ func nativeRecordPartition(schema *apacheiceberg.Schema, spec apacheiceberg.Part
 	return fmt.Sprintf("%#v", partition), values, nil
 }
 
+// nativeParquetSizing is the table's Iceberg write-size configuration. The
+// keys and defaults are iceberg-go's, so native writes, copy-on-write rewrites
+// and external maintenance (S3 Tables compaction) all target the same sizes.
+type nativeParquetSizing struct {
+	targetFileBytes int64
+	rowGroupBytes   int64
+	rowGroupRows    int64
+}
+
+// Like Iceberg Java and iceberg-go's write validation, explicitly configured
+// non-numeric or non-positive sizes are rejected instead of silently replaced.
+func nativeParquetSizes(properties apacheiceberg.Properties) (nativeParquetSizing, error) {
+	var sizes nativeParquetSizing
+	for _, setting := range []struct {
+		key   string
+		value *int64
+		def   int64
+	}{
+		{table.WriteTargetFileSizeBytesKey, &sizes.targetFileBytes, table.WriteTargetFileSizeBytesDefault},
+		{table.ParquetRowGroupSizeBytesKey, &sizes.rowGroupBytes, table.ParquetRowGroupSizeBytesDefault},
+		{table.ParquetRowGroupLimitKey, &sizes.rowGroupRows, table.ParquetRowGroupLimitDefault},
+	} {
+		*setting.value = setting.def
+		raw, exists := properties[setting.key]
+		if !exists {
+			continue
+		}
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return nativeParquetSizing{}, fmt.Errorf("%w: invalid %s value %q: %v", apacheiceberg.ErrInvalidArgument, setting.key, raw, err)
+		}
+		if parsed <= 0 {
+			return nativeParquetSizing{}, fmt.Errorf("%w: %s must be greater than 0, got %d", apacheiceberg.ErrInvalidArgument, setting.key, parsed)
+		}
+		*setting.value = parsed
+	}
+	return sizes, nil
+}
+
 // Arrow checks data-page and dictionary sizes only after a column minibatch.
 // Its default of 1,024 values can therefore produce pages larger than the
 // reader's safety limits when CDC has hydrated large string/binary values.
 // Check after every value in both streaming and one-shot writers. The 1 MiB
 // targets remain soft: Parquet cannot split an individual oversized value,
 // which can still exceed reader limits; values are never truncated.
+// The row-group row cap is the table's write.parquet.row-group-limit, so a
+// CDC flush up to that size stays a single row group.
 func nativeParquetWriterProperties(schema *apacheiceberg.Schema, stream types.StreamInterface, properties apacheiceberg.Properties) (*parquet.WriterProperties, error) {
-	properties, err := nativeBloomFilterProperties(schema, stream, properties)
+	sizes, err := nativeParquetSizes(properties)
+	if err != nil {
+		return nil, err
+	}
+	properties, err = nativeBloomFilterProperties(schema, stream, properties)
 	if err != nil {
 		return nil, err
 	}
@@ -1786,7 +1830,7 @@ func nativeParquetWriterProperties(schema *apacheiceberg.Schema, stream types.St
 		parquet.WithCompression(compress.Codecs.Zstd),
 		parquet.WithCompressionLevel(3),
 		parquet.WithStats(true),
-		parquet.WithMaxRowGroupLength(64 * 1024),
+		parquet.WithMaxRowGroupLength(sizes.rowGroupRows),
 		parquet.WithBatchSize(1),
 		parquet.WithDataPageSize(pageBytes),
 		parquet.WithDictionaryPageSizeLimit(pageBytes),
