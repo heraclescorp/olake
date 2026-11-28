@@ -304,8 +304,17 @@ func IsJSON(str string) bool {
 	return json.Unmarshal([]byte(str), &js) == nil
 }
 
+// idKeyer is a value that renders itself inside an olake id differently from its text, so the ids
+// of rows already written keep matching (a decimal key renders as the double it used to be).
+type idKeyer interface {
+	IDKey() string
+}
+
 // keyString renders one primary key value for the olake id. Byte values (binary keys) are hex encoded
 func keyString(v any) string {
+	if keyer, ok := v.(idKeyer); ok {
+		return keyer.IDKey()
+	}
 	switch {
 	case !IsBinarySupported():
 		return fmt.Sprint(v)

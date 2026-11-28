@@ -9,6 +9,7 @@ import (
 
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/drivers/abstract"
+	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils"
 	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/datazip-inc/olake/utils/typeutils"
@@ -25,6 +26,7 @@ type pgoutputReplicator struct {
 	txnCommitTime       time.Time // transaction commit time
 	txnFinalLSN         pglogrepl.LSN
 	relationIDToMsgMap  map[uint32]*pglogrepl.RelationMessage // map to store relation id
+	typeNames           map[uint32]relationTypeNames          // converter type names of each relation's columns
 	progress            *replicationProgress
 	typeMap             *pgtype.Map
 	preserveToastValues bool     // mark columns Postgres left out of an UPDATE so the destination can recover them
@@ -204,6 +206,7 @@ func (p *pgoutputReplicator) tupleValuesToMap(rel *pglogrepl.RelationMessage, tu
 	var rowBytes int64
 	var unchangedToastColumns []string
 
+	typeNames := p.columnTypeNames(rel)
 	for idx, col := range tuple.Columns {
 		if idx >= len(rel.Columns) {
 			continue
@@ -239,7 +242,7 @@ func (p *pgoutputReplicator) tupleValuesToMap(rel *pglogrepl.RelationMessage, tu
 			continue
 		}
 
-		typeName := oidToString(colType)
+		typeName := typeNames[idx]
 		var value any
 		if colType == pgtype.VarcharArrayOID {
 			if p.typeMap == nil {
@@ -344,6 +347,53 @@ func (p *pgoutputReplicator) emitDelete(ctx context.Context, m *pglogrepl.Delete
 
 	return insertFn(ctx, abstract.NewCDCChange(stream, p.txnCommitTime, "delete", values,
 		map[string]any{CDCLSN: p.changePosition().String()}, rowBytes, nil))
+}
+
+// columnTypeNames returns the converter's type name for each column of rel, built once per
+// Relation message so no value pays for it.
+func (p *pgoutputReplicator) columnTypeNames(rel *pglogrepl.RelationMessage) []string {
+	if cached, ok := p.typeNames[rel.RelationID]; ok && cached.relation == rel {
+		return cached.names
+	}
+	names := make([]string, len(rel.Columns))
+	for idx, column := range rel.Columns {
+		names[idx] = columnTypeName(column.DataType, column.TypeModifier)
+	}
+	if p.typeNames == nil {
+		p.typeNames = make(map[uint32]relationTypeNames)
+	}
+	p.typeNames[rel.RelationID] = relationTypeNames{relation: rel, names: names}
+	return names
+}
+
+// relationTypeNames holds the converter's type names for the columns of one Relation message.
+type relationTypeNames struct {
+	relation *pglogrepl.RelationMessage
+	names    []string
+}
+
+// columnTypeName is the converter's type name for a column of type oid and type modifier typmod.
+// A numeric with a declared precision and scale is named by the decimal(p,s) it holds; an
+// unconstrained numeric (typmod -1), or one Iceberg cannot hold as a decimal, stays numeric.
+func columnTypeName(oid uint32, typmod int32) string {
+	if oid == pgtype.NumericOID {
+		if precision, scale, constrained := numericTypmod(typmod); constrained {
+			if decimal, ok := types.DecimalOf(precision, scale); ok {
+				return string(decimal)
+			}
+		}
+	}
+	return oidToString(oid)
+}
+
+// numericTypmod decodes a numeric type modifier, (precision<<16 | scale) + VARHDRSZ (4). An
+// unconstrained numeric has typmod -1.
+func numericTypmod(typmod int32) (precision, scale int, constrained bool) {
+	if typmod < 4 {
+		return 0, 0, false
+	}
+	mod := typmod - 4
+	return int((mod >> 16) & 0xffff), int(mod & 0xffff), true
 }
 
 // OIDToString converts a PostgreSQL OID to its string representation

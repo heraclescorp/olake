@@ -26,6 +26,7 @@ import (
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils/logger"
+	"github.com/datazip-inc/olake/utils/typeutils"
 	"github.com/goccy/go-json"
 )
 
@@ -1228,11 +1229,23 @@ func nativeIndexValue(column arrow.Array, row int) any {
 		return value.Value(row)
 	case *array.Float64:
 		return value.Value(row)
+	case *array.Decimal128:
+		typ := value.DataType().(*arrow.Decimal128Type)
+		return typeutils.NewDecimal(value.Value(row), typ.Precision, typ.Scale)
+	case *array.Date32:
+		return typeutils.Date{Time: value.Value(row).ToTime().UTC()}
+	case *array.Timestamp:
+		typ := value.DataType().(*arrow.TimestampType)
+		if typ.TimeZone != "" {
+			return column.GetOneForMarshal(row)
+		}
+		return typeutils.TimestampNTZ{Time: value.Value(row).ToTime(typ.Unit)}
 	case *array.Dictionary:
 		return nativeIndexValue(value.Dictionary(), value.GetValueIndex(row))
 	default:
 		// TOAST-bearing source values (text, JSON, arrays) are stored as strings;
-		// the other primitive values retain their Arrow logical representation.
+		// the other primitive values retain their Arrow logical representation, and
+		// decimals, dates and wall-clock timestamps the source type they were read as.
 		return column.GetOneForMarshal(row)
 	}
 }

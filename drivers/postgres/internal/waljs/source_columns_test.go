@@ -55,10 +55,34 @@ func TestSourceColumnExistingRowValue(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			column := filter.sourceColumn("qty", pgtype.Int4OID, tc.catalog)
+			column := filter.sourceColumn("qty", pgtype.Int4OID, -1, tc.catalog)
 			assert.Equal(t, types.SourceColumn{Name: "qty", Type: types.Int32, ExistingRowValue: tc.wantValue, ExistingRowValueUnknown: tc.wantUnknown}, column)
 		})
 	}
+}
+
+// numericTypmodOf encodes a numeric(precision,scale) type modifier as PostgreSQL does.
+func numericTypmodOf(precision, scale int32) int32 {
+	return precision<<16 | scale + 4
+}
+
+func TestNumericTypmodTypeNames(t *testing.T) {
+	assert.Equal(t, "decimal(10,2)", columnTypeName(pgtype.NumericOID, numericTypmodOf(10, 2)))
+	assert.Equal(t, "decimal(6,4)", columnTypeName(pgtype.NumericOID, numericTypmodOf(6, 4)))
+	assert.Equal(t, "decimal(16,2)", columnTypeName(pgtype.NumericOID, numericTypmodOf(16, 2)))
+	assert.Equal(t, "numeric", columnTypeName(pgtype.NumericOID, -1), "unconstrained numeric")
+	assert.Equal(t, "numeric", columnTypeName(pgtype.NumericOID, numericTypmodOf(50, 2)), "wider than an Iceberg decimal")
+	assert.Equal(t, "int4", columnTypeName(pgtype.Int4OID, -1))
+	assert.Equal(t, "timestamp", columnTypeName(pgtype.TimestampOID, -1))
+	assert.Equal(t, "date", columnTypeName(pgtype.DateOID, -1))
+	precision, scale, constrained := numericTypmod(numericTypmodOf(10, 2))
+	assert.Equal(t, []any{10, 2, true}, []any{precision, scale, constrained})
+	_, _, constrained = numericTypmod(-1)
+	assert.False(t, constrained)
+
+	changed := &pglogrepl.RelationMessage{Columns: []*pglogrepl.RelationMessageColumn{{Name: "amount", DataType: pgtype.NumericOID, TypeModifier: numericTypmodOf(16, 2)}}}
+	before := &pglogrepl.RelationMessage{Columns: []*pglogrepl.RelationMessageColumn{{Name: "amount", DataType: pgtype.NumericOID, TypeModifier: numericTypmodOf(10, 2)}}}
+	assert.True(t, relationColumnsChanged(before, changed), "a numeric's precision changed")
 }
 
 func TestRelationSourceColumns(t *testing.T) {

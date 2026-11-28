@@ -27,6 +27,9 @@ func nativeRecoveryValue(column arrow.Array, row int) any {
 	switch value := column.(type) {
 	case *array.String, *array.LargeString, *array.StringView, *array.Binary, *array.LargeBinary, *array.FixedSizeBinary, *array.BinaryView:
 		return nativeIndexValue(column, row)
+	case *array.Decimal128:
+		// the unscaled integer itself: Arrow renders a decimal's text through a binary float
+		return value.Value(row)
 	case *array.Dictionary:
 		return nativeRecoveryValue(value.Dictionary(), value.GetValueIndex(row))
 	default:

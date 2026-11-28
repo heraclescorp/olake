@@ -314,7 +314,7 @@ func nativeSourceColumnDefault(iceType string, value any) (apacheiceberg.Optiona
 				return apacheiceberg.Optional[apacheiceberg.Literal]{}, fmt.Errorf("source default %v is not a valid %s", value, iceType)
 			}
 		}
-	case apacheiceberg.TimestampType, apacheiceberg.TimestampTzType:
+	case apacheiceberg.DateType, apacheiceberg.TimestampType, apacheiceberg.TimestampTzType:
 		if bytes, ok := value.([]byte); ok {
 			value = string(bytes)
 		}
@@ -349,6 +349,10 @@ func nativeSourceColumnDefault(iceType string, value any) (apacheiceberg.Optiona
 	optional, err := nativePartitionLiteral(field, value)
 	if err != nil {
 		return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
+	}
+	if !optional.Valid {
+		// a NaN decimal, which no decimal column holds
+		return apacheiceberg.Optional[apacheiceberg.Literal]{}, fmt.Errorf("source default %v is not a valid %s", value, iceType)
 	}
 	literal := optional.Val
 	switch number := literal.Any().(type) {
@@ -436,8 +440,13 @@ func (w *nativeWriter) AlterSourceColumns(ctx context.Context, added []*nativeSo
 					// TimestampLiteral represents both timezone variants, but the
 					// SDK's default validator treats its native type as timestamp.
 					// Its supported JSON numeric form retains exact epoch micros.
-					if _, timezone := field.Type.(apacheiceberg.TimestampTzType); timezone {
+					switch field.Type.(type) {
+					case apacheiceberg.TimestampTzType:
 						field.InitialDefault = json.Number(strconv.FormatInt(int64(field.InitialDefault.(apacheiceberg.Timestamp)), 10))
+					case apacheiceberg.DecimalType:
+						// A decimal's single-value JSON form is its exact text; the
+						// struct would encode its unscaled integer as an empty object.
+						field.InitialDefault = field.InitialDefault.(apacheiceberg.Decimal).String()
 					}
 				}
 			}

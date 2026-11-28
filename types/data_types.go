@@ -21,12 +21,15 @@ const (
 	Object         DataType = "object"
 	Array          DataType = "array"
 	Unknown        DataType = "unknown"
+	Date           DataType = "date"          // a calendar date, without a time of day or zone
+	TimestampNTZ   DataType = "timestamp_ntz" // a wall-clock date and time, without a zone
 	Timestamp      DataType = "timestamp"
 	TimestampMilli DataType = "timestamp_milli" // storing datetime up to 3 precisions
 	TimestampMicro DataType = "timestamp_micro" // storing datetime up to 6 precisions
 	TimestampNano  DataType = "timestamp_nano"  // storing datetime up to 9 precisions
 	Binary         DataType = "binary"
 	FixedBinary    DataType = "fixed_binary(%d)"
+	Decimal        DataType = "decimal(%d,%d)"
 )
 
 var (
@@ -37,18 +40,23 @@ var (
 
 // Tree Representation of TypeWeights
 //
-//                                        10 (Binary)
+//                                        12 (Binary)
 //                                       /           \
-//                              5 (String)            \ 11 (FixedBinary)
+//                              5 (String)            \ 13 (FixedBinary)
 //                            /            \
-//             3 (Float64)   /              \ 9 (TimestampNano)
+//             3 (Float64)   /              \ 11 (TimestampNano)
 //                         /  \             /
-//             2 (Int64)  /    \4(Float32) / 8 (TimestampMicro)
+//             2 (Int64)  /    \4(Float32) / 10 (TimestampMicro)
 //                       /                /
-//            1 (Int32) /                / 7 (TimestampMilli)
+//            1 (Int32) /                / 9 (TimestampMilli)
 //                     /                /
-//           0 (Bool) /                / 6 (Timestamp)
+//           0 (Bool) /                / 8 (Timestamp)
+//                                    /
+//                                   / 7 (TimestampNTZ)
+//                                  /
+//                                 / 6 (Date)
 //
+// Decimal is off the tree: it weighs as Float64, the type every decimal falls back to (see typeWeight).
 
 var TypeWeights = map[DataType]int{
 	Bool:           0,
@@ -57,12 +65,14 @@ var TypeWeights = map[DataType]int{
 	Float64:        3,
 	Float32:        4,
 	String:         5,
-	TimestampNano:  9,
-	TimestampMicro: 8,
-	TimestampMilli: 7,
-	Timestamp:      6,
-	Binary:         10,
-	FixedBinary:    11,
+	Date:           6,
+	TimestampNTZ:   7,
+	Timestamp:      8,
+	TimestampMilli: 9,
+	TimestampMicro: 10,
+	TimestampNano:  11,
+	Binary:         12,
+	FixedBinary:    13,
 }
 
 // ValueType is the type d's inherent value type ignoring the parameters
@@ -120,6 +130,8 @@ var destinationTypes = destinationTypesMap{
 	Float32:        {"float", leafNode(parquet.FloatType)},
 	Float64:        {"double", leafNode(parquet.DoubleType)},
 	String:         {"string", plainNode(parquet.String)},
+	Date:           {"date", plainNode(parquet.Date)},
+	TimestampNTZ:   {"timestamp", timestampNTZNode},
 	Timestamp:      {"timestamptz", timestampNode}, // timestamptz as we use default utc
 	TimestampMilli: {"timestamptz", timestampNode},
 	TimestampMicro: {"timestamptz", timestampNode},
@@ -128,6 +140,7 @@ var destinationTypes = destinationTypesMap{
 	Array:          {"string", plainNode(parquet.String)},
 	Binary:         {"binary", leafNode(parquet.ByteArrayType)},
 	FixedBinary:    {"fixed[%d]", fixedBinaryNode}, // the pattern is a registry key; only an instance renders
+	Decimal:        {"decimal(%d, %d)", decimalNode},
 }
 
 type icebergToDataTypeMap map[string]DataType
@@ -152,15 +165,18 @@ func (m icebergToDataTypeMap) get(icebergType string) (DataType, bool) {
 // share the same iceberg type. A family is registered under its pattern, the same key its
 // destination mapping produces. IcebergTypeToDatatype falls back to fallbackType.
 var icebergToDataType = icebergToDataTypeMap{
-	"boolean":     Bool,
-	"int":         Int32,
-	"long":        Int64,
-	"float":       Float32,
-	"double":      Float64,
-	"timestamptz": TimestampMicro,
-	"string":      String,
-	"binary":      Binary,
-	"fixed[%d]":   FixedBinary,
+	"boolean":         Bool,
+	"int":             Int32,
+	"long":            Int64,
+	"float":           Float32,
+	"double":          Float64,
+	"date":            Date,
+	"timestamp":       TimestampNTZ,
+	"timestamptz":     TimestampMicro,
+	"string":          String,
+	"binary":          Binary,
+	"fixed[%d]":       FixedBinary,
+	"decimal(%d, %d)": Decimal,
 }
 
 type Record map[string]any

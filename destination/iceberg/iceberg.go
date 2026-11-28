@@ -63,18 +63,28 @@ type Iceberg struct {
 	// Schema is refreshed at explicit evolution and commit boundaries.
 }
 
-// Pre-computed lookup tables for type validation
+// Pre-computed lookup tables for type validation; a decimal(p, s) value is looked up as "decimal".
+// Tables created before PostgreSQL numeric, date and timestamp columns got their own types hold
+// them as double and timestamptz. Such a column keeps its type: a decimal is written as the double
+// its text parses to, a date as UTC midnight and a wall-clock timestamp as that instant in UTC,
+// exactly the values those columns received before.
 var validTypeTransitions = map[string]map[string]bool{
 	"int":         {"int": true, "long": true},
 	"long":        {"long": true, "int": true},
 	"float":       {"float": true, "double": true},
-	"double":      {"double": true, "float": true},
+	"double":      {"double": true, "float": true, "decimal": true},
 	"boolean":     {"boolean": true},
 	"string":      {"string": true},
-	"timestamptz": {"timestamptz": true},
+	"date":        {"date": true},
+	"timestamp":   {"timestamp": true, "date": true},
+	"timestamptz": {"timestamptz": true, "timestamp": true, "date": true},
 }
 
-// promotionTransitions tracks when type promotion is required
+// nanDecimalAsNull warns once a sync, not once a row, that a NaN decimal is written as null.
+var nanDecimalAsNull sync.Once
+
+// promotionTransitions tracks when type promotion is required; isPromotionRequired also widens a
+// decimal's precision.
 var promotionTransitions = map[string]map[string]bool{
 	"int":   {"long": true},
 	"float": {"double": true},
@@ -416,14 +426,27 @@ func parsePartitionRegex(pattern string, resolveColumnName func(string) string) 
 // iceberg type valueType, as its value type or through an iceberg promotion. A fixed[n] value of
 // the wrong length fails on write.
 func isValidTypeForColumn(columnType, valueType string) bool {
-	if types.IcebergValueType(columnType) == valueType || validTypeTransitions[columnType][valueType] {
+	if types.IcebergValueType(columnType) == valueType || validTypeTransitions[columnType][transitionKey(valueType)] || isPromotionRequired(columnType, valueType) {
 		return true
 	}
 	return getCommonAncestorType(columnType, valueType) == columnType
 }
 
-// isPromotionRequired checks if promotion is needed using lookup table
+// transitionKey is the validTypeTransitions key of a value's iceberg type: a decimal's family.
+func transitionKey(valueType string) string {
+	if _, _, isDecimal := types.IcebergDecimalParams(valueType); isDecimal {
+		return "decimal"
+	}
+	return valueType
+}
+
+// isPromotionRequired checks if promotion is needed using lookup table. Iceberg widens a decimal's
+// precision, never its scale.
 func isPromotionRequired(oldType, newType string) bool {
+	if oldPrecision, oldScale, isDecimal := types.IcebergDecimalParams(oldType); isDecimal {
+		newPrecision, newScale, isNewDecimal := types.IcebergDecimalParams(newType)
+		return isNewDecimal && newScale == oldScale && newPrecision > oldPrecision
+	}
 	if transitions, ok := promotionTransitions[oldType]; ok {
 		return transitions[newType]
 	}
@@ -1597,6 +1620,19 @@ func appendNativeValue(builder array.Builder, value any) error {
 	switch b := builder.(type) {
 	case *array.Decimal128Builder:
 		typ := b.Type().(*arrow.Decimal128Type)
+		if v, ok := value.(typeutils.Decimal); ok {
+			if v.IsNaN() {
+				nanDecimalAsNull.Do(func() { logger.Warn("writing NaN as null in decimal columns, which cannot hold it") })
+				b.AppendNull()
+				break
+			}
+			unscaled, scale := v.Unscaled()
+			if scale != typ.Scale || !unscaled.FitsInPrecision(typ.Precision) {
+				return fmt.Errorf("decimal value %s does not fit column type %s", v, typ)
+			}
+			b.Append(unscaled)
+			break
+		}
 		if v, ok := value.(decimal128.Num); ok {
 			b.Append(v)
 			break
@@ -1617,6 +1653,12 @@ func appendNativeValue(builder array.Builder, value any) error {
 			return err
 		}
 		b.Append(v)
+	case *array.Date32Builder:
+		v, err := typeutils.ReformatCalendarDate(value)
+		if err != nil {
+			return err
+		}
+		b.Append(arrow.Date32FromTime(v.Time))
 	case *array.BooleanBuilder:
 		v, err := typeutils.ReformatBool(value)
 		if err != nil {
@@ -1725,6 +1767,20 @@ func nativePartitionLiteral(field apacheiceberg.NestedField, value any) (apachei
 			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
 		}
 		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(v), Valid: true}, nil
+	case apacheiceberg.DateType:
+		v, err := typeutils.ReformatCalendarDate(value)
+		if err != nil {
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
+		}
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(apacheiceberg.Date(arrow.Date32FromTime(v.Time))), Valid: true}, nil
+	case apacheiceberg.DecimalType:
+		typ := field.Type.(apacheiceberg.DecimalType)
+		v, err := typeutils.ReformatDecimal(types.Decimal.Of(typ.Precision(), typ.Scale()), value)
+		if err != nil || v.IsNaN() {
+			return apacheiceberg.Optional[apacheiceberg.Literal]{}, err
+		}
+		unscaled, scale := v.Unscaled()
+		return apacheiceberg.Optional[apacheiceberg.Literal]{Val: apacheiceberg.NewLiteral(apacheiceberg.Decimal{Val: unscaled, Scale: int(scale)}), Valid: true}, nil
 	case apacheiceberg.TimestampType, apacheiceberg.TimestampTzType:
 		v, err := typeutils.ReformatDate(value, true)
 		if err != nil {

@@ -167,8 +167,62 @@ func TestIsValidTypeForColumn(t *testing.T) {
 		},
 		{
 			name:       "a column type olake does not map keeps its own value type and rejects string",
-			columnType: "date",
+			columnType: "time",
 			valueType:  "string",
+			valid:      false,
+		},
+		{
+			name:       "a double column created before decimals takes a decimal as its double",
+			columnType: "double",
+			valueType:  "decimal(16, 2)",
+			valid:      true,
+		},
+		{
+			name:       "a timestamptz column created before dates takes a date as UTC midnight",
+			columnType: "timestamptz",
+			valueType:  "date",
+			valid:      true,
+		},
+		{
+			name:       "a timestamptz column created before wall-clock timestamps takes one as UTC",
+			columnType: "timestamptz",
+			valueType:  "timestamp",
+			valid:      true,
+		},
+		{
+			name:       "a date column rejects a timestamp",
+			columnType: "date",
+			valueType:  "timestamptz",
+			valid:      false,
+		},
+		{
+			name:       "a wall-clock timestamp column rejects a timestamptz",
+			columnType: "timestamp",
+			valueType:  "timestamptz",
+			valid:      false,
+		},
+		{
+			name:       "a decimal column rejects a double",
+			columnType: "decimal(16, 2)",
+			valueType:  "double",
+			valid:      false,
+		},
+		{
+			name:       "a decimal column takes a narrower decimal of its scale",
+			columnType: "decimal(16, 2)",
+			valueType:  "decimal(10, 2)",
+			valid:      true,
+		},
+		{
+			name:       "iceberg widens a decimal's precision",
+			columnType: "decimal(10, 2)",
+			valueType:  "decimal(16, 2)",
+			valid:      true,
+		},
+		{
+			name:       "iceberg never changes a decimal's scale",
+			columnType: "decimal(16, 2)",
+			valueType:  "decimal(16, 4)",
 			valid:      false,
 		},
 	}
@@ -178,6 +232,15 @@ func TestIsValidTypeForColumn(t *testing.T) {
 			assert.Equal(t, tc.valid, isValidTypeForColumn(tc.columnType, tc.valueType))
 		})
 	}
+}
+
+func TestIsPromotionRequiredWidensDecimalPrecision(t *testing.T) {
+	assert.True(t, isPromotionRequired("decimal(10, 2)", "decimal(16, 2)"))
+	assert.False(t, isPromotionRequired("decimal(16, 2)", "decimal(10, 2)"), "a narrower decimal fits as it is")
+	assert.False(t, isPromotionRequired("decimal(10, 2)", "decimal(16, 4)"), "iceberg never changes a decimal's scale")
+	assert.False(t, isPromotionRequired("double", "decimal(16, 2)"), "a double column keeps its type")
+	assert.False(t, isPromotionRequired("timestamptz", "timestamp"), "a timestamptz column keeps its type")
+	assert.True(t, isPromotionRequired("int", "long"))
 }
 
 // chunkWriter keeps the ids of the records each Write call received.

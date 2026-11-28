@@ -305,6 +305,7 @@ func canonicalPostgresBackfillPlan(stream types.StreamInterface, plan *types.Set
 	chunks := plan.Array()
 	column := stream.Self().StreamMetadata.ChunkColumn
 	columnType, _ := stream.Schema().GetType(column)
+	numeric := columnType == types.Int64 || columnType == types.Float64 || types.BaseOf(columnType) == types.Decimal
 	quote := func(value string) string { return "'" + strings.ReplaceAll(value, "'", "''") + "'" }
 	boundary := func(value any) any {
 		switch value := value.(type) {
@@ -314,13 +315,13 @@ func canonicalPostgresBackfillPlan(stream types.StreamInterface, plan *types.Set
 			if columnType == types.Binary {
 				return "decode('" + hex.EncodeToString(value) + "','hex')"
 			}
-			if columnType == types.Int64 || columnType == types.Float64 {
+			if numeric {
 				return json.Number(string(value))
 			}
 			return quote(string(value))
 		case string:
 			if column != "" {
-				if columnType == types.Int64 || columnType == types.Float64 {
+				if numeric {
 					return json.Number(value)
 				}
 				return quote(value)

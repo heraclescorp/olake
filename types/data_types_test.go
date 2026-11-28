@@ -60,6 +60,10 @@ func TestToIceberg(t *testing.T) {
 		{Unknown, "string"},
 		{Binary, "binary"},
 		{FixedBinaryOf(16), "fixed[16]"},
+		{Date, "date"},
+		{TimestampNTZ, "timestamp"},
+		{Decimal.Of(16, 2), "decimal(16, 2)"},
+		{Decimal.Of(38, 0), "decimal(38, 0)"},
 		{DataType("undeclared_type"), "string"},
 	}
 
@@ -91,6 +95,11 @@ func TestToNewParquet(t *testing.T) {
 		{Unknown, parquet.Leaf(parquet.ByteArrayType)},
 		{Binary, parquet.Leaf(parquet.ByteArrayType)},
 		{FixedBinaryOf(16), parquet.Leaf(parquet.FixedLenByteArrayType(16))},
+		{Date, parquet.Date()},
+		{TimestampNTZ, parquet.TimestampAdjusted(parquet.Microsecond, false)},
+		{Decimal.Of(9, 2), parquet.Decimal(2, 9, parquet.Int32Type)},
+		{Decimal.Of(16, 2), parquet.Decimal(2, 16, parquet.Int64Type)},
+		{Decimal.Of(38, 6), parquet.String()},
 		{DataType("undeclared_type"), parquet.Leaf(parquet.ByteArrayType)},
 	}
 
@@ -117,9 +126,15 @@ func TestIcebergTypeToDatatype(t *testing.T) {
 		{"string", String},
 		{"binary", Binary},
 		{"fixed[16]", FixedBinaryOf(16)},
-		{"fixed[0]", String},   // iceberg fixed needs a positive length
-		{"fixed[abc]", String}, // malformed length
-		{"fixed", String},      // length missing
+		{"date", Date},
+		{"timestamp", TimestampNTZ},
+		{"decimal(16, 2)", Decimal.Of(16, 2)},
+		{"decimal(6, 4)", Decimal.Of(6, 4)},
+		{"decimal(39, 2)", String}, // iceberg decimals hold at most 38 digits
+		{"decimal(16,2)", String},  // iceberg renders a space after the comma
+		{"fixed[0]", String},       // iceberg fixed needs a positive length
+		{"fixed[abc]", String},     // malformed length
+		{"fixed", String},          // length missing
 		{"undeclared_type", String},
 	}
 

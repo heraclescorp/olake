@@ -24,6 +24,16 @@ func Compare(a, b any) int {
 		return 1
 	}
 
+	// A decimal compares exactly with any number; a date or wall-clock timestamp as the instant a
+	// timestamp column holds for it, so values compare with bounds of either column type.
+	if aDecimal, isDecimal := a.(Decimal); isDecimal {
+		return compareDecimal(aDecimal, b)
+	}
+	if bDecimal, isDecimal := b.(Decimal); isDecimal {
+		return -compareDecimal(bDecimal, a)
+	}
+	a, b = comparableTime(a), comparableTime(b)
+
 	switch aVal := a.(type) {
 	case uint, uint8, uint16, uint32, uint64:
 		aUint := reflect.ValueOf(a).Convert(reflect.TypeOf(uint64(0))).Uint()
@@ -100,5 +110,28 @@ func Compare(a, b any) int {
 		}
 		// For any other types, convert to string for comparison
 		return strings.Compare(fmt.Sprintf("%v", a), fmt.Sprintf("%v", b))
+	}
+}
+
+func compareDecimal(a Decimal, b any) int {
+	other, isDecimal := b.(Decimal)
+	if !isDecimal {
+		parsed, err := ParseDecimal(b)
+		if err != nil {
+			return strings.Compare(a.String(), fmt.Sprintf("%v", b))
+		}
+		other = parsed
+	}
+	return a.Cmp(other)
+}
+
+func comparableTime(v any) any {
+	switch v := v.(type) {
+	case Date:
+		return v.Time
+	case TimestampNTZ:
+		return v.Time
+	default:
+		return v
 	}
 }

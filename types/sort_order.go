@@ -177,11 +177,11 @@ func sortPrimitive(property *Property, temporalOnly bool) bool {
 		return false
 	}
 	switch primitive.ValueType() {
-	case Timestamp, TimestampMilli, TimestampMicro, TimestampNano:
+	case Date, TimestampNTZ, Timestamp, TimestampMilli, TimestampMicro, TimestampNano:
 		return true
 	case Bool, Int32, Int64, Float32, Float64, String, Binary:
 		return !temporalOnly
 	default:
-		return false
+		return !temporalOnly && BaseOf(primitive) == Decimal
 	}
 }
